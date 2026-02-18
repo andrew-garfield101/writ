@@ -1,0 +1,23 @@
+# Rust
+target/
+
+# IDE / tool config
+.vscode/
+.idea/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python (for writ-py bindings)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# writ's own data (when dogfooding)
+.writ/

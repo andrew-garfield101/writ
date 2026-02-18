@@ -128,7 +128,7 @@ impl PyRepository {
     ///
     /// If `paths` is provided, only seal matching files (selective seal).
     /// Otherwise seals all changes.
-    #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="complete", paths=None))]
+    #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="complete", paths=None, tests_passed=None, tests_failed=None, linted=false))]
     fn seal(
         &self,
         py: Python,
@@ -138,12 +138,20 @@ impl PyRepository {
         spec_id: Option<String>,
         status: &str,
         paths: Option<Vec<String>>,
+        tests_passed: Option<u32>,
+        tests_failed: Option<u32>,
+        linted: bool,
     ) -> PyResult<PyObject> {
         let agent = AgentIdentity {
             id: agent_id.to_string(),
             agent_type: parse_agent_type(agent_type)?,
         };
         let task_status = parse_task_status(status)?;
+        let verification = Verification {
+            tests_passed,
+            tests_failed,
+            linted,
+        };
 
         let seal = if let Some(ref p) = paths {
             self.inner
@@ -152,7 +160,7 @@ impl PyRepository {
                     summary.to_string(),
                     spec_id,
                     task_status,
-                    Verification::default(),
+                    verification,
                     p,
                 )
                 .map_err(writ_err)?
@@ -163,7 +171,7 @@ impl PyRepository {
                     summary.to_string(),
                     spec_id,
                     task_status,
-                    Verification::default(),
+                    verification,
                 )
                 .map_err(writ_err)?
         };
@@ -274,6 +282,50 @@ impl PyRepository {
     fn list_specs(&self, py: Python) -> PyResult<PyObject> {
         let specs = self.inner.list_specs().map_err(writ_err)?;
         to_pydict(py, &specs)
+    }
+
+    /// Analyze convergence between two specs (three-way merge).
+    ///
+    /// Returns a ConvergenceReport dict with auto_merged, conflicts,
+    /// left_only, right_only, and is_clean fields.
+    fn converge(&self, py: Python, left_spec: &str, right_spec: &str) -> PyResult<PyObject> {
+        let report = self
+            .inner
+            .converge(left_spec, right_spec)
+            .map_err(writ_err)?;
+        to_pydict(py, &report)
+    }
+
+    /// Apply a convergence result to the working directory.
+    ///
+    /// Writes merged files and resolved conflicts to disk.
+    /// Does NOT create a seal — call `seal()` after to capture the result.
+    ///
+    /// `report` should be the dict returned by `converge()`.
+    /// `resolutions` is a list of dicts with `path` and `content` keys
+    /// (only needed if the report has conflicts).
+    #[pyo3(signature = (report, resolutions=None))]
+    fn apply_convergence(
+        &self,
+        py: Python,
+        report: PyObject,
+        resolutions: Option<PyObject>,
+    ) -> PyResult<()> {
+        let report: writ_core::convergence::ConvergenceReport =
+            pythonize::depythonize(&report.bind(py))
+                .map_err(|e| WritError::new_err(e.to_string()))?;
+
+        let resolutions: Vec<writ_core::convergence::FileResolution> = match resolutions {
+            Some(r) => pythonize::depythonize(&r.bind(py))
+                .map_err(|e| WritError::new_err(e.to_string()))?,
+            None => Vec::new(),
+        };
+
+        self.inner
+            .apply_convergence(&report, &resolutions)
+            .map_err(writ_err)?;
+
+        Ok(())
     }
 }
 

@@ -50,6 +50,18 @@ enum Commands {
         /// Seal only these paths (comma-separated). Remaining changes stay pending.
         #[arg(long, value_delimiter = ',')]
         paths: Option<Vec<String>>,
+
+        /// Number of tests that passed.
+        #[arg(long)]
+        tests_passed: Option<u32>,
+
+        /// Number of tests that failed.
+        #[arg(long)]
+        tests_failed: Option<u32>,
+
+        /// Whether the code was linted.
+        #[arg(long)]
+        linted: bool,
     },
 
     /// Inspect a specific seal.
@@ -119,6 +131,23 @@ enum Commands {
         /// Output format: "human" (default) or "json".
         #[arg(long, default_value = "human")]
         format: String,
+    },
+
+    /// Analyze convergence between two specs (three-way merge).
+    Converge {
+        /// Left spec ID.
+        left_spec: String,
+
+        /// Right spec ID.
+        right_spec: String,
+
+        /// Output format: "human" (default), "json", or "brief".
+        #[arg(long, default_value = "human")]
+        format: String,
+
+        /// Apply the convergence result to the working directory (clean merges only).
+        #[arg(long)]
+        apply: bool,
     },
 
     /// Manage specs (requirements).
@@ -193,7 +222,10 @@ fn main() {
             spec,
             status,
             paths,
-        } => cmd_seal(&cwd, &summary, &agent, spec, &status, paths),
+            tests_passed,
+            tests_failed,
+            linted,
+        } => cmd_seal(&cwd, &summary, &agent, spec, &status, paths, tests_passed, tests_failed, linted),
         Commands::Show {
             seal_id,
             diff,
@@ -211,6 +243,12 @@ fn main() {
             force,
             format,
         } => cmd_restore(&cwd, &seal_id, force, &format),
+        Commands::Converge {
+            left_spec,
+            right_spec,
+            format,
+            apply,
+        } => cmd_converge(&cwd, &left_spec, &right_spec, &format, apply),
         Commands::Spec { action } => match action {
             SpecCommands::Add {
                 id,
@@ -284,6 +322,9 @@ fn cmd_seal(
     spec_id: Option<String>,
     status: &str,
     paths: Option<Vec<String>>,
+    tests_passed: Option<u32>,
+    tests_failed: Option<u32>,
+    linted: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
 
@@ -302,13 +343,19 @@ fn cmd_seal(
         _ => TaskStatus::Complete,
     };
 
+    let verification = Verification {
+        tests_passed,
+        tests_failed,
+        linted,
+    };
+
     let seal = if let Some(paths) = paths {
         repo.seal_paths(
             agent,
             summary.to_string(),
             spec_id,
             task_status,
-            Verification::default(),
+            verification,
             &paths,
         )?
     } else {
@@ -317,12 +364,25 @@ fn cmd_seal(
             summary.to_string(),
             spec_id,
             task_status,
-            Verification::default(),
+            verification,
         )?
     };
 
     println!("sealed {}", &seal.id[..12]);
     println!("  summary: {}", seal.summary);
+    if seal.verification.tests_passed.is_some() || seal.verification.tests_failed.is_some() || seal.verification.linted {
+        print!("  verified:");
+        if let Some(p) = seal.verification.tests_passed {
+            print!(" {p} passed");
+        }
+        if let Some(f) = seal.verification.tests_failed {
+            print!(" {f} failed");
+        }
+        if seal.verification.linted {
+            print!(" linted");
+        }
+        println!();
+    }
     println!("  changes: {} file(s)", seal.changes.len());
     for c in &seal.changes {
         let marker = match c.change_type {
@@ -669,6 +729,19 @@ fn cmd_show(
                 println!("  spec:      {spec}");
             }
             println!("  status:    {:?}", seal.status);
+            if seal.verification.tests_passed.is_some() || seal.verification.tests_failed.is_some() || seal.verification.linted {
+                print!("  verified: ");
+                if let Some(p) = seal.verification.tests_passed {
+                    print!(" {p} passed");
+                }
+                if let Some(f) = seal.verification.tests_failed {
+                    print!(" {f} failed");
+                }
+                if seal.verification.linted {
+                    print!(" linted");
+                }
+                println!();
+            }
             println!("  summary:   {}", seal.summary);
             println!("  changes:   {} file(s)", seal.changes.len());
             for c in &seal.changes {
@@ -789,6 +862,122 @@ fn cmd_spec_status(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             "  {status_marker}{:<20} {:?}  ({seal_count} seal(s))",
             spec.id, spec.status
         );
+    }
+
+    Ok(())
+}
+
+fn cmd_converge(
+    cwd: &PathBuf,
+    left_spec: &str,
+    right_spec: &str,
+    format: &str,
+    apply: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    let report = repo.converge(left_spec, right_spec)?;
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        "brief" => {
+            let status = if report.is_clean { "clean" } else { "conflict" };
+            println!(
+                "{} + {} = {} (auto:{} conflicts:{} left:{} right:{})",
+                report.left_spec,
+                report.right_spec,
+                status,
+                report.auto_merged.len(),
+                report.conflicts.len(),
+                report.left_only.len(),
+                report.right_only.len(),
+            );
+        }
+        _ => {
+            println!(
+                "convergence: {} + {}",
+                report.left_spec, report.right_spec
+            );
+
+            if let Some(ref base) = report.base_seal_id {
+                println!("  base: seal {}", &base[..12.min(base.len())]);
+            } else {
+                println!("  base: (empty state)");
+            }
+            println!();
+
+            if !report.auto_merged.is_empty() {
+                println!("  auto-merged ({} file(s)):", report.auto_merged.len());
+                for m in &report.auto_merged {
+                    println!("    ~ {}", m.path);
+                }
+                println!();
+            }
+
+            if !report.left_only.is_empty() {
+                println!("  left only ({} file(s)):", report.left_only.len());
+                for p in &report.left_only {
+                    println!("    ~ {p}");
+                }
+                println!();
+            }
+
+            if !report.right_only.is_empty() {
+                println!("  right only ({} file(s)):", report.right_only.len());
+                for p in &report.right_only {
+                    println!("    ~ {p}");
+                }
+                println!();
+            }
+
+            if !report.conflicts.is_empty() {
+                println!("  conflicts ({} file(s)):", report.conflicts.len());
+                for c in &report.conflicts {
+                    println!("    {}:", c.path);
+                    for (i, region) in c.regions.iter().enumerate() {
+                        println!("      region {} (line {}):", i + 1, region.base_start);
+                        if !region.base_lines.is_empty() {
+                            for bl in &region.base_lines {
+                                println!("        base:  {bl}");
+                            }
+                        }
+                        for ll in &region.left_lines {
+                            println!("        left:  {ll}");
+                        }
+                        for rl in &region.right_lines {
+                            println!("        right: {rl}");
+                        }
+                    }
+                }
+                println!();
+            }
+
+            if report.is_clean {
+                println!("  result: clean");
+                if !apply {
+                    println!("  run with --apply to write merged files");
+                }
+            } else {
+                println!(
+                    "  result: {} conflict(s) — resolve before applying",
+                    report.conflicts.len()
+                );
+            }
+        }
+    }
+
+    if apply {
+        if !report.is_clean {
+            eprintln!("error: cannot --apply with unresolved conflicts");
+            eprintln!("  use JSON output to inspect conflicts and resolve programmatically");
+            std::process::exit(1);
+        }
+        repo.apply_convergence(&report, &[])?;
+        if format != "json" {
+            println!("\n  applied — merged files written to working directory");
+            println!("  seal with `writ seal` to capture the converged state");
+        }
     }
 
     Ok(())

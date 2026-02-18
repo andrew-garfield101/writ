@@ -11,6 +11,7 @@ serde_json = "1"
 sha2 = "0.10"
 walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"
 
 [dev-dependencies]
 tempfile = "3"

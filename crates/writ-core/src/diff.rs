@@ -84,7 +84,7 @@ pub fn is_binary(data: &[u8]) -> bool {
 }
 
 /// Compute the longest common subsequence table for two slices of lines.
-fn lcs_table(old: &[&str], new: &[&str]) -> Vec<Vec<usize>> {
+pub(crate) fn lcs_table(old: &[&str], new: &[&str]) -> Vec<Vec<usize>> {
     let m = old.len();
     let n = new.len();
     let mut table = vec![vec![0usize; n + 1]; m + 1];
@@ -104,14 +104,14 @@ fn lcs_table(old: &[&str], new: &[&str]) -> Vec<Vec<usize>> {
 
 /// Edit operation produced by LCS backtracking.
 #[derive(Debug, PartialEq)]
-enum EditOp {
+pub(crate) enum EditOp {
     Equal(usize, usize), // old_idx, new_idx
     Insert(usize),       // new_idx
     Delete(usize),       // old_idx
 }
 
 /// Backtrack through the LCS table to produce a sequence of edit operations.
-fn lcs_backtrack(table: &[Vec<usize>], old: &[&str], new: &[&str]) -> Vec<EditOp> {
+pub(crate) fn lcs_backtrack(table: &[Vec<usize>], old: &[&str], new: &[&str]) -> Vec<EditOp> {
     let mut ops = Vec::new();
     let mut i = old.len();
     let mut j = new.len();

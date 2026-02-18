@@ -22,6 +22,12 @@ pub enum WritError {
     SealNotFound(String),
     /// A spec with this ID was not found.
     SpecNotFound(String),
+    /// Spec has no seals — cannot converge.
+    SpecHasNoSeals(String),
+    /// Convergence has unresolved conflicts.
+    UnresolvedConflicts(usize),
+    /// Could not acquire the repository lock within the timeout.
+    LockTimeout,
     /// Generic error with a message.
     Other(String),
 }
@@ -37,6 +43,11 @@ impl fmt::Display for WritError {
             WritError::NothingToSeal => write!(f, "no changes to seal"),
             WritError::SealNotFound(id) => write!(f, "seal not found: {id}"),
             WritError::SpecNotFound(id) => write!(f, "spec not found: {id}"),
+            WritError::SpecHasNoSeals(id) => write!(f, "spec has no seals: {id}"),
+            WritError::UnresolvedConflicts(n) => {
+                write!(f, "{n} unresolved conflict(s) — provide resolutions before applying")
+            }
+            WritError::LockTimeout => write!(f, "could not acquire repository lock within timeout"),
             WritError::Other(msg) => write!(f, "{msg}"),
         }
     }

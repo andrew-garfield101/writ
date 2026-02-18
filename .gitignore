@@ -21,3 +21,6 @@ venv/
 
 # writ's own data (when dogfooding)
 .writ/
+
+# Temporary / scratch directories
+tmp/

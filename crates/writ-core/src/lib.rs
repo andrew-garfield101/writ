@@ -5,11 +5,13 @@
 //! and **convergence** (not merging).
 
 pub mod context;
+pub mod convergence;
 pub mod diff;
 pub mod error;
 pub mod hash;
 pub mod ignore;
 pub mod index;
+pub mod lock;
 pub mod object;
 pub mod repo;
 pub mod seal;

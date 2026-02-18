@@ -165,7 +165,7 @@ writ/
 
 **Storage model:** Content-addressable object store (SHA-256, 2-char prefix directories). Seals and specs stored as JSON in `.writ/seals/` and `.writ/specs/`. Index at `.writ/index.json`. HEAD pointer at `.writ/HEAD`.
 
-**Test coverage:** 72 Rust tests + 31 Python tests = 103 total tests.
+**Test coverage:** 81 Rust tests + 35 Python tests = 116 total tests.
 
 ## Building from source
 
@@ -187,9 +187,7 @@ pytest tests/
 The core VCS primitives are implemented. What's ahead:
 
 - **Convergence** — writ's answer to merging. When multiple agents modify overlapping files, their seals need to reconcile. This is the hardest unsolved problem.
-- **Verification as trust infrastructure** — Seals carrying proof that tests passed, not just summaries claiming they did. Enables orchestrators to promote only verified seals. In multi-agent systems where agents don't inherently trust each other, this is how you build confidence without human review of every change.
-- **Remote/shared state** — `writ push` / `writ pull` for agents running across machines or processes.
-- **Concurrency** — File locking or alternative storage models for agents sealing simultaneously.
+- **Remote/shared state** — `writ push` / `writ pull` for agents running across machines or processes. Currently locking is local (`flock`-based); distributed locking for multi-machine scenarios is future work.
 - **Agent SDK** — Higher-level Python toolkit for common agent workflows (task pickup, context loading, seal-on-completion patterns).
 
 ## License

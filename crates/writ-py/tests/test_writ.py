@@ -296,3 +296,150 @@ class TestJsonRoundTrip:
         ctx = repo.context()
         result = json.dumps(ctx)
         assert isinstance(result, str)
+
+
+class TestVerification:
+    def test_seal_with_verification(self, tmp_repo):
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("content")
+        seal = repo.seal(
+            summary="verified work",
+            agent_id="worker-1",
+            agent_type="agent",
+            tests_passed=42,
+            tests_failed=0,
+            linted=True,
+        )
+        assert seal["verification"]["tests_passed"] == 42
+        assert seal["verification"]["tests_failed"] == 0
+        assert seal["verification"]["linted"] is True
+
+    def test_seal_verification_default(self, tmp_repo):
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("content")
+        seal = repo.seal(summary="default verification")
+        assert seal["verification"]["tests_passed"] is None
+        assert seal["verification"]["tests_failed"] is None
+        assert seal["verification"]["linted"] is False
+
+    def test_seal_verification_partial(self, tmp_repo):
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("content")
+        seal = repo.seal(summary="partial", tests_passed=10)
+        assert seal["verification"]["tests_passed"] == 10
+        assert seal["verification"]["tests_failed"] is None
+        assert seal["verification"]["linted"] is False
+
+
+class TestConvergence:
+    def _setup_base_and_specs(self, repo, path):
+        """Helper: create a base file and two specs."""
+        (path / "shared.py").write_text("line1\nline2\nline3\nline4\nline5\n")
+        repo.seal(summary="base state")
+        repo.add_spec(id="feat-a", title="Feature A")
+        repo.add_spec(id="feat-b", title="Feature B")
+
+    def test_converge_clean(self, tmp_repo):
+        """Two specs modify disjoint files — clean convergence."""
+        repo, path = tmp_repo
+        self._setup_base_and_specs(repo, path)
+
+        # Spec A adds a new file.
+        (path / "module_a.py").write_text("# module A\n")
+        repo.seal(summary="add module a", spec_id="feat-a")
+
+        # Spec B adds a different file.
+        (path / "module_b.py").write_text("# module B\n")
+        repo.seal(summary="add module b", spec_id="feat-b")
+
+        report = repo.converge("feat-a", "feat-b")
+        assert isinstance(report, dict)
+        assert report["is_clean"] is True
+        assert len(report["conflicts"]) == 0
+        assert "module_a.py" in report["left_only"]
+        assert "module_b.py" in report["right_only"]
+
+    def test_converge_with_conflicts(self, tmp_repo):
+        """Two specs modify the same line differently — conflict detected."""
+        repo, path = tmp_repo
+        self._setup_base_and_specs(repo, path)
+
+        # Both specs change line 2 of shared.py.
+        (path / "shared.py").write_text("line1\nFEATURE_A\nline3\nline4\nline5\n")
+        repo.seal(summary="feat a in shared", spec_id="feat-a")
+
+        (path / "shared.py").write_text("line1\nFEATURE_B\nline3\nline4\nline5\n")
+        repo.seal(summary="feat b in shared", spec_id="feat-b")
+
+        report = repo.converge("feat-a", "feat-b")
+        assert report["is_clean"] is False
+        assert len(report["conflicts"]) == 1
+        assert report["conflicts"][0]["path"] == "shared.py"
+        # Verify structured conflict data.
+        regions = report["conflicts"][0]["regions"]
+        assert len(regions) >= 1
+        assert regions[0]["left_lines"] == ["FEATURE_A"]
+        assert regions[0]["right_lines"] == ["FEATURE_B"]
+
+    def test_apply_convergence(self, tmp_repo):
+        """Apply a clean convergence and verify files on disk."""
+        repo, path = tmp_repo
+        self._setup_base_and_specs(repo, path)
+
+        # Non-overlapping changes to shared.py.
+        (path / "shared.py").write_text("CHANGED_A\nline2\nline3\nline4\nline5\n")
+        repo.seal(summary="change top", spec_id="feat-a")
+
+        (path / "shared.py").write_text("line1\nline2\nline3\nline4\nCHANGED_B\n")
+        repo.seal(summary="change bottom", spec_id="feat-b")
+
+        report = repo.converge("feat-a", "feat-b")
+        assert report["is_clean"] is True
+
+        repo.apply_convergence(report)
+
+        # Verify merged content on disk.
+        content = (path / "shared.py").read_text()
+        assert "CHANGED_A" in content
+        assert "CHANGED_B" in content
+
+    def test_converge_unknown_spec(self, tmp_repo):
+        """Converging with a nonexistent spec raises WritError."""
+        repo, path = tmp_repo
+        with pytest.raises(writ.WritError):
+            repo.converge("nonexistent-a", "nonexistent-b")
+
+    def test_converge_report_is_json_serializable(self, tmp_repo):
+        """Convergence report should be JSON-serializable for agents."""
+        repo, path = tmp_repo
+        self._setup_base_and_specs(repo, path)
+
+        (path / "module_a.py").write_text("# A\n")
+        repo.seal(summary="a work", spec_id="feat-a")
+
+        (path / "module_b.py").write_text("# B\n")
+        repo.seal(summary="b work", spec_id="feat-b")
+
+        report = repo.converge("feat-a", "feat-b")
+        result = json.dumps(report)
+        assert isinstance(result, str)
+
+
+class TestLocking:
+    def test_lock_timeout_error(self, tmp_repo):
+        """Hold a lock via the filesystem and verify seal raises WritError."""
+        import fcntl
+
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("content")
+
+        lock_path = path / ".writ" / "writ.lock"
+        lock_file = open(lock_path, "w")
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+        try:
+            with pytest.raises(writ.WritError, match="lock"):
+                repo.seal(summary="should timeout")
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()

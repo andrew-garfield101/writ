@@ -3,12 +3,17 @@
 //! A Repository ties together the object store, index, seals, and specs
 //! into a unified interface.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::convergence::{
+    self, ConvergenceReport, FileConflict, FileResolution, FileMergeResult, MergedFile,
+};
+use crate::lock::RepoLock;
 use crate::context::{
     ContextOutput, ContextScope, DiffSummary, SealSummary, WorkingStateSummary,
 };
@@ -79,6 +84,14 @@ impl Repository {
         })
     }
 
+    /// Default lock timeout for mutable operations.
+    const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// Acquire an exclusive lock on the repository.
+    fn lock(&self) -> WritResult<RepoLock> {
+        RepoLock::acquire(&self.writ_dir, Self::LOCK_TIMEOUT)
+    }
+
     /// Get the working directory state.
     pub fn state(&self) -> WritResult<WorkingState> {
         let index = self.load_index()?;
@@ -95,6 +108,7 @@ impl Repository {
         status: TaskStatus,
         verification: Verification,
     ) -> WritResult<Seal> {
+        let _lock = self.lock()?;
         let mut index = self.load_index()?;
         let rules = self.ignore_rules();
         let working_state = state::compute_state(&self.root, &index, &rules);
@@ -426,6 +440,7 @@ impl Repository {
     /// Updates files on disk, the index, and HEAD. Does not create a new seal.
     /// Untracked files are left alone.
     pub fn restore(&self, seal_id: &str) -> WritResult<RestoreResult> {
+        let _lock = self.lock()?;
         let full_id = self.resolve_seal_id(seal_id)?;
         let seal = self.load_seal(&full_id)?;
         let target_index = self.load_tree_index(&seal.tree)?;
@@ -554,6 +569,227 @@ impl Repository {
         })
     }
 
+    // -------------------------------------------------------------------
+    // Convergence
+    // -------------------------------------------------------------------
+
+    /// Analyze convergence between two specs.
+    ///
+    /// Performs a three-way merge for each file modified by both specs,
+    /// using the state before either spec started as the common base.
+    /// Returns a structured report — no side effects.
+    pub fn converge(
+        &self,
+        left_spec: &str,
+        right_spec: &str,
+    ) -> WritResult<ConvergenceReport> {
+        let left_spec_data = self.load_spec(left_spec)?;
+        let right_spec_data = self.load_spec(right_spec)?;
+
+        if left_spec_data.sealed_by.is_empty() {
+            return Err(WritError::SpecHasNoSeals(left_spec.to_string()));
+        }
+        if right_spec_data.sealed_by.is_empty() {
+            return Err(WritError::SpecHasNoSeals(right_spec.to_string()));
+        }
+
+        // Collect files modified by each spec.
+        let left_files = self.spec_modified_files(&left_spec_data)?;
+        let right_files = self.spec_modified_files(&right_spec_data)?;
+
+        // Find the latest seal for each spec.
+        let left_seal_id = left_spec_data.sealed_by.last().unwrap().clone();
+        let right_seal_id = right_spec_data.sealed_by.last().unwrap().clone();
+        let left_seal = self.load_seal(&left_seal_id)?;
+        let right_seal = self.load_seal(&right_seal_id)?;
+
+        // Find the base: walk the seal chain and find the earliest seal
+        // belonging to either spec, then use its parent as base.
+        let all_spec_seals: HashSet<&str> = left_spec_data
+            .sealed_by
+            .iter()
+            .chain(right_spec_data.sealed_by.iter())
+            .map(|s| s.as_str())
+            .collect();
+
+        let chain = self.log()?;
+        let mut base_seal_id: Option<String> = None;
+        // chain is newest-first; we want the earliest spec seal.
+        for seal in chain.iter().rev() {
+            if all_spec_seals.contains(seal.id.as_str()) {
+                base_seal_id = seal.parent.clone();
+                break;
+            }
+        }
+
+        // Load tree indices.
+        let base_index = match &base_seal_id {
+            Some(id) => {
+                let base_seal = self.load_seal(id)?;
+                self.load_tree_index(&base_seal.tree)?
+            }
+            None => Index::default(),
+        };
+        let left_index = self.load_tree_index(&left_seal.tree)?;
+        let right_index = self.load_tree_index(&right_seal.tree)?;
+
+        // Categorize files.
+        let both_files: HashSet<&String> = left_files.intersection(&right_files).collect();
+        let left_only: Vec<String> = left_files
+            .iter()
+            .filter(|f| !both_files.contains(f))
+            .cloned()
+            .collect();
+        let right_only: Vec<String> = right_files
+            .iter()
+            .filter(|f| !both_files.contains(f))
+            .cloned()
+            .collect();
+
+        // Three-way merge for overlapping files.
+        let mut auto_merged = Vec::new();
+        let mut conflicts = Vec::new();
+
+        for path in &both_files {
+            let base_content = self.file_content_at_tree(&base_index, path)?;
+            let left_content = self.file_content_at_tree(&left_index, path)?;
+            let right_content = self.file_content_at_tree(&right_index, path)?;
+
+            let base_str = base_content.as_deref().unwrap_or("");
+            let left_str = left_content.as_deref().unwrap_or("");
+            let right_str = right_content.as_deref().unwrap_or("");
+
+            match convergence::three_way_merge(base_str, left_str, right_str) {
+                FileMergeResult::Clean(content) => {
+                    auto_merged.push(MergedFile {
+                        path: path.to_string(),
+                        content,
+                    });
+                }
+                FileMergeResult::Conflict(regions) => {
+                    conflicts.push(FileConflict {
+                        path: path.to_string(),
+                        base_content: base_content.clone(),
+                        left_content: left_str.to_string(),
+                        right_content: right_str.to_string(),
+                        regions,
+                    });
+                }
+            }
+        }
+
+        let is_clean = conflicts.is_empty();
+
+        Ok(ConvergenceReport {
+            left_spec: left_spec.to_string(),
+            right_spec: right_spec.to_string(),
+            base_seal_id,
+            left_seal_id,
+            right_seal_id,
+            auto_merged,
+            conflicts,
+            left_only,
+            right_only,
+            is_clean,
+        })
+    }
+
+    /// Apply a convergence result to the working directory.
+    ///
+    /// Writes merged files and resolved conflicts to disk. Does NOT
+    /// create a seal — call `seal()` after to capture the result.
+    pub fn apply_convergence(
+        &self,
+        report: &ConvergenceReport,
+        resolutions: &[FileResolution],
+    ) -> WritResult<()> {
+        // Verify all conflicts have resolutions.
+        let unresolved = report
+            .conflicts
+            .iter()
+            .filter(|c| !resolutions.iter().any(|r| r.path == c.path))
+            .count();
+        if unresolved > 0 {
+            return Err(WritError::UnresolvedConflicts(unresolved));
+        }
+
+        let _lock = self.lock()?;
+
+        // Load the tree indices to retrieve content for left/right-only files.
+        let left_seal = self.load_seal(&report.left_seal_id)?;
+        let right_seal = self.load_seal(&report.right_seal_id)?;
+        let left_index = self.load_tree_index(&left_seal.tree)?;
+        let right_index = self.load_tree_index(&right_seal.tree)?;
+
+        // Write auto-merged files.
+        for merged in &report.auto_merged {
+            let file_path = self.root.join(&merged.path);
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&file_path, &merged.content)?;
+        }
+
+        // Write left-only files (use content from left tree).
+        for path in &report.left_only {
+            if let Some(content) = self.file_content_at_tree(&left_index, path)? {
+                let file_path = self.root.join(path);
+                if let Some(parent) = file_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&file_path, content)?;
+            }
+        }
+
+        // Write right-only files (use content from right tree).
+        for path in &report.right_only {
+            if let Some(content) = self.file_content_at_tree(&right_index, path)? {
+                let file_path = self.root.join(path);
+                if let Some(parent) = file_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&file_path, content)?;
+            }
+        }
+
+        // Write resolved conflicts.
+        for resolution in resolutions {
+            let file_path = self.root.join(&resolution.path);
+            if let Some(parent) = file_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&file_path, &resolution.content)?;
+        }
+
+        Ok(())
+    }
+
+    // -------------------------------------------------------------------
+    // Convergence helpers
+    // -------------------------------------------------------------------
+
+    /// Get file content from a tree index, returned as a UTF-8 string.
+    fn file_content_at_tree(&self, index: &Index, path: &str) -> WritResult<Option<String>> {
+        if let Some(entry) = index.entries.get(path) {
+            let bytes = self.objects.retrieve(&entry.hash)?;
+            Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Collect all file paths modified by a spec (union of all its seals' changes).
+    fn spec_modified_files(&self, spec: &Spec) -> WritResult<HashSet<String>> {
+        let mut files = HashSet::new();
+        for seal_id in &spec.sealed_by {
+            let seal = self.load_seal(seal_id)?;
+            for change in &seal.changes {
+                files.insert(change.path.clone());
+            }
+        }
+        Ok(files)
+    }
+
     /// Create a seal from changes matching the given paths only.
     ///
     /// Paths are matched exactly or as directory prefixes.
@@ -567,6 +803,7 @@ impl Repository {
         verification: Verification,
         paths: &[String],
     ) -> WritResult<Seal> {
+        let _lock = self.lock()?;
         let mut index = self.load_index()?;
         let rules = self.ignore_rules();
         let working_state = state::compute_state(&self.root, &index, &rules);
@@ -705,7 +942,7 @@ impl Repository {
     ///
     /// The tree hash points to a serialized `BTreeMap<String, IndexEntry>`,
     /// which we wrap into an Index struct.
-    fn load_tree_index(&self, tree_hash: &str) -> WritResult<Index> {
+    pub(crate) fn load_tree_index(&self, tree_hash: &str) -> WritResult<Index> {
         let data = self.objects.retrieve(tree_hash)?;
         let entries: BTreeMap<String, IndexEntry> = serde_json::from_slice(&data)?;
         Ok(Index { entries })
@@ -1858,5 +2095,523 @@ mod tests {
         let paths: Vec<&str> = state.changes.iter().map(|c| c.path.as_str()).collect();
         assert!(paths.contains(&"main.rs"));
         assert!(!paths.contains(&"node_modules/pkg.js"));
+    }
+
+    // -------------------------------------------------------------------
+    // Verification tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_seal_with_verification() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("app.py"), "print('hello')").unwrap();
+
+        let verification = Verification {
+            tests_passed: Some(42),
+            tests_failed: Some(0),
+            linted: true,
+        };
+
+        let seal = repo
+            .seal(
+                test_agent(),
+                "tested change".to_string(),
+                None,
+                TaskStatus::Complete,
+                verification,
+            )
+            .unwrap();
+
+        assert_eq!(seal.verification.tests_passed, Some(42));
+        assert_eq!(seal.verification.tests_failed, Some(0));
+        assert!(seal.verification.linted);
+    }
+
+    #[test]
+    fn test_seal_verification_in_log() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("app.py"), "print('hello')").unwrap();
+
+        let verification = Verification {
+            tests_passed: Some(10),
+            tests_failed: Some(2),
+            linted: false,
+        };
+
+        repo.seal(
+            test_agent(),
+            "with verification".to_string(),
+            None,
+            TaskStatus::Complete,
+            verification,
+        )
+        .unwrap();
+
+        let log = repo.log().unwrap();
+        assert_eq!(log[0].verification.tests_passed, Some(10));
+        assert_eq!(log[0].verification.tests_failed, Some(2));
+        assert!(!log[0].verification.linted);
+    }
+
+    #[test]
+    fn test_seal_verification_default() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("app.py"), "print('hello')").unwrap();
+
+        let seal = repo
+            .seal(
+                test_agent(),
+                "default verification".to_string(),
+                None,
+                TaskStatus::Complete,
+                Verification::default(),
+            )
+            .unwrap();
+
+        assert_eq!(seal.verification.tests_passed, None);
+        assert_eq!(seal.verification.tests_failed, None);
+        assert!(!seal.verification.linted);
+    }
+
+    // -------------------------------------------------------------------
+    // Lock integration tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_seal_holds_lock() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+
+        // Lock file should be created during seal and released after.
+        repo.seal(
+            test_agent(),
+            "lock test".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        // Lock should be released — acquiring again should succeed.
+        let lock = crate::lock::RepoLock::acquire(
+            &dir.path().join(".writ"),
+            Duration::from_millis(100),
+        );
+        assert!(lock.is_ok());
+    }
+
+    #[test]
+    fn test_concurrent_seal_safety() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create two files
+        fs::write(dir.path().join("a.txt"), "aaa").unwrap();
+        fs::write(dir.path().join("b.txt"), "bbb").unwrap();
+
+        // Seal 'a' first so 'b' remains pending for the second seal.
+        repo.seal_paths(
+            test_agent(),
+            "seal a".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            &["a.txt".to_string()],
+        )
+        .unwrap();
+
+        // Now create a second file for the concurrent test.
+        fs::write(dir.path().join("c.txt"), "ccc").unwrap();
+
+        // Both threads will try to seal simultaneously — locking ensures
+        // they succeed sequentially without corruption.
+        let root = dir.path().to_path_buf();
+        let barrier = Arc::new(Barrier::new(2));
+
+        let b1 = barrier.clone();
+        let r1 = root.clone();
+        let t1 = std::thread::spawn(move || {
+            let repo = Repository::open(&r1).unwrap();
+            b1.wait();
+            repo.seal_paths(
+                test_agent(),
+                "thread 1".to_string(),
+                None,
+                TaskStatus::Complete,
+                Verification::default(),
+                &["b.txt".to_string()],
+            )
+        });
+
+        let b2 = barrier.clone();
+        let r2 = root.clone();
+        let t2 = std::thread::spawn(move || {
+            let repo = Repository::open(&r2).unwrap();
+            b2.wait();
+            repo.seal_paths(
+                test_agent(),
+                "thread 2".to_string(),
+                None,
+                TaskStatus::Complete,
+                Verification::default(),
+                &["c.txt".to_string()],
+            )
+        });
+
+        let res1 = t1.join().unwrap();
+        let res2 = t2.join().unwrap();
+
+        // Both should succeed (sequential via locking).
+        assert!(res1.is_ok());
+        assert!(res2.is_ok());
+
+        // Verify repository integrity — should have 3 seals total.
+        let log = repo.log().unwrap();
+        assert_eq!(log.len(), 3);
+    }
+
+    // -------------------------------------------------------------------
+    // Convergence integration tests
+    // -------------------------------------------------------------------
+
+    /// Helper: set up a repo with a base seal and two specs ready for convergence testing.
+    fn setup_convergence_repo(
+        dir: &tempfile::TempDir,
+    ) -> (Repository, String, String) {
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a base file and seal it.
+        fs::write(
+            dir.path().join("shared.py"),
+            "line1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            test_agent(),
+            "base state".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        // Create two specs.
+        let spec_a = Spec::new("feat-a".to_string(), "Feature A".to_string(), String::new());
+        let spec_b = Spec::new("feat-b".to_string(), "Feature B".to_string(), String::new());
+        repo.add_spec(&spec_a).unwrap();
+        repo.add_spec(&spec_b).unwrap();
+
+        (repo, "feat-a".to_string(), "feat-b".to_string())
+    }
+
+    #[test]
+    fn test_converge_disjoint_files() {
+        let dir = tempdir().unwrap();
+        let (repo, spec_a, spec_b) = setup_convergence_repo(&dir);
+
+        // Spec A modifies a separate file.
+        fs::write(dir.path().join("module_a.py"), "feature A code\n").unwrap();
+        repo.seal(
+            test_agent(),
+            "add module a".to_string(),
+            Some(spec_a.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        // Spec B modifies a different separate file.
+        fs::write(dir.path().join("module_b.py"), "feature B code\n").unwrap();
+        repo.seal(
+            test_agent(),
+            "add module b".to_string(),
+            Some(spec_b.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        let report = repo.converge(&spec_a, &spec_b).unwrap();
+
+        assert!(report.is_clean);
+        assert!(report.auto_merged.is_empty());
+        assert!(report.conflicts.is_empty());
+        assert!(report.left_only.contains(&"module_a.py".to_string()));
+        assert!(report.right_only.contains(&"module_b.py".to_string()));
+    }
+
+    #[test]
+    fn test_converge_overlapping_clean() {
+        let dir = tempdir().unwrap();
+        let (repo, spec_a, spec_b) = setup_convergence_repo(&dir);
+
+        // Spec A changes line 1 of shared.py.
+        fs::write(
+            dir.path().join("shared.py"),
+            "CHANGED_A\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            test_agent(),
+            "change top of shared".to_string(),
+            Some(spec_a.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        // Spec B changes line 5 of shared.py (non-overlapping).
+        fs::write(
+            dir.path().join("shared.py"),
+            "line1\nline2\nline3\nline4\nCHANGED_B\n",
+        )
+        .unwrap();
+        repo.seal(
+            test_agent(),
+            "change bottom of shared".to_string(),
+            Some(spec_b.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        let report = repo.converge(&spec_a, &spec_b).unwrap();
+
+        assert!(report.is_clean);
+        assert_eq!(report.auto_merged.len(), 1);
+        assert_eq!(report.auto_merged[0].path, "shared.py");
+        assert!(report.conflicts.is_empty());
+        // Both changes should be present in merged content.
+        assert!(report.auto_merged[0].content.contains("CHANGED_A"));
+        assert!(report.auto_merged[0].content.contains("CHANGED_B"));
+    }
+
+    #[test]
+    fn test_converge_overlapping_conflict() {
+        let dir = tempdir().unwrap();
+        let (repo, spec_a, spec_b) = setup_convergence_repo(&dir);
+
+        // Spec A changes line 2 to something.
+        fs::write(
+            dir.path().join("shared.py"),
+            "line1\nFEATURE_A\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            test_agent(),
+            "feature a in shared".to_string(),
+            Some(spec_a.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        // Spec B changes the same line differently.
+        fs::write(
+            dir.path().join("shared.py"),
+            "line1\nFEATURE_B\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            test_agent(),
+            "feature b in shared".to_string(),
+            Some(spec_b.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        let report = repo.converge(&spec_a, &spec_b).unwrap();
+
+        assert!(!report.is_clean);
+        assert_eq!(report.conflicts.len(), 1);
+        assert_eq!(report.conflicts[0].path, "shared.py");
+        assert!(!report.conflicts[0].regions.is_empty());
+        // Verify conflict has structured data.
+        let region = &report.conflicts[0].regions[0];
+        assert_eq!(region.left_lines, vec!["FEATURE_A"]);
+        assert_eq!(region.right_lines, vec!["FEATURE_B"]);
+    }
+
+    #[test]
+    fn test_converge_spec_not_found() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.converge("nonexistent", "also-missing");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_converge_no_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create spec but don't seal anything against it.
+        let spec = Spec::new("empty-spec".to_string(), "No Seals".to_string(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        let spec2 = Spec::new("other-spec".to_string(), "Other".to_string(), String::new());
+        repo.add_spec(&spec2).unwrap();
+
+        let result = repo.converge("empty-spec", "other-spec");
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("no seals"));
+    }
+
+    #[test]
+    fn test_apply_convergence_clean() {
+        let dir = tempdir().unwrap();
+        let (repo, spec_a, spec_b) = setup_convergence_repo(&dir);
+
+        // Spec A adds module_a.py and modifies top of shared.py.
+        fs::write(dir.path().join("module_a.py"), "# module A\n").unwrap();
+        fs::write(
+            dir.path().join("shared.py"),
+            "CHANGED_A\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            test_agent(),
+            "spec a work".to_string(),
+            Some(spec_a.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        // Spec B adds module_b.py and modifies bottom of shared.py.
+        fs::write(dir.path().join("module_b.py"), "# module B\n").unwrap();
+        fs::write(
+            dir.path().join("shared.py"),
+            "line1\nline2\nline3\nline4\nCHANGED_B\n",
+        )
+        .unwrap();
+        repo.seal(
+            test_agent(),
+            "spec b work".to_string(),
+            Some(spec_b.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        let report = repo.converge(&spec_a, &spec_b).unwrap();
+        assert!(report.is_clean);
+
+        // Apply convergence (no resolutions needed for clean merge).
+        repo.apply_convergence(&report, &[]).unwrap();
+
+        // Verify files on disk.
+        let shared = fs::read_to_string(dir.path().join("shared.py")).unwrap();
+        assert!(shared.contains("CHANGED_A"));
+        assert!(shared.contains("CHANGED_B"));
+
+        let module_a = fs::read_to_string(dir.path().join("module_a.py")).unwrap();
+        assert_eq!(module_a, "# module A\n");
+
+        let module_b = fs::read_to_string(dir.path().join("module_b.py")).unwrap();
+        assert_eq!(module_b, "# module B\n");
+    }
+
+    #[test]
+    fn test_apply_convergence_with_resolutions() {
+        let dir = tempdir().unwrap();
+        let (repo, spec_a, spec_b) = setup_convergence_repo(&dir);
+
+        // Both specs change the same line differently → conflict.
+        fs::write(
+            dir.path().join("shared.py"),
+            "line1\nFEATURE_A\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            test_agent(),
+            "a changes shared".to_string(),
+            Some(spec_a.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        fs::write(
+            dir.path().join("shared.py"),
+            "line1\nFEATURE_B\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            test_agent(),
+            "b changes shared".to_string(),
+            Some(spec_b.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        let report = repo.converge(&spec_a, &spec_b).unwrap();
+        assert!(!report.is_clean);
+
+        // Provide resolution for the conflict.
+        let resolutions = vec![crate::convergence::FileResolution {
+            path: "shared.py".to_string(),
+            content: "line1\nMERGED_RESULT\nline3\nline4\nline5\n".to_string(),
+        }];
+
+        repo.apply_convergence(&report, &resolutions).unwrap();
+
+        // Verify resolved content is written.
+        let shared = fs::read_to_string(dir.path().join("shared.py")).unwrap();
+        assert!(shared.contains("MERGED_RESULT"));
+    }
+
+    #[test]
+    fn test_apply_unresolved_conflicts() {
+        let dir = tempdir().unwrap();
+        let (repo, spec_a, spec_b) = setup_convergence_repo(&dir);
+
+        // Create a conflict.
+        fs::write(
+            dir.path().join("shared.py"),
+            "line1\nFEATURE_A\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            test_agent(),
+            "a work".to_string(),
+            Some(spec_a.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        fs::write(
+            dir.path().join("shared.py"),
+            "line1\nFEATURE_B\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            test_agent(),
+            "b work".to_string(),
+            Some(spec_b.clone()),
+            TaskStatus::Complete,
+            Verification::default(),
+        )
+        .unwrap();
+
+        let report = repo.converge(&spec_a, &spec_b).unwrap();
+        assert!(!report.is_clean);
+
+        // Try to apply without providing resolutions → should error.
+        let result = repo.apply_convergence(&report, &[]);
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("unresolved conflict"));
     }
 }

@@ -953,3 +953,64 @@ class TestRemote:
 
         status = repo.remote_status("origin")
         assert isinstance(json.dumps(status), str)
+
+
+class TestInstall:
+    """Tests for the enhanced writ install command."""
+
+    def test_install_returns_dict(self, tmp_path):
+        result = writ.Repository.install(str(tmp_path))
+        assert isinstance(result, dict)
+
+    def test_install_has_new_fields(self, tmp_path):
+        result = writ.Repository.install(str(tmp_path))
+        assert "repo_root" in result
+        assert "writignore_created" in result
+        assert "already_imported" in result
+        assert "reimported" in result
+        assert "tracked_files" in result
+        assert "available_operations" in result
+
+    def test_install_initializes(self, tmp_path):
+        result = writ.Repository.install(str(tmp_path))
+        assert result["initialized"] is True
+        assert result["git_detected"] is False
+        assert (tmp_path / ".writ").exists()
+
+    def test_install_idempotent(self, tmp_path):
+        first = writ.Repository.install(str(tmp_path))
+        assert first["initialized"] is True
+        assert first["writignore_created"] is True
+
+        second = writ.Repository.install(str(tmp_path))
+        assert second["initialized"] is False
+        assert second["writignore_created"] is False
+
+    def test_install_creates_writignore(self, tmp_path):
+        result = writ.Repository.install(str(tmp_path))
+        assert result["writignore_created"] is True
+        assert (tmp_path / ".writignore").exists()
+
+    def test_install_preserves_writignore(self, tmp_path):
+        (tmp_path / ".writignore").write_text("my_custom\n")
+        result = writ.Repository.install(str(tmp_path))
+        assert result["writignore_created"] is False
+        assert (tmp_path / ".writignore").read_text() == "my_custom\n"
+
+    def test_install_json_serializable(self, tmp_path):
+        result = writ.Repository.install(str(tmp_path))
+        serialized = json.dumps(result)
+        assert isinstance(serialized, str)
+
+    def test_install_detects_claude_code(self, tmp_path):
+        (tmp_path / "CLAUDE.md").write_text("# Project")
+        result = writ.Repository.install(str(tmp_path))
+        detected = [f for f in result.get("frameworks_detected", []) if f["detected"]]
+        assert len(detected) > 0
+
+    def test_install_available_operations(self, tmp_path):
+        result = writ.Repository.install(str(tmp_path))
+        ops = result["available_operations"]
+        assert isinstance(ops, list)
+        assert len(ops) > 0
+        assert any("context" in op for op in ops)

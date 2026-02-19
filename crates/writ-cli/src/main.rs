@@ -23,7 +23,11 @@ enum Commands {
     Init,
 
     /// One-command setup: init + detect git + import baseline.
-    Install,
+    Install {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
 
     /// Show working directory state.
     State {
@@ -69,6 +73,10 @@ enum Commands {
         /// Allow sealing with no file changes (e.g. metadata-only updates).
         #[arg(long)]
         allow_empty: bool,
+
+        /// Expected HEAD seal ID (for optimistic conflict detection).
+        #[arg(long)]
+        expected_head: Option<String>,
     },
 
     /// Inspect a specific seal.
@@ -366,7 +374,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init => cmd_init(&cwd),
-        Commands::Install => cmd_install(&cwd),
+        Commands::Install { format } => cmd_install(&cwd, &format),
         Commands::State { format } => cmd_state(&cwd, &format),
         Commands::Seal {
             summary,
@@ -378,7 +386,8 @@ fn main() {
             tests_failed,
             linted,
             allow_empty,
-        } => cmd_seal(&cwd, &summary, &agent, spec, &status, paths, tests_passed, tests_failed, linted, allow_empty),
+            expected_head,
+        } => cmd_seal(&cwd, &summary, &agent, spec, &status, paths, tests_passed, tests_failed, linted, allow_empty, expected_head),
         Commands::Show {
             seal_id,
             diff,
@@ -480,30 +489,103 @@ fn cmd_init(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_install(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_install(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let result = Repository::install(cwd)?;
 
-    if result.initialized {
-        println!("initialized writ repository in .writ/");
-    } else {
-        println!("writ repository already exists");
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        _ => {
+            // Init status
+            if result.initialized {
+                println!("initialized writ repository in .writ/");
+            } else {
+                println!("writ repository already exists");
+            }
+
+            // .writignore
+            if result.writignore_created {
+                println!("created .writignore");
+            }
+
+            // Git status
+            if result.git_detected {
+                let branch = result.git_branch.as_deref().unwrap_or("(detached)");
+                let head = result.git_head_short.as_deref().unwrap_or("unknown");
+                println!("git: {} @ {}", branch, head);
+
+                if let Some(true) = result.git_dirty {
+                    let count = result.git_dirty_count.unwrap_or(0);
+                    eprintln!(
+                        "warning: git working tree has {} uncommitted change(s)",
+                        count
+                    );
+                }
+            } else {
+                println!("no git repository detected");
+            }
+
+            // Import status
+            if result.git_imported {
+                let seal_short = result
+                    .imported_seal_id
+                    .as_deref()
+                    .map(|s| &s[..12.min(s.len())])
+                    .unwrap_or("?");
+                let files = result.imported_files.unwrap_or(0);
+
+                if result.reimported {
+                    println!("re-imported git baseline: {} file(s), seal {}", files, seal_short);
+                } else {
+                    println!("imported git baseline: {} file(s), seal {}", files, seal_short);
+                }
+            } else if result.already_imported {
+                println!("git baseline already synced");
+            } else if let Some(ref reason) = result.import_skipped_reason {
+                println!("import skipped: {}", reason);
+            }
+
+            if let Some(ref err) = result.import_error {
+                eprintln!("import error: {}", err);
+            }
+
+            // Tracked files
+            println!("tracked: {} file(s)", result.tracked_files);
+
+            // Frameworks
+            let detected: Vec<_> = result
+                .frameworks_detected
+                .iter()
+                .filter(|f| f.detected)
+                .collect();
+            for f in &detected {
+                println!(
+                    "detected {:?} ({})",
+                    f.framework,
+                    f.indicators.join(", ")
+                );
+            }
+
+            // Hooks
+            for hook in &result.hooks_installed {
+                for f in &hook.files_created {
+                    println!("  + {f}");
+                }
+                for f in &hook.files_updated {
+                    println!("  ~ {f}");
+                }
+            }
+
+            // Next steps
+            println!();
+            println!("ready. next steps:");
+            for op in &result.available_operations {
+                println!("  {}", op);
+            }
+        }
     }
 
-    if result.git_imported {
-        println!(
-            "imported git baseline: {} file(s), seal {}",
-            result.imported_files.unwrap_or(0),
-            result.imported_seal_id.as_deref().map(|s| &s[..12]).unwrap_or("?"),
-        );
-    } else if result.git_detected {
-        println!("git detected but import skipped (may already be imported)");
-    } else {
-        println!("no git repository detected");
-    }
-
-    println!("\nready. agents can now run:");
-    println!("  writ context              # see project state");
-    println!("  writ seal --summary ...   # checkpoint work");
     Ok(())
 }
 
@@ -554,6 +636,7 @@ fn cmd_seal(
     tests_failed: Option<u32>,
     linted: bool,
     allow_empty: bool,
+    expected_head: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
 
@@ -578,8 +661,8 @@ fn cmd_seal(
         linted,
     };
 
-    let seal = if let Some(paths) = paths {
-        repo.seal_paths(
+    let (seal, conflict_warning) = if let Some(paths) = paths {
+        let s = repo.seal_paths(
             agent,
             summary.to_string(),
             spec_id,
@@ -587,19 +670,45 @@ fn cmd_seal(
             verification,
             &paths,
             allow_empty,
-        )?
-    } else {
-        repo.seal(
+        )?;
+        (s, None)
+    } else if expected_head.is_some() {
+        repo.seal_with_check(
             agent,
             summary.to_string(),
             spec_id,
             task_status,
             verification,
             allow_empty,
+            expected_head,
         )?
+    } else {
+        let s = repo.seal(
+            agent,
+            summary.to_string(),
+            spec_id,
+            task_status,
+            verification,
+            allow_empty,
+        )?;
+        (s, None)
     };
 
     println!("sealed {}", &seal.id[..12]);
+
+    if let Some(ref w) = conflict_warning {
+        if w.is_clean {
+            println!("  note: HEAD moved ({} intervening seal(s)), but no file overlap",
+                w.intervening_seals.len());
+        } else {
+            println!("  WARNING: HEAD moved, {} overlapping file(s):",
+                w.overlapping_files.len());
+            for f in &w.overlapping_files {
+                println!("    ! {f}");
+            }
+            println!("  consider running `writ converge` to reconcile");
+        }
+    }
     println!("  summary: {}", seal.summary);
     if seal.verification.tests_passed.is_some() || seal.verification.tests_failed.is_some() || seal.verification.linted {
         print!("  verified:");

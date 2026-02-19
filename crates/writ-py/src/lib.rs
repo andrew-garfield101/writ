@@ -190,6 +190,60 @@ impl PyRepository {
         to_pydict(py, &seal)
     }
 
+    /// Seal with optimistic conflict detection.
+    ///
+    /// Returns a dict with `seal` and optional `conflict_warning`.
+    #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="complete", tests_passed=None, tests_failed=None, linted=false, allow_empty=false, expected_head=None))]
+    fn seal_with_check(
+        &self,
+        py: Python,
+        summary: &str,
+        agent_id: &str,
+        agent_type: &str,
+        spec_id: Option<String>,
+        status: &str,
+        tests_passed: Option<u32>,
+        tests_failed: Option<u32>,
+        linted: bool,
+        allow_empty: bool,
+        expected_head: Option<String>,
+    ) -> PyResult<PyObject> {
+        let agent = AgentIdentity {
+            id: agent_id.to_string(),
+            agent_type: parse_agent_type(agent_type)?,
+        };
+        let task_status = parse_task_status(status)?;
+        let verification = Verification {
+            tests_passed,
+            tests_failed,
+            linted,
+        };
+
+        let (seal, warning) = self
+            .inner
+            .seal_with_check(
+                agent,
+                summary.to_string(),
+                spec_id,
+                task_status,
+                verification,
+                allow_empty,
+                expected_head,
+            )
+            .map_err(writ_err)?;
+
+        #[derive(serde::Serialize)]
+        struct SealWithCheckResult {
+            seal: writ_core::seal::Seal,
+            conflict_warning: Option<writ_core::repo::SealConflictWarning>,
+        }
+
+        to_pydict(py, &SealWithCheckResult {
+            seal,
+            conflict_warning: warning,
+        })
+    }
+
     /// Get seal history (newest first).
     #[pyo3(signature = (limit=None))]
     fn log(&self, py: Python, limit: Option<usize>) -> PyResult<PyObject> {
@@ -198,6 +252,21 @@ impl PyRepository {
             seals.truncate(n);
         }
         to_pydict(py, &seals)
+    }
+
+    /// Get the seal chain for a specific spec, walking from its tip.
+    #[pyo3(signature = (spec_id, limit=None))]
+    fn spec_log(&self, py: Python, spec_id: &str, limit: Option<usize>) -> PyResult<PyObject> {
+        let mut seals = self.inner.spec_log(spec_id).map_err(writ_err)?;
+        if let Some(n) = limit {
+            seals.truncate(n);
+        }
+        to_pydict(py, &seals)
+    }
+
+    /// Get the tip seal ID for a specific spec.
+    fn spec_head(&self, spec_id: &str) -> PyResult<Option<String>> {
+        self.inner.spec_head(spec_id).map_err(writ_err)
     }
 
     /// Diff working tree against HEAD.
@@ -469,6 +538,24 @@ impl PyRepository {
 // Module registration
 // ---------------------------------------------------------------------------
 
+/// Detect agent frameworks in a project directory.
+#[pyfunction]
+#[pyo3(name = "detect_frameworks")]
+fn py_detect_frameworks(py: Python, path: &str) -> PyResult<PyObject> {
+    let p = PathBuf::from(path);
+    let detections = writ_core::hooks::detect_frameworks(&p);
+    to_pydict(py, &detections)
+}
+
+/// Install writ hooks for all detected agent frameworks.
+#[pyfunction]
+#[pyo3(name = "install_hooks")]
+fn py_install_hooks(py: Python, path: &str) -> PyResult<PyObject> {
+    let p = PathBuf::from(path);
+    let results = writ_core::hooks::install_hooks(&p).map_err(writ_err)?;
+    to_pydict(py, &results)
+}
+
 #[pymodule]
 fn writ(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRepository>()?;
@@ -476,5 +563,7 @@ fn writ(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyTaskStatus>()?;
     m.add_class::<PySpecStatus>()?;
     m.add("WritError", m.py().get_type::<WritError>())?;
+    m.add_function(wrap_pyfunction!(py_detect_frameworks, m)?)?;
+    m.add_function(wrap_pyfunction!(py_install_hooks, m)?)?;
     Ok(())
 }

@@ -41,6 +41,64 @@ pub struct Repository {
     objects: ObjectStore,
 }
 
+/// Snapshot of git working tree state, used by install().
+#[cfg(feature = "bridge")]
+struct GitStateSnapshot {
+    branch: Option<String>,
+    head_short: Option<String>,
+    head_full: Option<String>,
+    dirty: bool,
+    dirty_count: usize,
+}
+
+/// Query git state without modifying anything.
+#[cfg(feature = "bridge")]
+fn query_git_state(root: &Path) -> Option<GitStateSnapshot> {
+    let git_repo = git2::Repository::discover(root).ok()?;
+
+    let branch = git_repo
+        .head()
+        .ok()
+        .and_then(|h| {
+            if h.is_branch() {
+                h.shorthand().map(String::from)
+            } else {
+                None
+            }
+        });
+
+    let (head_short, head_full) = match git_repo.head().ok().and_then(|h| h.target()) {
+        Some(oid) => {
+            let full = oid.to_string();
+            let short = full[..12.min(full.len())].to_string();
+            (Some(short), Some(full))
+        }
+        None => (None, None),
+    };
+
+    let (dirty, dirty_count) = match git_repo.statuses(None) {
+        Ok(statuses) => {
+            let count = statuses
+                .iter()
+                .filter(|s| {
+                    let st = s.status();
+                    st != git2::Status::CURRENT && st != git2::Status::IGNORED
+                })
+                .count();
+            (count > 0, count)
+        }
+        Err(_) => (false, 0),
+    };
+
+    Some(GitStateSnapshot {
+        branch,
+        head_short,
+        head_full,
+        dirty,
+        dirty_count,
+    })
+}
+
 impl Repository {
     /// Initialize a new writ repository in the given directory.
     ///
@@ -55,6 +113,7 @@ impl Repository {
         fs::create_dir_all(writ_dir.join("objects"))?;
         fs::create_dir_all(writ_dir.join("seals"))?;
         fs::create_dir_all(writ_dir.join("specs"))?;
+        fs::create_dir_all(writ_dir.join("heads"))?;
         fs::write(writ_dir.join("HEAD"), "")?;
 
         let index = Index::default();
@@ -82,57 +141,148 @@ impl Repository {
         })
     }
 
-    /// One-command setup: init writ, detect git, and import baseline.
+    /// One-command setup: init writ, detect git, import baseline, install hooks.
     ///
-    /// If `.writ/` already exists, opens the existing repo. If a `.git/`
-    /// is found, imports the current git HEAD as the writ baseline.
+    /// Idempotent: safe to run multiple times. Re-imports only when git HEAD
+    /// moves. Reports git state, framework detection, and tracked file count.
     #[cfg(feature = "bridge")]
     pub fn install(root: &Path) -> WritResult<InstallResult> {
+        let repo_root = fs::canonicalize(root)
+            .unwrap_or_else(|_| root.to_path_buf())
+            .to_string_lossy()
+            .to_string();
+
+        // Step 1: Init or open
         let writ_dir = root.join(WRIT_DIR);
         let initialized = !writ_dir.exists();
+        if initialized {
+            Self::init(root)?;
+        }
+        let repo = Self::open(root)?;
 
-        let repo = if initialized {
-            Self::init(root)?
-        } else {
-            Self::open(root)?
-        };
+        // Step 2: Create .writignore if needed
+        let writignore_created = crate::ignore::create_writignore(root)?;
 
-        let git_detected = root.join(".git").exists()
-            || git2::Repository::discover(root).is_ok();
+        // Step 3: Detect frameworks and install hooks
+        let frameworks_detected = crate::hooks::detect_frameworks(root);
+        let hooks_installed = crate::hooks::install_hooks(root)?;
+
+        // Step 4: Detect git and query state
+        let git_state = query_git_state(root);
+        let git_detected = git_state.is_some();
+
+        // Step 5: Idempotent import
+        let mut git_imported = false;
+        let mut imported_seal_id = None;
+        let mut imported_files = None;
+        let mut import_skipped_reason = None;
+        let mut import_error = None;
+        let mut already_imported = false;
+        let mut reimported = false;
 
         if git_detected {
-            let agent = AgentIdentity {
-                id: "writ-bridge".to_string(),
-                agent_type: crate::seal::AgentType::Agent,
-            };
-            match repo.bridge_import(None, agent) {
-                Ok(result) => {
-                    return Ok(InstallResult {
-                        initialized,
-                        git_detected: true,
-                        git_imported: true,
-                        imported_seal_id: Some(result.seal_id),
-                        imported_files: Some(result.files_imported),
-                    });
+            let bridge_state = repo.load_bridge_state()?;
+            let current_head = git_state.as_ref().and_then(|gs| gs.head_full.clone());
+
+            match (
+                bridge_state.last_imported_git_commit.as_deref(),
+                current_head.as_deref(),
+            ) {
+                // No previous import → fresh import
+                (None, _) => {
+                    let agent = AgentIdentity {
+                        id: "writ-bridge".to_string(),
+                        agent_type: crate::seal::AgentType::Agent,
+                    };
+                    match repo.bridge_import(None, agent) {
+                        Ok(result) => {
+                            git_imported = true;
+                            imported_seal_id = Some(result.seal_id);
+                            imported_files = Some(result.files_imported);
+                        }
+                        Err(e) => {
+                            import_error = Some(e.to_string());
+                            import_skipped_reason =
+                                Some(format!("import failed: {e}"));
+                        }
+                    }
                 }
-                Err(_) => {
-                    return Ok(InstallResult {
-                        initialized,
-                        git_detected: true,
-                        git_imported: false,
-                        imported_seal_id: None,
-                        imported_files: None,
-                    });
+                // Same HEAD → already synced
+                (Some(prev), Some(curr)) if prev == curr => {
+                    already_imported = true;
+                    import_skipped_reason = Some(format!(
+                        "already synced at {}",
+                        &prev[..12.min(prev.len())]
+                    ));
+                    imported_seal_id = bridge_state.last_imported_seal_id.clone();
+                }
+                // HEAD moved → re-import
+                (Some(prev), Some(_curr)) => {
+                    let agent = AgentIdentity {
+                        id: "writ-bridge".to_string(),
+                        agent_type: crate::seal::AgentType::Agent,
+                    };
+                    match repo.bridge_import(None, agent) {
+                        Ok(result) => {
+                            git_imported = true;
+                            reimported = true;
+                            imported_seal_id = Some(result.seal_id);
+                            imported_files = Some(result.files_imported);
+                        }
+                        Err(e) => {
+                            import_error = Some(e.to_string());
+                            import_skipped_reason = Some(format!(
+                                "re-import failed (prev: {}): {e}",
+                                &prev[..12.min(prev.len())]
+                            ));
+                        }
+                    }
+                }
+                // Had import but can't resolve HEAD now
+                (Some(prev), None) => {
+                    import_skipped_reason = Some(format!(
+                        "previous import from {} but cannot resolve current HEAD",
+                        &prev[..12.min(prev.len())]
+                    ));
                 }
             }
         }
 
+        // Step 6: Count tracked files
+        let tracked_files = repo
+            .load_index()
+            .map(|idx| idx.entries.len())
+            .unwrap_or(0);
+
+        // Step 7: Available operations
+        let available_operations = vec![
+            "writ context".to_string(),
+            "writ state".to_string(),
+            "writ seal --summary '...'".to_string(),
+            "writ log".to_string(),
+            "writ diff".to_string(),
+        ];
+
         Ok(InstallResult {
             initialized,
-            git_detected: false,
-            git_imported: false,
-            imported_seal_id: None,
-            imported_files: None,
+            git_detected,
+            git_imported,
+            imported_seal_id,
+            imported_files,
+            repo_root,
+            git_branch: git_state.as_ref().and_then(|gs| gs.branch.clone()),
+            git_head_short: git_state.as_ref().and_then(|gs| gs.head_short.clone()),
+            git_dirty: git_state.as_ref().map(|gs| gs.dirty),
+            git_dirty_count: git_state.as_ref().map(|gs| gs.dirty_count),
+            import_skipped_reason,
+            import_error,
+            writignore_created,
+            already_imported,
+            reimported,
+            tracked_files,
+            available_operations,
+            frameworks_detected,
+            hooks_installed,
         })
     }
 
@@ -211,7 +361,7 @@ impl Repository {
 
         let tree_json = serde_json::to_string(&index.entries)?;
         let tree_hash = self.objects.store(tree_json.as_bytes())?;
-        let parent = self.read_head()?;
+        let parent = self.resolve_parent(spec_id.as_deref())?;
 
         let seal = Seal::new(
             parent,
@@ -229,6 +379,7 @@ impl Repository {
         index.save(&self.writ_dir.join("index.json"))?;
 
         if let Some(ref sid) = spec_id {
+            self.write_spec_head(sid, &seal.id)?;
             if let Ok(mut spec) = self.load_spec(sid) {
                 spec.sealed_by.push(seal.id.clone());
                 spec.updated_at = chrono::Utc::now();
@@ -239,7 +390,83 @@ impl Repository {
         Ok(seal)
     }
 
-    /// Get the seal history (newest first).
+    /// Seal with optimistic conflict detection.
+    ///
+    /// If `expected_head` is provided, checks whether HEAD moved since
+    /// the agent started. The seal always proceeds, but returns a
+    /// `SealConflictWarning` if another agent sealed in between.
+    pub fn seal_with_check(
+        &self,
+        agent: AgentIdentity,
+        summary: String,
+        spec_id: Option<String>,
+        status: TaskStatus,
+        verification: Verification,
+        allow_empty: bool,
+        expected_head: Option<String>,
+    ) -> WritResult<(Seal, Option<SealConflictWarning>)> {
+        let pre_seal_head = if spec_id.is_some() {
+            self.resolve_parent(spec_id.as_deref())?
+        } else {
+            self.read_head()?
+        };
+
+        let seal = self.seal(agent, summary, spec_id, status, verification, allow_empty)?;
+
+        let normalized_expected = match expected_head {
+            Some(ref eh) => self.resolve_seal_id(eh).ok(),
+            None => None,
+        };
+
+        let warning = match (normalized_expected, pre_seal_head) {
+            (Some(expected), Some(actual)) if expected != actual => {
+                let mut intervening = Vec::new();
+                let mut intervening_files: HashSet<String> = HashSet::new();
+                let mut cursor = Some(actual.clone());
+                while let Some(ref id) = cursor {
+                    if *id == expected {
+                        break;
+                    }
+                    if let Ok(s) = self.load_seal(id) {
+                        for c in &s.changes {
+                            intervening_files.insert(c.path.clone());
+                        }
+                        intervening.push(s.id.clone());
+                        cursor = s.parent.clone();
+                    } else {
+                        break;
+                    }
+                }
+
+                let my_files: HashSet<String> = seal
+                    .changes
+                    .iter()
+                    .map(|c| c.path.clone())
+                    .collect();
+
+                let overlapping: Vec<String> = my_files
+                    .intersection(&intervening_files)
+                    .cloned()
+                    .collect();
+
+                let is_clean = overlapping.is_empty();
+
+                Some(SealConflictWarning {
+                    expected_head: expected,
+                    actual_head: actual,
+                    intervening_seals: intervening,
+                    intervening_files: intervening_files.into_iter().collect(),
+                    overlapping_files: overlapping,
+                    is_clean,
+                })
+            }
+            _ => None,
+        };
+
+        Ok((seal, warning))
+    }
+
+    /// Get the seal history (newest first) from global HEAD.
     pub fn log(&self) -> WritResult<Vec<Seal>> {
         let mut seals = Vec::new();
         let mut current = self.read_head()?;
@@ -251,6 +478,25 @@ impl Repository {
         }
 
         Ok(seals)
+    }
+
+    /// Get the seal chain for a specific spec, walking from its tip.
+    pub fn spec_log(&self, spec_id: &str) -> WritResult<Vec<Seal>> {
+        let mut seals = Vec::new();
+        let mut current = self.read_spec_head(spec_id)?;
+
+        while let Some(seal_id) = current {
+            let seal = self.load_seal(&seal_id)?;
+            current = seal.parent.clone();
+            seals.push(seal);
+        }
+
+        Ok(seals)
+    }
+
+    /// Get the tip seal ID for a specific spec (None if spec has no seals).
+    pub fn spec_head(&self, spec_id: &str) -> WritResult<Option<String>> {
+        self.read_spec_head(spec_id)
     }
 
     /// Add a new spec to the repository.
@@ -1021,7 +1267,7 @@ impl Repository {
 
         let tree_json = serde_json::to_string(&index.entries)?;
         let tree_hash = self.objects.store(tree_json.as_bytes())?;
-        let parent = self.read_head()?;
+        let parent = self.resolve_parent(spec_id.as_deref())?;
 
         let seal = Seal::new(
             parent,
@@ -1039,6 +1285,7 @@ impl Repository {
         index.save(&self.writ_dir.join("index.json"))?;
 
         if let Some(ref sid) = spec_id {
+            self.write_spec_head(sid, &seal.id)?;
             if let Ok(mut spec) = self.load_spec(sid) {
                 spec.sealed_by.push(seal.id.clone());
                 spec.updated_at = chrono::Utc::now();
@@ -1084,6 +1331,41 @@ impl Repository {
         } else {
             Ok(Some(trimmed.to_string()))
         }
+    }
+
+    /// Read the tip seal for a specific spec.
+    fn read_spec_head(&self, spec_id: &str) -> WritResult<Option<String>> {
+        let path = self.writ_dir.join("heads").join(spec_id);
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(&path)?;
+        let trimmed = content.trim();
+        if trimmed.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+
+    /// Update the tip seal for a specific spec.
+    fn write_spec_head(&self, spec_id: &str, seal_id: &str) -> WritResult<()> {
+        let heads_dir = self.writ_dir.join("heads");
+        if !heads_dir.exists() {
+            fs::create_dir_all(&heads_dir)?;
+        }
+        atomic_write(&heads_dir.join(spec_id), seal_id.as_bytes())
+    }
+
+    /// Determine the parent seal for a new seal. Uses spec-scoped head
+    /// when a spec is given, falling back to global HEAD.
+    fn resolve_parent(&self, spec_id: Option<&str>) -> WritResult<Option<String>> {
+        if let Some(sid) = spec_id {
+            if let Some(spec_head) = self.read_spec_head(sid)? {
+                return Ok(Some(spec_head));
+            }
+        }
+        self.read_head()
     }
 
     /// Load a seal by its full ID (low-level).
@@ -1714,6 +1996,7 @@ impl Repository {
         fs::create_dir_all(path.join("objects"))?;
         fs::create_dir_all(path.join("seals"))?;
         fs::create_dir_all(path.join("specs"))?;
+        fs::create_dir_all(path.join("heads"))?;
         fs::write(path.join("HEAD"), "")?;
         Ok(())
     }
@@ -1768,6 +2051,7 @@ impl Repository {
             Self::sync_seals(&self.writ_dir.join("seals"), &remote_path.join("seals"))?;
         let (specs_pushed, _conflicts) =
             Self::merge_specs(&self.writ_dir.join("specs"), &remote_path.join("specs"))?;
+        Self::sync_heads(&self.writ_dir, &remote_path)?;
 
         let local_head = self.read_head()?;
         let remote_head_str = fs::read_to_string(remote_path.join("HEAD"))
@@ -1835,6 +2119,7 @@ impl Repository {
             Self::sync_seals(&remote_path.join("seals"), &self.writ_dir.join("seals"))?;
         let (specs_pulled, spec_conflicts) =
             Self::merge_specs(&remote_path.join("specs"), &self.writ_dir.join("specs"))?;
+        Self::sync_heads(&remote_path, &self.writ_dir)?;
 
         let local_head = self.read_head()?;
         let remote_head_str = fs::read_to_string(remote_path.join("HEAD"))
@@ -2024,6 +2309,35 @@ impl Repository {
             let dst_path = dst.join(&name);
             if !dst_path.exists() {
                 fs::copy(entry.path(), &dst_path)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Sync spec head pointers from src to dst (latest-wins).
+    fn sync_heads(src: &Path, dst: &Path) -> WritResult<usize> {
+        let mut count = 0;
+        let src_heads = src.join("heads");
+        let dst_heads = dst.join("heads");
+        if !src_heads.is_dir() {
+            return Ok(0);
+        }
+        if !dst_heads.exists() {
+            fs::create_dir_all(&dst_heads)?;
+        }
+        for entry in fs::read_dir(&src_heads)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let dst_path = dst_heads.join(&name);
+            let src_content = fs::read_to_string(entry.path())?.trim().to_string();
+            let dst_content = if dst_path.exists() {
+                fs::read_to_string(&dst_path)?.trim().to_string()
+            } else {
+                String::new()
+            };
+            if src_content != dst_content && !src_content.is_empty() {
+                atomic_write(&dst_path, src_content.as_bytes())?;
                 count += 1;
             }
         }
@@ -2246,7 +2560,7 @@ impl Repository {
 }
 
 /// Result of `writ install`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstallResult {
     pub initialized: bool,
     pub git_detected: bool,
@@ -2255,6 +2569,65 @@ pub struct InstallResult {
     pub imported_seal_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub imported_files: Option<usize>,
+    /// Absolute path to repository root.
+    #[serde(default)]
+    pub repo_root: String,
+    /// Current git branch name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_branch: Option<String>,
+    /// First 12 chars of git HEAD hash.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_head_short: Option<String>,
+    /// Whether git working tree has uncommitted changes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_dirty: Option<bool>,
+    /// Number of dirty files in git working tree.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_dirty_count: Option<usize>,
+    /// Why import was skipped (human-readable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_skipped_reason: Option<String>,
+    /// Error message if bridge_import failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub import_error: Option<String>,
+    /// Whether .writignore was created by this install.
+    #[serde(default)]
+    pub writignore_created: bool,
+    /// True if baseline was already imported and HEAD hasn't moved.
+    #[serde(default)]
+    pub already_imported: bool,
+    /// True if baseline was re-imported because git HEAD moved.
+    #[serde(default)]
+    pub reimported: bool,
+    /// Total files tracked after install.
+    #[serde(default)]
+    pub tracked_files: usize,
+    /// Next steps for agents.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub available_operations: Vec<String>,
+    /// Frameworks detected during install.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub frameworks_detected: Vec<crate::hooks::FrameworkDetection>,
+    /// Hooks installed during install.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub hooks_installed: Vec<crate::hooks::HookResult>,
+}
+
+/// Returned by `seal()` when HEAD moved since the agent started working.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealConflictWarning {
+    /// The HEAD the agent expected (what they saw at session start).
+    pub expected_head: String,
+    /// The actual HEAD at seal time (someone else sealed in between).
+    pub actual_head: String,
+    /// Seals that were added between expected and actual HEAD.
+    pub intervening_seals: Vec<String>,
+    /// Files modified by intervening seals.
+    pub intervening_files: Vec<String>,
+    /// Files this seal touches that overlap with intervening changes.
+    pub overlapping_files: Vec<String>,
+    /// True if no files overlap (safe concurrent work).
+    pub is_clean: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5523,5 +5896,637 @@ mod bridge_tests {
     fn test_bridge_rejects_invalid_git_ref() {
         assert!(Repository::validate_git_ref("").is_err());
         assert!(Repository::validate_git_ref(&"x".repeat(600)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod spec_head_tests {
+    use super::*;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn test_agent() -> AgentIdentity {
+        AgentIdentity {
+            id: "test-agent".to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_spec_scoped_head_isolation() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec_a = Spec::new("spec-a".into(), "Feature A".into(), "".into());
+        let spec_b = Spec::new("spec-b".into(), "Feature B".into(), "".into());
+        repo.add_spec(&spec_a).unwrap();
+        repo.add_spec(&spec_b).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "content-a").unwrap();
+        let seal_a1 = repo.seal(
+            test_agent(), "a work 1".into(), Some("spec-a".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        fs::write(dir.path().join("b.txt"), "content-b").unwrap();
+        let seal_b1 = repo.seal(
+            test_agent(), "b work 1".into(), Some("spec-b".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        assert_eq!(repo.spec_head("spec-a").unwrap(), Some(seal_a1.id.clone()));
+        assert_eq!(repo.spec_head("spec-b").unwrap(), Some(seal_b1.id.clone()));
+        assert_ne!(seal_a1.id, seal_b1.id);
+    }
+
+    #[test]
+    fn test_spec_head_chains_correctly() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("my-spec".into(), "Test Spec".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        let seal1 = repo.seal(
+            test_agent(), "first".into(), Some("my-spec".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "v2").unwrap();
+        let seal2 = repo.seal(
+            test_agent(), "second".into(), Some("my-spec".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        assert_eq!(repo.spec_head("my-spec").unwrap(), Some(seal2.id.clone()));
+        assert_eq!(seal2.parent, Some(seal1.id.clone()));
+    }
+
+    #[test]
+    fn test_spec_head_none_for_unknown_spec() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        assert_eq!(repo.spec_head("nonexistent").unwrap(), None);
+    }
+
+    #[test]
+    fn test_spec_log_returns_spec_chain() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("log-spec".into(), "Log Test".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        fs::write(dir.path().join("f.txt"), "a").unwrap();
+        let s1 = repo.seal(
+            test_agent(), "s1".into(), Some("log-spec".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        fs::write(dir.path().join("f.txt"), "b").unwrap();
+        let s2 = repo.seal(
+            test_agent(), "s2".into(), Some("log-spec".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let spec_seals = repo.spec_log("log-spec").unwrap();
+        assert_eq!(spec_seals.len(), 2);
+        assert_eq!(spec_seals[0].id, s2.id);
+        assert_eq!(spec_seals[1].id, s1.id);
+    }
+
+    #[test]
+    fn test_seal_without_spec_uses_global_head() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "first").unwrap();
+        let seal1 = repo.seal(
+            test_agent(), "no spec 1".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "second").unwrap();
+        let seal2 = repo.seal(
+            test_agent(), "no spec 2".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        assert_eq!(seal2.parent, Some(seal1.id.clone()));
+        assert_eq!(repo.spec_head("anything").unwrap(), None);
+    }
+}
+
+#[cfg(test)]
+mod merge_on_seal_tests {
+    use super::*;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_seal_with_check_no_conflict() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let s1 = repo.seal(
+            agent("a1"), "first".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "world").unwrap();
+        let (s2, warning) = repo.seal_with_check(
+            agent("a1"), "second".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+            Some(s1.id.clone()),
+        ).unwrap();
+
+        assert!(warning.is_none());
+        assert_eq!(s2.parent, Some(s1.id));
+    }
+
+    #[test]
+    fn test_seal_with_check_detects_head_movement() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "v1").unwrap();
+        let s1 = repo.seal(
+            agent("a1"), "base".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent B seals (moving HEAD)
+        fs::write(dir.path().join("b.txt"), "agent-b-work").unwrap();
+        let _s2 = repo.seal(
+            agent("a2"), "agent b work".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent A seals with expected_head = s1 (stale)
+        fs::write(dir.path().join("a.txt"), "v2").unwrap();
+        let (s3, warning) = repo.seal_with_check(
+            agent("a1"), "agent a work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+            Some(s1.id.clone()),
+        ).unwrap();
+
+        assert!(warning.is_some());
+        let w = warning.unwrap();
+        assert_eq!(w.expected_head, s1.id);
+        assert_eq!(w.intervening_seals.len(), 1);
+        assert!(w.is_clean, "different files = no overlap");
+        assert!(s3.id.len() == 64);
+    }
+
+    #[test]
+    fn test_seal_with_check_detects_file_overlap() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "v1").unwrap();
+        let s1 = repo.seal(
+            agent("a1"), "base".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent B modifies the same file
+        fs::write(dir.path().join("shared.txt"), "agent-b").unwrap();
+        let _s2 = repo.seal(
+            agent("a2"), "agent b edits shared".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent A also modifies shared.txt
+        fs::write(dir.path().join("shared.txt"), "agent-a").unwrap();
+        let (_s3, warning) = repo.seal_with_check(
+            agent("a1"), "agent a edits shared".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+            Some(s1.id.clone()),
+        ).unwrap();
+
+        assert!(warning.is_some());
+        let w = warning.unwrap();
+        assert!(!w.is_clean, "same file = overlap");
+        assert!(w.overlapping_files.contains(&"shared.txt".to_string()));
+    }
+
+    #[test]
+    fn test_seal_with_check_short_id() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let s1 = repo.seal(
+            agent("a1"), "first".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Use a short ID (first 12 chars) as expected_head
+        let short_id = s1.id[..12].to_string();
+
+        fs::write(dir.path().join("a.txt"), "world").unwrap();
+        let (_s2, warning) = repo.seal_with_check(
+            agent("a1"), "second".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+            Some(short_id),
+        ).unwrap();
+
+        // Short ID should resolve to full ID — no false conflict
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn test_seal_with_check_no_expected_head() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let (_seal, warning) = repo.seal_with_check(
+            agent("a1"), "no check".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+            None,
+        ).unwrap();
+
+        assert!(warning.is_none());
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::*;
+    use crate::context::ContextScope;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use std::time::Instant;
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_scale_100_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let start = Instant::now();
+        for i in 0..100 {
+            let spec = Spec::new(
+                format!("spec-{i}"),
+                format!("Spec number {i}"),
+                String::new(),
+            );
+            repo.add_spec(&spec).unwrap();
+        }
+        let add_time = start.elapsed();
+        assert!(add_time.as_secs() < 5, "Adding 100 specs took {:?}", add_time);
+
+        let start = Instant::now();
+        let specs = repo.list_specs().unwrap();
+        let list_time = start.elapsed();
+        assert_eq!(specs.len(), 100);
+        assert!(list_time.as_secs() < 2, "Listing 100 specs took {:?}", list_time);
+    }
+
+    #[test]
+    fn test_scale_500_seals_linear_chain() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("big-spec".into(), "Scale test".into(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        let start = Instant::now();
+        for i in 0..500 {
+            fs::write(dir.path().join("file.txt"), format!("iteration {i}")).unwrap();
+            repo.seal(
+                agent("scale-agent"),
+                format!("seal {i}"),
+                Some("big-spec".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            ).unwrap();
+        }
+        let seal_time = start.elapsed();
+        assert!(seal_time.as_secs() < 120, "500 seals took {:?}", seal_time);
+
+        let start = Instant::now();
+        let chain = repo.log().unwrap();
+        let log_time = start.elapsed();
+        assert_eq!(chain.len(), 500);
+        assert!(log_time.as_secs() < 5, "Walking 500-seal chain took {:?}", log_time);
+
+        let start = Instant::now();
+        let spec_chain = repo.spec_log("big-spec").unwrap();
+        let spec_log_time = start.elapsed();
+        assert_eq!(spec_chain.len(), 500);
+        assert!(spec_log_time.as_secs() < 5, "Walking 500-seal spec chain took {:?}", spec_log_time);
+    }
+
+    #[test]
+    fn test_scale_context_with_many_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("ctx-spec".into(), "Context scale".into(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        for i in 0..200 {
+            fs::write(dir.path().join("file.txt"), format!("v{i}")).unwrap();
+            repo.seal(
+                agent("ctx-agent"),
+                format!("seal {i}"),
+                Some("ctx-spec".into()),
+                TaskStatus::InProgress,
+                Verification { tests_passed: Some(i as u32), tests_failed: None, linted: true },
+                false,
+            ).unwrap();
+        }
+
+        let start = Instant::now();
+        let ctx = repo.context(
+            ContextScope::Full,
+            20,
+            &ContextFilter { status: None, agent: None },
+        ).unwrap();
+        let ctx_time = start.elapsed();
+        assert_eq!(ctx.recent_seals.len(), 20);
+        assert!(ctx_time.as_secs() < 10, "Full context with 200 seals took {:?}", ctx_time);
+
+        let start = Instant::now();
+        let spec_ctx = repo.context(
+            ContextScope::Spec("ctx-spec".into()),
+            10,
+            &ContextFilter { status: None, agent: None },
+        ).unwrap();
+        let spec_ctx_time = start.elapsed();
+        assert_eq!(spec_ctx.recent_seals.len(), 10);
+        assert!(spec_ctx_time.as_secs() < 10, "Spec context with 200 seals took {:?}", spec_ctx_time);
+    }
+
+    #[test]
+    fn test_scale_parallel_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        for i in 0..50 {
+            let spec = Spec::new(
+                format!("parallel-{i}"),
+                format!("Parallel spec {i}"),
+                String::new(),
+            );
+            repo.add_spec(&spec).unwrap();
+        }
+
+        let start = Instant::now();
+        for i in 0..50 {
+            let fname = format!("file-{i}.txt");
+            for j in 0..10 {
+                fs::write(dir.path().join(&fname), format!("spec{i}-iter{j}")).unwrap();
+                repo.seal(
+                    agent(&format!("agent-{i}")),
+                    format!("work on spec-{i}, iteration {j}"),
+                    Some(format!("parallel-{i}")),
+                    TaskStatus::InProgress,
+                    Verification::default(),
+                    false,
+                ).unwrap();
+            }
+        }
+        let total_time = start.elapsed();
+        assert!(total_time.as_secs() < 180, "50 specs x 10 seals took {:?}", total_time);
+
+        for i in 0..50 {
+            let head = repo.spec_head(&format!("parallel-{i}")).unwrap();
+            assert!(head.is_some(), "spec parallel-{i} should have a head");
+        }
+
+        let all_seals = repo.log().unwrap();
+        assert_eq!(all_seals.len(), 500);
+    }
+
+    #[test]
+    fn test_scale_many_files_in_single_seal() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        for i in 0..200 {
+            fs::write(dir.path().join(format!("file-{i}.txt")), format!("content-{i}")).unwrap();
+        }
+
+        let start = Instant::now();
+        let seal = repo.seal(
+            agent("bulk-agent"),
+            "bulk seal 200 files".into(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        ).unwrap();
+        let seal_time = start.elapsed();
+
+        assert_eq!(seal.changes.len(), 200);
+        assert!(seal_time.as_secs() < 10, "Sealing 200 files took {:?}", seal_time);
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "bridge")]
+mod install_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_install_fresh_no_git() {
+        let dir = tempdir().unwrap();
+        let result = Repository::install(dir.path()).unwrap();
+        assert!(result.initialized);
+        assert!(!result.git_detected);
+        assert!(!result.git_imported);
+        assert!(result.writignore_created);
+        assert_eq!(result.tracked_files, 0);
+    }
+
+    #[test]
+    fn test_install_idempotent_no_git() {
+        let dir = tempdir().unwrap();
+        let first = Repository::install(dir.path()).unwrap();
+        assert!(first.initialized);
+        assert!(first.writignore_created);
+
+        let second = Repository::install(dir.path()).unwrap();
+        assert!(!second.initialized);
+        assert!(!second.writignore_created);
+    }
+
+    #[test]
+    fn test_install_has_repo_root() {
+        let dir = tempdir().unwrap();
+        let result = Repository::install(dir.path()).unwrap();
+        assert!(!result.repo_root.is_empty());
+    }
+
+    #[test]
+    fn test_install_has_available_operations() {
+        let dir = tempdir().unwrap();
+        let result = Repository::install(dir.path()).unwrap();
+        assert!(!result.available_operations.is_empty());
+        assert!(result.available_operations.iter().any(|op| op.contains("context")));
+    }
+
+    #[test]
+    fn test_install_creates_writignore() {
+        let dir = tempdir().unwrap();
+        Repository::install(dir.path()).unwrap();
+        assert!(dir.path().join(".writignore").exists());
+    }
+
+    #[test]
+    fn test_install_preserves_existing_writignore() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".writignore"), "my_custom_rules\n").unwrap();
+        let result = Repository::install(dir.path()).unwrap();
+        assert!(!result.writignore_created);
+        let content = fs::read_to_string(dir.path().join(".writignore")).unwrap();
+        assert_eq!(content, "my_custom_rules\n");
+    }
+
+    #[test]
+    fn test_install_writignore_imports_gitignore() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "build\n*.log\n").unwrap();
+        let result = Repository::install(dir.path()).unwrap();
+        assert!(result.writignore_created);
+        let content = fs::read_to_string(dir.path().join(".writignore")).unwrap();
+        assert!(content.contains("build"));
+        assert!(content.contains("*.log"));
+    }
+
+    #[test]
+    fn test_install_detects_claude_code() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), "# Project").unwrap();
+        let result = Repository::install(dir.path()).unwrap();
+        assert!(result.frameworks_detected.iter().any(|f| f.detected));
+    }
+
+    #[test]
+    fn test_install_no_frameworks() {
+        let dir = tempdir().unwrap();
+        let result = Repository::install(dir.path()).unwrap();
+        assert!(result.frameworks_detected.iter().all(|f| !f.detected));
+    }
+
+    #[test]
+    fn test_install_result_serializable() {
+        let dir = tempdir().unwrap();
+        let result = Repository::install(dir.path()).unwrap();
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("initialized"));
+        assert!(json.contains("repo_root"));
+    }
+
+    // --- Git-dependent tests ---
+
+    fn setup_git_repo(dir: &Path) {
+        let repo = git2::Repository::init(dir).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_str("user.name", "Test").unwrap();
+        config.set_str("user.email", "test@test.com").unwrap();
+
+        fs::write(dir.join("main.py"), "print('hello')").unwrap();
+        fs::write(dir.join("README.md"), "# Project").unwrap();
+
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("main.py")).unwrap();
+        index.add_path(Path::new("README.md")).unwrap();
+        let oid = index.write_tree().unwrap();
+        index.write().unwrap();
+
+        let tree = repo.find_tree(oid).unwrap();
+        let sig = repo.signature().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_install_with_git() {
+        let dir = tempdir().unwrap();
+        setup_git_repo(dir.path());
+        let result = Repository::install(dir.path()).unwrap();
+        assert!(result.git_detected);
+        assert!(result.git_imported);
+        assert!(result.imported_files.unwrap() > 0);
+        assert!(result.git_branch.is_some());
+        assert_eq!(result.git_head_short.as_ref().unwrap().len(), 12);
+        assert!(result.tracked_files > 0);
+    }
+
+    #[test]
+    fn test_install_idempotent_already_synced() {
+        let dir = tempdir().unwrap();
+        setup_git_repo(dir.path());
+
+        let first = Repository::install(dir.path()).unwrap();
+        assert!(first.git_imported);
+        assert!(!first.already_imported);
+
+        let second = Repository::install(dir.path()).unwrap();
+        assert!(!second.git_imported);
+        assert!(second.already_imported);
+        assert!(second.import_skipped_reason.as_ref().unwrap().contains("already synced"));
+    }
+
+    #[test]
+    fn test_install_reimports_on_head_move() {
+        let dir = tempdir().unwrap();
+        setup_git_repo(dir.path());
+
+        let first = Repository::install(dir.path()).unwrap();
+        assert!(first.git_imported);
+
+        // Make a new git commit
+        let git_repo = git2::Repository::open(dir.path()).unwrap();
+        fs::write(dir.path().join("new_file.txt"), "new content").unwrap();
+        let mut index = git_repo.index().unwrap();
+        index.add_path(Path::new("new_file.txt")).unwrap();
+        let oid = index.write_tree().unwrap();
+        index.write().unwrap();
+        let tree = git_repo.find_tree(oid).unwrap();
+        let sig = git_repo.signature().unwrap();
+        let head = git_repo.head().unwrap().peel_to_commit().unwrap();
+        git_repo
+            .commit(Some("HEAD"), &sig, &sig, "second commit", &tree, &[&head])
+            .unwrap();
+
+        let second = Repository::install(dir.path()).unwrap();
+        assert!(second.git_imported);
+        assert!(second.reimported);
+        assert_ne!(first.imported_seal_id, second.imported_seal_id);
+    }
+
+    #[test]
+    fn test_install_detects_dirty_git() {
+        let dir = tempdir().unwrap();
+        setup_git_repo(dir.path());
+
+        // Modify a tracked file without committing
+        fs::write(dir.path().join("main.py"), "print('modified')").unwrap();
+
+        let result = Repository::install(dir.path()).unwrap();
+        assert_eq!(result.git_dirty, Some(true));
+        assert!(result.git_dirty_count.unwrap() >= 1);
     }
 }

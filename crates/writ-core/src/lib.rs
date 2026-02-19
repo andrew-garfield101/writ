@@ -12,6 +12,7 @@ pub mod diff;
 pub mod error;
 pub mod fsutil;
 pub mod hash;
+pub mod hooks;
 pub mod ignore;
 pub mod index;
 pub mod lock;

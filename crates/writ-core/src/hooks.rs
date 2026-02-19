@@ -174,35 +174,36 @@ fn writ_claude_md_section() -> String {
 
 This project uses **writ** for AI-native version control. Use writ alongside git.
 
-### Key commands
+### CLI (preferred)
+
+```bash
+writ context                                              # project state
+writ context --spec my-feature                            # scoped to a spec
+writ seal -s "what you did" --agent your-id --spec feat   # checkpoint
+writ log --limit 5                                        # recent seals
+```
+
+### Python API
 
 ```python
 import writ
-
 repo = writ.Repository.open(".")
-ctx = repo.context()          # Get full project context
-ctx = repo.context(spec="X")  # Get context scoped to a spec
-
-repo.seal(
-    summary="what you did and why",
-    agent_id="your-agent-id",
-    spec_id="the-spec-you-are-working-on",
-    status="in-progress",
-)
+ctx = repo.context(spec="my-feature")
+repo.seal(summary="what you did", agent_id="your-id", agent_type="agent", spec_id="feat", status="in-progress")
 ```
 
 ### Workflow
 
-1. Call `repo.context()` at the start of every task to see project state
+1. Run `writ context` at the start of every task to understand project state
 2. Do your work
-3. Call `repo.seal()` when you reach a meaningful checkpoint
-4. Check `context()` again if you need to understand what other agents have done
+3. Run `writ seal` when you reach a meaningful checkpoint
+4. Check `writ context` again to see what other agents have done
 
 ### Rules
 
 - Always seal your work before finishing a task
-- Use the spec_id parameter to link seals to specs
-- Include test results in seals when available (tests_passed, tests_failed)
+- Use --spec to link seals to specs
+- Include test results when available (--tests-passed N --tests-failed M)
 - If context shows unsealed changes, seal before starting new work
 "#.to_string()
 }
@@ -212,65 +213,57 @@ fn writ_agents_md_section() -> String {
 
 This project uses **writ** for AI-native version control.
 
-### Setup
-
-```python
-import writ
-repo = writ.Repository.open(".")
-```
-
 ### Before starting work
 
-```python
-ctx = repo.context(spec="your-spec-id")
+```bash
+writ context --spec your-spec-id
 ```
 
 ### After completing work
 
+```bash
+writ seal -s "description of changes" --agent your-id --spec your-spec-id --status complete --tests-passed N
+```
+
+### Python API (alternative)
+
 ```python
-repo.seal(
-    summary="description of changes",
-    agent_id="your-id",
-    spec_id="your-spec-id",
-    status="complete",
-    tests_passed=N,
-)
+import writ
+repo = writ.Repository.open(".")
+repo.context(spec="your-spec-id")
+repo.seal(summary="changes", agent_id="your-id", agent_type="agent", spec_id="your-spec-id", status="complete")
 ```
 
 ### Guidelines
 
-- Always call `context()` first to understand project state
+- Always run `writ context` first to understand project state
 - Seal after every meaningful unit of work
-- Link seals to specs with `spec_id`
-- Include verification data (test counts, lint status)
+- Link seals to specs with --spec
+- Include verification data (--tests-passed, --tests-failed, --linted)
 "#.to_string()
 }
 
 const CLAUDE_SEAL_COMMAND: &str = r#"Seal the current work as a writ checkpoint.
 
-```python
-import writ
-repo = writ.Repository.open(".")
-ctx = repo.context()
+Run this command to create a structured checkpoint:
 
-repo.seal(
-    summary="$ARGUMENTS",
-    agent_id="claude-code",
-    agent_type="agent",
-    spec_id=None,
-    status="in-progress",
-)
-print("Sealed successfully")
+```bash
+writ seal -s "$ARGUMENTS" --agent claude-code --status in-progress
 ```
+
+To link to a spec, add `--spec your-spec-id`. To include test results, add `--tests-passed N`.
 "#;
 
 const CLAUDE_CONTEXT_COMMAND: &str = r#"Show the current writ context for this project.
 
-```python
-import writ, json
-repo = writ.Repository.open(".")
-ctx = repo.context()
-print(json.dumps(ctx, indent=2, default=str))
+```bash
+writ context --format json
+```
+
+To scope context to a specific spec:
+
+```bash
+writ context --spec your-spec-id --format json
 ```
 "#;
 

@@ -2,14 +2,11 @@
 
 import json
 import os
-import sys
 
 import pytest
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
-
 import writ
-from writ_sdk import Agent, Phase, Pipeline
+from writ.sdk import Agent, Phase, Pipeline
 
 
 @pytest.fixture

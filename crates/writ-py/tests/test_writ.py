@@ -1014,3 +1014,219 @@ class TestInstall:
         assert isinstance(ops, list)
         assert len(ops) > 0
         assert any("context" in op for op in ops)
+
+
+class TestAutoConflictDetection:
+    """P0: seal() auto-detects conflicts when context() was called first."""
+
+    def test_seal_without_context_no_warning(self, tmp_path):
+        """Standard seal without context() has no conflict_warning."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("hello")
+        result = repo.seal(summary="first", agent_id="a1", agent_type="agent")
+        # Without context() call, no automatic detection.
+        assert result.get("conflict_warning") is None
+
+    def test_seal_after_context_no_conflict(self, tmp_path):
+        """context() + seal() with no HEAD movement: no warning."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("v1")
+        repo.seal(summary="base", agent_id="a1", agent_type="agent")
+
+        repo.context()  # Records HEAD.
+        (tmp_path / "a.txt").write_text("v2")
+        result = repo.seal(summary="update", agent_id="a1", agent_type="agent")
+        assert result.get("conflict_warning") is None
+
+    def test_seal_after_context_detects_conflict(self, tmp_path):
+        """context() + another agent seals + seal(): conflict_warning present."""
+        repo_a = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("v1")
+        repo_a.seal(summary="base", agent_id="a1", agent_type="agent")
+
+        # Agent A calls context, records HEAD.
+        repo_a.context()
+
+        # Agent B (separate repo instance) seals, moving HEAD on disk.
+        repo_b = writ.Repository.open(str(tmp_path))
+        (tmp_path / "b.txt").write_text("agent-b-work")
+        repo_b.seal(summary="agent-b", agent_id="a2", agent_type="agent")
+
+        # Agent A seals — should detect HEAD moved.
+        (tmp_path / "a.txt").write_text("v2")
+        result = repo_a.seal(summary="agent-a", agent_id="a1", agent_type="agent")
+        assert result.get("conflict_warning") is not None
+        warning = result["conflict_warning"]
+        assert warning["is_clean"] is True  # Different files, no overlap.
+        assert len(warning["intervening_seals"]) == 1
+
+    def test_conflict_warning_shows_overlapping_files(self, tmp_path):
+        """Conflict warning reports overlapping files."""
+        repo_a = writ.Repository.init(str(tmp_path))
+        (tmp_path / "shared.txt").write_text("v1")
+        repo_a.seal(summary="base", agent_id="a1", agent_type="agent")
+
+        repo_a.context()
+
+        # Agent B modifies the same file.
+        repo_b = writ.Repository.open(str(tmp_path))
+        (tmp_path / "shared.txt").write_text("agent-b-edit")
+        repo_b.seal(summary="agent-b", agent_id="a2", agent_type="agent")
+
+        (tmp_path / "shared.txt").write_text("agent-a-edit")
+        result = repo_a.seal(summary="agent-a", agent_id="a1", agent_type="agent")
+        warning = result["conflict_warning"]
+        assert warning["is_clean"] is False
+        assert "shared.txt" in warning["overlapping_files"]
+
+    def test_context_head_clears_after_seal(self, tmp_path):
+        """After seal(), the tracked HEAD is cleared."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("v1")
+        repo.seal(summary="base", agent_id="a1", agent_type="agent")
+
+        repo.context()
+        (tmp_path / "a.txt").write_text("v2")
+        repo.seal(summary="update", agent_id="a1", agent_type="agent")
+
+        # Second seal without new context() call: no warning.
+        (tmp_path / "a.txt").write_text("v3")
+        result = repo.seal(summary="third", agent_id="a1", agent_type="agent")
+        assert result.get("conflict_warning") is None
+
+
+class TestSpecScopedContextFiltering:
+    """P0: context(spec=X) filters working_state, pending_changes, seal_nudge."""
+
+    def test_filters_by_file_scope(self, tmp_path):
+        """Only spec-scoped files appear in working_state."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="auth", title="Auth")
+        repo.update_spec("auth", file_scope=["src/auth.py"])
+
+        os.makedirs(str(tmp_path / "src"))
+        (tmp_path / "src" / "auth.py").write_text("auth code")
+        (tmp_path / "readme.md").write_text("docs")
+        repo.seal(summary="base", agent_id="a1", agent_type="agent", spec_id="auth")
+
+        (tmp_path / "src" / "auth.py").write_text("auth v2")
+        (tmp_path / "readme.md").write_text("docs v2")
+
+        ctx = repo.context(spec="auth")
+        assert "src/auth.py" in ctx["working_state"]["modified_files"]
+        assert "readme.md" not in ctx["working_state"]["modified_files"]
+
+    def test_filters_pending_changes(self, tmp_path):
+        """Only spec-scoped files in pending_changes."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="ui", title="UI")
+        repo.update_spec("ui", file_scope=["style.css"])
+
+        (tmp_path / "style.css").write_text("body {}")
+        (tmp_path / "app.js").write_text("console.log()")
+        repo.seal(summary="base", agent_id="a1", agent_type="agent", spec_id="ui")
+
+        (tmp_path / "style.css").write_text("body { color: red }")
+        (tmp_path / "app.js").write_text("changed")
+
+        ctx = repo.context(spec="ui")
+        pc = ctx["pending_changes"]
+        assert pc["files_changed"] == 1
+        assert pc["files"][0]["path"] == "style.css"
+
+    def test_no_nudge_for_unrelated_changes(self, tmp_path):
+        """Seal nudge is absent when only non-spec files changed."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="api", title="API")
+        repo.update_spec("api", file_scope=["api.py"])
+
+        (tmp_path / "api.py").write_text("v1")
+        (tmp_path / "other.py").write_text("v1")
+        repo.seal(summary="base", agent_id="a1", agent_type="agent", spec_id="api")
+
+        (tmp_path / "other.py").write_text("v2")
+
+        ctx = repo.context(spec="api")
+        assert ctx.get("seal_nudge") is None
+
+    def test_infers_scope_from_seals(self, tmp_path):
+        """When no file_scope set, infer from files in spec's seals."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+
+        (tmp_path / "feature.py").write_text("v1")
+        repo.seal(summary="impl", agent_id="a1", agent_type="agent", spec_id="feat")
+
+        (tmp_path / "unrelated.py").write_text("v1")
+        repo.seal(summary="other", agent_id="a1", agent_type="agent")
+
+        (tmp_path / "feature.py").write_text("v2")
+        (tmp_path / "unrelated.py").write_text("v2")
+
+        ctx = repo.context(spec="feat")
+        assert "feature.py" in ctx["working_state"]["modified_files"]
+        assert "unrelated.py" not in ctx["working_state"]["modified_files"]
+
+
+class TestFileScopeWarning:
+    def test_no_warning_when_no_scope(self, tmp_path):
+        """No warning when spec has no file_scope set."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+        (tmp_path / "anything.py").write_text("hello")
+        result = repo.seal(
+            summary="work", agent_id="a1", agent_type="agent", spec_id="feat"
+        )
+        assert result.get("file_scope_warning") is None
+
+    def test_no_warning_when_in_scope(self, tmp_path):
+        """No warning when all files are within scope."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+        repo.update_spec("feat", file_scope=["src/"])
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("hello")
+        result = repo.seal(
+            summary="work", agent_id="a1", agent_type="agent", spec_id="feat"
+        )
+        assert result.get("file_scope_warning") is None
+
+    def test_warning_when_out_of_scope(self, tmp_path):
+        """Warning returned when files are outside declared scope."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+        repo.update_spec("feat", file_scope=["src/"])
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("in scope")
+        (tmp_path / "README.md").write_text("out of scope")
+        result = repo.seal(
+            summary="work", agent_id="a1", agent_type="agent", spec_id="feat"
+        )
+        w = result.get("file_scope_warning")
+        assert w is not None
+        assert "README.md" in w["out_of_scope_files"]
+        assert "src/main.py" in w["in_scope_files"]
+        assert w["spec_id"] == "feat"
+        assert "src/" in w["declared_scope"]
+
+    def test_warning_with_glob_scope(self, tmp_path):
+        """Glob patterns in file_scope work correctly."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+        repo.update_spec("feat", file_scope=["*.py"])
+        (tmp_path / "main.py").write_text("python")
+        (tmp_path / "styles.css").write_text("css")
+        result = repo.seal(
+            summary="work", agent_id="a1", agent_type="agent", spec_id="feat"
+        )
+        w = result.get("file_scope_warning")
+        assert w is not None
+        assert "styles.css" in w["out_of_scope_files"]
+        assert "main.py" in w["in_scope_files"]
+
+    def test_no_warning_without_spec(self, tmp_path):
+        """No file scope check when sealing without a spec."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "file.py").write_text("hello")
+        result = repo.seal(summary="work", agent_id="a1", agent_type="agent")
+        assert result.get("file_scope_warning") is None

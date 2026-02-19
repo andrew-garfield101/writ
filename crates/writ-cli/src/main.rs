@@ -733,6 +733,17 @@ fn cmd_seal(
         println!("    {marker} {}", c.path);
     }
 
+    if let Some(ref sid) = seal.spec_id {
+        let changed: Vec<String> = seal.changes.iter().map(|c| c.path.clone()).collect();
+        if let Some(w) = repo.check_file_scope(sid, &changed) {
+            eprintln!("  WARNING: {} file(s) outside spec '{}' file_scope {:?}:",
+                w.out_of_scope_files.len(), w.spec_id, w.declared_scope);
+            for f in &w.out_of_scope_files {
+                eprintln!("    ! {f}");
+            }
+        }
+    }
+
     Ok(())
 }
 

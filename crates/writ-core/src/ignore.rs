@@ -152,7 +152,7 @@ pub fn create_writignore(repo_root: &Path) -> crate::WritResult<bool> {
 }
 
 /// Simple glob matching: `*` matches any characters, `?` matches one character.
-fn glob_match(pattern: &str, text: &str) -> bool {
+pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = text.chars().collect();
     let mut pi = 0;

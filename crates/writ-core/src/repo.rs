@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -39,6 +40,8 @@ pub struct Repository {
     writ_dir: PathBuf,
     /// Content-addressable object store.
     objects: ObjectStore,
+    /// In-memory HEAD recorded at last context() call, for automatic conflict detection.
+    last_context_head: Mutex<Option<String>>,
 }
 
 /// Snapshot of git working tree state, used by install().
@@ -138,6 +141,7 @@ impl Repository {
             root: root.to_path_buf(),
             writ_dir,
             objects,
+            last_context_head: Mutex::new(None),
         })
     }
 
@@ -734,6 +738,15 @@ impl Repository {
             true
         };
 
+        // Track HEAD for automatic conflict detection in seal().
+        let tracked_head = match &scope {
+            ContextScope::Full => self.read_head()?,
+            ContextScope::Spec(spec_id) => self.resolve_parent(Some(spec_id))?,
+        };
+        if let Ok(mut guard) = self.last_context_head.lock() {
+            *guard = tracked_head;
+        }
+
         match scope {
             ContextScope::Full => {
                 let specs = self.list_specs()?;
@@ -773,15 +786,90 @@ impl Repository {
                     .map(SealSummary::from_seal)
                     .collect();
 
-                let file_scope = if spec.file_scope.is_empty() {
-                    let index = self.load_index()?;
-                    index.entries.keys().cloned().collect()
+                // Build the set of spec-relevant files for filtering.
+                // Priority: spec.file_scope (explicit) > files from spec seals (inferred).
+                let file_scope: Vec<String>;
+                let has_scope_filter: bool;
+
+                if !spec.file_scope.is_empty() {
+                    file_scope = spec.file_scope.clone();
+                    has_scope_filter = true;
                 } else {
-                    spec.file_scope.clone()
+                    // Infer scope from files touched in this spec's seals.
+                    let mut inferred: HashSet<String> = HashSet::new();
+                    for seal_id in &spec.sealed_by {
+                        if let Ok(s) = self.load_seal(seal_id) {
+                            for c in &s.changes {
+                                inferred.insert(c.path.clone());
+                            }
+                        }
+                    }
+                    if inferred.is_empty() {
+                        // No seals yet — fall back to all tracked files.
+                        let index = self.load_index()?;
+                        file_scope = index.entries.keys().cloned().collect();
+                        has_scope_filter = false;
+                    } else {
+                        file_scope = inferred.into_iter().collect();
+                        has_scope_filter = true;
+                    }
                 };
+
+                // Filter working state to spec-relevant files.
+                let (filtered_ws, filtered_pending, filtered_nudge) = if has_scope_filter {
+                    let matches_scope = |path: &str| -> bool {
+                        file_scope.iter().any(|scope_entry| {
+                            // Exact match or prefix match (for directory patterns like "src/components/").
+                            path == scope_entry
+                                || (scope_entry.ends_with('/') && path.starts_with(scope_entry.as_str()))
+                        })
+                    };
+
+                    let filtered_state = WorkingStateSummary {
+                        clean: ws_summary.new_files.iter().chain(ws_summary.modified_files.iter()).chain(ws_summary.deleted_files.iter())
+                            .all(|p| !matches_scope(p)),
+                        new_files: ws_summary.new_files.iter().filter(|p| matches_scope(p)).cloned().collect(),
+                        modified_files: ws_summary.modified_files.iter().filter(|p| matches_scope(p)).cloned().collect(),
+                        deleted_files: ws_summary.deleted_files.iter().filter(|p| matches_scope(p)).cloned().collect(),
+                        tracked_count: ws_summary.tracked_count,
+                    };
+
+                    let filtered_pending = pending_changes.map(|pc| {
+                        let filtered_files: Vec<_> = pc.files.into_iter()
+                            .filter(|f| matches_scope(&f.path))
+                            .collect();
+                        let total_add: usize = filtered_files.iter().map(|f| f.additions).sum();
+                        let total_del: usize = filtered_files.iter().map(|f| f.deletions).sum();
+                        DiffSummary {
+                            files_changed: filtered_files.len(),
+                            total_additions: total_add,
+                            total_deletions: total_del,
+                            files: filtered_files,
+                        }
+                    });
+
+                    let spec_change_count = filtered_state.new_files.len()
+                        + filtered_state.modified_files.len()
+                        + filtered_state.deleted_files.len();
+                    let filtered_nudge = if spec_change_count > 0 {
+                        Some(SealNudge {
+                            unsealed_file_count: spec_change_count,
+                            message: format!(
+                                "{spec_change_count} spec-relevant file(s) changed since last seal — consider checkpointing"
+                            ),
+                        })
+                    } else {
+                        None
+                    };
+
+                    (filtered_state, filtered_pending, filtered_nudge)
+                } else {
+                    (ws_summary, pending_changes, seal_nudge)
+                };
+
                 let tracked_files = file_scope.len();
 
-                // Compute dependency status
+                // Compute dependency status.
                 let dependency_status = if !spec.depends_on.is_empty() {
                     let deps: Vec<DepStatus> = spec
                         .depends_on
@@ -796,7 +884,7 @@ impl Repository {
                     None
                 };
 
-                // Compute spec progress
+                // Compute spec progress.
                 let spec_progress = if !spec.sealed_by.is_empty() {
                     let mut agents = Vec::new();
                     let mut latest_at: Option<String> = None;
@@ -831,10 +919,10 @@ impl Repository {
                     writ_version: "0.1.0".to_string(),
                     active_spec: Some(spec),
                     all_specs: None,
-                    working_state: ws_summary,
+                    working_state: filtered_ws,
                     recent_seals: spec_seals,
-                    pending_changes,
-                    seal_nudge,
+                    pending_changes: filtered_pending,
+                    seal_nudge: filtered_nudge,
                     file_scope,
                     tracked_files,
                     dependency_status,
@@ -842,6 +930,21 @@ impl Repository {
                     available_operations,
                 })
             }
+        }
+    }
+
+    /// Get the HEAD recorded at the last `context()` call.
+    ///
+    /// Used for automatic conflict detection: if HEAD moved between
+    /// `context()` and `seal()`, the caller can detect it.
+    pub fn last_context_head(&self) -> Option<String> {
+        self.last_context_head.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Clear the tracked context HEAD (called after seal to prevent stale state).
+    pub fn clear_context_head(&self) {
+        if let Ok(mut guard) = self.last_context_head.lock() {
+            *guard = None;
         }
     }
 
@@ -2542,6 +2645,50 @@ impl Repository {
         }
     }
 
+    /// Check whether changed files fall outside the spec's declared file_scope.
+    /// Returns None if the spec has no file_scope set (empty = no restriction).
+    pub fn check_file_scope(
+        &self,
+        spec_id: &str,
+        changed_paths: &[String],
+    ) -> Option<FileScopeWarning> {
+        let spec = self.load_spec(spec_id).ok()?;
+        if spec.file_scope.is_empty() {
+            return None;
+        }
+
+        let mut in_scope = Vec::new();
+        let mut out_of_scope = Vec::new();
+
+        for path in changed_paths {
+            let matches = spec.file_scope.iter().any(|scope| {
+                if scope.ends_with('/') {
+                    path.starts_with(scope) || path.starts_with(&scope[..scope.len() - 1])
+                } else if scope.contains('*') {
+                    crate::ignore::glob_match(scope, path)
+                } else {
+                    path == scope || path.starts_with(&format!("{scope}/"))
+                }
+            });
+            if matches {
+                in_scope.push(path.clone());
+            } else {
+                out_of_scope.push(path.clone());
+            }
+        }
+
+        if out_of_scope.is_empty() {
+            return None;
+        }
+
+        Some(FileScopeWarning {
+            spec_id: spec_id.to_string(),
+            declared_scope: spec.file_scope.clone(),
+            out_of_scope_files: out_of_scope,
+            in_scope_files: in_scope,
+        })
+    }
+
     /// Count total seals in a directory (simple file count).
     fn count_seals_in_dir(dir: &Path) -> WritResult<usize> {
         if !dir.is_dir() {
@@ -2611,6 +2758,19 @@ pub struct InstallResult {
     /// Hooks installed during install.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub hooks_installed: Vec<crate::hooks::HookResult>,
+}
+
+/// Returned by `seal()` when changed files fall outside the spec's declared `file_scope`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileScopeWarning {
+    /// The spec ID whose scope was exceeded.
+    pub spec_id: String,
+    /// The declared file scope patterns on the spec.
+    pub declared_scope: Vec<String>,
+    /// Changed files that fall outside the declared scope.
+    pub out_of_scope_files: Vec<String>,
+    /// Changed files that are within scope.
+    pub in_scope_files: Vec<String>,
 }
 
 /// Returned by `seal()` when HEAD moved since the agent started working.
@@ -6157,6 +6317,291 @@ mod merge_on_seal_tests {
         ).unwrap();
 
         assert!(warning.is_none());
+    }
+}
+
+#[cfg(test)]
+mod context_head_tracking_tests {
+    use super::*;
+    use crate::context::{ContextFilter, ContextScope};
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_context_records_head() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        assert!(repo.last_context_head().is_none());
+
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        repo.seal(
+            agent("a1"), "first".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert!(repo.last_context_head().is_some());
+    }
+
+    #[test]
+    fn test_context_records_spec_head() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("feat".into(), "Feature".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        let s1 = repo.seal(
+            agent("a1"), "first".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        repo.context(ContextScope::Spec("feat".into()), 10, &ContextFilter::default()).unwrap();
+        let tracked = repo.last_context_head().unwrap();
+        assert_eq!(tracked, s1.id);
+    }
+
+    #[test]
+    fn test_clear_context_head() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        repo.seal(
+            agent("a1"), "first".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert!(repo.last_context_head().is_some());
+
+        repo.clear_context_head();
+        assert!(repo.last_context_head().is_none());
+    }
+
+    #[test]
+    fn test_no_context_head_before_context_call() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        assert!(repo.last_context_head().is_none());
+    }
+
+    #[test]
+    fn test_context_head_none_when_no_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        // HEAD is empty when no seals exist.
+        assert!(repo.last_context_head().is_none());
+    }
+}
+
+#[cfg(test)]
+mod spec_scoped_context_tests {
+    use super::*;
+    use crate::context::{ContextFilter, ContextScope};
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_spec_context_filters_working_state_by_file_scope() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create spec with explicit file_scope.
+        let mut spec = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        spec.file_scope = vec!["src/auth.py".to_string()];
+        repo.add_spec(&spec).unwrap();
+
+        // Create files — one in scope, one not.
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/auth.py"), "auth code").unwrap();
+        std::fs::write(dir.path().join("readme.md"), "docs").unwrap();
+
+        // Seal both files so they're tracked.
+        repo.seal(
+            agent("a1"), "base".into(), Some("auth".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Modify both files.
+        std::fs::write(dir.path().join("src/auth.py"), "auth v2").unwrap();
+        std::fs::write(dir.path().join("readme.md"), "updated docs").unwrap();
+
+        // Spec-scoped context should only show auth.py changes.
+        let ctx = repo.context(
+            ContextScope::Spec("auth".into()), 10, &ContextFilter::default(),
+        ).unwrap();
+
+        assert!(ctx.working_state.modified_files.contains(&"src/auth.py".to_string()));
+        assert!(!ctx.working_state.modified_files.contains(&"readme.md".to_string()));
+    }
+
+    #[test]
+    fn test_spec_context_filters_pending_changes() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let mut spec = crate::spec::Spec::new("ui".into(), "UI".into(), "".into());
+        spec.file_scope = vec!["style.css".to_string()];
+        repo.add_spec(&spec).unwrap();
+
+        // Create and track files.
+        std::fs::write(dir.path().join("style.css"), "body {}").unwrap();
+        std::fs::write(dir.path().join("app.js"), "console.log()").unwrap();
+        repo.seal(
+            agent("a1"), "base".into(), Some("ui".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Modify both.
+        std::fs::write(dir.path().join("style.css"), "body { color: red }").unwrap();
+        std::fs::write(dir.path().join("app.js"), "console.log('changed')").unwrap();
+
+        let ctx = repo.context(
+            ContextScope::Spec("ui".into()), 10, &ContextFilter::default(),
+        ).unwrap();
+
+        // pending_changes should only contain style.css.
+        let pc = ctx.pending_changes.unwrap();
+        assert_eq!(pc.files_changed, 1);
+        assert_eq!(pc.files[0].path, "style.css");
+    }
+
+    #[test]
+    fn test_spec_context_filters_seal_nudge() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let mut spec = crate::spec::Spec::new("api".into(), "API".into(), "".into());
+        spec.file_scope = vec!["api.py".to_string()];
+        repo.add_spec(&spec).unwrap();
+
+        // Track files.
+        std::fs::write(dir.path().join("api.py"), "v1").unwrap();
+        std::fs::write(dir.path().join("unrelated.py"), "v1").unwrap();
+        repo.seal(
+            agent("a1"), "base".into(), Some("api".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Modify only the unrelated file.
+        std::fs::write(dir.path().join("unrelated.py"), "v2").unwrap();
+
+        let ctx = repo.context(
+            ContextScope::Spec("api".into()), 10, &ContextFilter::default(),
+        ).unwrap();
+
+        // No spec-relevant changes → no nudge.
+        assert!(ctx.seal_nudge.is_none());
+    }
+
+    #[test]
+    fn test_spec_context_infers_scope_from_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create spec without explicit file_scope.
+        let spec = crate::spec::Spec::new("feat".into(), "Feature".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        // Seal a file linked to this spec.
+        std::fs::write(dir.path().join("feature.py"), "v1").unwrap();
+        repo.seal(
+            agent("a1"), "impl".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Also seal an unrelated file (no spec).
+        std::fs::write(dir.path().join("other.py"), "v1").unwrap();
+        repo.seal(
+            agent("a1"), "other work".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Modify both files.
+        std::fs::write(dir.path().join("feature.py"), "v2").unwrap();
+        std::fs::write(dir.path().join("other.py"), "v2").unwrap();
+
+        let ctx = repo.context(
+            ContextScope::Spec("feat".into()), 10, &ContextFilter::default(),
+        ).unwrap();
+
+        // Should only show feature.py (inferred from spec seals).
+        assert!(ctx.working_state.modified_files.contains(&"feature.py".to_string()));
+        assert!(!ctx.working_state.modified_files.contains(&"other.py".to_string()));
+    }
+
+    #[test]
+    fn test_spec_context_no_filter_when_no_scope_or_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create spec with no file_scope and no seals.
+        let spec = crate::spec::Spec::new("new".into(), "New Feature".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        // Create and track a file.
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        repo.seal(
+            agent("a1"), "base".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "changed").unwrap();
+
+        let ctx = repo.context(
+            ContextScope::Spec("new".into()), 10, &ContextFilter::default(),
+        ).unwrap();
+
+        // No scope filter → all changes shown.
+        assert!(ctx.working_state.modified_files.contains(&"a.txt".to_string()));
+    }
+
+    #[test]
+    fn test_spec_context_directory_prefix_matching() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let mut spec = crate::spec::Spec::new("ui".into(), "UI".into(), "".into());
+        spec.file_scope = vec!["src/components/".to_string()];
+        repo.add_spec(&spec).unwrap();
+
+        // Create files in and out of scope.
+        std::fs::create_dir_all(dir.path().join("src/components")).unwrap();
+        std::fs::write(dir.path().join("src/components/Button.tsx"), "btn").unwrap();
+        std::fs::write(dir.path().join("src/utils.ts"), "utils").unwrap();
+        repo.seal(
+            agent("a1"), "base".into(), Some("ui".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Modify both.
+        std::fs::write(dir.path().join("src/components/Button.tsx"), "btn v2").unwrap();
+        std::fs::write(dir.path().join("src/utils.ts"), "utils v2").unwrap();
+
+        let ctx = repo.context(
+            ContextScope::Spec("ui".into()), 10, &ContextFilter::default(),
+        ).unwrap();
+
+        assert!(ctx.working_state.modified_files.contains(&"src/components/Button.tsx".to_string()));
+        assert!(!ctx.working_state.modified_files.contains(&"src/utils.ts".to_string()));
     }
 }
 

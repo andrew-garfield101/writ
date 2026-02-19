@@ -91,6 +91,36 @@ fn to_pydict<T: serde::Serialize>(py: Python, value: &T) -> PyResult<PyObject> {
     Ok(obj.unbind())
 }
 
+#[derive(serde::Serialize)]
+struct SealResult {
+    #[serde(flatten)]
+    seal: writ_core::seal::Seal,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    conflict_warning: Option<writ_core::repo::SealConflictWarning>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    file_scope_warning: Option<writ_core::repo::FileScopeWarning>,
+}
+
+fn build_seal_result(
+    repo: &writ_core::Repository,
+    seal: writ_core::seal::Seal,
+    conflict_warning: Option<writ_core::repo::SealConflictWarning>,
+) -> SealResult {
+    let file_scope_warning = seal.spec_id.as_ref().and_then(|sid| {
+        let changed: Vec<String> = seal
+            .changes
+            .iter()
+            .map(|c| c.path.clone())
+            .collect();
+        repo.check_file_scope(sid, &changed)
+    });
+    SealResult {
+        seal,
+        conflict_warning,
+        file_scope_warning,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Repository wrapper
 // ---------------------------------------------------------------------------
@@ -136,6 +166,11 @@ impl PyRepository {
     ///
     /// If `paths` is provided, only seal matching files (selective seal).
     /// Otherwise seals all changes.
+    ///
+    /// Automatic conflict detection: if `context()` was called before this
+    /// seal, the HEAD recorded at that time is used to check whether another
+    /// agent sealed in between. If so, the returned dict includes a
+    /// `conflict_warning` field with details.
     #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="complete", paths=None, tests_passed=None, tests_failed=None, linted=false, allow_empty=false))]
     fn seal(
         &self,
@@ -162,8 +197,11 @@ impl PyRepository {
             linted,
         };
 
-        let seal = if let Some(ref p) = paths {
-            self.inner
+        // Check if context() recorded a HEAD for automatic conflict detection.
+        let tracked_head = self.inner.last_context_head();
+
+        if let Some(ref p) = paths {
+            let seal = self.inner
                 .seal_paths(
                     agent,
                     summary.to_string(),
@@ -173,9 +211,27 @@ impl PyRepository {
                     p,
                     allow_empty,
                 )
-                .map_err(writ_err)?
+                .map_err(writ_err)?;
+            self.inner.clear_context_head();
+            let result = build_seal_result(&self.inner, seal, None);
+            to_pydict(py, &result)
+        } else if tracked_head.is_some() {
+            let (seal, warning) = self.inner
+                .seal_with_check(
+                    agent,
+                    summary.to_string(),
+                    spec_id,
+                    task_status,
+                    verification,
+                    allow_empty,
+                    tracked_head,
+                )
+                .map_err(writ_err)?;
+            self.inner.clear_context_head();
+            let result = build_seal_result(&self.inner, seal, warning);
+            to_pydict(py, &result)
         } else {
-            self.inner
+            let seal = self.inner
                 .seal(
                     agent,
                     summary.to_string(),
@@ -184,10 +240,10 @@ impl PyRepository {
                     verification,
                     allow_empty,
                 )
-                .map_err(writ_err)?
-        };
-
-        to_pydict(py, &seal)
+                .map_err(writ_err)?;
+            let result = build_seal_result(&self.inner, seal, None);
+            to_pydict(py, &result)
+        }
     }
 
     /// Seal with optimistic conflict detection.
@@ -232,16 +288,8 @@ impl PyRepository {
             )
             .map_err(writ_err)?;
 
-        #[derive(serde::Serialize)]
-        struct SealWithCheckResult {
-            seal: writ_core::seal::Seal,
-            conflict_warning: Option<writ_core::repo::SealConflictWarning>,
-        }
-
-        to_pydict(py, &SealWithCheckResult {
-            seal,
-            conflict_warning: warning,
-        })
+        let result = build_seal_result(&self.inner, seal, warning);
+        to_pydict(py, &result)
     }
 
     /// Get seal history (newest first).
@@ -557,7 +605,8 @@ fn py_install_hooks(py: Python, path: &str) -> PyResult<PyObject> {
 }
 
 #[pymodule]
-fn writ(m: &Bound<'_, PyModule>) -> PyResult<()> {
+#[pyo3(name = "_native")]
+fn writ_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyRepository>()?;
     m.add_class::<PyAgentType>()?;
     m.add_class::<PyTaskStatus>()?;

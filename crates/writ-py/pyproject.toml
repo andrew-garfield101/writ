@@ -3,10 +3,34 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "writ"
+name = "writ-vcs"
 version = "0.1.0"
-description = "Python bindings for writ — AI-native version control"
+description = "AI-native version control for agentic workflows — structured checkpoints, spec-driven development, and multi-agent coordination"
 requires-python = ">=3.8"
+license = "AGPL-3.0-or-later"
+readme = "README.md"
+keywords = ["version-control", "ai", "agents", "llm", "vcs", "agentic"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Version Control",
+    "License :: OSI Approved :: GNU Affero General Public License v3 or later (AGPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Repository = "https://github.com/agarfield/writ"
+Issues = "https://github.com/agarfield/writ/issues"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "writ._native"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "maturin>=1.0"]

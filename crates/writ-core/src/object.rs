@@ -8,6 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::error::{WritError, WritResult};
+use crate::fsutil::atomic_write;
 use crate::hash::hash_bytes;
 
 /// Validate that a hash string is well-formed (64 hex chars).
@@ -45,23 +46,30 @@ impl ObjectStore {
             return Ok(hash);
         }
 
-        // Create the 2-char prefix directory
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
 
-        fs::write(&path, data)?;
+        atomic_write(&path, data)?;
         Ok(hash)
     }
 
-    /// Retrieve an object by its hash.
+    /// Retrieve an object by its hash, verifying integrity on read.
     pub fn retrieve(&self, hash: &str) -> WritResult<Vec<u8>> {
         validate_hash(hash)?;
         let path = self.object_path(hash);
         if !path.exists() {
             return Err(WritError::ObjectNotFound(hash.to_string()));
         }
-        Ok(fs::read(&path)?)
+        let data = fs::read(&path)?;
+        let actual = hash_bytes(&data);
+        if actual != hash {
+            return Err(WritError::Other(format!(
+                "object corrupted: expected {}, got {actual}",
+                &hash[..12]
+            )));
+        }
+        Ok(data)
     }
 
     /// Check if an object exists.

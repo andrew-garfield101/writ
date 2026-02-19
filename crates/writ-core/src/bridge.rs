@@ -52,6 +52,9 @@ pub struct ExportedSeal {
     pub git_commit: String,
     /// Seal summary (used as commit message).
     pub summary: String,
+    /// Agent that created the seal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
 }
 
 /// Result of a bridge export operation.

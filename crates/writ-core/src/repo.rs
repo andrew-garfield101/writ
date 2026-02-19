@@ -20,6 +20,7 @@ use crate::context::{
 };
 use crate::diff::{self, DiffOutput, FileDiff};
 use crate::error::{WritError, WritResult};
+use crate::fsutil::atomic_write;
 use crate::ignore::IgnoreRules;
 use crate::index::{Index, IndexEntry};
 use crate::object::ObjectStore;
@@ -51,15 +52,11 @@ impl Repository {
             return Err(WritError::AlreadyExists);
         }
 
-        // Create directory structure
         fs::create_dir_all(writ_dir.join("objects"))?;
         fs::create_dir_all(writ_dir.join("seals"))?;
         fs::create_dir_all(writ_dir.join("specs"))?;
-
-        // Create empty HEAD
         fs::write(writ_dir.join("HEAD"), "")?;
 
-        // Create empty index
         let index = Index::default();
         index.save(&writ_dir.join("index.json"))?;
 
@@ -82,6 +79,60 @@ impl Repository {
             root: root.to_path_buf(),
             writ_dir,
             objects,
+        })
+    }
+
+    /// One-command setup: init writ, detect git, and import baseline.
+    ///
+    /// If `.writ/` already exists, opens the existing repo. If a `.git/`
+    /// is found, imports the current git HEAD as the writ baseline.
+    #[cfg(feature = "bridge")]
+    pub fn install(root: &Path) -> WritResult<InstallResult> {
+        let writ_dir = root.join(WRIT_DIR);
+        let initialized = !writ_dir.exists();
+
+        let repo = if initialized {
+            Self::init(root)?
+        } else {
+            Self::open(root)?
+        };
+
+        let git_detected = root.join(".git").exists()
+            || git2::Repository::discover(root).is_ok();
+
+        if git_detected {
+            let agent = AgentIdentity {
+                id: "writ-bridge".to_string(),
+                agent_type: crate::seal::AgentType::Agent,
+            };
+            match repo.bridge_import(None, agent) {
+                Ok(result) => {
+                    return Ok(InstallResult {
+                        initialized,
+                        git_detected: true,
+                        git_imported: true,
+                        imported_seal_id: Some(result.seal_id),
+                        imported_files: Some(result.files_imported),
+                    });
+                }
+                Err(_) => {
+                    return Ok(InstallResult {
+                        initialized,
+                        git_detected: true,
+                        git_imported: false,
+                        imported_seal_id: None,
+                        imported_files: None,
+                    });
+                }
+            }
+        }
+
+        Ok(InstallResult {
+            initialized,
+            git_detected: false,
+            git_imported: false,
+            imported_seal_id: None,
+            imported_files: None,
         })
     }
 
@@ -120,7 +171,6 @@ impl Repository {
             return Err(WritError::NothingToSeal);
         }
 
-        // Build the change list and update the index
         let mut changes = Vec::new();
 
         for file_state in &working_state.changes {
@@ -143,7 +193,6 @@ impl Repository {
                         new_hash: Some(new_hash.clone()),
                     });
 
-                    // Update index
                     let size = content.len() as u64;
                     index.upsert(&file_state.path, new_hash, size);
                 }
@@ -160,14 +209,10 @@ impl Repository {
             }
         }
 
-        // Build tree hash from the current index state
         let tree_json = serde_json::to_string(&index.entries)?;
         let tree_hash = self.objects.store(tree_json.as_bytes())?;
-
-        // Read the current HEAD to get the parent seal
         let parent = self.read_head()?;
 
-        // Create the seal
         let seal = Seal::new(
             parent,
             tree_hash,
@@ -179,16 +224,10 @@ impl Repository {
             summary,
         );
 
-        // Save the seal
         self.save_seal(&seal)?;
-
-        // Update HEAD
-        fs::write(self.writ_dir.join("HEAD"), &seal.id)?;
-
-        // Save updated index
+        atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
         index.save(&self.writ_dir.join("index.json"))?;
 
-        // If linked to a spec, record the seal ID on the spec
         if let Some(ref sid) = spec_id {
             if let Ok(mut spec) = self.load_spec(sid) {
                 spec.sealed_by.push(seal.id.clone());
@@ -604,7 +643,6 @@ impl Repository {
             }
         }
 
-        // Delete tracked files not in the target index
         for tracked_path in current_index.entries.keys() {
             if !target_index.entries.contains_key(tracked_path) {
                 let full_path = self.validate_path(tracked_path)?;
@@ -612,18 +650,14 @@ impl Repository {
                     fs::remove_file(&full_path)?;
                     deleted.push(tracked_path.clone());
                 }
-                // Clean up empty parent directories (best-effort)
                 if let Some(parent) = full_path.parent() {
                     let _ = Self::remove_empty_dirs(parent, &self.root);
                 }
             }
         }
 
-        // Update index to match target
         target_index.save(&self.writ_dir.join("index.json"))?;
-
-        // Update HEAD
-        fs::write(self.writ_dir.join("HEAD"), &seal.id)?;
+        atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
 
         let total_files = target_index.entries.len();
 
@@ -727,11 +761,9 @@ impl Repository {
             return Err(WritError::SpecHasNoSeals(right_spec.to_string()));
         }
 
-        // Collect files modified by each spec.
         let left_files = self.spec_modified_files(&left_spec_data)?;
         let right_files = self.spec_modified_files(&right_spec_data)?;
 
-        // Find the latest seal for each spec.
         let left_seal_id = left_spec_data.sealed_by.last().unwrap().clone();
         let right_seal_id = right_spec_data.sealed_by.last().unwrap().clone();
         let left_seal = self.load_seal(&left_seal_id)?;
@@ -756,7 +788,6 @@ impl Repository {
             }
         }
 
-        // Load tree indices.
         let base_index = match &base_seal_id {
             Some(id) => {
                 let base_seal = self.load_seal(id)?;
@@ -767,7 +798,6 @@ impl Repository {
         let left_index = self.load_tree_index(&left_seal.tree)?;
         let right_index = self.load_tree_index(&right_seal.tree)?;
 
-        // Categorize files.
         let both_files: HashSet<&String> = left_files.intersection(&right_files).collect();
         let left_only: Vec<String> = left_files
             .iter()
@@ -780,7 +810,6 @@ impl Repository {
             .cloned()
             .collect();
 
-        // Three-way merge for overlapping files.
         let mut auto_merged = Vec::new();
         let mut conflicts = Vec::new();
 
@@ -837,7 +866,6 @@ impl Repository {
         report: &ConvergenceReport,
         resolutions: &[FileResolution],
     ) -> WritResult<()> {
-        // Verify all conflicts have resolutions.
         let unresolved = report
             .conflicts
             .iter()
@@ -849,13 +877,11 @@ impl Repository {
 
         let _lock = self.lock()?;
 
-        // Load the tree indices to retrieve content for left/right-only files.
         let left_seal = self.load_seal(&report.left_seal_id)?;
         let right_seal = self.load_seal(&report.right_seal_id)?;
         let left_index = self.load_tree_index(&left_seal.tree)?;
         let right_index = self.load_tree_index(&right_seal.tree)?;
 
-        // Write auto-merged files.
         for merged in &report.auto_merged {
             let file_path = self.validate_path(&merged.path)?;
             if let Some(parent) = file_path.parent() {
@@ -864,7 +890,6 @@ impl Repository {
             fs::write(&file_path, &merged.content)?;
         }
 
-        // Write left-only files (use content from left tree).
         for path in &report.left_only {
             if let Some(content) = self.file_content_at_tree(&left_index, path)? {
                 let file_path = self.validate_path(path)?;
@@ -875,7 +900,6 @@ impl Repository {
             }
         }
 
-        // Write right-only files (use content from right tree).
         for path in &report.right_only {
             if let Some(content) = self.file_content_at_tree(&right_index, path)? {
                 let file_path = self.validate_path(path)?;
@@ -886,7 +910,6 @@ impl Repository {
             }
         }
 
-        // Write resolved conflicts.
         for resolution in resolutions {
             let file_path = self.validate_path(&resolution.path)?;
             if let Some(parent) = file_path.parent() {
@@ -1012,7 +1035,7 @@ impl Repository {
         );
 
         self.save_seal(&seal)?;
-        fs::write(self.writ_dir.join("HEAD"), &seal.id)?;
+        atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
         index.save(&self.writ_dir.join("index.json"))?;
 
         if let Some(ref sid) = spec_id {
@@ -1079,14 +1102,14 @@ impl Repository {
     fn save_seal(&self, seal: &Seal) -> WritResult<()> {
         let path = self.writ_dir.join("seals").join(format!("{}.json", seal.id));
         let json = serde_json::to_string_pretty(seal)?;
-        fs::write(path, json)?;
+        atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
 
     fn save_spec(&self, spec: &Spec) -> WritResult<()> {
         let path = self.writ_dir.join("specs").join(format!("{}.json", spec.id));
         let json = serde_json::to_string_pretty(spec)?;
-        fs::write(path, json)?;
+        atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
 
@@ -1321,7 +1344,7 @@ impl Repository {
     fn save_bridge_state(&self, state: &crate::bridge::BridgeState) -> WritResult<()> {
         let path = self.writ_dir.join("bridge.json");
         let json = serde_json::to_string_pretty(state)?;
-        fs::write(path, json)?;
+        atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
 
@@ -1362,11 +1385,8 @@ impl Repository {
 
         self.walk_git_tree(&git_repo, &tree, "", &mut index, &mut changes)?;
 
-        // Build tree hash from the new index
         let tree_json = serde_json::to_string(&index.entries)?;
         let tree_hash = self.objects.store(tree_json.as_bytes())?;
-
-        // Read the current HEAD to chain from existing writ history (if any)
         let parent = self.read_head()?;
 
         let short_hash = &git_commit_hash[..12.min(git_commit_hash.len())];
@@ -1382,10 +1402,9 @@ impl Repository {
         );
 
         self.save_seal(&seal)?;
-        fs::write(self.writ_dir.join("HEAD"), &seal.id)?;
+        atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
         index.save(&self.writ_dir.join("index.json"))?;
 
-        // Save bridge state
         let bridge_state = BridgeState {
             last_imported_git_commit: Some(git_commit_hash.clone()),
             last_imported_seal_id: Some(seal.id.clone()),
@@ -1488,7 +1507,6 @@ impl Repository {
             .unwrap()
             .to_string();
 
-        // Collect seals to export (newest-first from log, stop at boundary)
         let all_seals = self.log()?;
         let mut to_export = Vec::new();
         for seal in &all_seals {
@@ -1507,7 +1525,6 @@ impl Repository {
             });
         }
 
-        // Find the git parent commit
         let parent_git_hash = bridge_state
             .last_exported_git_commit
             .as_deref()
@@ -1567,6 +1584,7 @@ impl Repository {
                 seal_id: seal.id.clone(),
                 git_commit: new_commit_oid.to_string(),
                 summary: seal.summary.clone(),
+                agent_id: Some(seal.agent.id.clone()),
             });
 
             parent_commit = git_repo.find_commit(new_commit_oid)?;
@@ -1577,7 +1595,6 @@ impl Repository {
         let refname = format!("refs/heads/{branch_name}");
         git_repo.reference(&refname, final_oid, true, "writ bridge export")?;
 
-        // Update bridge state
         bridge_state.last_exported_seal_id = Some(to_export.last().unwrap().id.clone());
         bridge_state.exported_to_branch = Some(branch_name.to_string());
         bridge_state.last_exported_git_commit = Some(final_oid.to_string());
@@ -1741,22 +1758,17 @@ impl Repository {
         let remote_path = PathBuf::from(&entry.path);
         self.validate_remote(&remote_path)?;
 
-        // Acquire remote lock
         let _remote_lock =
             RepoLock::acquire_named(&remote_path, "remote.lock", Duration::from_secs(10))
                 .map_err(|_| WritError::RemoteLockTimeout)?;
 
-        // Sync immutable data
         let objects_pushed =
             Self::sync_objects(&self.writ_dir.join("objects"), &remote_path.join("objects"))?;
         let seals_pushed =
             Self::sync_seals(&self.writ_dir.join("seals"), &remote_path.join("seals"))?;
-
-        // Merge specs (local → remote)
         let (specs_pushed, _conflicts) =
             Self::merge_specs(&self.writ_dir.join("specs"), &remote_path.join("specs"))?;
 
-        // Fast-forward check for HEAD
         let local_head = self.read_head()?;
         let remote_head_str = fs::read_to_string(remote_path.join("HEAD"))
             .unwrap_or_default()
@@ -1771,15 +1783,13 @@ impl Repository {
         let head_updated = if let Some(ref local_h) = local_head {
             match &remote_head {
                 None => {
-                    // Remote has no HEAD — write ours
-                    fs::write(remote_path.join("HEAD"), local_h)?;
+                    atomic_write(&remote_path.join("HEAD"), local_h.as_bytes())?;
                     true
                 }
                 Some(remote_h) if remote_h == local_h => false,
                 Some(remote_h) => {
-                    // Check if local HEAD descends from remote HEAD
                     if self.is_descendant(local_h, remote_h)? {
-                        fs::write(remote_path.join("HEAD"), local_h)?;
+                        atomic_write(&remote_path.join("HEAD"), local_h.as_bytes())?;
                         true
                     } else {
                         return Err(WritError::PushDiverged);
@@ -1790,7 +1800,6 @@ impl Repository {
             false
         };
 
-        // Update sync state
         let mut sync_state = self.load_sync_state()?;
         sync_state.last_push_at = Some(chrono::Utc::now());
         sync_state.last_push_seal_id = local_head.clone();
@@ -1816,22 +1825,17 @@ impl Repository {
         let remote_path = PathBuf::from(&entry.path);
         self.validate_remote(&remote_path)?;
 
-        // Acquire remote lock
         let _remote_lock =
             RepoLock::acquire_named(&remote_path, "remote.lock", Duration::from_secs(10))
                 .map_err(|_| WritError::RemoteLockTimeout)?;
 
-        // Sync immutable data (remote → local)
         let objects_pulled =
             Self::sync_objects(&remote_path.join("objects"), &self.writ_dir.join("objects"))?;
         let seals_pulled =
             Self::sync_seals(&remote_path.join("seals"), &self.writ_dir.join("seals"))?;
-
-        // Merge specs (remote → local)
         let (specs_pulled, spec_conflicts) =
             Self::merge_specs(&remote_path.join("specs"), &self.writ_dir.join("specs"))?;
 
-        // Fast-forward check for HEAD
         let local_head = self.read_head()?;
         let remote_head_str = fs::read_to_string(remote_path.join("HEAD"))
             .unwrap_or_default()
@@ -1846,15 +1850,13 @@ impl Repository {
         let head_updated = match (&local_head, &remote_head) {
             (_, None) => false,
             (None, Some(remote_h)) => {
-                // Local has no HEAD — accept remote's
-                fs::write(self.writ_dir.join("HEAD"), remote_h)?;
+                atomic_write(&self.writ_dir.join("HEAD"), remote_h.as_bytes())?;
                 true
             }
             (Some(local_h), Some(remote_h)) if local_h == remote_h => false,
             (Some(local_h), Some(remote_h)) => {
-                // Check if remote HEAD descends from local HEAD
                 if self.is_descendant(remote_h, local_h)? {
-                    fs::write(self.writ_dir.join("HEAD"), remote_h)?;
+                    atomic_write(&self.writ_dir.join("HEAD"), remote_h.as_bytes())?;
                     true
                 } else if self.is_descendant(local_h, remote_h)? {
                     // Local is ahead — no-op
@@ -1865,7 +1867,6 @@ impl Repository {
             }
         };
 
-        // Update sync state
         let mut sync_state = self.load_sync_state()?;
         sync_state.last_pull_at = Some(chrono::Utc::now());
         sync_state.last_pull_seal_id = remote_head.clone();
@@ -2244,7 +2245,18 @@ impl Repository {
     }
 }
 
-/// The result of a restore operation.
+/// Result of `writ install`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstallResult {
+    pub initialized: bool,
+    pub git_detected: bool,
+    pub git_imported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_seal_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub imported_files: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RestoreResult {
     /// Seal ID that was restored to.

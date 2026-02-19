@@ -1,6 +1,6 @@
 # writ
 
-**AI native version control for agentic systems.**
+**AI-native version control for agentic systems.**
 
 > *"Git tracks files. Writ tracks intent, authorship, and verification on top of that."*
 >
@@ -8,71 +8,65 @@
 >
 > — AAIS_2, after completing a full spec-driven development cycle using writ
 
-Writ is a version control system designed from the ground up for LLMs and multi-agent development fleets. Its core primitives are **specs** (not branches), **seals** (not commits), and **convergence** (not merging).
+Writ is version control designed for LLMs and multi-agent development. Its primitives are **specs** (not branches), **seals** (not commits), and **convergence** (not merging). It works alongside git, not instead of it.
 
-## Why not git?
+## The round-trip
 
-Git was designed for humans typing commands in a terminal. Every interaction is string-in, string-out. When an agent uses git, it shells out to a CLI, parses unstructured text, and reconstructs meaning from output designed for human eyeballs. That's not just inefficient, it's an entire category of bugs.
+Git is the human layer. Writ is the agent layer. The bridge connects them.
 
-Libraries like GitPython and pygit2 help, but the fundamental problem isn't the interface, it's the data model. Git's organizational primitive is the **branch** (a pointer to a commit). It carries no structured metadata about *what task* a commit serves, *which agent* made it, whether *tests passed*, or *what files are in scope*. You can bolt conventions on top, but conventions are things some agents follow and others don't.
+```
+ Human world                Agent world                  Human world
+┌──────────┐  writ install  ┌─────────────────┐  bridge export  ┌──────────────┐
+│ git repo │ ──────────────→│ agents work in  │ ──────────────→ │ git branch   │
+│ (HEAD)   │                │ writ: specs,    │                 │ with commits │
+│          │                │ seals, context  │                 │ + trailers   │
+└──────────┘                └─────────────────┘                 └──────────────┘
+                                                                       │
+                                                                  git merge / PR
+```
 
-Writ's bet is that agent-native metadata belongs **inside** the VCS, not layered on top. Specs, agent identity, verification status, and structured context are first-class, not commit message conventions.
+```bash
+# Human commits code in git
+git commit -m "initial project"
 
-## Core concepts
+# One command sets up writ and imports the git baseline
+writ install
 
-| Git | Writ | What changes |
-|-----|------|-------------|
-| Branch | **Spec** | A structured requirement document with status, dependencies, file scope, and acceptance criteria. The unit of work. |
-| Commit | **Seal** | A structured checkpoint carrying agent identity, spec linkage, verification metadata, and a content-addressable tree hash. |
-| `git status` | `writ state` | Returns structured data (dict/JSON), not text to parse. |
-| `git log` | `writ context` | One call returns spec details, recent history, working state, pending changes, and file scope, sized for a context window. |
+# Agents work entirely in writ
+writ seal --summary "added auth module" --agent implementer --spec auth
+writ seal --summary "tests passing" --agent tester --tests-passed 42
+
+# Export back to git when done
+writ bridge export --branch writ/output --pr-body
+
+# Human creates a PR from the branch
+git log writ/output   # sees agent seals as commits with metadata trailers
+```
+
+Each exported git commit carries structured trailers: `Writ-Seal-Id`, `Writ-Spec`, `Writ-Status`, `Writ-Tests-Passed`. Full provenance survives the round-trip.
 
 ## `context()`
 
-The most expensive thing in an agent's workflow is building situational awareness. With git, that's 4 to 5 separate commands, each returning text that needs parsing and synthesis. With writ:
+The most expensive thing in an agent's workflow is building situational awareness. With git, that takes 4 to 5 separate commands, each returning text that needs parsing. With writ:
 
 ```python
 ctx = repo.context(spec="auth-migration")
 ```
 
-One call. One structured response. Spec details, recent seal history, working state, pending changes, file scope, all in a single JSON-serializable dict. That's not an incremental improvement over git. It's a category difference in how agents bootstrap into a task.
+One call. One structured dict. Spec details, dependency status, recent seal history, working state, pending changes, file scope, verification results, and a nudge if there are unsealed changes. That's not an incremental improvement. It's a category difference in how agents bootstrap into a task.
 
 ## Quick start
 
-### CLI
-
 ```bash
-# Initialize
-writ init
+# In any git repo (or standalone)
+writ install
 
-# Check state (structured output)
-writ state --format json
-
-# Create a seal
-writ seal --summary "implemented token refresh" --agent worker-1 --spec auth-migration
-
-# Selective seal (only specific paths)
-writ seal --summary "auth changes only" --paths src/auth,src/middleware --spec auth-migration
-
-# View seal history
-writ log
-
-# Inspect a specific seal
-writ show abc123 --diff
-
-# Get structured context for an agent
-writ context --spec auth-migration --format json
-
-# Manage specs
-writ spec add --id auth-migration --title "Migrate to OAuth2"
-writ spec update auth-migration --status in-progress
-writ spec status
-
-# Restore to a previous state
-writ restore abc123 --force
+# Agents can immediately work
+writ context --format json
+writ seal --summary "first checkpoint" --agent my-agent
 ```
 
-### Python (via PyO3 bindings)
+### Python
 
 ```bash
 cd crates/writ-py
@@ -83,104 +77,106 @@ pip install maturin && maturin develop
 ```python
 import writ
 
-# Every return value is a dict. json.dumps() always works.
-repo = writ.Repository.init("/path/to/project")
-
-# State
-state = repo.state()
-# {"changes": [{"path": "auth.py", "status": "new", ...}], "tracked_count": 0}
-
-# Seal with full agent identity and spec linkage
-seal = repo.seal(
-    summary="implemented token refresh endpoint",
-    agent_id="claude-worker-3",
-    agent_type="agent",
-    spec_id="auth-migration",
-    status="in-progress",
-    paths=["src/auth", "tests/test_auth.py"],
-)
-
-# One-call context for task bootstrapping
+writ.Repository.install(".")
+repo = writ.Repository.open(".")
 ctx = repo.context(spec="auth-migration")
-
-# Diff, inspect, restore
-diff = repo.diff()
-seal_info = repo.get_seal("abc123")
-result = repo.restore("abc123")
-
-# Spec management
-repo.add_spec(id="auth-migration", title="Migrate to OAuth2")
-repo.update_spec("auth-migration", status="in-progress")
-specs = repo.list_specs()
+repo.seal(
+    summary="token refresh endpoint",
+    agent_id="worker-3",
+    spec_id="auth-migration",
+    tests_passed=12,
+)
 ```
 
-## Multi-agent scenario
+### Agent SDK
 
-Three agents, each assigned a spec. They work independently, creating seals as they go:
+Higher-level abstractions for common agent workflows:
 
 ```python
-# Agent A: works on auth
-ctx = repo.context(spec="auth-migration")  # scoped context, only auth history
-# ... does work ...
-repo.seal(summary="token refresh endpoint", agent_id="agent-auth",
-          spec_id="auth-migration", status="in-progress", paths=["src/auth"])
+from writ_sdk import Agent, Phase
 
-# Agent B: works on payments
-ctx = repo.context(spec="payment-refactor")  # separate scoped context
-# ... does work ...
-repo.seal(summary="stripe integration", agent_id="agent-payments",
-          spec_id="payment-refactor", status="complete", paths=["src/payments"])
+with Agent("implementer", spec_id="auth") as agent:
+    ctx = agent.context
+    # ... do work ...
+    if agent.should_seal():
+        agent.seal("implemented token refresh", tests_passed=12)
 ```
 
-The human developer checks in:
+## Multi-agent workflow
+
+Three agents, different specs, working concurrently. Sealing is serialized via advisory file locks, so agents queue safely.
+
+```python
+# Agent A: auth migration
+with Agent("agent-auth", spec_id="auth-migration") as a:
+    ctx = a.context                          # scoped to auth seals only
+    # ... implements auth ...
+    a.seal("token refresh endpoint")
+
+# Agent B: payments (concurrent, different spec)
+with Agent("agent-payments", spec_id="payment-refactor") as b:
+    ctx = b.context                          # scoped to payments only
+    # ... implements payments ...
+    b.seal("stripe integration", tests_passed=8, status="complete")
+```
+
+When specs overlap, convergence handles it:
+
+```python
+report = repo.converge("auth-migration", "payment-refactor")
+if report["is_clean"]:
+    repo.apply_convergence(report, [])
+else:
+    # Conflicts are JSON dicts, not <<<< markers
+    # An orchestrator agent can resolve them programmatically
+    for conflict in report["conflicts"]:
+        resolution = resolve(conflict)
+        resolutions.append(resolution)
+    repo.apply_convergence(report, resolutions)
+```
+
+The human checks in:
 
 ```bash
 $ writ spec status
-  > auth-migration       InProgress  (3 seal(s))
-  v payment-refactor     Complete    (5 seal(s))
-    db-optimization      Pending     (0 seal(s))
-
-$ writ show abc123 --diff
-seal abc123def456...
-  agent:     agent-auth (Agent)
-  spec:      auth-migration
-  status:    InProgress
-  summary:   token refresh endpoint
-  changes:   2 file(s)
-    + src/auth/refresh.py
-    ~ tests/test_auth.py
-
---- a/src/auth/refresh.py
-+++ b/src/auth/refresh.py
-@@ -1,0 +1,42 @@
-+async def refresh_token(token: str) -> TokenResponse:
-...
+  > auth-migration       InProgress  (3 seals)
+  v payment-refactor     Complete    (5 seals)
+    db-optimization      Pending     (0 seals)
 ```
 
-Full transparency. No branch archaeology. No parsing commit messages to figure out which agent did what.
+## Why not just git?
+
+Git's data model is built around **branches** (a pointer to a commit). Commits carry no structured metadata about which task they serve, which agent made them, or whether tests passed. You can bolt conventions on top, but conventions are things some agents follow and others don't.
+
+Writ puts agent-native metadata inside the VCS, not layered on top:
+
+| Git | Writ | What changes |
+|-----|------|-------------|
+| Branch | **Spec** | Structured requirement with status, dependencies, file scope, acceptance criteria |
+| Commit | **Seal** | Checkpoint with agent identity, spec linkage, verification metadata, tree hash |
+| `git status` | `writ state` | Returns structured data (dict/JSON), not text to parse |
+| `git log` | `writ context` | One call returns everything an agent needs to start working |
 
 ## Architecture
 
 ```
 writ/
 ├── crates/
-│   ├── writ-core/    # Core library (Rust): objects, index, seals, specs, diff, context, convergence, bridge
-│   ├── writ-cli/     # CLI binary (clap)
-│   └── writ-py/      # Python bindings (PyO3 + maturin)
+│   ├── writ-core/    # Rust: objects, index, seals, specs, diff, context, convergence, bridge
+│   ├── writ-cli/     # CLI (clap)
+│   └── writ-py/      # Python bindings (PyO3) + Agent SDK
 ```
 
-**Storage model:** Content-addressable object store (SHA-256, 2-char prefix directories). Seals and specs stored as JSON in `.writ/seals/` and `.writ/specs/`. Index at `.writ/index.json`. HEAD pointer at `.writ/HEAD`. Bridge state at `.writ/bridge.json`.
+**Storage:** Content-addressable object store (SHA-256). Atomic writes (temp + fsync + rename) on all state files. Hash verification on retrieve. Advisory file locking for concurrency.
 
-**Test coverage:** 127 Rust tests + 59 Python tests = 186 total.
+**Test coverage:** 168 Rust + 93 Python = 261 total.
 
 ## Building from source
 
 ```bash
-# Prerequisites: Rust toolchain, Python 3.8+
-cargo build          # builds writ-core and writ-cli
-cargo test --workspace --exclude writ-py  # runs Rust tests
+cargo build
+cargo test --workspace --exclude writ-py
 
-# Python bindings
 cd crates/writ-py
 python3 -m venv .venv && source .venv/bin/activate
 pip install maturin pytest
@@ -192,18 +188,24 @@ pytest tests/
 
 ### Shipped
 
-- **Convergence.** Spec-based three-way merge. When two agents modify overlapping files, `converge()` produces a structured report with auto-merged files and conflict regions (JSON dicts, not `<<<<<<<` markers). Agents resolve conflicts programmatically.
-- **Verification on seals.** `tests_passed`, `tests_failed`, `linted` attached directly to seals. Enables orchestrators to gate promotion on verified results.
-- **Concurrency safety.** Advisory file locking via `flock(2)` for agents sealing simultaneously.
-- **Git bridge.** `bridge_import()` snapshots a git commit as a writ baseline. `bridge_export()` replays writ seals as git commits on a branch, with metadata trailers (`Writ-Seal-Id`, `Writ-Spec`, `Writ-Status`, `Writ-Tests-Passed`) preserving full provenance. Git is the human layer, writ is the agent layer, bridge is the translation.
-- **Context filtering.** `context(status=, agent=)` narrows seal history. Seal nudging prompts agents to checkpoint. `changed_paths` on seal summaries surface which files each seal touched.
+- **Round-trip.** `writ install` for one-command setup. `bridge export --pr-body` for structured PR descriptions.
+- **Convergence.** Spec-based three-way merge with JSON conflict regions.
+- **Verification.** `tests_passed`, `tests_failed`, `linted` on seals.
+- **Concurrency.** Advisory file locking via `flock(2)`.
+- **Git bridge.** Import/export with metadata trailers preserving provenance.
+- **Context filtering.** Status and agent filters, seal nudging, changed paths.
+- **Rich context.** Acceptance criteria, design notes, tech stack, dependency status, and spec progress in `context()`.
+- **Agent SDK.** Agent, Phase, Pipeline abstractions for common workflows.
+- **Security hardening.** Path traversal protection, hash validation, input sanitization, serde hardening.
+- **Atomic storage.** Crash-safe writes on all state files.
+- **Remote/shared state.** `writ push` / `writ pull` for agents across machines.
 
 ### Ahead
 
-- **Remote/shared state.** `writ push` / `writ pull` for agents running across machines or processes.
-- **Rich context.** Embed spec content, design decisions, and tech stack directly in `context()` output so agents can start working without exploring.
-- **Agent SDK.** Higher-level Python toolkit for common agent workflows (task pickup, context loading, seal-on-completion patterns).
-- **Scale testing.** Validate context output and seal history performance with hundreds of specs and thousands of seals.
+- **Spec-scoped HEAD.** Per-spec tip pointers for true parallel agent isolation.
+- **Merge-on-seal.** Automatic conflict detection when HEAD moves during work.
+- **Agent framework integrations.** Hooks for Codex, Claude Code, and other orchestrators.
+- **Scale testing.** Performance validation with hundreds of specs and thousands of seals.
 
 ## License
 

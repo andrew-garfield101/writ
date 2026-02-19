@@ -10,6 +10,7 @@ pub mod context;
 pub mod convergence;
 pub mod diff;
 pub mod error;
+pub mod fsutil;
 pub mod hash;
 pub mod ignore;
 pub mod index;

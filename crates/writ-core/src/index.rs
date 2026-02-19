@@ -10,6 +10,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::error::WritResult;
+use crate::fsutil::atomic_write;
 
 /// A tracked file entry in the index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,10 +41,10 @@ impl Index {
         Ok(index)
     }
 
-    /// Save the index to a JSON file.
+    /// Save the index to a JSON file (atomic: temp + fsync + rename).
     pub fn save(&self, path: &Path) -> WritResult<()> {
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)?;
+        atomic_write(path, json.as_bytes())?;
         Ok(())
     }
 

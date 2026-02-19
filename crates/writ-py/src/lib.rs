@@ -118,6 +118,14 @@ impl PyRepository {
         Ok(PyRepository { inner })
     }
 
+    /// One-command setup: init + detect git + import baseline.
+    #[staticmethod]
+    fn install(py: Python, path: &str) -> PyResult<PyObject> {
+        let p = PathBuf::from(path);
+        let result = writ_core::Repository::install(&p).map_err(writ_err)?;
+        to_pydict(py, &result)
+    }
+
     /// Get working directory state as a dict.
     fn state(&self, py: Python) -> PyResult<PyObject> {
         let state = self.inner.state().map_err(writ_err)?;

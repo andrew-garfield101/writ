@@ -15,6 +15,7 @@ pub mod ignore;
 pub mod index;
 pub mod lock;
 pub mod object;
+pub mod remote;
 pub mod repo;
 pub mod seal;
 pub mod spec;

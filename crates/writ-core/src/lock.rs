@@ -26,7 +26,14 @@ impl RepoLock {
     /// Polls with a short sleep interval until the lock is acquired or
     /// the timeout expires. Returns `WritError::LockTimeout` on failure.
     pub fn acquire(writ_dir: &Path, timeout: Duration) -> WritResult<Self> {
-        let lock_path = writ_dir.join("writ.lock");
+        Self::acquire_named(writ_dir, "writ.lock", timeout)
+    }
+
+    /// Acquire an exclusive lock using a custom lock file name.
+    ///
+    /// Used for remote locking where the lock file is `remote.lock`.
+    pub fn acquire_named(dir: &Path, name: &str, timeout: Duration) -> WritResult<Self> {
+        let lock_path = dir.join(name);
         let file = OpenOptions::new()
             .create(true)
             .write(true)

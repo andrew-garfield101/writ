@@ -15,8 +15,8 @@ use crate::convergence::{
 };
 use crate::lock::RepoLock;
 use crate::context::{
-    ContextFilter, ContextOutput, ContextScope, DiffSummary, SealNudge, SealSummary,
-    WorkingStateSummary,
+    ContextFilter, ContextOutput, ContextScope, DepStatus, DiffSummary, SealNudge, SealSummary,
+    SpecProgress, WorkingStateSummary,
 };
 use crate::diff::{self, DiffOutput, FileDiff};
 use crate::error::{WritError, WritResult};
@@ -24,7 +24,7 @@ use crate::ignore::IgnoreRules;
 use crate::index::{Index, IndexEntry};
 use crate::object::ObjectStore;
 use crate::seal::{AgentIdentity, ChangeType, FileChange, Seal, TaskStatus, Verification};
-use crate::spec::{Spec, SpecUpdate};
+use crate::spec::{Spec, SpecStatus, SpecUpdate};
 use crate::state::{self, FileStatus, WorkingState};
 
 /// The `.writ` directory name.
@@ -110,6 +110,7 @@ impl Repository {
         verification: Verification,
         allow_empty: bool,
     ) -> WritResult<Seal> {
+        Self::validate_agent_id(&agent.id)?;
         let _lock = self.lock()?;
         let mut index = self.load_index()?;
         let rules = self.ignore_rules();
@@ -414,6 +415,11 @@ impl Repository {
             "list_specs()".to_string(),
             "converge(left_spec, right_spec)".to_string(),
             "apply_convergence(report, resolutions?)".to_string(),
+            "push(remote?)".to_string(),
+            "pull(remote?)".to_string(),
+            "remote_init(path)".to_string(),
+            "remote_add(name, path)".to_string(),
+            "remote_status(remote?)".to_string(),
             "bridge_import(git_ref?)".to_string(),
             "bridge_export(branch?)".to_string(),
             "bridge_status()".to_string(),
@@ -467,6 +473,8 @@ impl Repository {
                     seal_nudge,
                     file_scope,
                     tracked_files,
+                    dependency_status: None,
+                    spec_progress: None,
                     available_operations,
                 })
             }
@@ -488,6 +496,52 @@ impl Repository {
                 };
                 let tracked_files = file_scope.len();
 
+                // Compute dependency status
+                let dependency_status = if !spec.depends_on.is_empty() {
+                    let deps: Vec<DepStatus> = spec
+                        .depends_on
+                        .iter()
+                        .map(|dep_id| match self.load_spec(dep_id) {
+                            Ok(dep_spec) => DepStatus::from_spec(dep_id, &dep_spec.status),
+                            Err(_) => DepStatus::not_found(dep_id),
+                        })
+                        .collect();
+                    Some(deps)
+                } else {
+                    None
+                };
+
+                // Compute spec progress
+                let spec_progress = if !spec.sealed_by.is_empty() {
+                    let mut agents = Vec::new();
+                    let mut latest_at: Option<String> = None;
+                    for seal_id in &spec.sealed_by {
+                        if let Ok(seal) = self.load_seal(seal_id) {
+                            if !agents.contains(&seal.agent.id) {
+                                agents.push(seal.agent.id.clone());
+                            }
+                            let ts = seal.timestamp.to_rfc3339();
+                            if latest_at.as_ref().map_or(true, |prev| ts > *prev) {
+                                latest_at = Some(ts);
+                            }
+                        }
+                    }
+                    let status_str = match spec.status {
+                        SpecStatus::Pending => "pending",
+                        SpecStatus::InProgress => "in-progress",
+                        SpecStatus::Complete => "complete",
+                        SpecStatus::Blocked => "blocked",
+                    };
+                    Some(SpecProgress {
+                        total_seals: spec.sealed_by.len(),
+                        current_status: status_str.to_string(),
+                        agents_involved: agents,
+                        latest_seal_at: latest_at,
+                    })
+                } else {
+                    None
+                };
+
                 Ok(ContextOutput {
                     writ_version: "0.1.0".to_string(),
                     active_spec: Some(spec),
@@ -498,6 +552,8 @@ impl Repository {
                     seal_nudge,
                     file_scope,
                     tracked_files,
+                    dependency_status,
+                    spec_progress,
                     available_operations,
                 })
             }
@@ -521,7 +577,7 @@ impl Repository {
 
         // Write/update all files from the target index
         for (rel_path, entry) in &target_index.entries {
-            let full_path = self.root.join(rel_path);
+            let full_path = self.validate_path(rel_path)?;
 
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent)?;
@@ -551,7 +607,7 @@ impl Repository {
         // Delete tracked files not in the target index
         for tracked_path in current_index.entries.keys() {
             if !target_index.entries.contains_key(tracked_path) {
-                let full_path = self.root.join(tracked_path);
+                let full_path = self.validate_path(tracked_path)?;
                 if full_path.exists() {
                     fs::remove_file(&full_path)?;
                     deleted.push(tracked_path.clone());
@@ -592,6 +648,15 @@ impl Repository {
         }
         if let Some(file_scope) = update.file_scope {
             spec.file_scope = file_scope;
+        }
+        if let Some(acceptance_criteria) = update.acceptance_criteria {
+            spec.acceptance_criteria = acceptance_criteria;
+        }
+        if let Some(design_notes) = update.design_notes {
+            spec.design_notes = design_notes;
+        }
+        if let Some(tech_stack) = update.tech_stack {
+            spec.tech_stack = tech_stack;
         }
 
         spec.updated_at = chrono::Utc::now();
@@ -792,7 +857,7 @@ impl Repository {
 
         // Write auto-merged files.
         for merged in &report.auto_merged {
-            let file_path = self.root.join(&merged.path);
+            let file_path = self.validate_path(&merged.path)?;
             if let Some(parent) = file_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -802,7 +867,7 @@ impl Repository {
         // Write left-only files (use content from left tree).
         for path in &report.left_only {
             if let Some(content) = self.file_content_at_tree(&left_index, path)? {
-                let file_path = self.root.join(path);
+                let file_path = self.validate_path(path)?;
                 if let Some(parent) = file_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -813,7 +878,7 @@ impl Repository {
         // Write right-only files (use content from right tree).
         for path in &report.right_only {
             if let Some(content) = self.file_content_at_tree(&right_index, path)? {
-                let file_path = self.root.join(path);
+                let file_path = self.validate_path(path)?;
                 if let Some(parent) = file_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -823,7 +888,7 @@ impl Repository {
 
         // Write resolved conflicts.
         for resolution in resolutions {
-            let file_path = self.root.join(&resolution.path);
+            let file_path = self.validate_path(&resolution.path)?;
             if let Some(parent) = file_path.parent() {
                 fs::create_dir_all(parent)?;
             }
@@ -873,6 +938,7 @@ impl Repository {
         paths: &[String],
         allow_empty: bool,
     ) -> WritResult<Seal> {
+        Self::validate_agent_id(&agent.id)?;
         let _lock = self.lock()?;
         let mut index = self.load_index()?;
         let rules = self.ignore_rules();
@@ -964,6 +1030,22 @@ impl Repository {
 
     fn ignore_rules(&self) -> IgnoreRules {
         IgnoreRules::load(&self.root)
+    }
+
+    /// Validate a relative path and return its absolute form within the repo root.
+    ///
+    /// Rejects absolute paths, `..` components, and any path that would
+    /// resolve outside the repository root.
+    fn validate_path(&self, rel_path: &str) -> WritResult<PathBuf> {
+        if rel_path.starts_with('/') || rel_path.starts_with('\\') {
+            return Err(WritError::PathTraversal(rel_path.to_string()));
+        }
+        for component in Path::new(rel_path).components() {
+            if matches!(component, std::path::Component::ParentDir) {
+                return Err(WritError::PathTraversal(rel_path.to_string()));
+            }
+        }
+        Ok(self.root.join(rel_path))
     }
 
     fn load_index(&self) -> WritResult<Index> {
@@ -1171,7 +1253,59 @@ impl Repository {
         Ok(())
     }
 
-    // --- Bridge: git ↔ writ round-trip ---
+    // --- Input validation helpers ---
+
+    /// Validate a git branch name against basic safety rules.
+    #[cfg(feature = "bridge")]
+    fn validate_branch_name(name: &str) -> WritResult<()> {
+        if name.is_empty() || name.len() > 256 {
+            return Err(WritError::InvalidInput(format!(
+                "branch name must be 1-256 chars, got {}",
+                name.len()
+            )));
+        }
+        if name.contains("..") || name.contains("\\") || name.ends_with(".lock") {
+            return Err(WritError::InvalidInput(format!(
+                "branch name contains forbidden pattern: {name}"
+            )));
+        }
+        if name.bytes().any(|b| b < 0x20 || b == 0x7f || b == b' ' || b == b'~' || b == b'^' || b == b':') {
+            return Err(WritError::InvalidInput(format!(
+                "branch name contains control or forbidden characters: {name}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate a git ref string for basic safety.
+    #[cfg(feature = "bridge")]
+    fn validate_git_ref(refstr: &str) -> WritResult<()> {
+        if refstr.is_empty() || refstr.len() > 512 {
+            return Err(WritError::InvalidInput(format!(
+                "git ref must be 1-512 chars, got {}",
+                refstr.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Validate an agent ID (alphanumeric, hyphens, underscores, dots).
+    fn validate_agent_id(id: &str) -> WritResult<()> {
+        if id.is_empty() || id.len() > 128 {
+            return Err(WritError::InvalidInput(format!(
+                "agent ID must be 1-128 chars, got {}",
+                id.len()
+            )));
+        }
+        if !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.') {
+            return Err(WritError::InvalidInput(format!(
+                "agent ID contains invalid characters: {id}"
+            )));
+        }
+        Ok(())
+    }
+
+    // --- Bridge: git <> writ round-trip ---
 
     #[cfg(feature = "bridge")]
     fn load_bridge_state(&self) -> WritResult<crate::bridge::BridgeState> {
@@ -1204,6 +1338,8 @@ impl Repository {
         use crate::bridge::{BridgeState, ImportResult};
 
         let git_ref_str = git_ref.unwrap_or("HEAD");
+        Self::validate_git_ref(git_ref_str)?;
+        Self::validate_agent_id(&agent.id)?;
 
         // Open the git repository (discover walks up to find .git/)
         let git_repo = git2::Repository::discover(&self.root)
@@ -1332,6 +1468,7 @@ impl Repository {
         use crate::bridge::{ExportResult, ExportedSeal};
 
         let branch_name = branch.unwrap_or("writ/export");
+        Self::validate_branch_name(branch_name)?;
         let mut bridge_state = self.load_bridge_state()?;
 
         if bridge_state.last_imported_git_commit.is_none() {
@@ -1544,6 +1681,566 @@ impl Repository {
             last_export,
             pending_export_count: pending,
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Remote / push / pull
+// ---------------------------------------------------------------------------
+
+impl Repository {
+    /// Initialize a bare remote directory for push/pull.
+    pub fn remote_init(path: &Path) -> WritResult<()> {
+        if path.join("objects").exists() && path.join("seals").exists() {
+            return Err(WritError::AlreadyExists);
+        }
+        fs::create_dir_all(path.join("objects"))?;
+        fs::create_dir_all(path.join("seals"))?;
+        fs::create_dir_all(path.join("specs"))?;
+        fs::write(path.join("HEAD"), "")?;
+        Ok(())
+    }
+
+    /// Add a named remote to this repository's config.
+    pub fn remote_add(&self, name: &str, path: &str) -> WritResult<()> {
+        let mut config = self.load_config()?;
+        if config.remotes.contains_key(name) {
+            return Err(WritError::RemoteAlreadyExists(name.to_string()));
+        }
+        config.remotes.insert(
+            name.to_string(),
+            crate::remote::RemoteEntry {
+                path: path.to_string(),
+            },
+        );
+        self.save_config(&config)
+    }
+
+    /// Remove a named remote from this repository's config.
+    pub fn remote_remove(&self, name: &str) -> WritResult<()> {
+        let mut config = self.load_config()?;
+        if config.remotes.remove(name).is_none() {
+            return Err(WritError::RemoteNotFound(name.to_string()));
+        }
+        self.save_config(&config)
+    }
+
+    /// List all configured remotes.
+    pub fn remote_list(&self) -> WritResult<BTreeMap<String, crate::remote::RemoteEntry>> {
+        let config = self.load_config()?;
+        Ok(config.remotes)
+    }
+
+    /// Push local state to a named remote.
+    pub fn push(&self, remote_name: &str) -> WritResult<crate::remote::PushResult> {
+        let config = self.load_config()?;
+        let entry = config
+            .remotes
+            .get(remote_name)
+            .ok_or_else(|| WritError::RemoteNotFound(remote_name.to_string()))?;
+        let remote_path = PathBuf::from(&entry.path);
+        self.validate_remote(&remote_path)?;
+
+        // Acquire remote lock
+        let _remote_lock =
+            RepoLock::acquire_named(&remote_path, "remote.lock", Duration::from_secs(10))
+                .map_err(|_| WritError::RemoteLockTimeout)?;
+
+        // Sync immutable data
+        let objects_pushed =
+            Self::sync_objects(&self.writ_dir.join("objects"), &remote_path.join("objects"))?;
+        let seals_pushed =
+            Self::sync_seals(&self.writ_dir.join("seals"), &remote_path.join("seals"))?;
+
+        // Merge specs (local → remote)
+        let (specs_pushed, _conflicts) =
+            Self::merge_specs(&self.writ_dir.join("specs"), &remote_path.join("specs"))?;
+
+        // Fast-forward check for HEAD
+        let local_head = self.read_head()?;
+        let remote_head_str = fs::read_to_string(remote_path.join("HEAD"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let remote_head = if remote_head_str.is_empty() {
+            None
+        } else {
+            Some(remote_head_str)
+        };
+
+        let head_updated = if let Some(ref local_h) = local_head {
+            match &remote_head {
+                None => {
+                    // Remote has no HEAD — write ours
+                    fs::write(remote_path.join("HEAD"), local_h)?;
+                    true
+                }
+                Some(remote_h) if remote_h == local_h => false,
+                Some(remote_h) => {
+                    // Check if local HEAD descends from remote HEAD
+                    if self.is_descendant(local_h, remote_h)? {
+                        fs::write(remote_path.join("HEAD"), local_h)?;
+                        true
+                    } else {
+                        return Err(WritError::PushDiverged);
+                    }
+                }
+            }
+        } else {
+            false
+        };
+
+        // Update sync state
+        let mut sync_state = self.load_sync_state()?;
+        sync_state.last_push_at = Some(chrono::Utc::now());
+        sync_state.last_push_seal_id = local_head.clone();
+        sync_state.remote_head = local_head;
+        self.save_sync_state(&sync_state)?;
+
+        Ok(crate::remote::PushResult {
+            remote: remote_name.to_string(),
+            objects_pushed,
+            seals_pushed,
+            specs_pushed,
+            head_updated,
+        })
+    }
+
+    /// Pull remote state into local.
+    pub fn pull(&self, remote_name: &str) -> WritResult<crate::remote::PullResult> {
+        let config = self.load_config()?;
+        let entry = config
+            .remotes
+            .get(remote_name)
+            .ok_or_else(|| WritError::RemoteNotFound(remote_name.to_string()))?;
+        let remote_path = PathBuf::from(&entry.path);
+        self.validate_remote(&remote_path)?;
+
+        // Acquire remote lock
+        let _remote_lock =
+            RepoLock::acquire_named(&remote_path, "remote.lock", Duration::from_secs(10))
+                .map_err(|_| WritError::RemoteLockTimeout)?;
+
+        // Sync immutable data (remote → local)
+        let objects_pulled =
+            Self::sync_objects(&remote_path.join("objects"), &self.writ_dir.join("objects"))?;
+        let seals_pulled =
+            Self::sync_seals(&remote_path.join("seals"), &self.writ_dir.join("seals"))?;
+
+        // Merge specs (remote → local)
+        let (specs_pulled, spec_conflicts) =
+            Self::merge_specs(&remote_path.join("specs"), &self.writ_dir.join("specs"))?;
+
+        // Fast-forward check for HEAD
+        let local_head = self.read_head()?;
+        let remote_head_str = fs::read_to_string(remote_path.join("HEAD"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let remote_head = if remote_head_str.is_empty() {
+            None
+        } else {
+            Some(remote_head_str)
+        };
+
+        let head_updated = match (&local_head, &remote_head) {
+            (_, None) => false,
+            (None, Some(remote_h)) => {
+                // Local has no HEAD — accept remote's
+                fs::write(self.writ_dir.join("HEAD"), remote_h)?;
+                true
+            }
+            (Some(local_h), Some(remote_h)) if local_h == remote_h => false,
+            (Some(local_h), Some(remote_h)) => {
+                // Check if remote HEAD descends from local HEAD
+                if self.is_descendant(remote_h, local_h)? {
+                    fs::write(self.writ_dir.join("HEAD"), remote_h)?;
+                    true
+                } else if self.is_descendant(local_h, remote_h)? {
+                    // Local is ahead — no-op
+                    false
+                } else {
+                    return Err(WritError::PullDiverged);
+                }
+            }
+        };
+
+        // Update sync state
+        let mut sync_state = self.load_sync_state()?;
+        sync_state.last_pull_at = Some(chrono::Utc::now());
+        sync_state.last_pull_seal_id = remote_head.clone();
+        sync_state.remote_head = remote_head;
+        self.save_sync_state(&sync_state)?;
+
+        Ok(crate::remote::PullResult {
+            remote: remote_name.to_string(),
+            objects_pulled,
+            seals_pulled,
+            specs_pulled,
+            head_updated,
+            spec_conflicts,
+        })
+    }
+
+    /// Get sync status with a remote.
+    pub fn remote_status(
+        &self,
+        remote_name: &str,
+    ) -> WritResult<crate::remote::RemoteStatus> {
+        let config = self.load_config()?;
+        let entry = config
+            .remotes
+            .get(remote_name)
+            .ok_or_else(|| WritError::RemoteNotFound(remote_name.to_string()))?;
+        let remote_path = PathBuf::from(&entry.path);
+        self.validate_remote(&remote_path)?;
+
+        let local_head = self.read_head()?;
+        let remote_head_str = fs::read_to_string(remote_path.join("HEAD"))
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let remote_head = if remote_head_str.is_empty() {
+            None
+        } else {
+            Some(remote_head_str)
+        };
+
+        // Count ahead/behind by walking seal chains
+        let ahead = match (&local_head, &remote_head) {
+            (Some(local_h), Some(remote_h)) if local_h != remote_h => {
+                self.count_seals_between(local_h, remote_h).unwrap_or(0)
+            }
+            (Some(_), None) => {
+                // All local seals are ahead
+                self.log().map(|s| s.len()).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        let behind = match (&local_head, &remote_head) {
+            (Some(local_h), Some(remote_h)) if local_h != remote_h => {
+                self.count_remote_seals_between(&remote_path, remote_h, local_h)
+                    .unwrap_or(0)
+            }
+            (None, Some(_)) => {
+                // Count all remote seals
+                Self::count_seals_in_dir(&remote_path.join("seals")).unwrap_or(0)
+            }
+            _ => 0,
+        };
+
+        Ok(crate::remote::RemoteStatus {
+            name: remote_name.to_string(),
+            path: entry.path.clone(),
+            local_head,
+            remote_head,
+            ahead,
+            behind,
+        })
+    }
+
+    // --- Private helpers for remote ---
+
+    fn validate_remote(&self, path: &Path) -> WritResult<()> {
+        if !path.join("objects").is_dir() || !path.join("seals").is_dir() {
+            return Err(WritError::InvalidRemote(
+                path.display().to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_config(&self) -> WritResult<crate::remote::RemoteConfig> {
+        let path = self.writ_dir.join("config.json");
+        if path.exists() {
+            let data = fs::read_to_string(&path)?;
+            Ok(serde_json::from_str(&data)?)
+        } else {
+            Ok(crate::remote::RemoteConfig::default())
+        }
+    }
+
+    fn save_config(&self, config: &crate::remote::RemoteConfig) -> WritResult<()> {
+        let path = self.writ_dir.join("config.json");
+        let data = serde_json::to_string_pretty(config)?;
+        fs::write(path, data)?;
+        Ok(())
+    }
+
+    fn load_sync_state(&self) -> WritResult<crate::remote::SyncState> {
+        let path = self.writ_dir.join("sync.json");
+        if path.exists() {
+            let data = fs::read_to_string(&path)?;
+            Ok(serde_json::from_str(&data)?)
+        } else {
+            Ok(crate::remote::SyncState::default())
+        }
+    }
+
+    fn save_sync_state(&self, state: &crate::remote::SyncState) -> WritResult<()> {
+        let path = self.writ_dir.join("sync.json");
+        let data = serde_json::to_string_pretty(state)?;
+        fs::write(path, data)?;
+        Ok(())
+    }
+
+    /// Copy objects that exist in src but not dst (by 2-char prefix dirs).
+    fn sync_objects(src: &Path, dst: &Path) -> WritResult<usize> {
+        let mut count = 0;
+        if !src.is_dir() {
+            return Ok(0);
+        }
+        for prefix_entry in fs::read_dir(src)? {
+            let prefix_entry = prefix_entry?;
+            if !prefix_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let prefix_name = prefix_entry.file_name();
+            let dst_prefix = dst.join(&prefix_name);
+            for obj_entry in fs::read_dir(prefix_entry.path())? {
+                let obj_entry = obj_entry?;
+                let obj_name = obj_entry.file_name();
+                let dst_obj = dst_prefix.join(&obj_name);
+                if !dst_obj.exists() {
+                    fs::create_dir_all(&dst_prefix)?;
+                    fs::copy(obj_entry.path(), &dst_obj)?;
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Copy seals that exist in src but not dst.
+    fn sync_seals(src: &Path, dst: &Path) -> WritResult<usize> {
+        let mut count = 0;
+        if !src.is_dir() {
+            return Ok(0);
+        }
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let dst_path = dst.join(&name);
+            if !dst_path.exists() {
+                fs::copy(entry.path(), &dst_path)?;
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Merge specs from src into dst. Returns (count, conflicts).
+    fn merge_specs(
+        src: &Path,
+        dst: &Path,
+    ) -> WritResult<(usize, Vec<crate::remote::SpecMergeConflict>)> {
+        let mut count = 0;
+        let conflicts = Vec::new();
+        if !src.is_dir() {
+            return Ok((0, conflicts));
+        }
+        for entry in fs::read_dir(src)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let dst_path = dst.join(&name);
+            if !dst_path.exists() {
+                // New spec — just copy
+                fs::copy(entry.path(), &dst_path)?;
+                count += 1;
+            } else {
+                // Both sides have this spec — field-level merge
+                let src_data = fs::read_to_string(entry.path())?;
+                let dst_data = fs::read_to_string(&dst_path)?;
+                let src_spec: crate::spec::Spec = serde_json::from_str(&src_data)?;
+                let dst_spec: crate::spec::Spec = serde_json::from_str(&dst_data)?;
+
+                let merged = Self::merge_spec_fields(&src_spec, &dst_spec);
+                let merged_json = serde_json::to_string_pretty(&merged)?;
+                fs::write(&dst_path, merged_json)?;
+                count += 1;
+            }
+        }
+        Ok((count, conflicts))
+    }
+
+    /// Merge two versions of the same spec field-by-field.
+    fn merge_spec_fields(incoming: &crate::spec::Spec, existing: &crate::spec::Spec) -> crate::spec::Spec {
+        use crate::spec::SpecStatus;
+
+        // Title/description: take the one with newer updated_at
+        let (title, description) = if incoming.updated_at > existing.updated_at {
+            (incoming.title.clone(), incoming.description.clone())
+        } else {
+            (existing.title.clone(), existing.description.clone())
+        };
+
+        // Status: take the most progressed (Blocked always wins)
+        let status = if incoming.status == SpecStatus::Blocked
+            || existing.status == SpecStatus::Blocked
+        {
+            SpecStatus::Blocked
+        } else {
+            let rank = |s: &SpecStatus| match s {
+                SpecStatus::Pending => 0,
+                SpecStatus::InProgress => 1,
+                SpecStatus::Complete => 2,
+                SpecStatus::Blocked => 3,
+            };
+            if rank(&incoming.status) >= rank(&existing.status) {
+                incoming.status.clone()
+            } else {
+                existing.status.clone()
+            }
+        };
+
+        // List fields: union + dedup
+        let mut depends_on: Vec<String> = existing.depends_on.clone();
+        for d in &incoming.depends_on {
+            if !depends_on.contains(d) {
+                depends_on.push(d.clone());
+            }
+        }
+        let mut file_scope: Vec<String> = existing.file_scope.clone();
+        for f in &incoming.file_scope {
+            if !file_scope.contains(f) {
+                file_scope.push(f.clone());
+            }
+        }
+        let mut sealed_by: Vec<String> = existing.sealed_by.clone();
+        for s in &incoming.sealed_by {
+            if !sealed_by.contains(s) {
+                sealed_by.push(s.clone());
+            }
+        }
+        let mut acceptance_criteria: Vec<String> = existing.acceptance_criteria.clone();
+        for a in &incoming.acceptance_criteria {
+            if !acceptance_criteria.contains(a) {
+                acceptance_criteria.push(a.clone());
+            }
+        }
+        let mut design_notes: Vec<String> = existing.design_notes.clone();
+        for n in &incoming.design_notes {
+            if !design_notes.contains(n) {
+                design_notes.push(n.clone());
+            }
+        }
+        let mut tech_stack: Vec<String> = existing.tech_stack.clone();
+        for t in &incoming.tech_stack {
+            if !tech_stack.contains(t) {
+                tech_stack.push(t.clone());
+            }
+        }
+
+        // Timestamps: earlier created_at, later updated_at
+        let created_at = std::cmp::min(incoming.created_at, existing.created_at);
+        let updated_at = std::cmp::max(incoming.updated_at, existing.updated_at);
+
+        crate::spec::Spec {
+            id: existing.id.clone(),
+            title,
+            description,
+            status,
+            depends_on,
+            file_scope,
+            created_at,
+            updated_at,
+            sealed_by,
+            acceptance_criteria,
+            design_notes,
+            tech_stack,
+        }
+    }
+
+    /// Check if `child` seal is a descendant of `ancestor` by walking the chain.
+    fn is_descendant(&self, child: &str, ancestor: &str) -> WritResult<bool> {
+        if child == ancestor {
+            return Ok(true);
+        }
+        let mut current = child.to_string();
+        loop {
+            let seal = match self.load_seal(&current) {
+                Ok(s) => s,
+                Err(_) => return Ok(false),
+            };
+            match seal.parent {
+                Some(ref parent) if parent == ancestor => return Ok(true),
+                Some(ref parent) => current = parent.clone(),
+                None => return Ok(false),
+            }
+        }
+    }
+
+    /// Count seals between child and ancestor (exclusive on both ends).
+    fn count_seals_between(&self, child: &str, ancestor: &str) -> WritResult<usize> {
+        if child == ancestor {
+            return Ok(0);
+        }
+        let mut count = 0;
+        let mut current = child.to_string();
+        loop {
+            if current == ancestor {
+                return Ok(count);
+            }
+            let seal = match self.load_seal(&current) {
+                Ok(s) => s,
+                Err(_) => return Ok(count),
+            };
+            count += 1;
+            match seal.parent {
+                Some(ref parent) => current = parent.clone(),
+                None => return Ok(count),
+            }
+        }
+    }
+
+    /// Count remote seals between child and ancestor by reading remote seal files.
+    fn count_remote_seals_between(
+        &self,
+        remote_path: &Path,
+        child: &str,
+        ancestor: &str,
+    ) -> WritResult<usize> {
+        if child == ancestor {
+            return Ok(0);
+        }
+        let mut count = 0;
+        let mut current = child.to_string();
+        let seals_dir = remote_path.join("seals");
+        loop {
+            if current == ancestor {
+                return Ok(count);
+            }
+            let seal_path = seals_dir.join(format!("{current}.json"));
+            let data = match fs::read_to_string(&seal_path) {
+                Ok(d) => d,
+                Err(_) => return Ok(count),
+            };
+            let seal: Seal = match serde_json::from_str(&data) {
+                Ok(s) => s,
+                Err(_) => return Ok(count),
+            };
+            count += 1;
+            match seal.parent {
+                Some(ref parent) => current = parent.clone(),
+                None => return Ok(count),
+            }
+        }
+    }
+
+    /// Count total seals in a directory (simple file count).
+    fn count_seals_in_dir(dir: &Path) -> WritResult<usize> {
+        if !dir.is_dir() {
+            return Ok(0);
+        }
+        let count = fs::read_dir(dir)?
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map_or(false, |n| n.ends_with(".json"))
+            })
+            .count();
+        Ok(count)
     }
 }
 
@@ -3178,8 +3875,7 @@ mod tests {
             "task-1",
             SpecUpdate {
                 status: Some(SpecStatus::Complete),
-                depends_on: None,
-                file_scope: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -3615,6 +4311,842 @@ mod tests {
         assert_eq!(ctx.recent_seals.len(), 1);
         assert_eq!(ctx.recent_seals[0].agent, "implementer");
     }
+
+    // --- Rich context: spec enrichment tests ---
+
+    #[test]
+    fn test_spec_new_has_empty_enrichment_fields() {
+        let spec = Spec::new("test".to_string(), "Test".to_string(), String::new());
+        assert!(spec.acceptance_criteria.is_empty());
+        assert!(spec.design_notes.is_empty());
+        assert!(spec.tech_stack.is_empty());
+    }
+
+    #[test]
+    fn test_spec_backwards_compat_deserialize() {
+        let json = r#"{
+            "id": "old-spec",
+            "title": "Old Spec",
+            "description": "",
+            "status": "pending",
+            "depends_on": [],
+            "file_scope": [],
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-01-01T00:00:00Z",
+            "sealed_by": []
+        }"#;
+        let spec: Spec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.id, "old-spec");
+        assert!(spec.acceptance_criteria.is_empty());
+        assert!(spec.design_notes.is_empty());
+        assert!(spec.tech_stack.is_empty());
+    }
+
+    #[test]
+    fn test_spec_serializes_without_empty_fields() {
+        let spec = Spec::new("test".to_string(), "Test".to_string(), String::new());
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(!json.contains("acceptance_criteria"));
+        assert!(!json.contains("design_notes"));
+        assert!(!json.contains("tech_stack"));
+    }
+
+    #[test]
+    fn test_spec_serializes_with_enrichment() {
+        let mut spec = Spec::new("test".to_string(), "Test".to_string(), String::new());
+        spec.acceptance_criteria = vec!["All tests pass".to_string()];
+        spec.design_notes = vec!["Use async where possible".to_string()];
+        spec.tech_stack = vec!["rust".to_string(), "pyo3".to_string()];
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains("acceptance_criteria"));
+        assert!(json.contains("design_notes"));
+        assert!(json.contains("tech_stack"));
+        assert!(json.contains("All tests pass"));
+    }
+
+    #[test]
+    fn test_update_spec_acceptance_criteria() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("feat".to_string(), "Feature".to_string(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        let updated = repo
+            .update_spec(
+                "feat",
+                SpecUpdate {
+                    acceptance_criteria: Some(vec![
+                        "Auth flow works".to_string(),
+                        "Tests pass".to_string(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.acceptance_criteria.len(), 2);
+        assert_eq!(updated.acceptance_criteria[0], "Auth flow works");
+    }
+
+    #[test]
+    fn test_update_spec_design_notes() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("feat".to_string(), "Feature".to_string(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        let updated = repo
+            .update_spec(
+                "feat",
+                SpecUpdate {
+                    design_notes: Some(vec!["Use JWT for auth".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.design_notes.len(), 1);
+        assert_eq!(updated.design_notes[0], "Use JWT for auth");
+    }
+
+    #[test]
+    fn test_update_spec_tech_stack() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("feat".to_string(), "Feature".to_string(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        let updated = repo
+            .update_spec(
+                "feat",
+                SpecUpdate {
+                    tech_stack: Some(vec!["rust".to_string(), "python".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.tech_stack, vec!["rust", "python"]);
+    }
+
+    #[test]
+    fn test_context_dependency_status() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let dep = Spec::new("dep-1".to_string(), "Dependency".to_string(), String::new());
+        repo.add_spec(&dep).unwrap();
+
+        let mut main_spec = Spec::new("main".to_string(), "Main".to_string(), String::new());
+        main_spec.depends_on = vec!["dep-1".to_string()];
+        repo.add_spec(&main_spec).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        repo.seal(
+            test_agent(),
+            "initial".to_string(),
+            Some("main".to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(
+                ContextScope::Spec("main".to_string()),
+                10,
+                &ContextFilter::default(),
+            )
+            .unwrap();
+        let deps = ctx
+            .dependency_status
+            .expect("should have dependency_status");
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].spec_id, "dep-1");
+        assert_eq!(deps[0].status, "pending");
+        assert!(!deps[0].resolved);
+    }
+
+    #[test]
+    fn test_context_dependency_resolved() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let dep = Spec::new("dep-1".to_string(), "Dependency".to_string(), String::new());
+        repo.add_spec(&dep).unwrap();
+        repo.update_spec(
+            "dep-1",
+            SpecUpdate {
+                status: Some(crate::spec::SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut main_spec = Spec::new("main".to_string(), "Main".to_string(), String::new());
+        main_spec.depends_on = vec!["dep-1".to_string()];
+        repo.add_spec(&main_spec).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        repo.seal(
+            test_agent(),
+            "work".to_string(),
+            Some("main".to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(
+                ContextScope::Spec("main".to_string()),
+                10,
+                &ContextFilter::default(),
+            )
+            .unwrap();
+        let deps = ctx.dependency_status.unwrap();
+        assert_eq!(deps[0].status, "complete");
+        assert!(deps[0].resolved);
+    }
+
+    #[test]
+    fn test_context_dependency_missing() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let mut spec = Spec::new("main".to_string(), "Main".to_string(), String::new());
+        spec.depends_on = vec!["nonexistent".to_string()];
+        repo.add_spec(&spec).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        repo.seal(
+            test_agent(),
+            "work".to_string(),
+            Some("main".to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(
+                ContextScope::Spec("main".to_string()),
+                10,
+                &ContextFilter::default(),
+            )
+            .unwrap();
+        let deps = ctx.dependency_status.unwrap();
+        assert_eq!(deps[0].spec_id, "nonexistent");
+        assert_eq!(deps[0].status, "not-found");
+        assert!(!deps[0].resolved);
+    }
+
+    #[test]
+    fn test_context_spec_progress() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("feat".to_string(), "Feature".to_string(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        let agent_a = AgentIdentity {
+            id: "designer".to_string(),
+            agent_type: AgentType::Agent,
+        };
+        let agent_b = AgentIdentity {
+            id: "coder".to_string(),
+            agent_type: AgentType::Agent,
+        };
+
+        fs::write(dir.path().join("design.md"), "design").unwrap();
+        repo.seal(
+            agent_a,
+            "design done".to_string(),
+            Some("feat".to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("impl.py"), "code").unwrap();
+        repo.seal(
+            agent_b,
+            "impl done".to_string(),
+            Some("feat".to_string()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.update_spec(
+            "feat",
+            SpecUpdate {
+                status: Some(crate::spec::SpecStatus::InProgress),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(
+                ContextScope::Spec("feat".to_string()),
+                10,
+                &ContextFilter::default(),
+            )
+            .unwrap();
+        let progress = ctx.spec_progress.expect("should have spec_progress");
+        assert_eq!(progress.total_seals, 2);
+        assert_eq!(progress.current_status, "in-progress");
+        assert_eq!(progress.agents_involved.len(), 2);
+        assert!(progress.agents_involved.contains(&"designer".to_string()));
+        assert!(progress.agents_involved.contains(&"coder".to_string()));
+        assert!(progress.latest_seal_at.is_some());
+    }
+
+    #[test]
+    fn test_context_full_no_enrichment() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 10, &ContextFilter::default())
+            .unwrap();
+        assert!(ctx.dependency_status.is_none());
+        assert!(ctx.spec_progress.is_none());
+    }
+
+    // ─── Security: path traversal ─────────────────────────────
+    #[test]
+    fn test_validate_path_rejects_parent_traversal() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let err = repo.validate_path("../etc/passwd");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("traversal"));
+    }
+
+    #[test]
+    fn test_validate_path_rejects_absolute() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let err = repo.validate_path("/etc/passwd");
+        assert!(err.is_err());
+        let msg = format!("{}", err.unwrap_err());
+        assert!(msg.contains("traversal"));
+    }
+
+    #[test]
+    fn test_validate_path_accepts_normal() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let result = repo.validate_path("src/main.rs");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), dir.path().join("src/main.rs"));
+    }
+
+    #[test]
+    fn test_validate_path_rejects_nested_traversal() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        assert!(repo.validate_path("src/../../secret").is_err());
+    }
+
+    // ─── Security: agent ID validation ────────────────────────
+    #[test]
+    fn test_seal_rejects_invalid_agent_id() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("test.txt"), "data").unwrap();
+        let bad_agent = AgentIdentity {
+            id: "evil agent; rm -rf /".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        let result = repo.seal(
+            bad_agent,
+            "test".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        );
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("invalid"));
+    }
+
+    #[test]
+    fn test_seal_accepts_valid_agent_id() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("test.txt"), "data").unwrap();
+        let good_agent = AgentIdentity {
+            id: "my-agent_v2.0".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        let result = repo.seal(
+            good_agent,
+            "test".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        );
+        assert!(result.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod remote_tests {
+    use super::*;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn test_agent() -> AgentIdentity {
+        AgentIdentity {
+            id: "test-agent".to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    /// Helper: init a repo, create a file, and seal it.
+    fn setup_repo_with_seal(dir: &Path) -> Repository {
+        let repo = Repository::init(dir).unwrap();
+        fs::write(dir.join("hello.txt"), "hello world").unwrap();
+        repo.seal(
+            test_agent(),
+            "Initial seal".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo
+    }
+
+    #[test]
+    fn test_remote_init_creates_structure() {
+        let dir = tempdir().unwrap();
+        let remote_dir = dir.path().join("remote");
+        fs::create_dir(&remote_dir).unwrap();
+
+        Repository::remote_init(&remote_dir).unwrap();
+
+        assert!(remote_dir.join("objects").is_dir());
+        assert!(remote_dir.join("seals").is_dir());
+        assert!(remote_dir.join("specs").is_dir());
+        assert!(remote_dir.join("HEAD").exists());
+    }
+
+    #[test]
+    fn test_remote_init_twice_fails() {
+        let dir = tempdir().unwrap();
+        let remote_dir = dir.path().join("remote");
+        fs::create_dir(&remote_dir).unwrap();
+
+        Repository::remote_init(&remote_dir).unwrap();
+        let result = Repository::remote_init(&remote_dir);
+        assert!(matches!(result, Err(WritError::AlreadyExists)));
+    }
+
+    #[test]
+    fn test_remote_add_and_list() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.remote_add("origin", "/tmp/fake-remote").unwrap();
+        let remotes = repo.remote_list().unwrap();
+
+        assert_eq!(remotes.len(), 1);
+        assert_eq!(remotes["origin"].path, "/tmp/fake-remote");
+    }
+
+    #[test]
+    fn test_remote_add_duplicate_fails() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.remote_add("origin", "/tmp/remote1").unwrap();
+        let result = repo.remote_add("origin", "/tmp/remote2");
+        assert!(matches!(result, Err(WritError::RemoteAlreadyExists(_))));
+    }
+
+    #[test]
+    fn test_remote_remove() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.remote_add("origin", "/tmp/remote").unwrap();
+        repo.remote_remove("origin").unwrap();
+        let remotes = repo.remote_list().unwrap();
+        assert!(remotes.is_empty());
+    }
+
+    #[test]
+    fn test_remote_remove_nonexistent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.remote_remove("origin");
+        assert!(matches!(result, Err(WritError::RemoteNotFound(_))));
+    }
+
+    #[test]
+    fn test_push_objects_and_seals() {
+        let work = tempdir().unwrap();
+        let remote = tempdir().unwrap();
+        let remote_dir = remote.path().join("bare");
+        fs::create_dir(&remote_dir).unwrap();
+        Repository::remote_init(&remote_dir).unwrap();
+
+        let repo = setup_repo_with_seal(work.path());
+        repo.remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+
+        let result = repo.push("origin").unwrap();
+        assert_eq!(result.remote, "origin");
+        assert!(result.objects_pushed > 0);
+        assert!(result.seals_pushed > 0);
+        assert!(result.head_updated);
+    }
+
+    #[test]
+    fn test_push_fast_forward() {
+        let work = tempdir().unwrap();
+        let remote = tempdir().unwrap();
+        let remote_dir = remote.path().join("bare");
+        fs::create_dir(&remote_dir).unwrap();
+        Repository::remote_init(&remote_dir).unwrap();
+
+        let repo = setup_repo_with_seal(work.path());
+        repo.remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+
+        // First push
+        repo.push("origin").unwrap();
+
+        // Add another seal
+        fs::write(work.path().join("second.txt"), "more data").unwrap();
+        repo.seal(
+            test_agent(),
+            "Second seal".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Second push — should fast-forward
+        let result = repo.push("origin").unwrap();
+        assert!(result.head_updated);
+    }
+
+    #[test]
+    fn test_push_diverged_fails() {
+        let work1 = tempdir().unwrap();
+        let work2 = tempdir().unwrap();
+        let remote = tempdir().unwrap();
+        let remote_dir = remote.path().join("bare");
+        fs::create_dir(&remote_dir).unwrap();
+        Repository::remote_init(&remote_dir).unwrap();
+
+        // Repo 1: create and push
+        let repo1 = setup_repo_with_seal(work1.path());
+        repo1
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+        repo1.push("origin").unwrap();
+
+        // Repo 2: create independently (different seal chain)
+        let repo2 = setup_repo_with_seal(work2.path());
+        repo2
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+
+        // Repo 2 push should fail — divergent history
+        let result = repo2.push("origin");
+        assert!(matches!(result, Err(WritError::PushDiverged)));
+    }
+
+    #[test]
+    fn test_pull_objects_and_seals() {
+        let work1 = tempdir().unwrap();
+        let work2 = tempdir().unwrap();
+        let remote = tempdir().unwrap();
+        let remote_dir = remote.path().join("bare");
+        fs::create_dir(&remote_dir).unwrap();
+        Repository::remote_init(&remote_dir).unwrap();
+
+        // Repo 1: create and push
+        let repo1 = setup_repo_with_seal(work1.path());
+        repo1
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+        repo1.push("origin").unwrap();
+
+        // Repo 2: empty, pull from remote
+        let repo2 = Repository::init(work2.path()).unwrap();
+        repo2
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+
+        let result = repo2.pull("origin").unwrap();
+        assert!(result.objects_pulled > 0);
+        assert!(result.seals_pulled > 0);
+        assert!(result.head_updated);
+    }
+
+    #[test]
+    fn test_push_pull_roundtrip() {
+        let work1 = tempdir().unwrap();
+        let work2 = tempdir().unwrap();
+        let remote = tempdir().unwrap();
+        let remote_dir = remote.path().join("bare");
+        fs::create_dir(&remote_dir).unwrap();
+        Repository::remote_init(&remote_dir).unwrap();
+
+        // Repo 1: create content and push
+        let repo1 = setup_repo_with_seal(work1.path());
+        repo1
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+        repo1.push("origin").unwrap();
+
+        // Repo 2: pull
+        let repo2 = Repository::init(work2.path()).unwrap();
+        repo2
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+        repo2.pull("origin").unwrap();
+
+        // Verify HEAD matches
+        let log1 = repo1.log().unwrap();
+        let log2 = repo2.log().unwrap();
+        assert_eq!(log1.len(), log2.len());
+        assert_eq!(log1[0].id, log2[0].id);
+
+        // Verify the object can be retrieved
+        let seal = repo2.load_seal(&log2[0].id).unwrap();
+        assert_eq!(seal.summary, "Initial seal");
+    }
+
+    #[test]
+    fn test_spec_merge_union_sealed_by() {
+        let work1 = tempdir().unwrap();
+        let work2 = tempdir().unwrap();
+        let remote = tempdir().unwrap();
+        let remote_dir = remote.path().join("bare");
+        fs::create_dir(&remote_dir).unwrap();
+        Repository::remote_init(&remote_dir).unwrap();
+
+        // Repo 1: create spec and push
+        let repo1 = setup_repo_with_seal(work1.path());
+        repo1
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+        let spec = crate::spec::Spec::new(
+            "test-spec".to_string(),
+            "Test spec".to_string(),
+            "A spec for testing".to_string(),
+        );
+        repo1.add_spec(&spec).unwrap();
+        repo1.push("origin").unwrap();
+
+        // Repo 2: pull, then modify the spec
+        let repo2 = Repository::init(work2.path()).unwrap();
+        repo2
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+        repo2.pull("origin").unwrap();
+
+        // Both repos update the spec's sealed_by independently
+        let specs1 = repo1.list_specs().unwrap();
+        let spec_id = &specs1[0].id;
+
+        // Repo1: update file_scope (a list field)
+        repo1
+            .update_spec(
+                spec_id,
+                SpecUpdate {
+                    file_scope: Some(vec!["src/a.rs".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Repo2: update file_scope with different value
+        repo2
+            .update_spec(
+                spec_id,
+                SpecUpdate {
+                    file_scope: Some(vec!["src/b.rs".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        // Push from repo1, then push from repo2 (specs merge)
+        repo1.push("origin").unwrap();
+        repo2.push("origin").unwrap();
+
+        // Pull into repo1 to get merged result
+        repo1.pull("origin").unwrap();
+        let updated_specs = repo1.list_specs().unwrap();
+        let spec = &updated_specs[0];
+
+        // file_scope should be union of both
+        assert!(spec.file_scope.contains(&"src/a.rs".to_string()));
+        assert!(spec.file_scope.contains(&"src/b.rs".to_string()));
+    }
+
+    #[test]
+    fn test_spec_merge_status_progression() {
+        // Verify that merge_spec_fields picks the most progressed status
+        let now = chrono::Utc::now();
+        let spec_pending = crate::spec::Spec {
+            id: "spec-1".to_string(),
+            title: "Test".to_string(),
+            description: "Test spec".to_string(),
+            status: SpecStatus::Pending,
+            depends_on: vec![],
+            file_scope: vec![],
+            created_at: now,
+            updated_at: now,
+            sealed_by: vec![],
+            acceptance_criteria: vec![],
+            design_notes: vec![],
+            tech_stack: vec![],
+        };
+
+        let spec_in_progress = crate::spec::Spec {
+            status: SpecStatus::InProgress,
+            ..spec_pending.clone()
+        };
+
+        // InProgress should win over Pending
+        let merged = Repository::merge_spec_fields(&spec_in_progress, &spec_pending);
+        assert_eq!(merged.status, SpecStatus::InProgress);
+
+        // Blocked should always win
+        let spec_blocked = crate::spec::Spec {
+            status: SpecStatus::Blocked,
+            ..spec_pending.clone()
+        };
+        let merged2 = Repository::merge_spec_fields(&spec_pending, &spec_blocked);
+        assert_eq!(merged2.status, SpecStatus::Blocked);
+    }
+
+    #[test]
+    fn test_push_idempotent() {
+        let work = tempdir().unwrap();
+        let remote = tempdir().unwrap();
+        let remote_dir = remote.path().join("bare");
+        fs::create_dir(&remote_dir).unwrap();
+        Repository::remote_init(&remote_dir).unwrap();
+
+        let repo = setup_repo_with_seal(work.path());
+        repo.remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+
+        // Push twice — second should succeed with no new data
+        let first = repo.push("origin").unwrap();
+        let second = repo.push("origin").unwrap();
+
+        assert!(first.objects_pushed > 0);
+        assert_eq!(second.objects_pushed, 0);
+        assert_eq!(second.seals_pushed, 0);
+        assert!(!second.head_updated); // HEAD already matches
+    }
+
+    #[test]
+    fn test_pull_fast_forward() {
+        let work1 = tempdir().unwrap();
+        let work2 = tempdir().unwrap();
+        let remote = tempdir().unwrap();
+        let remote_dir = remote.path().join("bare");
+        fs::create_dir(&remote_dir).unwrap();
+        Repository::remote_init(&remote_dir).unwrap();
+
+        // Repo 1: create and push initial seal
+        let repo1 = setup_repo_with_seal(work1.path());
+        repo1
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+        repo1.push("origin").unwrap();
+
+        // Repo 2: pull to sync
+        let repo2 = Repository::init(work2.path()).unwrap();
+        repo2
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+        repo2.pull("origin").unwrap();
+
+        // Repo 1: add more work and push
+        fs::write(work1.path().join("extra.txt"), "extra").unwrap();
+        repo1
+            .seal(
+                test_agent(),
+                "More work".to_string(),
+                None,
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        repo1.push("origin").unwrap();
+
+        // Repo 2: pull again — fast-forward
+        let result = repo2.pull("origin").unwrap();
+        assert!(result.head_updated);
+        assert!(result.seals_pulled > 0);
+    }
+
+    #[test]
+    fn test_remote_status_ahead_behind() {
+        let work1 = tempdir().unwrap();
+        let work2 = tempdir().unwrap();
+        let remote = tempdir().unwrap();
+        let remote_dir = remote.path().join("bare");
+        fs::create_dir(&remote_dir).unwrap();
+        Repository::remote_init(&remote_dir).unwrap();
+
+        // Repo 1: create and push
+        let repo1 = setup_repo_with_seal(work1.path());
+        repo1
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+        repo1.push("origin").unwrap();
+
+        // Repo 2: pull, then add local work (don't push)
+        let repo2 = Repository::init(work2.path()).unwrap();
+        repo2
+            .remote_add("origin", remote_dir.to_str().unwrap())
+            .unwrap();
+        repo2.pull("origin").unwrap();
+
+        // Repo 1: add more work and push
+        fs::write(work1.path().join("extra.txt"), "extra").unwrap();
+        repo1
+            .seal(
+                test_agent(),
+                "Repo1 extra".to_string(),
+                None,
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        repo1.push("origin").unwrap();
+
+        // Repo 2: status should show behind > 0
+        let status = repo2.remote_status("origin").unwrap();
+        assert_eq!(status.name, "origin");
+        assert!(status.behind > 0, "Expected behind > 0, got {}", status.behind);
+    }
 }
 
 #[cfg(all(test, feature = "bridge"))]
@@ -3954,5 +5486,30 @@ mod bridge_tests {
         let blob = entry.to_object(&git_repo).unwrap();
         let content = blob.as_blob().unwrap().content();
         assert_eq!(String::from_utf8_lossy(content), "from auth import Auth\nprint('hello')\n");
+    }
+
+    // ─── Security: bridge input validation ────────────────────
+    #[test]
+    fn test_bridge_rejects_invalid_branch_name() {
+        assert!(Repository::validate_branch_name("").is_err());
+        assert!(Repository::validate_branch_name("a..b").is_err());
+        assert!(Repository::validate_branch_name("main.lock").is_err());
+        assert!(Repository::validate_branch_name("has space").is_err());
+        assert!(Repository::validate_branch_name("ctrl\x01char").is_err());
+        assert!(Repository::validate_branch_name(&"x".repeat(300)).is_err());
+    }
+
+    #[test]
+    fn test_bridge_accepts_valid_branch_names() {
+        assert!(Repository::validate_branch_name("main").is_ok());
+        assert!(Repository::validate_branch_name("writ/export").is_ok());
+        assert!(Repository::validate_branch_name("feature/my-thing").is_ok());
+        assert!(Repository::validate_branch_name("v2.0-beta").is_ok());
+    }
+
+    #[test]
+    fn test_bridge_rejects_invalid_git_ref() {
+        assert!(Repository::validate_git_ref("").is_err());
+        assert!(Repository::validate_git_ref(&"x".repeat(600)).is_err());
     }
 }

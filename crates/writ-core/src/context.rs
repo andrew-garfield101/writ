@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::diff::DiffOutput;
 use crate::seal::{Seal, TaskStatus, Verification};
-use crate::spec::Spec;
+use crate::spec::{Spec, SpecStatus};
 use crate::state::{FileStatus, WorkingState};
 
 /// Scope of context to include.
@@ -197,6 +197,57 @@ pub struct SealNudge {
     pub message: String,
 }
 
+/// Status of a dependency spec (shown in spec-scoped context).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DepStatus {
+    /// Spec ID of the dependency.
+    pub spec_id: String,
+    /// Current status (kebab-case).
+    pub status: String,
+    /// Whether this dependency is resolved (status is "complete").
+    pub resolved: bool,
+}
+
+impl DepStatus {
+    /// Build from a spec status enum.
+    pub fn from_spec(spec_id: &str, status: &SpecStatus) -> Self {
+        let status_str = match status {
+            SpecStatus::Pending => "pending",
+            SpecStatus::InProgress => "in-progress",
+            SpecStatus::Complete => "complete",
+            SpecStatus::Blocked => "blocked",
+        };
+        DepStatus {
+            spec_id: spec_id.to_string(),
+            status: status_str.to_string(),
+            resolved: matches!(status, SpecStatus::Complete),
+        }
+    }
+
+    /// Build a "not found" entry for a missing dependency spec.
+    pub fn not_found(spec_id: &str) -> Self {
+        DepStatus {
+            spec_id: spec_id.to_string(),
+            status: "not-found".to_string(),
+            resolved: false,
+        }
+    }
+}
+
+/// Progress summary for a spec (shown in spec-scoped context).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecProgress {
+    /// Total number of seals linked to this spec.
+    pub total_seals: usize,
+    /// Current spec status (kebab-case).
+    pub current_status: String,
+    /// Unique agent IDs who have sealed against this spec.
+    pub agents_involved: Vec<String>,
+    /// Timestamp of the most recent seal (ISO 8601).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_seal_at: Option<String>,
+}
+
 /// The full context output, optimized for LLM consumption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextOutput {
@@ -230,6 +281,14 @@ pub struct ContextOutput {
 
     /// Total tracked file count.
     pub tracked_files: usize,
+
+    /// Status of each dependency when spec-scoped (omitted in full scope).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dependency_status: Option<Vec<DepStatus>>,
+
+    /// Summary of spec completion progress when spec-scoped (omitted in full scope).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_progress: Option<SpecProgress>,
 
     /// Available writ operations for agent discoverability.
     pub available_operations: Vec<String>,

@@ -263,13 +263,31 @@ impl PyRepository {
     }
 
     /// Register a new spec. Returns the created spec as a dict.
-    #[pyo3(signature = (id, title, description=""))]
-    fn add_spec(&self, py: Python, id: &str, title: &str, description: &str) -> PyResult<PyObject> {
-        let spec = Spec::new(
+    #[pyo3(signature = (id, title, description="", acceptance_criteria=None, design_notes=None, tech_stack=None))]
+    fn add_spec(
+        &self,
+        py: Python,
+        id: &str,
+        title: &str,
+        description: &str,
+        acceptance_criteria: Option<Vec<String>>,
+        design_notes: Option<Vec<String>>,
+        tech_stack: Option<Vec<String>>,
+    ) -> PyResult<PyObject> {
+        let mut spec = Spec::new(
             id.to_string(),
             title.to_string(),
             description.to_string(),
         );
+        if let Some(ac) = acceptance_criteria {
+            spec.acceptance_criteria = ac;
+        }
+        if let Some(dn) = design_notes {
+            spec.design_notes = dn;
+        }
+        if let Some(ts) = tech_stack {
+            spec.tech_stack = ts;
+        }
         self.inner.add_spec(&spec).map_err(writ_err)?;
         to_pydict(py, &spec)
     }
@@ -281,7 +299,7 @@ impl PyRepository {
     }
 
     /// Update a spec's mutable fields.
-    #[pyo3(signature = (id, status=None, depends_on=None, file_scope=None))]
+    #[pyo3(signature = (id, status=None, depends_on=None, file_scope=None, acceptance_criteria=None, design_notes=None, tech_stack=None))]
     fn update_spec(
         &self,
         py: Python,
@@ -289,6 +307,9 @@ impl PyRepository {
         status: Option<&str>,
         depends_on: Option<Vec<String>>,
         file_scope: Option<Vec<String>>,
+        acceptance_criteria: Option<Vec<String>>,
+        design_notes: Option<Vec<String>>,
+        tech_stack: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
         let parsed_status = match status {
             Some(s) => Some(parse_spec_status(s)?),
@@ -299,6 +320,9 @@ impl PyRepository {
             status: parsed_status,
             depends_on,
             file_scope,
+            acceptance_criteria,
+            design_notes,
+            tech_stack,
         };
 
         let spec = self.inner.update_spec(id, update).map_err(writ_err)?;
@@ -382,6 +406,53 @@ impl PyRepository {
     /// Get bridge sync status.
     fn bridge_status(&self, py: Python) -> PyResult<PyObject> {
         let status = self.inner.bridge_status().map_err(writ_err)?;
+        to_pydict(py, &status)
+    }
+
+    /// Initialize a bare remote directory.
+    #[staticmethod]
+    fn remote_init(path: &str) -> PyResult<()> {
+        let p = PathBuf::from(path);
+        writ_core::Repository::remote_init(&p).map_err(writ_err)?;
+        Ok(())
+    }
+
+    /// Add a named remote to this repository's config.
+    fn remote_add(&self, name: &str, path: &str) -> PyResult<()> {
+        self.inner.remote_add(name, path).map_err(writ_err)?;
+        Ok(())
+    }
+
+    /// Remove a named remote.
+    fn remote_remove(&self, name: &str) -> PyResult<()> {
+        self.inner.remote_remove(name).map_err(writ_err)?;
+        Ok(())
+    }
+
+    /// List all configured remotes as a dict.
+    fn remote_list(&self, py: Python) -> PyResult<PyObject> {
+        let remotes = self.inner.remote_list().map_err(writ_err)?;
+        to_pydict(py, &remotes)
+    }
+
+    /// Push local state to a named remote.
+    #[pyo3(signature = (remote="origin"))]
+    fn push(&self, py: Python, remote: &str) -> PyResult<PyObject> {
+        let result = self.inner.push(remote).map_err(writ_err)?;
+        to_pydict(py, &result)
+    }
+
+    /// Pull remote state into local.
+    #[pyo3(signature = (remote="origin"))]
+    fn pull(&self, py: Python, remote: &str) -> PyResult<PyObject> {
+        let result = self.inner.pull(remote).map_err(writ_err)?;
+        to_pydict(py, &result)
+    }
+
+    /// Get sync status with a remote.
+    #[pyo3(signature = (remote="origin"))]
+    fn remote_status(&self, py: Python, remote: &str) -> PyResult<PyObject> {
+        let status = self.inner.remote_status(remote).map_err(writ_err)?;
         to_pydict(py, &status)
     }
 }

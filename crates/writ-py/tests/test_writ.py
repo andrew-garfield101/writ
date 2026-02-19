@@ -703,3 +703,253 @@ class TestLocking:
         finally:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             lock_file.close()
+
+
+class TestRichContext:
+    def test_spec_with_acceptance_criteria(self, tmp_repo):
+        """add_spec with acceptance_criteria returns them in the dict."""
+        repo, path = tmp_repo
+        spec = repo.add_spec(
+            id="auth",
+            title="Auth Migration",
+            acceptance_criteria=["OAuth flow works", "Tests pass"],
+        )
+        assert spec["acceptance_criteria"] == ["OAuth flow works", "Tests pass"]
+
+    def test_spec_with_design_notes(self, tmp_repo):
+        """add_spec with design_notes returns them in the dict."""
+        repo, path = tmp_repo
+        spec = repo.add_spec(
+            id="auth",
+            title="Auth Migration",
+            design_notes=["Use JWT for stateless auth"],
+        )
+        assert spec["design_notes"] == ["Use JWT for stateless auth"]
+
+    def test_spec_with_tech_stack(self, tmp_repo):
+        """add_spec with tech_stack returns them in the dict."""
+        repo, path = tmp_repo
+        spec = repo.add_spec(
+            id="auth",
+            title="Auth Migration",
+            tech_stack=["rust", "pyo3", "tokio"],
+        )
+        assert spec["tech_stack"] == ["rust", "pyo3", "tokio"]
+
+    def test_update_spec_enrichment(self, tmp_repo):
+        """update_spec can set enrichment fields."""
+        repo, path = tmp_repo
+        repo.add_spec(id="feat", title="Feature")
+        updated = repo.update_spec(
+            "feat",
+            acceptance_criteria=["Compiles", "Tests green"],
+            design_notes=["Prefer composition over inheritance"],
+            tech_stack=["python", "fastapi"],
+        )
+        assert updated["acceptance_criteria"] == ["Compiles", "Tests green"]
+        assert updated["design_notes"] == ["Prefer composition over inheritance"]
+        assert updated["tech_stack"] == ["python", "fastapi"]
+
+    def test_backwards_compat_empty_fields(self, tmp_repo):
+        """Specs created without enrichment fields still work."""
+        repo, path = tmp_repo
+        spec = repo.add_spec(id="plain", title="Plain Spec")
+        # Empty enrichment fields are omitted from serialization
+        assert "acceptance_criteria" not in spec
+        assert "design_notes" not in spec
+        assert "tech_stack" not in spec
+
+    def test_context_dependency_status(self, tmp_repo):
+        """Spec-scoped context includes dependency_status."""
+        repo, path = tmp_repo
+        repo.add_spec(id="dep-1", title="Dependency")
+        repo.update_spec("dep-1", status="complete")
+        repo.add_spec(id="main", title="Main")
+        repo.update_spec("main", depends_on=["dep-1"])
+
+        (path / "file.txt").write_text("content")
+        repo.seal(summary="work", spec_id="main", status="in-progress")
+
+        ctx = repo.context(spec="main")
+        assert "dependency_status" in ctx
+        deps = ctx["dependency_status"]
+        assert len(deps) == 1
+        assert deps[0]["spec_id"] == "dep-1"
+        assert deps[0]["status"] == "complete"
+        assert deps[0]["resolved"] is True
+
+    def test_context_spec_progress(self, tmp_repo):
+        """Spec-scoped context includes spec_progress."""
+        repo, path = tmp_repo
+        repo.add_spec(id="feat", title="Feature")
+
+        (path / "a.txt").write_text("alpha")
+        repo.seal(
+            summary="design",
+            agent_id="designer",
+            agent_type="agent",
+            spec_id="feat",
+            status="in-progress",
+        )
+        (path / "b.txt").write_text("beta")
+        repo.seal(
+            summary="impl",
+            agent_id="coder",
+            agent_type="agent",
+            spec_id="feat",
+            status="complete",
+        )
+
+        ctx = repo.context(spec="feat")
+        assert "spec_progress" in ctx
+        progress = ctx["spec_progress"]
+        assert progress["total_seals"] == 2
+        assert len(progress["agents_involved"]) == 2
+        assert "designer" in progress["agents_involved"]
+        assert "coder" in progress["agents_involved"]
+
+    def test_enrichment_json_serializable(self, tmp_repo):
+        """All enrichment fields survive json.dumps()."""
+        repo, path = tmp_repo
+        spec = repo.add_spec(
+            id="rich",
+            title="Rich Spec",
+            acceptance_criteria=["criterion"],
+            design_notes=["note"],
+            tech_stack=["rust"],
+        )
+        result = json.dumps(spec)
+        assert isinstance(result, str)
+        assert "criterion" in result
+
+
+class TestRemote:
+    def test_remote_init(self, tmp_path):
+        """remote_init creates the bare directory structure."""
+        remote_dir = tmp_path / "remote"
+        remote_dir.mkdir()
+        writ.Repository.remote_init(str(remote_dir))
+
+        assert (remote_dir / "objects").is_dir()
+        assert (remote_dir / "seals").is_dir()
+        assert (remote_dir / "specs").is_dir()
+        assert (remote_dir / "HEAD").exists()
+
+    def test_push_pull_roundtrip(self, tmp_path):
+        """Push from one repo, pull into another, verify state matches."""
+        work1 = tmp_path / "work1"
+        work2 = tmp_path / "work2"
+        remote_dir = tmp_path / "remote"
+        work1.mkdir()
+        work2.mkdir()
+        remote_dir.mkdir()
+
+        writ.Repository.remote_init(str(remote_dir))
+
+        # Repo 1: create content and push
+        repo1 = writ.Repository.init(str(work1))
+        (work1 / "hello.txt").write_text("hello world")
+        repo1.seal(summary="Initial seal", agent_id="test-agent", agent_type="agent")
+        repo1.remote_add("origin", str(remote_dir))
+        result = repo1.push("origin")
+
+        assert result["remote"] == "origin"
+        assert result["objects_pushed"] > 0
+        assert result["seals_pushed"] > 0
+        assert result["head_updated"] is True
+
+        # Repo 2: pull
+        repo2 = writ.Repository.init(str(work2))
+        repo2.remote_add("origin", str(remote_dir))
+        pull_result = repo2.pull("origin")
+
+        assert pull_result["objects_pulled"] > 0
+        assert pull_result["seals_pulled"] > 0
+        assert pull_result["head_updated"] is True
+
+        # Verify logs match
+        log1 = repo1.log()
+        log2 = repo2.log()
+        assert len(log1) == len(log2)
+        assert log1[0]["id"] == log2[0]["id"]
+
+    def test_push_diverged_raises(self, tmp_path):
+        """Diverged histories should raise WritError on push."""
+        work1 = tmp_path / "work1"
+        work2 = tmp_path / "work2"
+        remote_dir = tmp_path / "remote"
+        work1.mkdir()
+        work2.mkdir()
+        remote_dir.mkdir()
+
+        writ.Repository.remote_init(str(remote_dir))
+
+        # Repo 1
+        repo1 = writ.Repository.init(str(work1))
+        (work1 / "a.txt").write_text("alpha")
+        repo1.seal(summary="R1 seal", agent_id="agent-1", agent_type="agent")
+        repo1.remote_add("origin", str(remote_dir))
+        repo1.push("origin")
+
+        # Repo 2 (independent history)
+        repo2 = writ.Repository.init(str(work2))
+        (work2 / "b.txt").write_text("beta")
+        repo2.seal(summary="R2 seal", agent_id="agent-2", agent_type="agent")
+        repo2.remote_add("origin", str(remote_dir))
+
+        with pytest.raises(writ.WritError, match="diverged"):
+            repo2.push("origin")
+
+    def test_remote_status(self, tmp_path):
+        """remote_status shows ahead/behind counts."""
+        work1 = tmp_path / "work1"
+        work2 = tmp_path / "work2"
+        remote_dir = tmp_path / "remote"
+        work1.mkdir()
+        work2.mkdir()
+        remote_dir.mkdir()
+
+        writ.Repository.remote_init(str(remote_dir))
+
+        # Repo 1: push initial
+        repo1 = writ.Repository.init(str(work1))
+        (work1 / "a.txt").write_text("alpha")
+        repo1.seal(summary="initial", agent_id="agent-1", agent_type="agent")
+        repo1.remote_add("origin", str(remote_dir))
+        repo1.push("origin")
+
+        # Repo 2: pull, then repo1 pushes more
+        repo2 = writ.Repository.init(str(work2))
+        repo2.remote_add("origin", str(remote_dir))
+        repo2.pull("origin")
+
+        (work1 / "b.txt").write_text("beta")
+        repo1.seal(summary="more work", agent_id="agent-1", agent_type="agent")
+        repo1.push("origin")
+
+        status = repo2.remote_status("origin")
+        assert status["name"] == "origin"
+        assert status["behind"] > 0
+
+    def test_push_pull_json_serializable(self, tmp_path):
+        """Push and pull results are JSON-safe."""
+        work = tmp_path / "work"
+        remote_dir = tmp_path / "remote"
+        work.mkdir()
+        remote_dir.mkdir()
+
+        writ.Repository.remote_init(str(remote_dir))
+
+        repo = writ.Repository.init(str(work))
+        (work / "file.txt").write_text("content")
+        repo.seal(summary="test", agent_id="agent", agent_type="agent")
+        repo.remote_add("origin", str(remote_dir))
+
+        push_result = repo.push("origin")
+        assert isinstance(json.dumps(push_result), str)
+
+        pull_result = repo.pull("origin")
+        assert isinstance(json.dumps(pull_result), str)
+
+        status = repo.remote_status("origin")
+        assert isinstance(json.dumps(status), str)

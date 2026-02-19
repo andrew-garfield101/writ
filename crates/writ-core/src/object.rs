@@ -10,6 +10,15 @@ use std::path::{Path, PathBuf};
 use crate::error::{WritError, WritResult};
 use crate::hash::hash_bytes;
 
+/// Validate that a hash string is well-formed (64 hex chars).
+fn validate_hash(hash: &str) -> WritResult<()> {
+    if hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Ok(())
+    } else {
+        Err(WritError::InvalidHash(hash.to_string()))
+    }
+}
+
 /// The object store manages content-addressable storage on disk.
 pub struct ObjectStore {
     /// Root path: `.writ/objects/`
@@ -47,6 +56,7 @@ impl ObjectStore {
 
     /// Retrieve an object by its hash.
     pub fn retrieve(&self, hash: &str) -> WritResult<Vec<u8>> {
+        validate_hash(hash)?;
         let path = self.object_path(hash);
         if !path.exists() {
             return Err(WritError::ObjectNotFound(hash.to_string()));
@@ -56,12 +66,13 @@ impl ObjectStore {
 
     /// Check if an object exists.
     pub fn exists(&self, hash: &str) -> bool {
-        self.object_path(hash).exists()
+        validate_hash(hash).is_ok() && self.object_path(hash).exists()
     }
 
     /// Get the filesystem path for an object hash.
     ///
     /// Uses 2-char prefix directories: hash `abcdef...` -> `ab/cdef...`
+    /// Callers must validate the hash before calling this.
     fn object_path(&self, hash: &str) -> PathBuf {
         let (prefix, rest) = hash.split_at(2);
         self.root.join(prefix).join(rest)
@@ -113,5 +124,39 @@ mod tests {
         let hash = store.store(b"test").unwrap();
         assert!(store.exists(&hash));
         assert!(!store.exists("nonexistent"));
+    }
+
+    #[test]
+    fn test_retrieve_rejects_invalid_hash() {
+        let dir = tempdir().unwrap();
+        let store = ObjectStore::new(dir.path());
+        let result = store.retrieve("not-a-valid-hash");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("invalid object hash"));
+    }
+
+    #[test]
+    fn test_retrieve_rejects_too_short_hash() {
+        let dir = tempdir().unwrap();
+        let store = ObjectStore::new(dir.path());
+        let result = store.retrieve("abcd");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_retrieve_rejects_traversal_in_hash() {
+        let dir = tempdir().unwrap();
+        let store = ObjectStore::new(dir.path());
+        let result = store.retrieve("../../../etc/passwd/../../../etc/shadow/../xx");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_exists_returns_false_for_invalid_hash() {
+        let dir = tempdir().unwrap();
+        let store = ObjectStore::new(dir.path());
+        assert!(!store.exists("not-valid"));
+        assert!(!store.exists("../../../etc/passwd"));
     }
 }

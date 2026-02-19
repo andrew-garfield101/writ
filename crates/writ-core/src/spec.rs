@@ -23,6 +23,7 @@ pub enum SpecStatus {
 
 /// A requirement specification tracked by writ.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Spec {
     /// Unique spec identifier (e.g. "auth-migration").
     pub id: String,
@@ -42,6 +43,15 @@ pub struct Spec {
     pub updated_at: DateTime<Utc>,
     /// IDs of seals linked to this spec.
     pub sealed_by: Vec<String>,
+    /// Testable conditions for spec completion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub acceptance_criteria: Vec<String>,
+    /// Key architectural decisions, constraints, or rationale.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub design_notes: Vec<String>,
+    /// Languages, frameworks, dependencies relevant to this spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tech_stack: Vec<String>,
 }
 
 impl std::str::FromStr for SpecStatus {
@@ -67,6 +77,12 @@ pub struct SpecUpdate {
     pub depends_on: Option<Vec<String>>,
     /// Replacement file scope list (if Some).
     pub file_scope: Option<Vec<String>>,
+    /// Replacement acceptance criteria (if Some).
+    pub acceptance_criteria: Option<Vec<String>>,
+    /// Replacement design notes (if Some).
+    pub design_notes: Option<Vec<String>>,
+    /// Replacement tech stack (if Some).
+    pub tech_stack: Option<Vec<String>>,
 }
 
 impl Spec {
@@ -83,6 +99,9 @@ impl Spec {
             created_at: now,
             updated_at: now,
             sealed_by: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            design_notes: Vec::new(),
+            tech_stack: Vec::new(),
         }
     }
 }

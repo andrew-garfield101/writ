@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 /// Persistent bridge state stored at `.writ/bridge.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BridgeState {
     /// Git commit hash that was last imported.
     #[serde(skip_serializing_if = "Option::is_none")]

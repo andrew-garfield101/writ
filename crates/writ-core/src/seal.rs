@@ -10,6 +10,7 @@ use crate::hash::hash_str;
 
 /// Identity of the agent or human that created a seal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AgentIdentity {
     /// Unique identifier (e.g. "human-andrew", "agent-worker-3").
     pub id: String,
@@ -27,6 +28,7 @@ pub enum AgentType {
 
 /// A single file change recorded in a seal.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FileChange {
     /// Relative path to the file.
     pub path: String,
@@ -49,6 +51,7 @@ pub enum ChangeType {
 
 /// Verification status at the time of sealing.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Verification {
     /// Number of tests that passed (if known).
     pub tests_passed: Option<u32>,
@@ -69,6 +72,7 @@ pub enum TaskStatus {
 
 /// A seal — writ's structured, verified checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Seal {
     /// Unique identifier (SHA-256 of the seal's content).
     pub id: String,

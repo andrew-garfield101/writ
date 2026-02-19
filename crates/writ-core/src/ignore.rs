@@ -51,16 +51,26 @@ impl IgnoreRules {
     }
 
     /// Parse `.writignore` content into rules.
+    ///
+    /// Enforces safety limits: max 1000 rules, max 1024 chars per pattern.
     pub fn parse(content: &str) -> Self {
+        const MAX_RULES: usize = 1000;
+        const MAX_PATTERN_LEN: usize = 1024;
+
         let mut dir_names: Vec<String> =
             ALWAYS_IGNORED_DIRS.iter().map(|s| s.to_string()).collect();
         let mut file_globs = Vec::new();
+        let mut count = 0;
 
         for line in content.lines() {
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
             }
+            if count >= MAX_RULES || trimmed.len() > MAX_PATTERN_LEN {
+                continue;
+            }
+            count += 1;
 
             if trimmed.contains('*') || trimmed.contains('?') {
                 file_globs.push(trimmed.to_string());

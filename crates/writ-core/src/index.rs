@@ -13,6 +13,7 @@ use crate::error::WritResult;
 
 /// A tracked file entry in the index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexEntry {
     /// SHA-256 hash of the file's content.
     pub hash: String,
@@ -22,6 +23,7 @@ pub struct IndexEntry {
 
 /// The full index mapping relative paths to their tracked state.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Index {
     /// Map of relative file path -> index entry.
     pub entries: BTreeMap<String, IndexEntry>,

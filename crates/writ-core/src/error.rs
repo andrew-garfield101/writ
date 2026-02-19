@@ -34,6 +34,24 @@ pub enum WritError {
     GitError(String),
     /// Bridge state is inconsistent.
     BridgeError(String),
+    /// Path traversal or absolute path rejected.
+    PathTraversal(String),
+    /// Invalid hash format.
+    InvalidHash(String),
+    /// Input validation failure.
+    InvalidInput(String),
+    /// No remote configured with this name.
+    RemoteNotFound(String),
+    /// The remote directory is not a valid writ remote.
+    InvalidRemote(String),
+    /// A remote already exists with this name.
+    RemoteAlreadyExists(String),
+    /// Push rejected: remote HEAD has diverged.
+    PushDiverged,
+    /// Pull detected diverged histories.
+    PullDiverged,
+    /// Could not acquire the remote lock within the timeout.
+    RemoteLockTimeout,
     /// Generic error with a message.
     Other(String),
 }
@@ -57,6 +75,23 @@ impl fmt::Display for WritError {
             WritError::NoGitRepo => write!(f, "no git repository found"),
             WritError::GitError(msg) => write!(f, "git error: {msg}"),
             WritError::BridgeError(msg) => write!(f, "bridge error: {msg}"),
+            WritError::PathTraversal(path) => write!(f, "path rejected (traversal): {path}"),
+            WritError::InvalidHash(hash) => write!(f, "invalid object hash: {hash}"),
+            WritError::InvalidInput(msg) => write!(f, "invalid input: {msg}"),
+            WritError::RemoteNotFound(name) => write!(f, "remote not found: '{name}'"),
+            WritError::InvalidRemote(path) => write!(f, "not a valid writ remote: {path}"),
+            WritError::RemoteAlreadyExists(name) => {
+                write!(f, "remote '{name}' already exists")
+            }
+            WritError::PushDiverged => {
+                write!(f, "push rejected: remote HEAD has diverged — pull first")
+            }
+            WritError::PullDiverged => {
+                write!(f, "histories diverged — use convergence to reconcile")
+            }
+            WritError::RemoteLockTimeout => {
+                write!(f, "could not acquire remote lock within timeout")
+            }
             WritError::Other(msg) => write!(f, "{msg}"),
         }
     }

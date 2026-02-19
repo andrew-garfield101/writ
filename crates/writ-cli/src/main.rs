@@ -173,6 +173,34 @@ enum Commands {
         #[command(subcommand)]
         action: BridgeCommands,
     },
+
+    /// Push local state to a remote.
+    Push {
+        /// Remote name (default: origin).
+        #[arg(long, default_value = "origin")]
+        remote: String,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Pull remote state into local.
+    Pull {
+        /// Remote name (default: origin).
+        #[arg(long, default_value = "origin")]
+        remote: String,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Manage remotes.
+    Remote {
+        #[command(subcommand)]
+        action: RemoteCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -190,6 +218,18 @@ enum SpecCommands {
         /// Spec description.
         #[arg(long, default_value = "")]
         description: String,
+
+        /// Acceptance criteria (repeat for multiple).
+        #[arg(long)]
+        acceptance_criteria: Option<Vec<String>>,
+
+        /// Design notes (repeat for multiple).
+        #[arg(long)]
+        design_notes: Option<Vec<String>>,
+
+        /// Tech stack (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        tech_stack: Option<Vec<String>>,
     },
 
     /// Show all specs and their status.
@@ -217,6 +257,18 @@ enum SpecCommands {
         /// Replacement file scope list (comma-separated paths).
         #[arg(long, value_delimiter = ',')]
         file_scope: Option<Vec<String>>,
+
+        /// Replacement acceptance criteria (repeat for multiple).
+        #[arg(long)]
+        acceptance_criteria: Option<Vec<String>>,
+
+        /// Replacement design notes (repeat for multiple).
+        #[arg(long)]
+        design_notes: Option<Vec<String>>,
+
+        /// Replacement tech stack (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        tech_stack: Option<Vec<String>>,
 
         /// Output format: "human" (default) or "json".
         #[arg(long, default_value = "human")]
@@ -254,6 +306,44 @@ enum BridgeCommands {
 
     /// Show bridge sync status.
     Status {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RemoteCommands {
+    /// Initialize a bare remote directory.
+    Init {
+        /// Path to create the remote at.
+        path: PathBuf,
+    },
+
+    /// Add a named remote.
+    Add {
+        /// Remote name (e.g. "origin").
+        name: String,
+
+        /// Filesystem path to the bare remote directory.
+        path: String,
+    },
+
+    /// Remove a named remote.
+    Remove {
+        /// Remote name to remove.
+        name: String,
+    },
+
+    /// List configured remotes.
+    List,
+
+    /// Show sync status with a remote.
+    Status {
+        /// Remote name (default: origin).
+        #[arg(long, default_value = "origin")]
+        remote: String,
+
         /// Output format: "human" (default) or "json".
         #[arg(long, default_value = "human")]
         format: String,
@@ -311,7 +401,18 @@ fn main() {
                 id,
                 title,
                 description,
-            } => cmd_spec_add(&cwd, &id, &title, &description),
+                acceptance_criteria,
+                design_notes,
+                tech_stack,
+            } => cmd_spec_add(
+                &cwd,
+                &id,
+                &title,
+                &description,
+                acceptance_criteria,
+                design_notes,
+                tech_stack,
+            ),
             SpecCommands::Status => cmd_spec_status(&cwd),
             SpecCommands::Show { id } => cmd_spec_show(&cwd, &id),
             SpecCommands::Update {
@@ -319,8 +420,21 @@ fn main() {
                 status,
                 depends_on,
                 file_scope,
+                acceptance_criteria,
+                design_notes,
+                tech_stack,
                 format,
-            } => cmd_spec_update(&cwd, &id, status, depends_on, file_scope, &format),
+            } => cmd_spec_update(
+                &cwd,
+                &id,
+                status,
+                depends_on,
+                file_scope,
+                acceptance_criteria,
+                design_notes,
+                tech_stack,
+                &format,
+            ),
         },
         Commands::Bridge { action } => match action {
             BridgeCommands::Import {
@@ -332,6 +446,17 @@ fn main() {
                 cmd_bridge_export(&cwd, &branch, &format)
             }
             BridgeCommands::Status { format } => cmd_bridge_status(&cwd, &format),
+        },
+        Commands::Push { remote, format } => cmd_push(&cwd, &remote, &format),
+        Commands::Pull { remote, format } => cmd_pull(&cwd, &remote, &format),
+        Commands::Remote { action } => match action {
+            RemoteCommands::Init { path } => cmd_remote_init(&path),
+            RemoteCommands::Add { name, path } => cmd_remote_add(&cwd, &name, &path),
+            RemoteCommands::Remove { name } => cmd_remote_remove(&cwd, &name),
+            RemoteCommands::List => cmd_remote_list(&cwd),
+            RemoteCommands::Status { remote, format } => {
+                cmd_remote_status(&cwd, &remote, &format)
+            }
         },
     };
 
@@ -918,6 +1043,9 @@ fn cmd_spec_update(
     status: Option<String>,
     depends_on: Option<Vec<String>>,
     file_scope: Option<Vec<String>>,
+    acceptance_criteria: Option<Vec<String>>,
+    design_notes: Option<Vec<String>>,
+    tech_stack: Option<Vec<String>>,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
@@ -931,6 +1059,9 @@ fn cmd_spec_update(
         status: parsed_status,
         depends_on,
         file_scope,
+        acceptance_criteria,
+        design_notes,
+        tech_stack,
     };
 
     let spec = repo.update_spec(id, update)?;
@@ -948,6 +1079,15 @@ fn cmd_spec_update(
             if !spec.file_scope.is_empty() {
                 println!("  file scope: {}", spec.file_scope.join(", "));
             }
+            if !spec.acceptance_criteria.is_empty() {
+                println!("  criteria:   {}", spec.acceptance_criteria.join("; "));
+            }
+            if !spec.design_notes.is_empty() {
+                println!("  notes:      {}", spec.design_notes.join("; "));
+            }
+            if !spec.tech_stack.is_empty() {
+                println!("  tech stack: {}", spec.tech_stack.join(", "));
+            }
         }
     }
 
@@ -959,12 +1099,33 @@ fn cmd_spec_add(
     id: &str,
     title: &str,
     description: &str,
+    acceptance_criteria: Option<Vec<String>>,
+    design_notes: Option<Vec<String>>,
+    tech_stack: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
-    let spec = Spec::new(id.to_string(), title.to_string(), description.to_string());
+    let mut spec = Spec::new(id.to_string(), title.to_string(), description.to_string());
+    if let Some(ac) = acceptance_criteria {
+        spec.acceptance_criteria = ac;
+    }
+    if let Some(dn) = design_notes {
+        spec.design_notes = dn;
+    }
+    if let Some(ts) = tech_stack {
+        spec.tech_stack = ts;
+    }
     repo.add_spec(&spec)?;
     println!("spec added: {id}");
     println!("  title: {title}");
+    if !spec.acceptance_criteria.is_empty() {
+        println!("  criteria:   {}", spec.acceptance_criteria.join("; "));
+    }
+    if !spec.design_notes.is_empty() {
+        println!("  notes:      {}", spec.design_notes.join("; "));
+    }
+    if !spec.tech_stack.is_empty() {
+        println!("  tech stack: {}", spec.tech_stack.join(", "));
+    }
     Ok(())
 }
 
@@ -1216,6 +1377,154 @@ fn cmd_bridge_status(
                 }
                 println!("pending: {} seal(s) to export", status.pending_export_count);
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_push(
+    cwd: &PathBuf,
+    remote: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    let result = repo.push(remote)?;
+
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&result)?),
+        _ => {
+            if !result.head_updated && result.objects_pushed == 0 && result.seals_pushed == 0 {
+                println!("everything up-to-date with '{}'", result.remote);
+            } else {
+                println!("pushed to '{}'", result.remote);
+                if result.objects_pushed > 0 {
+                    println!("  objects: {}", result.objects_pushed);
+                }
+                if result.seals_pushed > 0 {
+                    println!("  seals:   {}", result.seals_pushed);
+                }
+                if result.specs_pushed > 0 {
+                    println!("  specs:   {}", result.specs_pushed);
+                }
+                if result.head_updated {
+                    println!("  HEAD updated");
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_pull(
+    cwd: &PathBuf,
+    remote: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    let result = repo.pull(remote)?;
+
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&result)?),
+        _ => {
+            if !result.head_updated && result.objects_pulled == 0 && result.seals_pulled == 0 {
+                println!("already up-to-date with '{}'", result.remote);
+            } else {
+                println!("pulled from '{}'", result.remote);
+                if result.objects_pulled > 0 {
+                    println!("  objects: {}", result.objects_pulled);
+                }
+                if result.seals_pulled > 0 {
+                    println!("  seals:   {}", result.seals_pulled);
+                }
+                if result.specs_pulled > 0 {
+                    println!("  specs:   {}", result.specs_pulled);
+                }
+                if result.head_updated {
+                    println!("  HEAD updated");
+                }
+                if !result.spec_conflicts.is_empty() {
+                    println!("  spec conflicts: {}", result.spec_conflicts.len());
+                    for c in &result.spec_conflicts {
+                        println!("    {} — field '{}': local='{}' remote='{}'", c.spec_id, c.field, c.local_value, c.remote_value);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_remote_init(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    Repository::remote_init(path)?;
+    println!("initialized bare remote at {}", path.display());
+    Ok(())
+}
+
+fn cmd_remote_add(
+    cwd: &PathBuf,
+    name: &str,
+    path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    repo.remote_add(name, path)?;
+    println!("remote '{name}' added → {path}");
+    Ok(())
+}
+
+fn cmd_remote_remove(
+    cwd: &PathBuf,
+    name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    repo.remote_remove(name)?;
+    println!("remote '{name}' removed");
+    Ok(())
+}
+
+fn cmd_remote_list(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    let remotes = repo.remote_list()?;
+
+    if remotes.is_empty() {
+        println!("no remotes configured");
+    } else {
+        for (name, entry) in &remotes {
+            println!("  {name}\t{}", entry.path);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_remote_status(
+    cwd: &PathBuf,
+    remote: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    let status = repo.remote_status(remote)?;
+
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&status)?),
+        _ => {
+            println!("remote '{}' → {}", status.name, status.path);
+            let local = status
+                .local_head
+                .as_deref()
+                .map(|h| &h[..12])
+                .unwrap_or("(none)");
+            let remote_h = status
+                .remote_head
+                .as_deref()
+                .map(|h| &h[..12])
+                .unwrap_or("(none)");
+            println!("  local HEAD:  {local}");
+            println!("  remote HEAD: {remote_h}");
+            println!("  ahead:  {}", status.ahead);
+            println!("  behind: {}", status.behind);
         }
     }
 

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
-use writ_core::context::ContextScope;
+use writ_core::context::{ContextFilter, ContextScope};
 use writ_core::diff::LineOp;
 use writ_core::seal::{AgentIdentity, AgentType, ChangeType, TaskStatus, Verification};
 use writ_core::spec::{Spec, SpecUpdate};
@@ -62,6 +62,10 @@ enum Commands {
         /// Whether the code was linted.
         #[arg(long)]
         linted: bool,
+
+        /// Allow sealing with no file changes (e.g. metadata-only updates).
+        #[arg(long)]
+        allow_empty: bool,
     },
 
     /// Inspect a specific seal.
@@ -114,6 +118,14 @@ enum Commands {
         #[arg(long, default_value = "10")]
         seal_limit: usize,
 
+        /// Filter seals by task status (in-progress, complete, blocked).
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Filter seals by agent ID.
+        #[arg(long)]
+        agent: Option<String>,
+
         /// Output format: "json" (default), "human", or "brief".
         #[arg(long, default_value = "json")]
         format: String,
@@ -154,6 +166,12 @@ enum Commands {
     Spec {
         #[command(subcommand)]
         action: SpecCommands,
+    },
+
+    /// Bridge between git and writ.
+    Bridge {
+        #[command(subcommand)]
+        action: BridgeCommands,
     },
 }
 
@@ -206,6 +224,42 @@ enum SpecCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum BridgeCommands {
+    /// Import git state as a writ baseline seal.
+    Import {
+        /// Git ref to import (default: HEAD).
+        #[arg(long, default_value = "HEAD")]
+        git_ref: String,
+
+        /// Agent identifier for the import seal.
+        #[arg(long, default_value = "bridge")]
+        agent: String,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Export writ seals as git commits.
+    Export {
+        /// Git branch to create commits on (default: writ/export).
+        #[arg(long, default_value = "writ/export")]
+        branch: String,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Show bridge sync status.
+    Status {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().unwrap_or_else(|e| {
@@ -225,7 +279,8 @@ fn main() {
             tests_passed,
             tests_failed,
             linted,
-        } => cmd_seal(&cwd, &summary, &agent, spec, &status, paths, tests_passed, tests_failed, linted),
+            allow_empty,
+        } => cmd_seal(&cwd, &summary, &agent, spec, &status, paths, tests_passed, tests_failed, linted, allow_empty),
         Commands::Show {
             seal_id,
             diff,
@@ -236,8 +291,10 @@ fn main() {
         Commands::Context {
             spec,
             seal_limit,
+            status,
+            agent,
             format,
-        } => cmd_context(&cwd, spec, seal_limit, &format),
+        } => cmd_context(&cwd, spec, seal_limit, status, agent, &format),
         Commands::Restore {
             seal_id,
             force,
@@ -264,6 +321,17 @@ fn main() {
                 file_scope,
                 format,
             } => cmd_spec_update(&cwd, &id, status, depends_on, file_scope, &format),
+        },
+        Commands::Bridge { action } => match action {
+            BridgeCommands::Import {
+                git_ref,
+                agent,
+                format,
+            } => cmd_bridge_import(&cwd, &git_ref, &agent, &format),
+            BridgeCommands::Export { branch, format } => {
+                cmd_bridge_export(&cwd, &branch, &format)
+            }
+            BridgeCommands::Status { format } => cmd_bridge_status(&cwd, &format),
         },
     };
 
@@ -325,6 +393,7 @@ fn cmd_seal(
     tests_passed: Option<u32>,
     tests_failed: Option<u32>,
     linted: bool,
+    allow_empty: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
 
@@ -357,6 +426,7 @@ fn cmd_seal(
             task_status,
             verification,
             &paths,
+            allow_empty,
         )?
     } else {
         repo.seal(
@@ -365,6 +435,7 @@ fn cmd_seal(
             spec_id,
             task_status,
             verification,
+            allow_empty,
         )?
     };
 
@@ -540,6 +611,8 @@ fn cmd_context(
     cwd: &PathBuf,
     spec: Option<String>,
     seal_limit: usize,
+    status: Option<String>,
+    agent: Option<String>,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
@@ -549,7 +622,22 @@ fn cmd_context(
         None => ContextScope::Full,
     };
 
-    let ctx = repo.context(scope, seal_limit)?;
+    let filter_status = match status.as_deref() {
+        Some("in-progress") => Some(TaskStatus::InProgress),
+        Some("complete") => Some(TaskStatus::Complete),
+        Some("blocked") => Some(TaskStatus::Blocked),
+        Some(other) => {
+            return Err(format!("unknown status filter: '{other}' (use in-progress, complete, or blocked)").into());
+        }
+        None => None,
+    };
+
+    let filter = ContextFilter {
+        status: filter_status,
+        agent,
+    };
+
+    let ctx = repo.context(scope, seal_limit, &filter)?;
 
     match format {
         "brief" => {
@@ -592,6 +680,11 @@ fn cmd_context(
             }
             println!();
 
+            if let Some(ref nudge) = ctx.seal_nudge {
+                println!("  ⚠ {}", nudge.message);
+                println!();
+            }
+
             if let Some(ref pc) = ctx.pending_changes {
                 println!(
                     "pending: {} file(s), +{} -{}",
@@ -603,15 +696,49 @@ fn cmd_context(
             if !ctx.recent_seals.is_empty() {
                 println!("recent seals:");
                 for s in &ctx.recent_seals {
-                    println!("  {} {} — {}", s.id, s.agent, s.summary);
+                    let spec_part = s
+                        .spec_id
+                        .as_deref()
+                        .map(|id| format!(" spec:{id}"))
+                        .unwrap_or_default();
+                    let verify_part = match &s.verification {
+                        Some(v) => {
+                            let mut parts = Vec::new();
+                            if let Some(p) = v.tests_passed {
+                                parts.push(format!("{p}ok"));
+                            }
+                            if let Some(f) = v.tests_failed {
+                                parts.push(format!("{f}fail"));
+                            }
+                            if v.linted {
+                                parts.push("lint".to_string());
+                            }
+                            format!(" [{}]", parts.join(","))
+                        }
+                        None => String::new(),
+                    };
+                    println!(
+                        "  {} {} [{}] — {}{}{}",
+                        s.id, s.agent, s.status, s.summary, spec_part, verify_part
+                    );
+                    for p in &s.changed_paths {
+                        println!("    → {p}");
+                    }
                 }
                 println!();
             }
 
             println!("tracked: {} file(s)", ctx.tracked_files);
+
+            if !ctx.available_operations.is_empty() {
+                println!();
+                println!("available operations:");
+                for op in &ctx.available_operations {
+                    println!("  {op}");
+                }
+            }
         }
         _ => {
-            // Default: JSON
             println!("{}", serde_json::to_string_pretty(&ctx)?);
         }
     }
@@ -1004,6 +1131,91 @@ fn cmd_spec_show(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Erro
         println!("  sealed by:   {} seal(s)", spec.sealed_by.len());
         for sid in &spec.sealed_by {
             println!("    {}", &sid[..12]);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_bridge_import(
+    cwd: &PathBuf,
+    git_ref: &str,
+    agent_id: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+
+    let agent = AgentIdentity {
+        id: agent_id.to_string(),
+        agent_type: AgentType::Agent,
+    };
+
+    let result = repo.bridge_import(Some(git_ref), agent)?;
+
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&result)?),
+        _ => {
+            println!("imported git {} as seal {}", &result.git_commit[..12], &result.seal_id[..12]);
+            println!("  ref:   {}", result.git_ref);
+            println!("  files: {}", result.files_imported);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_bridge_export(
+    cwd: &PathBuf,
+    branch: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+
+    let result = repo.bridge_export(Some(branch))?;
+
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&result)?),
+        _ => {
+            if result.seals_exported == 0 {
+                println!("nothing to export — all seals already synced");
+            } else {
+                println!(
+                    "exported {} seal(s) to branch {}",
+                    result.seals_exported, result.branch
+                );
+                for e in &result.exported {
+                    println!("  {} → {} — {}", &e.seal_id[..12], &e.git_commit[..12], e.summary);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_bridge_status(
+    cwd: &PathBuf,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+
+    let status = repo.bridge_status()?;
+
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&status)?),
+        _ => {
+            if !status.initialized {
+                println!("bridge not initialized — run `writ bridge import` first");
+            } else {
+                if let Some(ref imp) = status.last_import {
+                    println!("last import: git {} → seal {}", &imp.git_commit[..12], &imp.seal_id[..12]);
+                    println!("  ref: {}", imp.git_ref);
+                }
+                if let Some(ref exp) = status.last_export {
+                    println!("last export: seal {} → git {} (branch: {})", &exp.seal_id[..12], &exp.git_commit[..12], exp.branch);
+                }
+                println!("pending: {} seal(s) to export", status.pending_export_count);
+            }
         }
     }
 

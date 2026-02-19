@@ -28,6 +28,12 @@ pub enum WritError {
     UnresolvedConflicts(usize),
     /// Could not acquire the repository lock within the timeout.
     LockTimeout,
+    /// No git repository found.
+    NoGitRepo,
+    /// A git operation failed.
+    GitError(String),
+    /// Bridge state is inconsistent.
+    BridgeError(String),
     /// Generic error with a message.
     Other(String),
 }
@@ -48,6 +54,9 @@ impl fmt::Display for WritError {
                 write!(f, "{n} unresolved conflict(s) — provide resolutions before applying")
             }
             WritError::LockTimeout => write!(f, "could not acquire repository lock within timeout"),
+            WritError::NoGitRepo => write!(f, "no git repository found"),
+            WritError::GitError(msg) => write!(f, "git error: {msg}"),
+            WritError::BridgeError(msg) => write!(f, "bridge error: {msg}"),
             WritError::Other(msg) => write!(f, "{msg}"),
         }
     }
@@ -64,6 +73,13 @@ impl From<io::Error> for WritError {
 impl From<serde_json::Error> for WritError {
     fn from(e: serde_json::Error) -> Self {
         WritError::Json(e)
+    }
+}
+
+#[cfg(feature = "bridge")]
+impl From<git2::Error> for WritError {
+    fn from(e: git2::Error) -> Self {
+        WritError::GitError(e.message().to_string())
     }
 }
 

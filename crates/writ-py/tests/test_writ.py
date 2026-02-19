@@ -425,6 +425,266 @@ class TestConvergence:
         assert isinstance(result, str)
 
 
+class TestAllowEmpty:
+    def test_seal_allow_empty(self, tmp_repo):
+        """allow_empty=True on a clean repo succeeds."""
+        repo, path = tmp_repo
+        seal = repo.seal(summary="metadata only", allow_empty=True)
+        assert isinstance(seal, dict)
+        assert seal["summary"] == "metadata only"
+        assert len(seal["changes"]) == 0
+
+    def test_seal_allow_empty_default_false(self, tmp_repo):
+        """Default allow_empty (False) still raises on clean repo."""
+        repo, path = tmp_repo
+        with pytest.raises(writ.WritError):
+            repo.seal(summary="should fail")
+
+
+class TestEnrichedContext:
+    def test_context_seal_summary_enriched(self, tmp_repo):
+        """Verification data appears in context seal summaries."""
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("content")
+        repo.seal(
+            summary="verified",
+            agent_id="worker-1",
+            agent_type="agent",
+            tests_passed=42,
+            tests_failed=0,
+            linted=True,
+        )
+
+        ctx = repo.context()
+        seal_summary = ctx["recent_seals"][0]
+        assert seal_summary["status"] == "complete"
+        assert seal_summary["verification"]["tests_passed"] == 42
+        assert seal_summary["verification"]["linted"] is True
+
+    def test_context_available_operations(self, tmp_repo):
+        """available_operations is present and non-empty."""
+        repo, path = tmp_repo
+        ctx = repo.context()
+        assert "available_operations" in ctx
+        assert isinstance(ctx["available_operations"], list)
+        assert len(ctx["available_operations"]) > 0
+
+    def test_context_seal_summary_omits_empty_verification(self, tmp_repo):
+        """Empty verification is omitted from context seal summaries."""
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("content")
+        repo.seal(summary="no verification")
+
+        ctx = repo.context()
+        seal_summary = ctx["recent_seals"][0]
+        assert seal_summary["status"] == "complete"
+        assert "verification" not in seal_summary
+
+
+class TestContextFiltering:
+    def test_filter_by_status(self, tmp_repo):
+        """Filter seals by task status."""
+        repo, path = tmp_repo
+        (path / "a.txt").write_text("alpha")
+        repo.seal(summary="wip", status="in-progress")
+        (path / "b.txt").write_text("beta")
+        repo.seal(summary="done", status="complete")
+
+        ctx = repo.context(status="complete")
+        assert len(ctx["recent_seals"]) == 1
+        assert ctx["recent_seals"][0]["status"] == "complete"
+
+        ctx = repo.context(status="in-progress")
+        assert len(ctx["recent_seals"]) == 1
+        assert ctx["recent_seals"][0]["status"] == "in-progress"
+
+    def test_filter_by_agent(self, tmp_repo):
+        """Filter seals by agent ID."""
+        repo, path = tmp_repo
+        (path / "a.txt").write_text("alpha")
+        repo.seal(summary="by alpha", agent_id="agent-alpha", agent_type="agent")
+        (path / "b.txt").write_text("beta")
+        repo.seal(summary="by beta", agent_id="agent-beta", agent_type="agent")
+
+        ctx = repo.context(agent="agent-alpha")
+        assert len(ctx["recent_seals"]) == 1
+        assert ctx["recent_seals"][0]["agent"] == "agent-alpha"
+
+    def test_filter_combined(self, tmp_repo):
+        """Combined status + agent filter."""
+        repo, path = tmp_repo
+        (path / "a.txt").write_text("a")
+        repo.seal(summary="w1 wip", agent_id="w1", agent_type="agent", status="in-progress")
+        (path / "b.txt").write_text("b")
+        repo.seal(summary="w2 done", agent_id="w2", agent_type="agent", status="complete")
+        (path / "c.txt").write_text("c")
+        repo.seal(summary="w1 done", agent_id="w1", agent_type="agent", status="complete")
+
+        ctx = repo.context(status="complete", agent="w1")
+        assert len(ctx["recent_seals"]) == 1
+        assert ctx["recent_seals"][0]["summary"] == "w1 done"
+
+    def test_filter_invalid_status(self, tmp_repo):
+        """Invalid status filter raises ValueError."""
+        repo, _ = tmp_repo
+        with pytest.raises(ValueError, match="unknown status"):
+            repo.context(status="banana")
+
+    def test_no_filter_returns_all(self, tmp_repo):
+        """Default (no filter) returns all seals."""
+        repo, path = tmp_repo
+        (path / "a.txt").write_text("a")
+        repo.seal(summary="first")
+        (path / "b.txt").write_text("b")
+        repo.seal(summary="second")
+
+        ctx = repo.context()
+        assert len(ctx["recent_seals"]) == 2
+
+
+class TestSealNudge:
+    def test_nudge_present_when_dirty(self, tmp_repo):
+        """seal_nudge appears when working directory has unsealed changes."""
+        repo, path = tmp_repo
+        (path / "tracked.txt").write_text("initial")
+        repo.seal(summary="base")
+
+        (path / "tracked.txt").write_text("modified")
+        (path / "new.txt").write_text("brand new")
+
+        ctx = repo.context()
+        assert "seal_nudge" in ctx
+        nudge = ctx["seal_nudge"]
+        assert nudge["unsealed_file_count"] == 2
+        assert "2 file(s) changed" in nudge["message"]
+
+    def test_nudge_absent_when_clean(self, tmp_repo):
+        """seal_nudge is omitted when working directory is clean."""
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("clean")
+        repo.seal(summary="sealed")
+
+        ctx = repo.context()
+        assert "seal_nudge" not in ctx
+
+
+class TestChangedPaths:
+    def test_seal_summary_has_paths(self, tmp_repo):
+        """Seal summaries include changed_paths for file relevance."""
+        repo, path = tmp_repo
+        (path / "auth.py").write_text("pass")
+        (path / "main.py").write_text("run")
+        repo.seal(summary="initial")
+
+        ctx = repo.context()
+        paths = ctx["recent_seals"][0]["changed_paths"]
+        assert len(paths) == 2
+        assert "auth.py" in paths
+        assert "main.py" in paths
+
+    def test_changed_paths_omitted_when_empty(self, tmp_repo):
+        """changed_paths is omitted from JSON when empty (allow_empty seal)."""
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("x")
+        repo.seal(summary="has files")
+
+        repo.seal(summary="metadata only", allow_empty=True)
+        ctx = repo.context()
+        empty_seal = ctx["recent_seals"][0]
+        assert "changed_paths" not in empty_seal
+
+
+class TestBridge:
+    def _setup_git_repo(self, path):
+        """Initialize a git repo with some files and an initial commit."""
+        import subprocess
+
+        subprocess.run(["git", "init"], cwd=str(path), check=True, capture_output=True)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            cwd=str(path),
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            cwd=str(path),
+            check=True,
+            capture_output=True,
+        )
+        (path / "main.py").write_text("print('hello')")
+        (path / "README.md").write_text("# Project")
+        subprocess.run(
+            ["git", "add", "."], cwd=str(path), check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial"],
+            cwd=str(path),
+            check=True,
+            capture_output=True,
+        )
+
+    def test_bridge_import(self, tmp_path):
+        """bridge_import creates a baseline seal from git state."""
+        self._setup_git_repo(tmp_path)
+        repo = writ.Repository.init(str(tmp_path))
+        result = repo.bridge_import()
+        assert isinstance(result, dict)
+        assert "seal_id" in result
+        assert result["files_imported"] > 0
+        assert result["git_ref"] == "HEAD"
+
+    def test_bridge_export(self, tmp_path):
+        """bridge_export creates git commits from writ seals."""
+        self._setup_git_repo(tmp_path)
+        repo = writ.Repository.init(str(tmp_path))
+        repo.bridge_import()
+
+        (tmp_path / "new_file.py").write_text("# new")
+        repo.seal(summary="agent work")
+
+        result = repo.bridge_export()
+        assert isinstance(result, dict)
+        assert result["seals_exported"] == 1
+        assert result["branch"] == "writ/export"
+
+    def test_bridge_status(self, tmp_path):
+        """bridge_status reports sync state."""
+        self._setup_git_repo(tmp_path)
+        repo = writ.Repository.init(str(tmp_path))
+
+        status = repo.bridge_status()
+        assert status["initialized"] is False
+
+        repo.bridge_import()
+        status = repo.bridge_status()
+        assert status["initialized"] is True
+        assert status["pending_export_count"] == 0
+
+    def test_bridge_roundtrip_json_serializable(self, tmp_path):
+        """All bridge results are JSON-serializable."""
+        import json
+
+        self._setup_git_repo(tmp_path)
+        repo = writ.Repository.init(str(tmp_path))
+        import_result = repo.bridge_import()
+        assert isinstance(json.dumps(import_result), str)
+
+        (tmp_path / "x.txt").write_text("x")
+        repo.seal(summary="change")
+        export_result = repo.bridge_export()
+        assert isinstance(json.dumps(export_result), str)
+
+        status = repo.bridge_status()
+        assert isinstance(json.dumps(status), str)
+
+    def test_bridge_no_git_repo_raises(self, tmp_repo):
+        """bridge_import on a non-git directory raises WritError."""
+        repo, path = tmp_repo
+        with pytest.raises(writ.WritError, match="git"):
+            repo.bridge_import()
+
+
 class TestLocking:
     def test_lock_timeout_error(self, tmp_repo):
         """Hold a lock via the filesystem and verify seal raises WritError."""

@@ -4,6 +4,8 @@
 //! Its core primitives are **specs** (not branches), **seals** (not commits),
 //! and **convergence** (not merging).
 
+#[cfg(feature = "bridge")]
+pub mod bridge;
 pub mod context;
 pub mod convergence;
 pub mod diff;

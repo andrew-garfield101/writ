@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 
-use writ_core::context::ContextScope;
+use writ_core::context::{ContextFilter, ContextScope};
 use writ_core::seal::{AgentIdentity, TaskStatus, Verification};
 use writ_core::spec::{Spec, SpecUpdate};
 
@@ -128,7 +128,7 @@ impl PyRepository {
     ///
     /// If `paths` is provided, only seal matching files (selective seal).
     /// Otherwise seals all changes.
-    #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="complete", paths=None, tests_passed=None, tests_failed=None, linted=false))]
+    #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="complete", paths=None, tests_passed=None, tests_failed=None, linted=false, allow_empty=false))]
     fn seal(
         &self,
         py: Python,
@@ -141,6 +141,7 @@ impl PyRepository {
         tests_passed: Option<u32>,
         tests_failed: Option<u32>,
         linted: bool,
+        allow_empty: bool,
     ) -> PyResult<PyObject> {
         let agent = AgentIdentity {
             id: agent_id.to_string(),
@@ -162,6 +163,7 @@ impl PyRepository {
                     task_status,
                     verification,
                     p,
+                    allow_empty,
                 )
                 .map_err(writ_err)?
         } else {
@@ -172,6 +174,7 @@ impl PyRepository {
                     spec_id,
                     task_status,
                     verification,
+                    allow_empty,
                 )
                 .map_err(writ_err)?
         };
@@ -208,18 +211,42 @@ impl PyRepository {
     }
 
     /// Get structured context for LLM consumption.
-    #[pyo3(signature = (spec=None, seal_limit=10))]
+    ///
+    /// Optional filters narrow the seal history before `seal_limit` is applied:
+    /// - `status`: "in-progress", "complete", or "blocked"
+    /// - `agent`: agent ID string
+    #[pyo3(signature = (spec=None, seal_limit=10, status=None, agent=None))]
     fn context(
         &self,
         py: Python,
         spec: Option<String>,
         seal_limit: usize,
+        status: Option<String>,
+        agent: Option<String>,
     ) -> PyResult<PyObject> {
         let scope = match spec {
             Some(id) => ContextScope::Spec(id),
             None => ContextScope::Full,
         };
-        let ctx = self.inner.context(scope, seal_limit).map_err(writ_err)?;
+        let filter_status = match status.as_deref() {
+            Some("in-progress") => Some(TaskStatus::InProgress),
+            Some("complete") => Some(TaskStatus::Complete),
+            Some("blocked") => Some(TaskStatus::Blocked),
+            Some(other) => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "unknown status filter: '{other}' (use in-progress, complete, or blocked)"
+                )));
+            }
+            None => None,
+        };
+        let filter = ContextFilter {
+            status: filter_status,
+            agent,
+        };
+        let ctx = self
+            .inner
+            .context(scope, seal_limit, &filter)
+            .map_err(writ_err)?;
         to_pydict(py, &ctx)
     }
 
@@ -326,6 +353,36 @@ impl PyRepository {
             .map_err(writ_err)?;
 
         Ok(())
+    }
+
+    /// Import git state as a writ baseline seal.
+    #[pyo3(signature = (git_ref="HEAD", agent_id="bridge", agent_type="agent"))]
+    fn bridge_import(
+        &self,
+        py: Python,
+        git_ref: &str,
+        agent_id: &str,
+        agent_type: &str,
+    ) -> PyResult<PyObject> {
+        let agent = AgentIdentity {
+            id: agent_id.to_string(),
+            agent_type: parse_agent_type(agent_type)?,
+        };
+        let result = self.inner.bridge_import(Some(git_ref), agent).map_err(writ_err)?;
+        to_pydict(py, &result)
+    }
+
+    /// Export writ seals as git commits on a branch.
+    #[pyo3(signature = (branch="writ/export"))]
+    fn bridge_export(&self, py: Python, branch: &str) -> PyResult<PyObject> {
+        let result = self.inner.bridge_export(Some(branch)).map_err(writ_err)?;
+        to_pydict(py, &result)
+    }
+
+    /// Get bridge sync status.
+    fn bridge_status(&self, py: Python) -> PyResult<PyObject> {
+        let status = self.inner.bridge_status().map_err(writ_err)?;
+        to_pydict(py, &status)
     }
 }
 

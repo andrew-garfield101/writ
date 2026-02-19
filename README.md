@@ -2,6 +2,9 @@
 
 **AI-native version control for agentic systems.**
 
+> *"Every minute an agent spends figuring out 'what happened before me' is wasted compute. Writ minimizes that."*
+> — AAIS_2, after its first production session using writ
+
 Writ is a version control system designed from the ground up for LLMs and multi-agent development fleets. Its core primitives are **specs** (not branches), **seals** (not commits), and **convergence** (not merging).
 
 ## Why not git?
@@ -165,7 +168,7 @@ writ/
 
 **Storage model:** Content-addressable object store (SHA-256, 2-char prefix directories). Seals and specs stored as JSON in `.writ/seals/` and `.writ/specs/`. Index at `.writ/index.json`. HEAD pointer at `.writ/HEAD`.
 
-**Test coverage:** 81 Rust tests + 35 Python tests = 116 total tests.
+**Test coverage:** 127 Rust tests + 59 Python tests = 186 total tests.
 
 ## Building from source
 
@@ -184,9 +187,10 @@ pytest tests/
 
 ## Roadmap
 
-The core VCS primitives are implemented. What's ahead:
+Core VCS, convergence, and enriched context are implemented and validated by two independent E2E agent tests. What's ahead:
 
-- **Convergence** — writ's answer to merging. When multiple agents modify overlapping files, their seals need to reconcile. This is the hardest unsolved problem.
+- **Context filtering** — `context(spec=, status=, agent=)` for scale. When seal counts hit dozens, agents need to query by dimension, not scan everything.
+- **Git bridge** — `writ bridge import` / `writ bridge export` for seamless round-trip with git. Human code lives in git; agents work in writ; the bridge translates between them.
 - **Remote/shared state** — `writ push` / `writ pull` for agents running across machines or processes. Currently locking is local (`flock`-based); distributed locking for multi-machine scenarios is future work.
 - **Agent SDK** — Higher-level Python toolkit for common agent workflows (task pickup, context loading, seal-on-completion patterns).
 

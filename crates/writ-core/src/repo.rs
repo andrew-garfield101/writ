@@ -15,7 +15,8 @@ use crate::convergence::{
 };
 use crate::lock::RepoLock;
 use crate::context::{
-    ContextOutput, ContextScope, DiffSummary, SealSummary, WorkingStateSummary,
+    ContextFilter, ContextOutput, ContextScope, DiffSummary, SealNudge, SealSummary,
+    WorkingStateSummary,
 };
 use crate::diff::{self, DiffOutput, FileDiff};
 use crate::error::{WritError, WritResult};
@@ -107,13 +108,14 @@ impl Repository {
         spec_id: Option<String>,
         status: TaskStatus,
         verification: Verification,
+        allow_empty: bool,
     ) -> WritResult<Seal> {
         let _lock = self.lock()?;
         let mut index = self.load_index()?;
         let rules = self.ignore_rules();
         let working_state = state::compute_state(&self.root, &index, &rules);
 
-        if working_state.is_clean() {
+        if working_state.is_clean() && !allow_empty {
             return Err(WritError::NothingToSeal);
         }
 
@@ -364,10 +366,14 @@ impl Repository {
     }
 
     /// Generate a structured context dump optimized for LLM consumption.
+    ///
+    /// `filter` narrows the seal history by status and/or agent. The filter
+    /// is applied *before* `seal_limit` truncation.
     pub fn context(
         &self,
         scope: ContextScope,
         seal_limit: usize,
+        filter: &ContextFilter,
     ) -> WritResult<ContextOutput> {
         let working_state = self.state()?;
         let seals = self.log()?;
@@ -380,11 +386,69 @@ impl Repository {
             None
         };
 
+        let seal_nudge = if !working_state.is_clean() {
+            let count = working_state.changes.len();
+            let msg = format!(
+                "{count} file(s) changed since last seal — consider checkpointing with seal()"
+            );
+            Some(SealNudge {
+                unsealed_file_count: count,
+                message: msg,
+            })
+        } else {
+            None
+        };
+
+        let available_operations = vec![
+            "state()".to_string(),
+            "seal(summary, agent_id?, spec_id?, status?, allow_empty?)".to_string(),
+            "log(limit?)".to_string(),
+            "diff()".to_string(),
+            "diff_seals(from_id, to_id)".to_string(),
+            "diff_seal(seal_id)".to_string(),
+            "get_seal(seal_id)".to_string(),
+            "restore(seal_id)".to_string(),
+            "context(spec?, seal_limit?, status?, agent?)".to_string(),
+            "add_spec(id, title, description?)".to_string(),
+            "update_spec(id, status?, depends_on?, file_scope?)".to_string(),
+            "list_specs()".to_string(),
+            "converge(left_spec, right_spec)".to_string(),
+            "apply_convergence(report, resolutions?)".to_string(),
+            "bridge_import(git_ref?)".to_string(),
+            "bridge_export(branch?)".to_string(),
+            "bridge_status()".to_string(),
+        ];
+
+        let apply_filter = |seal: &&Seal| -> bool {
+            if let Some(ref status) = filter.status {
+                let status_str = match status {
+                    TaskStatus::InProgress => "in-progress",
+                    TaskStatus::Complete => "complete",
+                    TaskStatus::Blocked => "blocked",
+                };
+                let seal_str = match seal.status {
+                    TaskStatus::InProgress => "in-progress",
+                    TaskStatus::Complete => "complete",
+                    TaskStatus::Blocked => "blocked",
+                };
+                if status_str != seal_str {
+                    return false;
+                }
+            }
+            if let Some(ref agent) = filter.agent {
+                if seal.agent.id != *agent {
+                    return false;
+                }
+            }
+            true
+        };
+
         match scope {
             ContextScope::Full => {
                 let specs = self.list_specs()?;
                 let recent: Vec<SealSummary> = seals
                     .iter()
+                    .filter(apply_filter)
                     .take(seal_limit)
                     .map(SealSummary::from_seal)
                     .collect();
@@ -400,8 +464,10 @@ impl Repository {
                     working_state: ws_summary,
                     recent_seals: recent,
                     pending_changes,
+                    seal_nudge,
                     file_scope,
                     tracked_files,
+                    available_operations,
                 })
             }
             ContextScope::Spec(spec_id) => {
@@ -409,6 +475,7 @@ impl Repository {
                 let spec_seals: Vec<SealSummary> = seals
                     .iter()
                     .filter(|s| s.spec_id.as_deref() == Some(spec_id.as_str()))
+                    .filter(apply_filter)
                     .take(seal_limit)
                     .map(SealSummary::from_seal)
                     .collect();
@@ -428,8 +495,10 @@ impl Repository {
                     working_state: ws_summary,
                     recent_seals: spec_seals,
                     pending_changes,
+                    seal_nudge,
                     file_scope,
                     tracked_files,
+                    available_operations,
                 })
             }
         }
@@ -802,6 +871,7 @@ impl Repository {
         status: TaskStatus,
         verification: Verification,
         paths: &[String],
+        allow_empty: bool,
     ) -> WritResult<Seal> {
         let _lock = self.lock()?;
         let mut index = self.load_index()?;
@@ -818,7 +888,7 @@ impl Repository {
             })
             .collect();
 
-        if matching_changes.is_empty() {
+        if matching_changes.is_empty() && !allow_empty {
             return Err(WritError::NothingToSeal);
         }
 
@@ -1100,6 +1170,381 @@ impl Repository {
         }
         Ok(())
     }
+
+    // --- Bridge: git ↔ writ round-trip ---
+
+    #[cfg(feature = "bridge")]
+    fn load_bridge_state(&self) -> WritResult<crate::bridge::BridgeState> {
+        let path = self.writ_dir.join("bridge.json");
+        if !path.exists() {
+            return Ok(crate::bridge::BridgeState::default());
+        }
+        let data = fs::read_to_string(&path)?;
+        Ok(serde_json::from_str(&data)?)
+    }
+
+    #[cfg(feature = "bridge")]
+    fn save_bridge_state(&self, state: &crate::bridge::BridgeState) -> WritResult<()> {
+        let path = self.writ_dir.join("bridge.json");
+        let json = serde_json::to_string_pretty(state)?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Import git state as a baseline writ seal.
+    ///
+    /// Reads the tree at `git_ref` (default "HEAD"), stores all file contents
+    /// in writ's object store, and creates a seal representing that snapshot.
+    #[cfg(feature = "bridge")]
+    pub fn bridge_import(
+        &self,
+        git_ref: Option<&str>,
+        agent: AgentIdentity,
+    ) -> WritResult<crate::bridge::ImportResult> {
+        use crate::bridge::{BridgeState, ImportResult};
+
+        let git_ref_str = git_ref.unwrap_or("HEAD");
+
+        // Open the git repository (discover walks up to find .git/)
+        let git_repo = git2::Repository::discover(&self.root)
+            .map_err(|_| WritError::NoGitRepo)?;
+
+        // Resolve ref to a commit
+        let obj = git_repo
+            .revparse_single(git_ref_str)
+            .map_err(|e| WritError::GitError(format!("cannot resolve '{}': {}", git_ref_str, e)))?;
+        let commit = obj
+            .peel_to_commit()
+            .map_err(|e| WritError::GitError(format!("not a commit: {}", e)))?;
+        let git_commit_hash = commit.id().to_string();
+        let tree = commit.tree()?;
+
+        // Walk the git tree, store every blob in writ's object store
+        let _lock = self.lock()?;
+        let mut index = Index::default();
+        let mut changes = Vec::new();
+
+        self.walk_git_tree(&git_repo, &tree, "", &mut index, &mut changes)?;
+
+        // Build tree hash from the new index
+        let tree_json = serde_json::to_string(&index.entries)?;
+        let tree_hash = self.objects.store(tree_json.as_bytes())?;
+
+        // Read the current HEAD to chain from existing writ history (if any)
+        let parent = self.read_head()?;
+
+        let short_hash = &git_commit_hash[..12.min(git_commit_hash.len())];
+        let seal = Seal::new(
+            parent,
+            tree_hash,
+            agent,
+            None,
+            TaskStatus::Complete,
+            changes.clone(),
+            Verification::default(),
+            format!("bridge import from git {short_hash}"),
+        );
+
+        self.save_seal(&seal)?;
+        fs::write(self.writ_dir.join("HEAD"), &seal.id)?;
+        index.save(&self.writ_dir.join("index.json"))?;
+
+        // Save bridge state
+        let bridge_state = BridgeState {
+            last_imported_git_commit: Some(git_commit_hash.clone()),
+            last_imported_seal_id: Some(seal.id.clone()),
+            imported_from_ref: Some(git_ref_str.to_string()),
+            last_sync_at: Some(chrono::Utc::now()),
+            ..Default::default()
+        };
+        self.save_bridge_state(&bridge_state)?;
+
+        Ok(ImportResult {
+            git_commit: git_commit_hash,
+            git_ref: git_ref_str.to_string(),
+            seal_id: seal.id,
+            files_imported: changes.len(),
+        })
+    }
+
+    /// Recursively walk a git tree and store all blobs in writ's object store.
+    #[cfg(feature = "bridge")]
+    fn walk_git_tree(
+        &self,
+        git_repo: &git2::Repository,
+        tree: &git2::Tree,
+        prefix: &str,
+        index: &mut Index,
+        changes: &mut Vec<FileChange>,
+    ) -> WritResult<()> {
+        for entry in tree.iter() {
+            let name = entry.name().unwrap_or("");
+            let path = if prefix.is_empty() {
+                name.to_string()
+            } else {
+                format!("{prefix}/{name}")
+            };
+
+            // Skip .writ/ and .git/ directories
+            if path == ".writ" || path == ".git" || path.starts_with(".writ/") || path.starts_with(".git/") {
+                continue;
+            }
+
+            match entry.kind() {
+                Some(git2::ObjectType::Blob) => {
+                    let obj = entry.to_object(git_repo)?;
+                    let blob = obj.as_blob().ok_or_else(|| {
+                        WritError::GitError(format!("expected blob at {path}"))
+                    })?;
+                    let content = blob.content();
+                    let hash = self.objects.store(content)?;
+                    let size = content.len() as u64;
+                    index.upsert(&path, hash.clone(), size);
+                    changes.push(FileChange {
+                        path,
+                        change_type: ChangeType::Added,
+                        old_hash: None,
+                        new_hash: Some(hash),
+                    });
+                }
+                Some(git2::ObjectType::Tree) => {
+                    let obj = entry.to_object(git_repo)?;
+                    let subtree = obj.as_tree().ok_or_else(|| {
+                        WritError::GitError(format!("expected tree at {path}"))
+                    })?;
+                    self.walk_git_tree(git_repo, subtree, &path, index, changes)?;
+                }
+                _ => {} // skip submodules, etc.
+            }
+        }
+        Ok(())
+    }
+
+    /// Export writ seals as git commits on a branch.
+    ///
+    /// Creates one git commit per seal since the last export (or since
+    /// the import baseline).
+    #[cfg(feature = "bridge")]
+    pub fn bridge_export(
+        &self,
+        branch: Option<&str>,
+    ) -> WritResult<crate::bridge::ExportResult> {
+        use crate::bridge::{ExportResult, ExportedSeal};
+
+        let branch_name = branch.unwrap_or("writ/export");
+        let mut bridge_state = self.load_bridge_state()?;
+
+        if bridge_state.last_imported_git_commit.is_none() {
+            return Err(WritError::BridgeError(
+                "import required before export — run bridge_import first".to_string(),
+            ));
+        }
+
+        let git_repo = git2::Repository::discover(&self.root)
+            .map_err(|_| WritError::NoGitRepo)?;
+
+        // Determine the boundary seal (last export or last import)
+        let boundary_seal_id = bridge_state
+            .last_exported_seal_id
+            .as_deref()
+            .or(bridge_state.last_imported_seal_id.as_deref())
+            .unwrap()
+            .to_string();
+
+        // Collect seals to export (newest-first from log, stop at boundary)
+        let all_seals = self.log()?;
+        let mut to_export = Vec::new();
+        for seal in &all_seals {
+            if seal.id == boundary_seal_id {
+                break;
+            }
+            to_export.push(seal);
+        }
+        to_export.reverse(); // oldest first for commit ordering
+
+        if to_export.is_empty() {
+            return Ok(ExportResult {
+                branch: branch_name.to_string(),
+                exported: Vec::new(),
+                seals_exported: 0,
+            });
+        }
+
+        // Find the git parent commit
+        let parent_git_hash = bridge_state
+            .last_exported_git_commit
+            .as_deref()
+            .or(bridge_state.last_imported_git_commit.as_deref())
+            .unwrap();
+        let parent_oid = git2::Oid::from_str(parent_git_hash)?;
+        let mut parent_commit = git_repo.find_commit(parent_oid)?;
+
+        let mut exported = Vec::new();
+
+        for seal in &to_export {
+            let writ_index = self.load_tree_index(&seal.tree)?;
+            let git_tree_oid = self.build_git_tree(&git_repo, &writ_index)?;
+            let git_tree = git_repo.find_tree(git_tree_oid)?;
+
+            // Build commit message with trailers
+            let mut message = seal.summary.clone();
+            message.push_str("\n\n");
+            message.push_str(&format!("Writ-Seal-Id: {}\n", seal.id));
+            if let Some(ref spec) = seal.spec_id {
+                message.push_str(&format!("Writ-Spec: {spec}\n"));
+            }
+            let status_str = match seal.status {
+                TaskStatus::InProgress => "in-progress",
+                TaskStatus::Complete => "complete",
+                TaskStatus::Blocked => "blocked",
+            };
+            message.push_str(&format!("Writ-Status: {status_str}\n"));
+            if let Some(p) = seal.verification.tests_passed {
+                message.push_str(&format!("Writ-Tests-Passed: {p}\n"));
+            }
+            if let Some(f) = seal.verification.tests_failed {
+                message.push_str(&format!("Writ-Tests-Failed: {f}\n"));
+            }
+            if seal.verification.linted {
+                message.push_str("Writ-Linted: true\n");
+            }
+
+            // Create author signature from seal agent + timestamp
+            let timestamp = seal.timestamp.timestamp();
+            let sig = git2::Signature::new(
+                &seal.agent.id,
+                &format!("{}@writ", seal.agent.id),
+                &git2::Time::new(timestamp, 0),
+            )?;
+
+            let new_commit_oid = git_repo.commit(
+                None, // don't update any ref yet
+                &sig,
+                &sig,
+                &message,
+                &git_tree,
+                &[&parent_commit],
+            )?;
+
+            exported.push(ExportedSeal {
+                seal_id: seal.id.clone(),
+                git_commit: new_commit_oid.to_string(),
+                summary: seal.summary.clone(),
+            });
+
+            parent_commit = git_repo.find_commit(new_commit_oid)?;
+        }
+
+        // Point the branch at the final commit
+        let final_oid = parent_commit.id();
+        let refname = format!("refs/heads/{branch_name}");
+        git_repo.reference(&refname, final_oid, true, "writ bridge export")?;
+
+        // Update bridge state
+        bridge_state.last_exported_seal_id = Some(to_export.last().unwrap().id.clone());
+        bridge_state.exported_to_branch = Some(branch_name.to_string());
+        bridge_state.last_exported_git_commit = Some(final_oid.to_string());
+        bridge_state.last_sync_at = Some(chrono::Utc::now());
+        self.save_bridge_state(&bridge_state)?;
+
+        let seals_exported = exported.len();
+        Ok(ExportResult {
+            branch: branch_name.to_string(),
+            exported,
+            seals_exported,
+        })
+    }
+
+    /// Build a nested git tree from a flat writ index.
+    #[cfg(feature = "bridge")]
+    fn build_git_tree(
+        &self,
+        git_repo: &git2::Repository,
+        writ_index: &Index,
+    ) -> WritResult<git2::Oid> {
+        let mut tree_builder = git_repo.treebuilder(None)?;
+
+        // Partition entries: files at this level vs subdirectories
+        let mut subdirs: BTreeMap<String, Index> = BTreeMap::new();
+
+        for (path, entry) in &writ_index.entries {
+            if let Some(slash_pos) = path.find('/') {
+                let dir = &path[..slash_pos];
+                let rest = &path[slash_pos + 1..];
+                subdirs
+                    .entry(dir.to_string())
+                    .or_default()
+                    .entries
+                    .insert(rest.to_string(), entry.clone());
+            } else {
+                // File at this level — create blob
+                let content = self.objects.retrieve(&entry.hash)?;
+                let blob_oid = git_repo.blob(&content)?;
+                tree_builder.insert(path, blob_oid, 0o100644)?;
+            }
+        }
+
+        // Recurse into subdirectories
+        for (dir_name, sub_index) in &subdirs {
+            let sub_tree_oid = self.build_git_tree(git_repo, &sub_index)?;
+            tree_builder.insert(dir_name, sub_tree_oid, 0o040000)?;
+        }
+
+        let tree_oid = tree_builder.write()?;
+        Ok(tree_oid)
+    }
+
+    /// Get current bridge sync status.
+    #[cfg(feature = "bridge")]
+    pub fn bridge_status(&self) -> WritResult<crate::bridge::BridgeStatus> {
+        use crate::bridge::{BridgeStatus, ExportSummary, ImportSummary};
+
+        let state = self.load_bridge_state()?;
+
+        if state.last_imported_git_commit.is_none() {
+            return Ok(BridgeStatus {
+                initialized: false,
+                last_import: None,
+                last_export: None,
+                pending_export_count: 0,
+            });
+        }
+
+        let last_import = Some(ImportSummary {
+            git_commit: state.last_imported_git_commit.clone().unwrap(),
+            git_ref: state.imported_from_ref.clone().unwrap_or_default(),
+            seal_id: state.last_imported_seal_id.clone().unwrap(),
+        });
+
+        let last_export = match (&state.last_exported_seal_id, &state.last_exported_git_commit, &state.exported_to_branch) {
+            (Some(seal_id), Some(git_commit), Some(branch)) => Some(ExportSummary {
+                seal_id: seal_id.clone(),
+                git_commit: git_commit.clone(),
+                branch: branch.clone(),
+            }),
+            _ => None,
+        };
+
+        // Count pending seals
+        let boundary = state.last_exported_seal_id.as_deref()
+            .or(state.last_imported_seal_id.as_deref())
+            .unwrap();
+        let all_seals = self.log()?;
+        let mut pending = 0;
+        for seal in &all_seals {
+            if seal.id == boundary {
+                break;
+            }
+            pending += 1;
+        }
+
+        Ok(BridgeStatus {
+            initialized: true,
+            last_import,
+            last_export,
+            pending_export_count: pending,
+        })
+    }
 }
 
 /// The result of a restore operation.
@@ -1182,6 +1627,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1201,6 +1647,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         );
         assert!(result.is_err());
     }
@@ -1225,6 +1672,7 @@ mod tests {
             None,
             TaskStatus::InProgress,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -1235,6 +1683,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -1278,6 +1727,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -1310,6 +1760,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -1334,6 +1785,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -1358,6 +1810,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1370,6 +1823,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1393,7 +1847,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
 
-        let ctx = repo.context(ContextScope::Full, 10).unwrap();
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
         assert!(ctx.working_state.clean);
         assert!(ctx.recent_seals.is_empty());
         assert!(ctx.pending_changes.is_none());
@@ -1412,10 +1866,11 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
-        let ctx = repo.context(ContextScope::Full, 10).unwrap();
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
         assert!(ctx.working_state.clean);
         assert_eq!(ctx.recent_seals.len(), 1);
         assert_eq!(ctx.recent_seals[0].summary, "initial");
@@ -1441,6 +1896,7 @@ mod tests {
             Some("feature-1".to_string()),
             TaskStatus::InProgress,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -1451,11 +1907,12 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
         let ctx = repo
-            .context(ContextScope::Spec("feature-1".to_string()), 10)
+            .context(ContextScope::Spec("feature-1".to_string()), 10, &ContextFilter::default())
             .unwrap();
         assert!(ctx.active_spec.is_some());
         assert_eq!(ctx.active_spec.unwrap().id, "feature-1");
@@ -1470,7 +1927,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
 
-        let result = repo.context(ContextScope::Spec("nope".to_string()), 10);
+        let result = repo.context(ContextScope::Spec("nope".to_string()), 10, &ContextFilter::default());
         assert!(result.is_err());
     }
 
@@ -1486,12 +1943,13 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
         fs::write(dir.path().join("file.txt"), "changed").unwrap();
 
-        let ctx = repo.context(ContextScope::Full, 10).unwrap();
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
         assert!(!ctx.working_state.clean);
         assert!(ctx.pending_changes.is_some());
         let pc = ctx.pending_changes.unwrap();
@@ -1511,11 +1969,12 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
         }
 
-        let ctx = repo.context(ContextScope::Full, 3).unwrap();
+        let ctx = repo.context(ContextScope::Full, 3, &ContextFilter::default()).unwrap();
         assert_eq!(ctx.recent_seals.len(), 3);
     }
 
@@ -1534,6 +1993,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1544,6 +2004,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -1569,6 +2030,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1580,6 +2042,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -1602,6 +2065,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1612,6 +2076,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -1634,6 +2099,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1644,6 +2110,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -1680,6 +2147,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1702,6 +2170,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1822,6 +2291,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1845,6 +2315,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1867,6 +2338,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -1879,6 +2351,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -1905,6 +2378,7 @@ mod tests {
                 TaskStatus::Complete,
                 Verification::default(),
                 &["a.txt".to_string()],
+                false,
             )
             .unwrap();
 
@@ -1931,6 +2405,7 @@ mod tests {
             TaskStatus::Complete,
             Verification::default(),
             &["nonexistent.txt".to_string()],
+            false,
         );
         assert!(result.is_err());
     }
@@ -1952,6 +2427,7 @@ mod tests {
                 TaskStatus::Complete,
                 Verification::default(),
                 &["src".to_string()],
+                false,
             )
             .unwrap();
 
@@ -1981,6 +2457,7 @@ mod tests {
                 TaskStatus::Complete,
                 Verification::default(),
                 &["a.txt".to_string(), "b.txt".to_string()],
+                false,
             )
             .unwrap();
 
@@ -2008,6 +2485,7 @@ mod tests {
             TaskStatus::InProgress,
             Verification::default(),
             &["a.txt".to_string()],
+            false,
         )
         .unwrap();
 
@@ -2028,6 +2506,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2041,6 +2520,7 @@ mod tests {
             TaskStatus::Complete,
             Verification::default(),
             &["b.txt".to_string()],
+            false,
         )
         .unwrap();
 
@@ -2052,6 +2532,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -2120,6 +2601,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 verification,
+                false,
             )
             .unwrap();
 
@@ -2146,6 +2628,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             verification,
+            false,
         )
         .unwrap();
 
@@ -2168,6 +2651,7 @@ mod tests {
                 None,
                 TaskStatus::Complete,
                 Verification::default(),
+                false,
             )
             .unwrap();
 
@@ -2193,6 +2677,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2223,6 +2708,7 @@ mod tests {
             TaskStatus::Complete,
             Verification::default(),
             &["a.txt".to_string()],
+            false,
         )
         .unwrap();
 
@@ -2246,6 +2732,7 @@ mod tests {
                 TaskStatus::Complete,
                 Verification::default(),
                 &["b.txt".to_string()],
+                false,
             )
         });
 
@@ -2261,6 +2748,7 @@ mod tests {
                 TaskStatus::Complete,
                 Verification::default(),
                 &["c.txt".to_string()],
+                false,
             )
         });
 
@@ -2298,6 +2786,7 @@ mod tests {
             None,
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2323,6 +2812,7 @@ mod tests {
             Some(spec_a.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2334,6 +2824,7 @@ mod tests {
             Some(spec_b.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2363,6 +2854,7 @@ mod tests {
             Some(spec_a.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2378,6 +2870,7 @@ mod tests {
             Some(spec_b.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2409,6 +2902,7 @@ mod tests {
             Some(spec_a.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2424,6 +2918,7 @@ mod tests {
             Some(spec_b.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2484,6 +2979,7 @@ mod tests {
             Some(spec_a.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2500,6 +2996,7 @@ mod tests {
             Some(spec_b.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2538,6 +3035,7 @@ mod tests {
             Some(spec_a.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2552,6 +3050,7 @@ mod tests {
             Some(spec_b.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2588,6 +3087,7 @@ mod tests {
             Some(spec_a.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2602,6 +3102,7 @@ mod tests {
             Some(spec_b.clone()),
             TaskStatus::Complete,
             Verification::default(),
+            false,
         )
         .unwrap();
 
@@ -2613,5 +3114,845 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("unresolved conflict"));
+    }
+
+    // -------------------------------------------------------------------
+    // Empty seal tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_seal_allow_empty() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a file and seal it so we have a non-empty repo.
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        repo.seal(
+            test_agent(),
+            "initial".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Repo is now clean — seal with allow_empty=true should succeed.
+        let seal = repo
+            .seal(
+                test_agent(),
+                "metadata-only update".to_string(),
+                None,
+                TaskStatus::Complete,
+                Verification::default(),
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(seal.changes.len(), 0);
+        assert_eq!(seal.summary, "metadata-only update");
+        assert!(seal.parent.is_some());
+    }
+
+    #[test]
+    fn test_seal_allow_empty_with_spec() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("task-1".to_string(), "Task One".to_string(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        repo.seal(
+            test_agent(),
+            "initial work".to_string(),
+            Some("task-1".to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Update spec to complete (no file changes).
+        repo.update_spec(
+            "task-1",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                depends_on: None,
+                file_scope: None,
+            },
+        )
+        .unwrap();
+
+        // Seal the spec completion — the AAIS_1 workflow.
+        let seal = repo
+            .seal(
+                test_agent(),
+                "mark task-1 complete".to_string(),
+                Some("task-1".to_string()),
+                TaskStatus::Complete,
+                Verification::default(),
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(seal.changes.len(), 0);
+        let loaded_spec = repo.load_spec("task-1").unwrap();
+        assert_eq!(loaded_spec.sealed_by.len(), 2);
+    }
+
+    #[test]
+    fn test_seal_allow_empty_false_still_fails() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.seal(
+            test_agent(),
+            "should fail".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_seal_paths_allow_empty() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        repo.seal(
+            test_agent(),
+            "initial".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // seal_paths with no matching paths but allow_empty=true.
+        let seal = repo
+            .seal_paths(
+                test_agent(),
+                "empty paths seal".to_string(),
+                None,
+                TaskStatus::Complete,
+                Verification::default(),
+                &["nonexistent.txt".to_string()],
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(seal.changes.len(), 0);
+    }
+
+    // -------------------------------------------------------------------
+    // Enriched context tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_context_seal_summary_has_status_and_verification() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        repo.seal(
+            test_agent(),
+            "verified work".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification {
+                tests_passed: Some(10),
+                tests_failed: Some(0),
+                linted: true,
+            },
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert_eq!(ctx.recent_seals.len(), 1);
+        assert_eq!(ctx.recent_seals[0].status, "in-progress");
+        let v = ctx.recent_seals[0].verification.as_ref().unwrap();
+        assert_eq!(v.tests_passed, Some(10));
+        assert_eq!(v.tests_failed, Some(0));
+        assert!(v.linted);
+    }
+
+    #[test]
+    fn test_context_seal_summary_omits_empty_verification() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        repo.seal(
+            test_agent(),
+            "no verification".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert!(ctx.recent_seals[0].verification.is_none());
+        assert_eq!(ctx.recent_seals[0].status, "complete");
+    }
+
+    #[test]
+    fn test_context_has_available_operations() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert!(!ctx.available_operations.is_empty());
+        assert!(ctx.available_operations.iter().any(|op| op.contains("seal")));
+        assert!(ctx.available_operations.iter().any(|op| op.contains("restore")));
+        assert!(ctx.available_operations.iter().any(|op| op.contains("converge")));
+        assert!(ctx.available_operations.iter().any(|op| op.contains("diff_seals")));
+    }
+
+    // --- Context filtering tests ---
+
+    #[test]
+    fn test_context_filter_by_status() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+        repo.seal(
+            test_agent(),
+            "in progress work".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("b.txt"), "beta").unwrap();
+        repo.seal(
+            test_agent(),
+            "done".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let filter = ContextFilter {
+            status: Some(TaskStatus::Complete),
+            ..Default::default()
+        };
+        let ctx = repo.context(ContextScope::Full, 10, &filter).unwrap();
+        assert_eq!(ctx.recent_seals.len(), 1);
+        assert_eq!(ctx.recent_seals[0].status, "complete");
+
+        let filter = ContextFilter {
+            status: Some(TaskStatus::InProgress),
+            ..Default::default()
+        };
+        let ctx = repo.context(ContextScope::Full, 10, &filter).unwrap();
+        assert_eq!(ctx.recent_seals.len(), 1);
+        assert_eq!(ctx.recent_seals[0].status, "in-progress");
+    }
+
+    #[test]
+    fn test_context_filter_by_agent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let agent_a = AgentIdentity {
+            id: "agent-alpha".to_string(),
+            agent_type: AgentType::Agent,
+        };
+        let agent_b = AgentIdentity {
+            id: "agent-beta".to_string(),
+            agent_type: AgentType::Agent,
+        };
+
+        fs::write(dir.path().join("a.txt"), "alpha work").unwrap();
+        repo.seal(
+            agent_a,
+            "alpha did this".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("b.txt"), "beta work").unwrap();
+        repo.seal(
+            agent_b,
+            "beta did this".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let filter = ContextFilter {
+            agent: Some("agent-alpha".to_string()),
+            ..Default::default()
+        };
+        let ctx = repo.context(ContextScope::Full, 10, &filter).unwrap();
+        assert_eq!(ctx.recent_seals.len(), 1);
+        assert_eq!(ctx.recent_seals[0].agent, "agent-alpha");
+    }
+
+    #[test]
+    fn test_context_filter_combined_status_and_agent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let agent_a = AgentIdentity {
+            id: "worker-1".to_string(),
+            agent_type: AgentType::Agent,
+        };
+        let agent_b = AgentIdentity {
+            id: "worker-2".to_string(),
+            agent_type: AgentType::Agent,
+        };
+
+        fs::write(dir.path().join("a.txt"), "w1 progress").unwrap();
+        repo.seal(
+            agent_a.clone(),
+            "w1 wip".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("b.txt"), "w2 done").unwrap();
+        repo.seal(
+            agent_b,
+            "w2 complete".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("c.txt"), "w1 done").unwrap();
+        repo.seal(
+            agent_a,
+            "w1 complete".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let filter = ContextFilter {
+            status: Some(TaskStatus::Complete),
+            agent: Some("worker-1".to_string()),
+        };
+        let ctx = repo.context(ContextScope::Full, 10, &filter).unwrap();
+        assert_eq!(ctx.recent_seals.len(), 1);
+        assert_eq!(ctx.recent_seals[0].summary, "w1 complete");
+    }
+
+    #[test]
+    fn test_context_filter_empty_returns_all() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            test_agent(),
+            "seal-1".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            test_agent(),
+            "seal-2".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert_eq!(ctx.recent_seals.len(), 2);
+    }
+
+    // --- Seal nudge tests ---
+
+    #[test]
+    fn test_seal_nudge_present_when_dirty() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("tracked.txt"), "initial").unwrap();
+        repo.seal(
+            test_agent(),
+            "initial".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("tracked.txt"), "modified").unwrap();
+        fs::write(dir.path().join("new.txt"), "brand new").unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        let nudge = ctx.seal_nudge.as_ref().expect("nudge should be present");
+        assert_eq!(nudge.unsealed_file_count, 2);
+        assert!(nudge.message.contains("2 file(s) changed"));
+    }
+
+    #[test]
+    fn test_seal_nudge_absent_when_clean() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "clean").unwrap();
+        repo.seal(
+            test_agent(),
+            "sealed".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert!(ctx.seal_nudge.is_none());
+    }
+
+    // --- File relevance / changed_paths tests ---
+
+    #[test]
+    fn test_seal_summary_includes_changed_paths() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("auth.py"), "pass").unwrap();
+        fs::write(dir.path().join("main.py"), "run").unwrap();
+        repo.seal(
+            test_agent(),
+            "initial commit".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        let paths = &ctx.recent_seals[0].changed_paths;
+        assert_eq!(paths.len(), 2);
+        assert!(paths.contains(&"auth.py".to_string()));
+        assert!(paths.contains(&"main.py".to_string()));
+    }
+
+    #[test]
+    fn test_context_filter_with_spec_scope() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("feat-x".to_string(), "Feature X".to_string(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        let agent_a = AgentIdentity {
+            id: "architect".to_string(),
+            agent_type: AgentType::Agent,
+        };
+        let agent_b = AgentIdentity {
+            id: "implementer".to_string(),
+            agent_type: AgentType::Agent,
+        };
+
+        fs::write(dir.path().join("design.md"), "arch").unwrap();
+        repo.seal(
+            agent_a,
+            "architecture".to_string(),
+            Some("feat-x".to_string()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("impl.py"), "code").unwrap();
+        repo.seal(
+            agent_b,
+            "implementation".to_string(),
+            Some("feat-x".to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let filter = ContextFilter {
+            agent: Some("implementer".to_string()),
+            ..Default::default()
+        };
+        let ctx = repo
+            .context(ContextScope::Spec("feat-x".to_string()), 10, &filter)
+            .unwrap();
+        assert_eq!(ctx.recent_seals.len(), 1);
+        assert_eq!(ctx.recent_seals[0].agent, "implementer");
+    }
+}
+
+#[cfg(all(test, feature = "bridge"))]
+mod bridge_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Set up a git repo with files, then init writ inside it.
+    fn setup_git_and_writ() -> (TempDir, Repository) {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Initialize git repo
+        let git_repo = git2::Repository::init(root).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+
+        // Create some files
+        fs::write(root.join("README.md"), "# Hello\n").unwrap();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.py"), "print('hello')\n").unwrap();
+        fs::write(root.join("src/utils.py"), "def add(a, b):\n    return a + b\n").unwrap();
+
+        // Add all and commit
+        let mut index = git_repo.index().unwrap();
+        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git_repo.find_tree(tree_id).unwrap();
+        git_repo.commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[]).unwrap();
+
+        // Initialize writ
+        let repo = Repository::init(root).unwrap();
+        (tmp, repo)
+    }
+
+    #[test]
+    fn test_bridge_import_creates_seal() {
+        let (_tmp, repo) = setup_git_and_writ();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+
+        let result = repo.bridge_import(None, agent).unwrap();
+        assert!(!result.seal_id.is_empty());
+        assert!(!result.git_commit.is_empty());
+        assert_eq!(result.git_ref, "HEAD");
+        assert_eq!(result.files_imported, 3); // README.md, src/main.py, src/utils.py
+
+        // Verify HEAD was updated
+        let head = repo.read_head().unwrap();
+        assert_eq!(head, Some(result.seal_id));
+    }
+
+    #[test]
+    fn test_bridge_import_stores_all_files() {
+        let (_tmp, repo) = setup_git_and_writ();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+
+        let result = repo.bridge_import(None, agent).unwrap();
+
+        // Load the seal and verify tree contains all files
+        let seal = repo.load_seal(&result.seal_id).unwrap();
+        let index = repo.load_tree_index(&seal.tree).unwrap();
+        assert!(index.entries.contains_key("README.md"));
+        assert!(index.entries.contains_key("src/main.py"));
+        assert!(index.entries.contains_key("src/utils.py"));
+
+        // Verify content round-trips
+        let readme_hash = &index.entries["README.md"].hash;
+        let content = repo.objects.retrieve(readme_hash).unwrap();
+        assert_eq!(String::from_utf8_lossy(&content), "# Hello\n");
+    }
+
+    #[test]
+    fn test_bridge_import_no_git_repo() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+
+        let err = repo.bridge_import(None, agent).unwrap_err();
+        assert!(matches!(err, WritError::NoGitRepo));
+    }
+
+    #[test]
+    fn test_bridge_import_with_ref() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let git_repo = git2::Repository::init(root).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+
+        // First commit (1 file)
+        fs::write(root.join("file1.txt"), "v1").unwrap();
+        let mut index = git_repo.index().unwrap();
+        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git_repo.find_tree(tree_id).unwrap();
+        let commit1_oid = git_repo.commit(Some("HEAD"), &sig, &sig, "first", &tree, &[]).unwrap();
+
+        // Second commit (2 files)
+        fs::write(root.join("file2.txt"), "v2").unwrap();
+        let mut index = git_repo.index().unwrap();
+        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git_repo.find_tree(tree_id).unwrap();
+        let commit1_obj = git_repo.find_commit(commit1_oid).unwrap();
+        git_repo.commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&commit1_obj]).unwrap();
+
+        // Import from the first commit by OID (only 1 file)
+        let repo = Repository::init(root).unwrap();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        let result = repo.bridge_import(Some(&commit1_oid.to_string()), agent).unwrap();
+        assert_eq!(result.files_imported, 1);
+        assert_eq!(result.git_commit, commit1_oid.to_string());
+    }
+
+    #[test]
+    fn test_bridge_export_creates_commits() {
+        let (tmp, repo) = setup_git_and_writ();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+
+        // Import baseline
+        repo.bridge_import(None, agent).unwrap();
+
+        // Create a new file and seal
+        fs::write(tmp.path().join("new_file.txt"), "new content").unwrap();
+        let agent2 = AgentIdentity {
+            id: "implementer".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            agent2,
+            "added new file".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        ).unwrap();
+
+        // Export
+        let result = repo.bridge_export(Some("writ/export")).unwrap();
+        assert_eq!(result.seals_exported, 1);
+        assert_eq!(result.branch, "writ/export");
+        assert_eq!(result.exported[0].summary, "added new file");
+
+        // Verify the git branch exists
+        let git_repo = git2::Repository::discover(tmp.path()).unwrap();
+        let branch = git_repo.find_branch("writ/export", git2::BranchType::Local).unwrap();
+        assert!(branch.is_head() == false);
+    }
+
+    #[test]
+    fn test_bridge_export_maps_metadata() {
+        let (tmp, repo) = setup_git_and_writ();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.bridge_import(None, agent).unwrap();
+
+        // Seal with verification and spec
+        fs::write(tmp.path().join("tested.py"), "# tested").unwrap();
+        repo.add_spec(&Spec::new("auth".to_string(), "Auth feature".to_string(), String::new())).unwrap();
+        let agent2 = AgentIdentity {
+            id: "tester".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            agent2,
+            "auth tests passing".to_string(),
+            Some("auth".to_string()),
+            TaskStatus::Complete,
+            Verification { tests_passed: Some(42), tests_failed: Some(0), linted: true },
+            false,
+        ).unwrap();
+
+        let result = repo.bridge_export(Some("writ/export")).unwrap();
+        assert_eq!(result.seals_exported, 1);
+
+        // Verify commit message has trailers
+        let git_repo = git2::Repository::discover(tmp.path()).unwrap();
+        let oid = git2::Oid::from_str(&result.exported[0].git_commit).unwrap();
+        let commit = git_repo.find_commit(oid).unwrap();
+        let msg = commit.message().unwrap();
+        assert!(msg.contains("Writ-Seal-Id:"));
+        assert!(msg.contains("Writ-Spec: auth"));
+        assert!(msg.contains("Writ-Status: complete"));
+        assert!(msg.contains("Writ-Tests-Passed: 42"));
+        assert!(msg.contains("Writ-Linted: true"));
+    }
+
+    #[test]
+    fn test_bridge_export_no_import() {
+        let (_tmp, repo) = setup_git_and_writ();
+
+        let err = repo.bridge_export(None).unwrap_err();
+        assert!(matches!(err, WritError::BridgeError(_)));
+    }
+
+    #[test]
+    fn test_bridge_export_nothing_pending() {
+        let (_tmp, repo) = setup_git_and_writ();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.bridge_import(None, agent).unwrap();
+
+        // Export immediately — no new seals
+        let result = repo.bridge_export(None).unwrap();
+        assert_eq!(result.seals_exported, 0);
+    }
+
+    #[test]
+    fn test_bridge_export_incremental() {
+        let (tmp, repo) = setup_git_and_writ();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.bridge_import(None, agent).unwrap();
+
+        // First seal + export
+        fs::write(tmp.path().join("a.txt"), "a").unwrap();
+        let a1 = AgentIdentity { id: "agent-1".to_string(), agent_type: crate::seal::AgentType::Agent };
+        repo.seal(a1, "first change".to_string(), None, TaskStatus::InProgress, Verification::default(), false).unwrap();
+        let result1 = repo.bridge_export(None).unwrap();
+        assert_eq!(result1.seals_exported, 1);
+
+        // Second seal + export (should only export the new one)
+        fs::write(tmp.path().join("b.txt"), "b").unwrap();
+        let a2 = AgentIdentity { id: "agent-1".to_string(), agent_type: crate::seal::AgentType::Agent };
+        repo.seal(a2, "second change".to_string(), None, TaskStatus::Complete, Verification::default(), false).unwrap();
+        let result2 = repo.bridge_export(None).unwrap();
+        assert_eq!(result2.seals_exported, 1);
+        assert_eq!(result2.exported[0].summary, "second change");
+    }
+
+    #[test]
+    fn test_bridge_status_no_state() {
+        let (_tmp, repo) = setup_git_and_writ();
+
+        let status = repo.bridge_status().unwrap();
+        assert!(!status.initialized);
+        assert_eq!(status.pending_export_count, 0);
+    }
+
+    #[test]
+    fn test_bridge_status_after_import() {
+        let (_tmp, repo) = setup_git_and_writ();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.bridge_import(None, agent).unwrap();
+
+        let status = repo.bridge_status().unwrap();
+        assert!(status.initialized);
+        assert!(status.last_import.is_some());
+        assert!(status.last_export.is_none());
+        assert_eq!(status.pending_export_count, 0);
+    }
+
+    #[test]
+    fn test_bridge_status_pending_count() {
+        let (tmp, repo) = setup_git_and_writ();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.bridge_import(None, agent).unwrap();
+
+        // Create 3 seals
+        for i in 1..=3 {
+            fs::write(tmp.path().join(format!("file{i}.txt")), format!("content {i}")).unwrap();
+            let a = AgentIdentity { id: "worker".to_string(), agent_type: crate::seal::AgentType::Agent };
+            repo.seal(a, format!("change {i}"), None, TaskStatus::InProgress, Verification::default(), false).unwrap();
+        }
+
+        let status = repo.bridge_status().unwrap();
+        assert_eq!(status.pending_export_count, 3);
+    }
+
+    #[test]
+    fn test_bridge_roundtrip() {
+        let (tmp, repo) = setup_git_and_writ();
+        let root = tmp.path();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+
+        // Import git baseline
+        let import_result = repo.bridge_import(None, agent).unwrap();
+        assert_eq!(import_result.files_imported, 3);
+
+        // Agent does work in writ
+        fs::write(root.join("src/new_module.py"), "class Auth:\n    pass\n").unwrap();
+        let a1 = AgentIdentity { id: "implementer".to_string(), agent_type: crate::seal::AgentType::Agent };
+        repo.seal(a1, "added auth module".to_string(), None, TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        // Modify existing file
+        fs::write(root.join("src/main.py"), "from auth import Auth\nprint('hello')\n").unwrap();
+        let a2 = AgentIdentity { id: "implementer".to_string(), agent_type: crate::seal::AgentType::Agent };
+        repo.seal(a2, "integrated auth".to_string(), None, TaskStatus::Complete, Verification { tests_passed: Some(5), tests_failed: Some(0), linted: false }, false).unwrap();
+
+        // Export back to git
+        let export_result = repo.bridge_export(Some("writ/output")).unwrap();
+        assert_eq!(export_result.seals_exported, 2);
+        assert_eq!(export_result.branch, "writ/output");
+
+        // Verify git branch has the correct file tree
+        let git_repo = git2::Repository::discover(root).unwrap();
+        let branch = git_repo.find_branch("writ/output", git2::BranchType::Local).unwrap();
+        let commit = branch.get().peel_to_commit().unwrap();
+        let tree = commit.tree().unwrap();
+
+        // Check new file exists in git tree
+        assert!(tree.get_path(std::path::Path::new("src/new_module.py")).is_ok());
+        // Check modified file content
+        let entry = tree.get_path(std::path::Path::new("src/main.py")).unwrap();
+        let blob = entry.to_object(&git_repo).unwrap();
+        let content = blob.as_blob().unwrap().content();
+        assert_eq!(String::from_utf8_lossy(content), "from auth import Auth\nprint('hello')\n");
     }
 }

@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::diff::DiffOutput;
-use crate::seal::Seal;
+use crate::seal::{Seal, TaskStatus, Verification};
 use crate::spec::Spec;
 use crate::state::{FileStatus, WorkingState};
 
@@ -18,6 +18,44 @@ pub enum ContextScope {
     Full,
     /// Scoped to a specific spec and its related files/seals.
     Spec(String),
+}
+
+/// Optional filters applied to the seal history in context output.
+#[derive(Debug, Clone, Default)]
+pub struct ContextFilter {
+    /// Only include seals with this task status.
+    pub status: Option<TaskStatus>,
+    /// Only include seals by this agent ID.
+    pub agent: Option<String>,
+}
+
+/// Token-efficient verification summary for context output.
+///
+/// Uses `skip_serializing_if` to omit default values, unlike the full
+/// `Verification` struct on seals which always includes all fields.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VerificationSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tests_passed: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tests_failed: Option<u32>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub linted: bool,
+}
+
+impl VerificationSummary {
+    /// Create from a full Verification, returning None if all defaults.
+    pub fn from_verification(v: &Verification) -> Option<Self> {
+        if v.tests_passed.is_none() && v.tests_failed.is_none() && !v.linted {
+            None
+        } else {
+            Some(VerificationSummary {
+                tests_passed: v.tests_passed,
+                tests_failed: v.tests_failed,
+                linted: v.linted,
+            })
+        }
+    }
 }
 
 /// A compact seal summary (truncated for token efficiency).
@@ -36,11 +74,26 @@ pub struct SealSummary {
     /// Linked spec ID, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_id: Option<String>,
+    /// Task status at the time of sealing.
+    pub status: String,
+    /// Verification results, if any were provided.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verification: Option<VerificationSummary>,
+    /// File paths changed in this seal — helps agents know which files to read.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub changed_paths: Vec<String>,
 }
 
 impl SealSummary {
     /// Create a compact summary from a full Seal.
     pub fn from_seal(seal: &Seal) -> Self {
+        let status = match seal.status {
+            TaskStatus::InProgress => "in-progress",
+            TaskStatus::Complete => "complete",
+            TaskStatus::Blocked => "blocked",
+        }
+        .to_string();
+
         SealSummary {
             id: seal.id[..12].to_string(),
             timestamp: seal.timestamp.to_rfc3339(),
@@ -48,6 +101,9 @@ impl SealSummary {
             summary: seal.summary.clone(),
             files_changed: seal.changes.len(),
             spec_id: seal.spec_id.clone(),
+            status,
+            verification: VerificationSummary::from_verification(&seal.verification),
+            changed_paths: seal.changes.iter().map(|c| c.path.clone()).collect(),
         }
     }
 }
@@ -132,6 +188,15 @@ pub struct FileDiffSummary {
     pub deletions: usize,
 }
 
+/// A nudge telling the agent they have unsealed work.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealNudge {
+    /// Number of files changed since last seal.
+    pub unsealed_file_count: usize,
+    /// Human/agent-readable suggestion.
+    pub message: String,
+}
+
 /// The full context output, optimized for LLM consumption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextOutput {
@@ -156,9 +221,16 @@ pub struct ContextOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_changes: Option<DiffSummary>,
 
+    /// Nudge when there are unsealed changes — prompts the agent to checkpoint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seal_nudge: Option<SealNudge>,
+
     /// Files in scope.
     pub file_scope: Vec<String>,
 
     /// Total tracked file count.
     pub tracked_files: usize,
+
+    /// Available writ operations for agent discoverability.
+    pub available_operations: Vec<String>,
 }

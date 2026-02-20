@@ -343,6 +343,12 @@ pub struct ContextOutput {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub diverged_branches: Vec<DivergedBranchWarning>,
 
+    /// True when diverged branches exist and convergence is recommended.
+    /// Agents should check this flag and run `writ converge` (or `converge()`
+    /// via the SDK) to merge diverged spec branches back into the main chain.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub convergence_recommended: bool,
+
     /// Available writ operations for agent discoverability.
     pub available_operations: Vec<String>,
 }

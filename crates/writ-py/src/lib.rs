@@ -312,6 +312,17 @@ impl PyRepository {
         to_pydict(py, &seals)
     }
 
+    /// Unified log across ALL heads (global + spec branches), deduped, newest-first.
+    /// Shows seals from diverged branches that `log()` would miss.
+    #[pyo3(signature = (limit=None))]
+    fn log_all(&self, py: Python, limit: Option<usize>) -> PyResult<PyObject> {
+        let mut seals = self.inner.log_all().map_err(writ_err)?;
+        if let Some(n) = limit {
+            seals.truncate(n);
+        }
+        to_pydict(py, &seals)
+    }
+
     /// Get the tip seal ID for a specific spec.
     fn spec_head(&self, spec_id: &str) -> PyResult<Option<String>> {
         self.inner.spec_head(spec_id).map_err(writ_err)

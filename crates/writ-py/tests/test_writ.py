@@ -1273,6 +1273,82 @@ class TestAgentActivity:
         assert parsed["agent_activity"][0]["agent_id"] == "worker"
 
 
+class TestLogAll:
+    """Sprint 2: Unified multi-head log shows seals from all branches."""
+
+    def test_log_all_empty(self, tmp_path):
+        """Empty repo returns empty list."""
+        repo = writ.Repository.init(str(tmp_path))
+        assert repo.log_all() == []
+
+    def test_log_all_matches_log_when_linear(self, tmp_path):
+        """Without diverged branches, log_all matches log."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="first", agent_id="dev", agent_type="agent")
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="second", agent_id="dev", agent_type="agent")
+
+        regular = repo.log()
+        all_seals = repo.log_all()
+        assert len(regular) == len(all_seals)
+        assert [s["id"] for s in regular] == [s["id"] for s in all_seals]
+
+    def test_log_all_includes_diverged_seals(self, tmp_path):
+        """Seals on diverged branches appear in log_all but not log."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+
+        # Agent A seals on alpha.
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        # Agent B seals on beta (will be diverged after next seal).
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+
+        # Agent A seals on alpha again — creates divergence.
+        (tmp_path / "a.txt").write_text("a2")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        regular = repo.log()
+        all_seals = repo.log_all()
+
+        # Regular log has 2 seals (alpha chain), log_all has 3 (includes beta).
+        assert len(regular) == 2
+        assert len(all_seals) == 3
+
+        # Agent B should appear in log_all but not regular log.
+        regular_agents = {s["agent"]["id"] for s in regular}
+        all_agents = {s["agent"]["id"] for s in all_seals}
+        assert "agent-b" not in regular_agents
+        assert "agent-b" in all_agents
+
+    def test_log_all_with_limit(self, tmp_path):
+        """Limit parameter works with log_all."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="first", agent_id="dev", agent_type="agent")
+        (tmp_path / "a.txt").write_text("b")
+        repo.seal(summary="second", agent_id="dev", agent_type="agent")
+
+        limited = repo.log_all(limit=1)
+        assert len(limited) == 1
+
+    def test_log_all_json_serializable(self, tmp_path):
+        """log_all output survives JSON round-trip."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="work", agent_id="dev", agent_type="agent")
+
+        all_seals = repo.log_all()
+        serialized = json.dumps(all_seals)
+        parsed = json.loads(serialized)
+        assert len(parsed) == 1
+        assert parsed[0]["summary"] == "work"
+
+
 class TestDeletesExcludedFromOwnership:
     """Sprint 1: Deleting a file shouldn't make you its owner."""
 
@@ -1433,6 +1509,62 @@ class TestDivergedBranchDetection:
         parsed = json.loads(serialized)
         assert len(parsed["diverged_branches"]) == 1
         assert parsed["diverged_branches"][0]["spec_id"] == "beta"
+
+
+class TestConvergenceNudge:
+    """Sprint 2: Context includes convergence_recommended flag when branches diverge."""
+
+    def test_convergence_not_recommended_when_linear(self, tmp_path):
+        """No convergence needed for a clean linear chain."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="work", agent_id="dev", agent_type="agent")
+
+        ctx = repo.context()
+        # Field should be absent (skipped when false) or explicitly False.
+        assert ctx.get("convergence_recommended", False) is False
+
+    def test_convergence_recommended_when_diverged(self, tmp_path):
+        """convergence_recommended is True when diverged branches exist."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        (tmp_path / "a.txt").write_text("a2")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        ctx = repo.context()
+        assert ctx["convergence_recommended"] is True
+
+    def test_convergence_not_recommended_in_spec_scoped(self, tmp_path):
+        """Spec-scoped context doesn't include convergence nudge."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        (tmp_path / "a.txt").write_text("a2")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        ctx = repo.context(spec="alpha")
+        assert ctx.get("convergence_recommended", False) is False
+
+    def test_convergence_omitted_from_json_when_false(self, tmp_path):
+        """Token-efficient: convergence_recommended is omitted from JSON when false."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="work", agent_id="dev", agent_type="agent")
+
+        ctx = repo.context()
+        serialized = json.dumps(ctx)
+        assert "convergence_recommended" not in serialized
 
 
 class TestFileScopeWarning:

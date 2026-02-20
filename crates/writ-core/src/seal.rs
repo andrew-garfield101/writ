@@ -62,7 +62,7 @@ pub struct Verification {
 }
 
 /// Task status associated with the seal.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TaskStatus {
     InProgress,

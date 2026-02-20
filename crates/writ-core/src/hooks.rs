@@ -209,7 +209,8 @@ repo.seal(summary="what you did", agent_id="your-id", agent_type="agent", spec_i
 - Use --status in-progress for intermediate work (this is the default)
 - Use --status complete only when the spec is fully done
 - Include test results when available (--tests-passed N --tests-failed M)
-- If context shows diverged branches, consider running `writ converge`
+- If context shows `convergence_recommended: true`, run `writ converge` to merge diverged branches
+- Use `writ log --all` to see seals from all branches (including diverged ones)
 - If context shows unsealed changes, seal before starting new work
 "#.to_string()
 }
@@ -253,7 +254,8 @@ repo.seal(summary="changes", agent_id="your-id", agent_type="agent", spec_id="yo
 - Use `--status complete` only on your final seal for a spec
 - Link seals to specs with --spec
 - Include verification data (--tests-passed, --tests-failed, --linted)
-- If context shows diverged branches, consider running `writ converge`
+- If context shows `convergence_recommended: true`, run `writ converge` to merge diverged branches
+- Use `writ log --all` to see unified history across all branches
 "#.to_string()
 }
 

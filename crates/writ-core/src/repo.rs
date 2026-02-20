@@ -714,12 +714,13 @@ impl Repository {
         })
     }
 
-    /// Collect seals from ALL heads (global + spec branches), deduped.
+    /// Unified log across ALL heads (global + spec branches), deduped.
     ///
     /// Walks global HEAD chain first, then each spec head. Seals already seen
     /// (from the global chain or an earlier spec) are skipped. Result is sorted
-    /// newest-first by timestamp.
-    fn collect_all_seals(&self) -> WritResult<Vec<Seal>> {
+    /// newest-first by timestamp. Use this for a complete chronological view
+    /// of all work, including agents on diverged branches.
+    pub fn log_all(&self) -> WritResult<Vec<Seal>> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut all_seals: Vec<Seal> = Vec::new();
 
@@ -955,7 +956,7 @@ impl Repository {
 
                 // Walk ALL heads (global + spec branches) for agent activity,
                 // so agents on diverged branches aren't invisible.
-                let all_seals = self.collect_all_seals()?;
+                let all_seals = self.log_all()?;
                 let agent_activity = Self::build_agent_activity(&all_seals, None);
 
                 // Detect diverged branches and build warnings.
@@ -979,6 +980,8 @@ impl Repository {
                     })
                     .collect();
 
+                let convergence_recommended = !diverged_branches.is_empty();
+
                 Ok(ContextOutput {
                     writ_version: "0.1.0".to_string(),
                     active_spec: None,
@@ -993,6 +996,7 @@ impl Repository {
                     spec_progress: None,
                     agent_activity,
                     diverged_branches,
+                    convergence_recommended,
                     available_operations,
                 })
             }
@@ -1137,7 +1141,7 @@ impl Repository {
 
                 // Walk ALL heads for agent activity so diverged agents are visible,
                 // filtered to spec-relevant files so agents only see relevant ownership.
-                let all_seals = self.collect_all_seals()?;
+                let all_seals = self.log_all()?;
                 let agent_activity = if has_scope_filter {
                     let scope_ref = &file_scope;
                     let scope_fn = |path: &str| -> bool {
@@ -1165,6 +1169,7 @@ impl Repository {
                     spec_progress,
                     agent_activity,
                     diverged_branches: Vec::new(),
+                    convergence_recommended: false,
                     available_operations,
                 })
             }
@@ -6857,6 +6862,151 @@ mod spec_scoped_context_tests {
 }
 
 #[cfg(test)]
+mod log_all_tests {
+    use super::*;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_log_all_empty_repo() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let seals = repo.log_all().unwrap();
+        assert!(seals.is_empty());
+    }
+
+    #[test]
+    fn test_log_all_matches_log_when_no_branches() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("dev"), "first".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            agent("dev"), "second".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let regular = repo.log().unwrap();
+        let all = repo.log_all().unwrap();
+        assert_eq!(regular.len(), all.len());
+        // Same seal IDs.
+        let regular_ids: Vec<&str> = regular.iter().map(|s| s.id.as_str()).collect();
+        let all_ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(regular_ids, all_ids);
+    }
+
+    #[test]
+    fn test_log_all_includes_diverged_branch_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+
+        // Agent A: seal on alpha.
+        std::fs::write(dir.path().join("a.txt"), "a1").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha first".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent B: seal on beta — parent from HEAD.
+        std::fs::write(dir.path().join("b.txt"), "b1").unwrap();
+        let beta_seal = repo.seal(
+            agent("agent-b"), "beta work".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent A: seal on alpha again — parent from heads/alpha, diverging from beta.
+        std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha second".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Regular log misses beta seal.
+        let regular = repo.log().unwrap();
+        let regular_ids: Vec<&str> = regular.iter().map(|s| s.id.as_str()).collect();
+        assert!(!regular_ids.contains(&beta_seal.id.as_str()),
+            "beta seal should NOT appear in regular log");
+
+        // log_all includes it.
+        let all = repo.log_all().unwrap();
+        let all_ids: Vec<&str> = all.iter().map(|s| s.id.as_str()).collect();
+        assert!(all_ids.contains(&beta_seal.id.as_str()),
+            "beta seal should appear in log_all");
+
+        // All seals should be present (3 total).
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn test_log_all_deduplicates() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+
+        // Seal with spec — appears in both global HEAD and heads/alpha.
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("dev"), "work".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        let all = repo.log_all().unwrap();
+        assert_eq!(all.len(), 1, "deduplication should prevent double-counting");
+    }
+
+    #[test]
+    fn test_log_all_sorted_newest_first() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha 2".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let all = repo.log_all().unwrap();
+        // Verify newest-first ordering.
+        for window in all.windows(2) {
+            assert!(window[0].timestamp >= window[1].timestamp,
+                "seals should be sorted newest-first");
+        }
+    }
+}
+
+#[cfg(test)]
 mod agent_activity_tests {
     use super::*;
     use crate::context::ContextScope;
@@ -7282,6 +7432,129 @@ mod agent_activity_tests {
         ).unwrap();
         assert!(ctx.diverged_branches.is_empty(),
             "spec-scoped context should not include diverged_branches");
+    }
+
+    #[test]
+    fn test_convergence_recommended_true_when_diverged() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha 2".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert!(ctx.convergence_recommended, "should recommend convergence when branches diverged");
+    }
+
+    #[test]
+    fn test_convergence_recommended_false_when_linear() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("dev"), "work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert!(!ctx.convergence_recommended, "no convergence needed for linear chain");
+    }
+
+    #[test]
+    fn test_convergence_recommended_false_in_spec_scoped() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha 2".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(
+            ContextScope::Spec("alpha".into()), 10, &ContextFilter::default(),
+        ).unwrap();
+        assert!(!ctx.convergence_recommended,
+            "spec-scoped context should not recommend convergence");
+    }
+
+    #[test]
+    fn test_convergence_recommended_serialized_only_when_true() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("dev"), "work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        let json = serde_json::to_string(&ctx).unwrap();
+        // When false, skip_serializing_if omits the field.
+        assert!(!json.contains("convergence_recommended"),
+            "convergence_recommended should be omitted when false");
+
+        // Now create divergence.
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("c.txt"), "c").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("b.txt"), "b2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha 2".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(json.contains("\"convergence_recommended\":true"),
+            "convergence_recommended should be present when true");
     }
 }
 

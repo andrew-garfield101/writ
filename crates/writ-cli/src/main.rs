@@ -107,6 +107,11 @@ enum Commands {
         /// Show seals for a specific spec (uses spec-scoped head).
         #[arg(long)]
         spec: Option<String>,
+
+        /// Show seals from ALL branches (global + spec heads), not just HEAD.
+        /// Useful for seeing work by agents on diverged branches.
+        #[arg(long)]
+        all: bool,
     },
 
     /// Show what changed (content-level diff).
@@ -398,7 +403,7 @@ fn main() {
             diff,
             format,
         } => cmd_show(&cwd, &seal_id, diff, &format),
-        Commands::Log { format, limit, spec } => cmd_log(&cwd, &format, limit, spec),
+        Commands::Log { format, limit, spec, all } => cmd_log(&cwd, &format, limit, spec, all),
         Commands::Diff { from, to, format } => cmd_diff(&cwd, from, to, &format),
         Commands::Context {
             spec,
@@ -751,6 +756,18 @@ fn cmd_seal(
                 eprintln!("    ! {f}");
             }
         }
+
+        if seal.status == TaskStatus::Complete {
+            let prior_seals = repo.spec_log(sid).unwrap_or_default();
+            let has_in_progress = prior_seals.iter().any(|s| {
+                s.id != seal.id && s.status == TaskStatus::InProgress
+            });
+            if !has_in_progress && prior_seals.len() <= 1 {
+                eprintln!("  HINT: This is the only seal for spec '{sid}' and it's marked 'complete'.");
+                eprintln!("        Consider using --status in-progress for intermediate work,");
+                eprintln!("        reserving --status complete for the final checkpoint.");
+            }
+        }
     }
 
     Ok(())
@@ -761,11 +778,13 @@ fn cmd_log(
     format: &str,
     limit: Option<usize>,
     spec: Option<String>,
+    all: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
-    let mut seals = match &spec {
-        Some(spec_id) => repo.spec_log(spec_id)?,
-        None => repo.log()?,
+    let mut seals = match (&spec, all) {
+        (Some(spec_id), _) => repo.spec_log(spec_id)?,
+        (None, true) => repo.log_all()?,
+        (None, false) => repo.log()?,
     };
 
     if let Some(n) = limit {
@@ -1056,6 +1075,12 @@ fn cmd_context(
                 for op in &ctx.available_operations {
                     println!("  {op}");
                 }
+            }
+
+            if ctx.convergence_recommended {
+                println!();
+                println!("  *** CONVERGENCE RECOMMENDED ***");
+                println!("  Diverged branches detected — run `writ converge` to merge them.");
             }
 
             print_diverged_branch_warnings(&repo);

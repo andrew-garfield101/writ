@@ -17,7 +17,8 @@ use crate::convergence::{
 use crate::lock::RepoLock;
 use crate::context::{
     AgentActivity, ContextFilter, ContextOutput, ContextScope, DepStatus, DiffSummary,
-    DivergedBranchWarning, SealNudge, SealSummary, SpecProgress, WorkingStateSummary,
+    DivergedBranchWarning, FileScopeViolation, SealNudge, SealSummary, SessionSummary,
+    SpecProgress, WorkingStateSummary,
 };
 use crate::diff::{self, DiffOutput, FileDiff};
 use crate::error::{WritError, WritResult};
@@ -982,7 +983,25 @@ impl Repository {
 
                 let convergence_recommended = !diverged_branches.is_empty();
 
-                Ok(ContextOutput {
+                let file_scope_violations: Vec<FileScopeViolation> = all_seals
+                    .iter()
+                    .take(seal_limit)
+                    .filter_map(|seal| {
+                        let spec_id = seal.spec_id.as_ref()?;
+                        let changed: Vec<String> =
+                            seal.changes.iter().map(|c| c.path.clone()).collect();
+                        let warning = self.check_file_scope(spec_id, &changed)?;
+                        Some(FileScopeViolation {
+                            seal_id: seal.id[..12].to_string(),
+                            agent_id: seal.agent.id.clone(),
+                            spec_id: spec_id.clone(),
+                            out_of_scope_files: warning.out_of_scope_files,
+                            declared_scope: warning.declared_scope,
+                        })
+                    })
+                    .collect();
+
+                let mut result = ContextOutput {
                     writ_version: "0.1.0".to_string(),
                     active_spec: None,
                     all_specs: if specs.is_empty() { None } else { Some(specs) },
@@ -997,12 +1016,61 @@ impl Repository {
                     agent_activity,
                     diverged_branches,
                     convergence_recommended,
+                    file_scope_violations,
+                    session_complete: false,
+                    session_summary: None,
                     available_operations,
-                })
+                };
+
+                // Check if all specs are complete and inject session summary.
+                if let Some(ref all) = result.all_specs {
+                    let all_complete = !all.is_empty()
+                        && all.iter().all(|s| {
+                            matches!(s.status, crate::spec::SpecStatus::Complete)
+                        });
+                    if all_complete {
+                        result.session_complete = true;
+                        let work_seals = all_seals
+                            .iter()
+                            .filter(|s| s.agent.id != "writ-bridge")
+                            .count();
+                        let agent_ids: HashSet<&str> = all_seals
+                            .iter()
+                            .filter(|s| s.agent.id != "writ-bridge")
+                            .map(|s| s.agent.id.as_str())
+                            .collect();
+                        let mut file_set: HashSet<&str> = HashSet::new();
+                        for s in all_seals.iter().filter(|s| s.agent.id != "writ-bridge") {
+                            for c in &s.changes {
+                                file_set.insert(&c.path);
+                            }
+                        }
+                        result.session_summary = Some(SessionSummary {
+                            headline: format!(
+                                "{} spec(s) complete — {} seal(s) by {} agent(s)",
+                                all.len(),
+                                work_seals,
+                                agent_ids.len(),
+                            ),
+                            total_seals: work_seals,
+                            agent_count: agent_ids.len(),
+                            specs_completed: all.len(),
+                            files_changed: file_set.len(),
+                            message: "All specs complete. Run `writ summary` for the full report and suggested commit message.".to_string(),
+                        });
+                    }
+                }
+
+                Ok(result)
             }
             ContextScope::Spec(spec_id) => {
                 let spec = self.load_spec(&spec_id)?;
-                let spec_seals: Vec<SealSummary> = seals
+
+                // Walk from the spec's own head pointer so seals on diverged
+                // branches are visible. Previously this filtered self.log()
+                // (global HEAD chain), which missed diverged spec seals entirely.
+                let spec_seal_chain = self.spec_log(&spec_id)?;
+                let spec_seals: Vec<SealSummary> = spec_seal_chain
                     .iter()
                     .filter(|s| s.spec_id.as_deref() == Some(spec_id.as_str()))
                     .filter(apply_filter)
@@ -1170,6 +1238,9 @@ impl Repository {
                     agent_activity,
                     diverged_branches: Vec::new(),
                     convergence_recommended: false,
+                    file_scope_violations: Vec::new(),
+                    session_complete: false,
+                    session_summary: None,
                     available_operations,
                 })
             }
@@ -1287,6 +1358,29 @@ impl Repository {
 
         spec.updated_at = chrono::Utc::now();
         self.save_spec(&spec)?;
+
+        // Auto-write summary when all specs are complete.
+        if matches!(spec.status, crate::spec::SpecStatus::Complete) {
+            let all_specs = self.list_specs().unwrap_or_default();
+            let all_complete = !all_specs.is_empty()
+                && all_specs
+                    .iter()
+                    .all(|s| matches!(s.status, crate::spec::SpecStatus::Complete));
+            if all_complete {
+                if let Ok(summary) = self.summary() {
+                    let summary_json = self.writ_dir.join("summary.json");
+                    if let Ok(json) = serde_json::to_string_pretty(&summary) {
+                        let _ = atomic_write(&summary_json, json.as_bytes());
+                    }
+                    let summary_txt = self.writ_dir.join("summary.txt");
+                    let _ = atomic_write(
+                        &summary_txt,
+                        summary.commit_message.as_bytes(),
+                    );
+                }
+            }
+        }
+
         Ok(spec)
     }
 
@@ -2032,6 +2126,31 @@ impl Repository {
         self.save_seal(&seal)?;
         atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
         index.save(&self.writ_dir.join("index.json"))?;
+
+        // Refresh the index to match the actual working directory so the
+        // next seal() only captures the agent's genuine changes, not the
+        // delta between the git tree and the working tree. Without this,
+        // the first agent to seal after bridge_import gets attributed with
+        // every file that differs from the git snapshot (dirty files, files
+        // not in git, ignore-rule mismatches, etc.).
+        let rules = self.ignore_rules();
+        let post_import_state = state::compute_state(&self.root, &index, &rules);
+        if !post_import_state.is_clean() {
+            for file_state in &post_import_state.changes {
+                match file_state.status {
+                    FileStatus::New | FileStatus::Modified => {
+                        let content = fs::read(self.root.join(&file_state.path))?;
+                        let hash = self.objects.store(&content)?;
+                        let size = content.len() as u64;
+                        index.upsert(&file_state.path, hash, size);
+                    }
+                    FileStatus::Deleted => {
+                        index.remove(&file_state.path);
+                    }
+                }
+            }
+            index.save(&self.writ_dir.join("index.json"))?;
+        }
 
         let bridge_state = BridgeState {
             last_imported_git_commit: Some(git_commit_hash.clone()),
@@ -2947,6 +3066,199 @@ impl Repository {
             .count();
         Ok(count)
     }
+
+    /// Generate a human-readable summary of all work done in this writ session.
+    ///
+    /// Walks the full seal history, aggregates by spec and agent, and produces
+    /// a structured output suitable for generating git commit messages and
+    /// reviewing what happened during an agentic workflow.
+    pub fn summary(&self) -> WritResult<SummaryOutput> {
+        let all_seals = self.log_all()?;
+
+        // Skip bridge import seals for the summary.
+        let work_seals: Vec<&Seal> = all_seals
+            .iter()
+            .filter(|s| s.agent.id != "writ-bridge")
+            .collect();
+
+        // Aggregate by spec.
+        let specs = self.list_specs()?;
+        let mut specs_summary: Vec<SpecSummaryEntry> = Vec::new();
+        for spec in &specs {
+            let spec_seals: Vec<&&Seal> = work_seals
+                .iter()
+                .filter(|s| s.spec_id.as_deref() == Some(&spec.id))
+                .collect();
+
+            if spec_seals.is_empty() {
+                continue;
+            }
+
+            let mut agents: Vec<String> = spec_seals
+                .iter()
+                .map(|s| s.agent.id.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            agents.sort();
+
+            let status = match spec.status {
+                crate::spec::SpecStatus::Pending => "pending",
+                crate::spec::SpecStatus::InProgress => "in-progress",
+                crate::spec::SpecStatus::Complete => "complete",
+                crate::spec::SpecStatus::Blocked => "blocked",
+            };
+
+            specs_summary.push(SpecSummaryEntry {
+                id: spec.id.clone(),
+                title: spec.title.clone(),
+                status: status.to_string(),
+                seal_count: spec_seals.len(),
+                agents,
+            });
+        }
+
+        // Aggregate by agent.
+        let mut agent_map: BTreeMap<String, (usize, HashSet<String>, Option<String>)> =
+            BTreeMap::new();
+        for seal in &work_seals {
+            let entry = agent_map
+                .entry(seal.agent.id.clone())
+                .or_insert((0, HashSet::new(), None));
+            entry.0 += 1;
+            if let Some(ref sid) = seal.spec_id {
+                entry.1.insert(sid.clone());
+            }
+            if entry.2.is_none() {
+                entry.2 = Some(seal.summary.clone());
+            }
+        }
+
+        let agents: Vec<AgentSummaryEntry> = agent_map
+            .into_iter()
+            .map(|(id, (count, specs_set, latest))| {
+                let mut specs_touched: Vec<String> = specs_set.into_iter().collect();
+                specs_touched.sort();
+                AgentSummaryEntry {
+                    id,
+                    seal_count: count,
+                    specs_touched,
+                    latest_summary: latest,
+                }
+            })
+            .collect();
+
+        // Collect all changed files across all seals (deduplicated).
+        let mut all_files: HashSet<String> = HashSet::new();
+        for seal in &work_seals {
+            for change in &seal.changes {
+                all_files.insert(change.path.clone());
+            }
+        }
+        let mut files_changed: Vec<String> = all_files.into_iter().collect();
+        files_changed.sort();
+
+        // Files to stage = current working tree changes.
+        let state = self.state()?;
+        let mut files_to_stage: Vec<String> = state
+            .changes
+            .iter()
+            .map(|c| c.path.clone())
+            .collect();
+        files_to_stage.sort();
+
+        // Divergence info.
+        let diverged = self.diverged_branches().unwrap_or_default();
+        let convergence_recommended = !diverged.is_empty();
+
+        // Build the headline.
+        let completed_specs: Vec<&SpecSummaryEntry> = specs_summary
+            .iter()
+            .filter(|s| s.status == "complete")
+            .collect();
+        let agent_count = agents.len();
+
+        let headline = if completed_specs.is_empty() {
+            format!(
+                "writ: {} seal(s) by {} agent(s), {} spec(s) in progress",
+                work_seals.len(),
+                agent_count,
+                specs_summary.len(),
+            )
+        } else if completed_specs.len() == 1 {
+            format!(
+                "writ: {} — {} seal(s) by {} agent(s)",
+                completed_specs[0].title,
+                work_seals.len(),
+                agent_count,
+            )
+        } else {
+            format!(
+                "writ: {} features complete — {} seal(s) by {} agent(s)",
+                completed_specs.len(),
+                work_seals.len(),
+                agent_count,
+            )
+        };
+
+        // Build the body.
+        let mut body_lines: Vec<String> = Vec::new();
+
+        if !specs_summary.is_empty() {
+            body_lines.push("Specs:".to_string());
+            for s in &specs_summary {
+                body_lines.push(format!(
+                    "  - {} [{}]: {} ({} seal(s) by {})",
+                    s.id,
+                    s.status,
+                    s.title,
+                    s.seal_count,
+                    s.agents.join(", "),
+                ));
+            }
+            body_lines.push(String::new());
+        }
+
+        if !agents.is_empty() {
+            body_lines.push("Agents:".to_string());
+            for a in &agents {
+                body_lines.push(format!(
+                    "  - {}: {} seal(s) on {}",
+                    a.id,
+                    a.seal_count,
+                    a.specs_touched.join(", "),
+                ));
+            }
+            body_lines.push(String::new());
+        }
+
+        body_lines.push(format!("Files changed: {}", files_changed.len()));
+        body_lines.push(format!("Total seals: {}", work_seals.len()));
+
+        if convergence_recommended {
+            body_lines.push(String::new());
+            body_lines.push(format!(
+                "Note: {} diverged branch(es) — consider running `writ converge` before committing.",
+                diverged.len(),
+            ));
+        }
+
+        let body = body_lines.join("\n");
+        let commit_message = format!("{headline}\n\n{body}");
+
+        Ok(SummaryOutput {
+            headline,
+            body,
+            commit_message,
+            specs_summary,
+            agents,
+            total_seals: work_seals.len(),
+            files_changed,
+            files_to_stage,
+            convergence_recommended,
+            diverged_branch_count: diverged.len(),
+        })
+    }
 }
 
 /// Result of `writ install`.
@@ -3058,6 +3370,51 @@ pub struct RestoreResult {
     pub deleted: Vec<String>,
     /// Total files in the restored state.
     pub total_files: usize,
+}
+
+/// Human-readable summary of all work done in this writ session.
+/// Designed for the round-trip workflow: writ install -> agents work -> writ summary -> git commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SummaryOutput {
+    /// High-level one-liner suitable for a git commit message subject line.
+    pub headline: String,
+    /// Detailed multi-line body suitable for a git commit message body.
+    pub body: String,
+    /// Suggested git commit message (headline + body combined).
+    pub commit_message: String,
+    /// Specs that were worked on, with their final status.
+    pub specs_summary: Vec<SpecSummaryEntry>,
+    /// Agents that participated, with seal counts.
+    pub agents: Vec<AgentSummaryEntry>,
+    /// Total seals created in this session.
+    pub total_seals: usize,
+    /// Files changed (added/modified/deleted) across all seals.
+    pub files_changed: Vec<String>,
+    /// Files to stage for git (current working tree changes).
+    pub files_to_stage: Vec<String>,
+    /// Whether convergence is recommended before committing.
+    pub convergence_recommended: bool,
+    /// Number of diverged branches.
+    pub diverged_branch_count: usize,
+}
+
+/// Per-spec entry in the summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpecSummaryEntry {
+    pub id: String,
+    pub title: String,
+    pub status: String,
+    pub seal_count: usize,
+    pub agents: Vec<String>,
+}
+
+/// Per-agent entry in the summary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSummaryEntry {
+    pub id: String,
+    pub seal_count: usize,
+    pub specs_touched: Vec<String>,
+    pub latest_summary: Option<String>,
 }
 
 #[cfg(test)]
@@ -6313,6 +6670,215 @@ mod bridge_tests {
         assert!(Repository::validate_git_ref("").is_err());
         assert!(Repository::validate_git_ref(&"x".repeat(600)).is_err());
     }
+
+    // ─── Bridge import index baseline refresh ────────────────────
+
+    #[test]
+    fn test_first_seal_after_bridge_captures_only_agent_changes() {
+        let (tmp, repo) = setup_git_and_writ();
+        let root = tmp.path();
+        let agent = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+
+        // Bridge imports 3 files from git.
+        let result = repo.bridge_import(None, agent).unwrap();
+        assert_eq!(result.files_imported, 3);
+
+        // Agent creates exactly 1 new file, then seals.
+        fs::write(root.join("agent_work.txt"), "my changes").unwrap();
+        let dev = AgentIdentity {
+            id: "dev".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        let seal = repo.seal(
+            dev, "agent work".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // The seal should have exactly 1 change (the new file), not 4.
+        assert_eq!(seal.changes.len(), 1, "first seal should only have agent's changes");
+        assert_eq!(seal.changes[0].path, "agent_work.txt");
+        assert_eq!(seal.changes[0].change_type, ChangeType::Added);
+    }
+
+    #[test]
+    fn test_bridge_import_dirty_tree_doesnt_pollute_first_seal() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Create git repo with 1 committed file.
+        let git_repo = git2::Repository::init(root).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        fs::write(root.join("committed.txt"), "in git").unwrap();
+        let mut index = git_repo.index().unwrap();
+        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git_repo.find_tree(tree_id).unwrap();
+        git_repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[]).unwrap();
+
+        // Add a dirty file (not committed to git).
+        fs::write(root.join("dirty.txt"), "uncommitted stuff").unwrap();
+
+        // Init writ and bridge_import.
+        let repo = Repository::init(root).unwrap();
+        let bridge = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.bridge_import(None, bridge).unwrap();
+
+        // The dirty file should be in the index now (baseline refreshed).
+        // Agent creates their own file and seals.
+        fs::write(root.join("agent.txt"), "agent work").unwrap();
+        let dev = AgentIdentity {
+            id: "dev".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        let seal = repo.seal(
+            dev, "agent work".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Seal should only contain agent.txt, not dirty.txt.
+        let paths: Vec<&str> = seal.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["agent.txt"],
+            "dirty file should not pollute first seal; got: {:?}", paths);
+    }
+
+    #[test]
+    fn test_bridge_import_from_old_commit_refreshes_baseline() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let git_repo = git2::Repository::init(root).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+
+        // First commit: 1 file.
+        fs::write(root.join("file1.txt"), "v1").unwrap();
+        let mut index = git_repo.index().unwrap();
+        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git_repo.find_tree(tree_id).unwrap();
+        let c1 = git_repo.commit(Some("HEAD"), &sig, &sig, "first", &tree, &[]).unwrap();
+
+        // Second commit: 2 files.
+        fs::write(root.join("file2.txt"), "v2").unwrap();
+        let mut index = git_repo.index().unwrap();
+        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git_repo.find_tree(tree_id).unwrap();
+        let c1_obj = git_repo.find_commit(c1).unwrap();
+        git_repo.commit(Some("HEAD"), &sig, &sig, "second", &tree, &[&c1_obj]).unwrap();
+
+        // Import from FIRST commit (only 1 file), but working dir has 2 files.
+        let repo = Repository::init(root).unwrap();
+        let bridge = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        let result = repo.bridge_import(Some(&c1.to_string()), bridge).unwrap();
+        assert_eq!(result.files_imported, 1, "bridge seal records 1 file from commit 1");
+
+        // file2.txt exists on disk but wasn't in commit 1.
+        // After baseline refresh, the index should include it.
+        // Agent adds file3 and seals — should only see file3.
+        fs::write(root.join("file3.txt"), "agent work").unwrap();
+        let dev = AgentIdentity {
+            id: "dev".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        let seal = repo.seal(
+            dev, "agent work".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        let paths: Vec<&str> = seal.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["file3.txt"],
+            "file2.txt (on disk but not in imported commit) should not appear; got: {:?}", paths);
+    }
+
+    #[test]
+    fn test_bridge_seal_preserves_git_tree_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+
+        let git_repo = git2::Repository::init(root).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        fs::write(root.join("committed.txt"), "in git").unwrap();
+        let mut index = git_repo.index().unwrap();
+        index.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = git_repo.find_tree(tree_id).unwrap();
+        git_repo.commit(Some("HEAD"), &sig, &sig, "initial", &tree, &[]).unwrap();
+
+        // Add dirty file before bridge_import.
+        fs::write(root.join("dirty.txt"), "not in git").unwrap();
+
+        let repo = Repository::init(root).unwrap();
+        let bridge = AgentIdentity {
+            id: "bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        let result = repo.bridge_import(None, bridge).unwrap();
+
+        // The bridge SEAL's tree should only have the git file (historical accuracy).
+        let seal = repo.load_seal(&result.seal_id).unwrap();
+        let tree_index = repo.load_tree_index(&seal.tree).unwrap();
+        assert!(tree_index.entries.contains_key("committed.txt"),
+            "bridge seal tree should have committed file");
+        assert!(!tree_index.entries.contains_key("dirty.txt"),
+            "bridge seal tree should NOT have dirty file");
+
+        // But the working index should have both (baseline refresh).
+        let working_index = repo.load_index().unwrap();
+        assert!(working_index.entries.contains_key("committed.txt"));
+        assert!(working_index.entries.contains_key("dirty.txt"),
+            "working index should include dirty file after refresh");
+    }
+
+    #[test]
+    fn test_bridge_import_ownership_not_polluted() {
+        let (tmp, repo) = setup_git_and_writ();
+        let root = tmp.path();
+        let bridge = AgentIdentity {
+            id: "writ-bridge".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.bridge_import(None, bridge).unwrap();
+
+        // Agent modifies 1 file and creates 1 new file.
+        fs::write(root.join("README.md"), "# Updated\n").unwrap();
+        fs::write(root.join("new.txt"), "new").unwrap();
+        let dev = AgentIdentity {
+            id: "dev-agent".to_string(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            dev, "agent changes".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Check agent activity — dev-agent should only own files they touched.
+        let all_seals = repo.log_all().unwrap();
+        let activity = Repository::build_agent_activity(&all_seals, None);
+
+        let dev_activity = activity.iter().find(|a| a.agent_id == "dev-agent");
+        assert!(dev_activity.is_some());
+        let owned: &Vec<String> = &dev_activity.unwrap().files_owned;
+        assert!(owned.contains(&"README.md".to_string()), "dev should own README.md");
+        assert!(owned.contains(&"new.txt".to_string()), "dev should own new.txt");
+        // dev should NOT own src/main.py or src/utils.py (bridge imported those).
+        assert!(!owned.contains(&"src/main.py".to_string()),
+            "dev should NOT own src/main.py; bridge imported it");
+        assert!(!owned.contains(&"src/utils.py".to_string()),
+            "dev should NOT own src/utils.py; bridge imported it");
+    }
 }
 
 #[cfg(test)]
@@ -6858,6 +7424,99 @@ mod spec_scoped_context_tests {
 
         assert!(ctx.working_state.modified_files.contains(&"src/components/Button.tsx".to_string()));
         assert!(!ctx.working_state.modified_files.contains(&"src/utils.ts".to_string()));
+    }
+
+    #[test]
+    fn test_spec_context_shows_diverged_spec_seals() {
+        // Reproduce the AAIS_6 bug: spec-scoped context should show seals
+        // even when the spec's branch has diverged from global HEAD.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+
+        // Agent A seals on alpha.
+        std::fs::write(dir.path().join("a.txt"), "a1").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha first".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent B seals on beta (diverges after next alpha seal).
+        std::fs::write(dir.path().join("b.txt"), "b1").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta work".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent B seals again on beta.
+        std::fs::write(dir.path().join("b.txt"), "b2").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta more".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent A seals on alpha — global HEAD moves, beta branch diverges.
+        std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha second".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Verify beta is actually diverged (not reachable from global HEAD).
+        let diverged = repo.diverged_branches().unwrap();
+        assert!(!diverged.is_empty(), "beta should be diverged");
+
+        // Spec-scoped context for beta should show its seals.
+        let ctx = repo.context(
+            ContextScope::Spec("beta".into()), 10, &ContextFilter::default(),
+        ).unwrap();
+
+        assert!(!ctx.recent_seals.is_empty(),
+            "spec-scoped context should show seals even on diverged branch; got empty");
+        assert_eq!(ctx.recent_seals.len(), 2,
+            "beta has 2 seals; got {}", ctx.recent_seals.len());
+        assert!(ctx.recent_seals.iter().all(|s| s.agent == "agent-b"),
+            "all beta seals should be from agent-b");
+    }
+
+    #[test]
+    fn test_spec_context_diverged_still_has_progress() {
+        // Spec progress should also work for diverged specs.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha 2".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(
+            ContextScope::Spec("beta".into()), 10, &ContextFilter::default(),
+        ).unwrap();
+
+        // spec_progress should be populated even though beta is diverged.
+        assert!(ctx.spec_progress.is_some(), "diverged spec should still have progress");
+        let progress = ctx.spec_progress.unwrap();
+        assert_eq!(progress.total_seals, 1);
+        assert_eq!(progress.agents_involved, vec!["agent-b"]);
     }
 }
 
@@ -7555,6 +8214,217 @@ mod agent_activity_tests {
         let json = serde_json::to_string(&ctx).unwrap();
         assert!(json.contains("\"convergence_recommended\":true"),
             "convergence_recommended should be present when true");
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_summary_empty_repo() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let summary = repo.summary().unwrap();
+        assert_eq!(summary.total_seals, 0);
+        assert!(summary.files_changed.is_empty());
+        assert!(summary.specs_summary.is_empty());
+        assert!(summary.agents.is_empty());
+    }
+
+    #[test]
+    fn test_summary_single_agent_single_spec() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("auth".into(), "Add authentication".into(), "".into())).unwrap();
+
+        std::fs::write(dir.path().join("auth.py"), "class Auth: pass").unwrap();
+        repo.seal(
+            agent("dev"), "added auth module".into(), Some("auth".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("auth.py"), "class Auth:\n    def login(self): pass").unwrap();
+        repo.seal(
+            agent("dev"), "added login method".into(), Some("auth".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let summary = repo.summary().unwrap();
+        assert_eq!(summary.total_seals, 2);
+        assert_eq!(summary.agents.len(), 1);
+        assert_eq!(summary.agents[0].id, "dev");
+        assert_eq!(summary.agents[0].seal_count, 2);
+        assert_eq!(summary.specs_summary.len(), 1);
+        assert_eq!(summary.specs_summary[0].id, "auth");
+        assert!(summary.files_changed.contains(&"auth.py".to_string()));
+        // Spec status wasn't explicitly updated, so headline shows "in progress".
+        assert!(summary.headline.contains("writ:"));
+
+        // Now update spec to complete and verify headline changes.
+        repo.update_spec("auth", SpecUpdate { status: Some(SpecStatus::Complete), ..Default::default() }).unwrap();
+        let summary2 = repo.summary().unwrap();
+        assert!(summary2.headline.contains("Add authentication"),
+            "headline with completed spec should include title: {}", summary2.headline);
+    }
+
+    #[test]
+    fn test_summary_multi_agent_multi_spec() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("feat-a".into(), "Feature A".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("feat-b".into(), "Feature B".into(), "".into())).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("agent-1"), "feature A work".into(), Some("feat-a".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            agent("agent-2"), "feature B work".into(), Some("feat-b".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Mark specs as complete.
+        repo.update_spec("feat-a", SpecUpdate { status: Some(SpecStatus::Complete), ..Default::default() }).unwrap();
+        repo.update_spec("feat-b", SpecUpdate { status: Some(SpecStatus::Complete), ..Default::default() }).unwrap();
+
+        let summary = repo.summary().unwrap();
+        assert_eq!(summary.total_seals, 2);
+        assert_eq!(summary.agents.len(), 2);
+        assert_eq!(summary.specs_summary.len(), 2);
+        assert!(summary.headline.contains("2 features complete"),
+            "headline: {}", summary.headline);
+    }
+
+    #[test]
+    fn test_summary_commit_message_format() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("fix".into(), "Fix login bug".into(), "".into())).unwrap();
+
+        std::fs::write(dir.path().join("fix.py"), "fixed").unwrap();
+        repo.seal(
+            agent("fixer"), "patched login".into(), Some("fix".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let summary = repo.summary().unwrap();
+        // commit_message should have headline and body.
+        assert!(summary.commit_message.contains(&summary.headline));
+        assert!(summary.commit_message.contains("Specs:"));
+        assert!(summary.commit_message.contains("fix"));
+        assert!(summary.commit_message.contains("Files changed:"));
+        assert!(summary.commit_message.contains("Total seals:"));
+    }
+
+    #[test]
+    fn test_summary_files_to_stage() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("dev"), "work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Modify a file after the last seal — should appear in files_to_stage.
+        std::fs::write(dir.path().join("a.txt"), "modified").unwrap();
+
+        let summary = repo.summary().unwrap();
+        assert!(summary.files_to_stage.contains(&"a.txt".to_string()),
+            "modified file should be in files_to_stage");
+    }
+
+    #[test]
+    fn test_summary_with_diverged_branches() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha 2".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let summary = repo.summary().unwrap();
+        assert!(summary.convergence_recommended);
+        assert!(summary.diverged_branch_count > 0);
+        assert!(summary.body.contains("diverged branch"));
+    }
+
+    #[test]
+    fn test_summary_excludes_bridge_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Simulate a bridge import seal by using agent_id "writ-bridge".
+        std::fs::write(dir.path().join("imported.txt"), "from git").unwrap();
+        repo.seal(
+            AgentIdentity { id: "writ-bridge".into(), agent_type: AgentType::Agent },
+            "bridge import from git abc123".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Real agent work.
+        std::fs::write(dir.path().join("new.txt"), "agent work").unwrap();
+        repo.seal(
+            agent("dev"), "actual work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let summary = repo.summary().unwrap();
+        assert_eq!(summary.total_seals, 1, "bridge seal should be excluded");
+        assert_eq!(summary.agents.len(), 1);
+        assert_eq!(summary.agents[0].id, "dev");
+    }
+
+    #[test]
+    fn test_summary_serializable() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("f.txt"), "content").unwrap();
+        repo.seal(
+            agent("dev"), "work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let summary = repo.summary().unwrap();
+        let json = serde_json::to_string(&summary).unwrap();
+        let parsed: SummaryOutput = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.total_seals, summary.total_seals);
+        assert_eq!(parsed.headline, summary.headline);
     }
 }
 

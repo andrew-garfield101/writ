@@ -212,6 +212,8 @@ repo.seal(summary="what you did", agent_id="your-id", agent_type="agent", spec_i
 - If context shows `convergence_recommended: true`, run `writ converge` to merge diverged branches
 - Use `writ log --all` to see seals from all branches (including diverged ones)
 - If context shows unsealed changes, seal before starting new work
+- When context shows `session_complete: true`, all specs are done — run `writ summary` for the full report
+- Summary files (.writ/summary.json, .writ/summary.txt) are auto-generated when all specs complete
 "#.to_string()
 }
 
@@ -256,6 +258,8 @@ repo.seal(summary="changes", agent_id="your-id", agent_type="agent", spec_id="yo
 - Include verification data (--tests-passed, --tests-failed, --linted)
 - If context shows `convergence_recommended: true`, run `writ converge` to merge diverged branches
 - Use `writ log --all` to see unified history across all branches
+- When context shows `session_complete: true`, all specs are done — run `writ summary` for the full report
+- Summary files (.writ/summary.json, .writ/summary.txt) are auto-generated when all specs complete
 "#.to_string()
 }
 

@@ -197,6 +197,22 @@ pub struct SealNudge {
     pub message: String,
 }
 
+/// A file scope violation detected when reviewing seal history.
+/// Surfaces cases where agents sealed files outside their spec's declared scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileScopeViolation {
+    /// The seal that contained out-of-scope files.
+    pub seal_id: String,
+    /// Agent who made the seal.
+    pub agent_id: String,
+    /// The spec whose scope was violated.
+    pub spec_id: String,
+    /// Files that were outside the spec's declared file_scope.
+    pub out_of_scope_files: Vec<String>,
+    /// The spec's declared scope (for reference).
+    pub declared_scope: Vec<String>,
+}
+
 /// Status of a dependency spec (shown in spec-scoped context).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DepStatus {
@@ -349,6 +365,32 @@ pub struct ContextOutput {
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
     pub convergence_recommended: bool,
 
+    /// File scope violations detected in recent seals.
+    /// Non-empty when agents sealed files outside their spec's declared file_scope.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub file_scope_violations: Vec<FileScopeViolation>,
+
+    /// True when all specs in the repository are marked complete.
+    /// Signals to agents/humans that work is done and `writ summary` is available.
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    pub session_complete: bool,
+
+    /// Inline session summary, populated only when session_complete is true.
+    /// Gives a quick overview without needing to run `writ summary` separately.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_summary: Option<SessionSummary>,
+
     /// Available writ operations for agent discoverability.
     pub available_operations: Vec<String>,
+}
+
+/// Compact inline summary shown in context when all specs are complete.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSummary {
+    pub headline: String,
+    pub total_seals: usize,
+    pub agent_count: usize,
+    pub specs_completed: usize,
+    pub files_changed: usize,
+    pub message: String,
 }

@@ -413,6 +413,22 @@ class Pipeline:
             })
 
         results["seal_history"] = agent.repo.log()
+
+        try:
+            summary = agent.repo.summary()
+            results["session_summary"] = summary
+            print("\n" + "=" * 62)
+            print("  WRIT SESSION COMPLETE")
+            print("=" * 62)
+            print(f"  {summary.get('headline', '')}")
+            print(f"  {summary.get('total_seals', 0)} seal(s), "
+                  f"{len(summary.get('files_changed', []))} file(s) changed")
+            print()
+            print("  Run `writ summary` for the full report.")
+            print("=" * 62 + "\n")
+        except Exception:
+            pass
+
         return results
 
 

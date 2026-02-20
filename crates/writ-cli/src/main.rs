@@ -152,6 +152,15 @@ enum Commands {
         format: String,
     },
 
+    /// Human-readable summary of all work done in this writ session.
+    /// Designed for the round-trip: writ install -> agents work -> writ summary -> git commit.
+    Summary {
+        /// Output format: "human" (default), "json", or "commit".
+        /// "commit" outputs just the suggested git commit message.
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
     /// Restore working directory to a specific seal's state.
     Restore {
         /// Seal ID to restore to (supports short prefix).
@@ -412,6 +421,7 @@ fn main() {
             agent,
             format,
         } => cmd_context(&cwd, spec, seal_limit, status, agent, &format),
+        Commands::Summary { format } => cmd_summary(&cwd, &format),
         Commands::Restore {
             seal_id,
             force,
@@ -997,6 +1007,12 @@ fn cmd_context(
         "human" => {
             println!("=== writ context ===\n");
 
+            if let Some(ref ss) = ctx.session_summary {
+                println!("  ✅ SESSION COMPLETE: {}", ss.headline);
+                println!("     {} file(s) changed. {}", ss.files_changed, ss.message);
+                println!();
+            }
+
             if let Some(ref spec) = ctx.active_spec {
                 println!("spec: {} — {}", spec.id, spec.title);
                 println!("  status: {:?}", spec.status);
@@ -1077,6 +1093,20 @@ fn cmd_context(
                 }
             }
 
+            if !ctx.file_scope_violations.is_empty() {
+                println!();
+                println!("file scope violations:");
+                for v in &ctx.file_scope_violations {
+                    println!(
+                        "  seal {} ({}) — {} file(s) outside spec '{}' scope:",
+                        v.seal_id, v.agent_id, v.out_of_scope_files.len(), v.spec_id
+                    );
+                    for f in &v.out_of_scope_files {
+                        println!("    ! {f}");
+                    }
+                }
+            }
+
             if ctx.convergence_recommended {
                 println!();
                 println!("  *** CONVERGENCE RECOMMENDED ***");
@@ -1087,6 +1117,93 @@ fn cmd_context(
         }
         _ => {
             println!("{}", serde_json::to_string_pretty(&ctx)?);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_summary(
+    cwd: &PathBuf,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    let summary = repo.summary()?;
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&summary)?);
+        }
+        "commit" => {
+            println!("{}", summary.commit_message);
+        }
+        _ => {
+            println!("══════════════════════════════════════════════════════════════");
+            println!("  WRIT SESSION SUMMARY");
+            println!("══════════════════════════════════════════════════════════════");
+            println!();
+            println!("  {}", summary.headline);
+            println!();
+
+            if !summary.specs_summary.is_empty() {
+                println!("  Specs:");
+                for s in &summary.specs_summary {
+                    let icon = match s.status.as_str() {
+                        "complete" => "✓",
+                        "in-progress" => "…",
+                        "blocked" => "✗",
+                        _ => "·",
+                    };
+                    println!(
+                        "    {icon} {:<25} [{}] {} seal(s) by {}",
+                        s.id, s.status, s.seal_count,
+                        s.agents.join(", "),
+                    );
+                    println!("      {}", s.title);
+                }
+                println!();
+            }
+
+            if !summary.agents.is_empty() {
+                println!("  Agents:");
+                for a in &summary.agents {
+                    println!(
+                        "    {:<20} {} seal(s) on {}",
+                        a.id, a.seal_count,
+                        a.specs_touched.join(", "),
+                    );
+                }
+                println!();
+            }
+
+            println!(
+                "  Total: {} seal(s), {} file(s) changed",
+                summary.total_seals,
+                summary.files_changed.len(),
+            );
+
+            if !summary.files_to_stage.is_empty() {
+                println!();
+                println!("  Files to stage ({}):", summary.files_to_stage.len());
+                for f in &summary.files_to_stage {
+                    println!("    {f}");
+                }
+            }
+
+            if summary.convergence_recommended {
+                println!();
+                println!("  ⚠ {} diverged branch(es) — run `writ converge` before committing.",
+                    summary.diverged_branch_count);
+            }
+
+            println!();
+            println!("──────────────────────────────────────────────────────────────");
+            println!("  Suggested commit message:");
+            println!("──────────────────────────────────────────────────────────────");
+            println!();
+            println!("{}", summary.commit_message);
+            println!();
+            println!("══════════════════════════════════════════════════════════════");
         }
     }
 

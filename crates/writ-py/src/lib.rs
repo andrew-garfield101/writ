@@ -545,6 +545,12 @@ impl PyRepository {
         to_pydict(py, &status)
     }
 
+    /// Human-readable summary of all work done in this writ session.
+    fn summary(&self, py: Python) -> PyResult<PyObject> {
+        let summary = self.inner.summary().map_err(writ_err)?;
+        to_pydict(py, &summary)
+    }
+
     /// Initialize a bare remote directory.
     #[staticmethod]
     fn remote_init(path: &str) -> PyResult<()> {

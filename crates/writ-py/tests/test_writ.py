@@ -2,6 +2,7 @@
 
 import json
 import os
+import subprocess
 
 import pytest
 import writ
@@ -1629,3 +1630,290 @@ class TestFileScopeWarning:
         (tmp_path / "file.py").write_text("hello")
         result = repo.seal(summary="work", agent_id="a1", agent_type="agent")
         assert result.get("file_scope_warning") is None
+
+
+def _init_git_repo(path):
+    """Helper: create a git repo with an initial commit."""
+    subprocess.run(["git", "init", str(path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.email", "test@test.com"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "config", "user.name", "Test"],
+                   check=True, capture_output=True)
+
+
+def _git_commit(path, message="commit"):
+    """Helper: stage all and commit."""
+    subprocess.run(["git", "-C", str(path), "add", "-A"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-m", message],
+                   check=True, capture_output=True)
+
+
+class TestBridgeImportAttribution:
+    """Sprint 3: Bridge import should not pollute first agent's seal."""
+
+    def test_first_seal_after_bridge_only_has_agent_changes(self, tmp_path):
+        """First seal after bridge_import should only contain the agent's actual changes."""
+        _init_git_repo(tmp_path)
+        (tmp_path / "readme.md").write_text("# Hello")
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("print('hello')")
+        _git_commit(tmp_path, "initial")
+
+        repo = writ.Repository.init(str(tmp_path))
+        result = repo.bridge_import(agent_id="bridge", agent_type="agent")
+        assert result["files_imported"] == 2  # readme.md + src/main.py
+
+        # Agent creates 1 new file.
+        (tmp_path / "agent.txt").write_text("my work")
+        seal = repo.seal(summary="agent work", agent_id="dev", agent_type="agent")
+        changes = seal["changes"]
+
+        # Only the agent's file should appear, not the bridge-imported files.
+        paths = [c["path"] for c in changes]
+        assert paths == ["agent.txt"], f"expected only agent.txt; got {paths}"
+
+    def test_dirty_tree_not_attributed_to_first_agent(self, tmp_path):
+        """Uncommitted files at bridge_import time shouldn't appear in first seal."""
+        _init_git_repo(tmp_path)
+        (tmp_path / "committed.txt").write_text("in git")
+        _git_commit(tmp_path, "initial")
+
+        # Dirty file exists before bridge_import.
+        (tmp_path / "dirty.txt").write_text("not committed")
+
+        repo = writ.Repository.init(str(tmp_path))
+        repo.bridge_import(agent_id="bridge", agent_type="agent")
+
+        # Agent creates their own file.
+        (tmp_path / "agent.txt").write_text("agent work")
+        seal = repo.seal(summary="work", agent_id="dev", agent_type="agent")
+        paths = [c["path"] for c in seal["changes"]]
+
+        assert "dirty.txt" not in paths, "dirty file should not pollute agent's seal"
+        assert "agent.txt" in paths
+
+    def test_bridge_seal_still_records_git_snapshot(self, tmp_path):
+        """Bridge seal should record the git tree for historical accuracy."""
+        _init_git_repo(tmp_path)
+        (tmp_path / "file.txt").write_text("content")
+        _git_commit(tmp_path, "initial")
+
+        repo = writ.Repository.init(str(tmp_path))
+        result = repo.bridge_import(agent_id="bridge", agent_type="agent")
+
+        # The import result should show the git file was captured.
+        assert result["files_imported"] == 1
+        assert len(result["seal_id"]) > 0
+
+
+class TestSpecScopedDivergedSeals:
+    """Sprint 3: Spec-scoped context shows seals from diverged branches."""
+
+    def test_diverged_spec_seals_visible_in_context(self, tmp_path):
+        """Seals on a diverged spec branch should appear in spec-scoped context."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+
+        # Agent A seals on alpha.
+        (tmp_path / "a.txt").write_text("a1")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        # Agent B seals twice on beta.
+        (tmp_path / "b.txt").write_text("b1")
+        repo.seal(summary="beta 1", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        (tmp_path / "b.txt").write_text("b2")
+        repo.seal(summary="beta 2", agent_id="agent-b", agent_type="agent", spec_id="beta")
+
+        # Agent A seals on alpha again — diverges beta.
+        (tmp_path / "a.txt").write_text("a2")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        # Spec-scoped context for beta should show its seals.
+        ctx = repo.context(spec="beta")
+        assert len(ctx["recent_seals"]) == 2, (
+            f"expected 2 beta seals; got {len(ctx['recent_seals'])}"
+        )
+        assert all(s["agent"] == "agent-b" for s in ctx["recent_seals"])
+
+    def test_diverged_spec_still_shows_progress(self, tmp_path):
+        """spec_progress should be populated for diverged specs."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        (tmp_path / "a.txt").write_text("a2")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        ctx = repo.context(spec="beta")
+        assert ctx.get("spec_progress") is not None
+        assert ctx["spec_progress"]["total_seals"] == 1
+        assert "agent-b" in ctx["spec_progress"]["agents_involved"]
+
+    def test_non_diverged_spec_still_works(self, tmp_path):
+        """Spec-scoped context still works for non-diverged specs."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+
+        (tmp_path / "f.txt").write_text("work")
+        repo.seal(summary="feature", agent_id="dev", agent_type="agent", spec_id="feat")
+
+        ctx = repo.context(spec="feat")
+        assert len(ctx["recent_seals"]) == 1
+        assert ctx["recent_seals"][0]["agent"] == "dev"
+
+    def test_diverged_spec_context_json_serializable(self, tmp_path):
+        """Diverged spec context survives JSON round-trip."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        (tmp_path / "a.txt").write_text("a2")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        ctx = repo.context(spec="beta")
+        serialized = json.dumps(ctx)
+        parsed = json.loads(serialized)
+        assert len(parsed["recent_seals"]) == 1
+        assert parsed["recent_seals"][0]["agent"] == "agent-b"
+
+
+class TestSummary:
+    """Sprint 3: Human-facing session summary for round-trip workflow."""
+
+    def test_summary_empty_repo(self, tmp_path):
+        """Empty repo returns a summary with zero seals."""
+        repo = writ.Repository.init(str(tmp_path))
+        summary = repo.summary()
+        assert summary["total_seals"] == 0
+        assert summary["files_changed"] == []
+        assert summary["agents"] == []
+        assert summary["specs_summary"] == []
+
+    def test_summary_has_all_fields(self, tmp_path):
+        """Summary dict has all expected fields."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="work", agent_id="dev", agent_type="agent")
+
+        s = repo.summary()
+        assert "headline" in s
+        assert "body" in s
+        assert "commit_message" in s
+        assert "specs_summary" in s
+        assert "agents" in s
+        assert "total_seals" in s
+        assert "files_changed" in s
+        assert "files_to_stage" in s
+        assert "convergence_recommended" in s
+        assert "diverged_branch_count" in s
+
+    def test_summary_single_spec_complete(self, tmp_path):
+        """Complete spec shows title in headline."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="auth", title="Add authentication")
+
+        (tmp_path / "auth.py").write_text("class Auth: pass")
+        repo.seal(summary="added auth", agent_id="dev", agent_type="agent", spec_id="auth")
+        repo.update_spec("auth", status="complete")
+
+        s = repo.summary()
+        assert "Add authentication" in s["headline"]
+        assert s["total_seals"] == 1
+        assert len(s["specs_summary"]) == 1
+        assert s["specs_summary"][0]["status"] == "complete"
+
+    def test_summary_multi_agent(self, tmp_path):
+        """Multiple agents appear in summary."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="agent-1 work", agent_id="agent-1", agent_type="agent", spec_id="feat")
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="agent-2 work", agent_id="agent-2", agent_type="agent", spec_id="feat")
+
+        s = repo.summary()
+        assert s["total_seals"] == 2
+        agent_ids = [a["id"] for a in s["agents"]]
+        assert "agent-1" in agent_ids
+        assert "agent-2" in agent_ids
+
+    def test_summary_commit_message(self, tmp_path):
+        """commit_message combines headline and body."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "f.txt").write_text("content")
+        repo.seal(summary="did stuff", agent_id="dev", agent_type="agent")
+
+        s = repo.summary()
+        assert s["headline"] in s["commit_message"]
+        assert "Files changed:" in s["body"]
+        assert "Total seals:" in s["body"]
+
+    def test_summary_files_to_stage(self, tmp_path):
+        """Working tree changes appear in files_to_stage."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="work", agent_id="dev", agent_type="agent")
+
+        # Modify after seal.
+        (tmp_path / "a.txt").write_text("modified")
+
+        s = repo.summary()
+        assert "a.txt" in s["files_to_stage"]
+
+    def test_summary_excludes_bridge_seals(self, tmp_path):
+        """Bridge import seals are excluded from summary counts."""
+        repo = writ.Repository.init(str(tmp_path))
+
+        # Simulate bridge seal.
+        (tmp_path / "imported.txt").write_text("from git")
+        repo.seal(summary="bridge import", agent_id="writ-bridge", agent_type="agent")
+
+        # Real work.
+        (tmp_path / "new.txt").write_text("agent work")
+        repo.seal(summary="actual work", agent_id="dev", agent_type="agent")
+
+        s = repo.summary()
+        assert s["total_seals"] == 1
+        assert len(s["agents"]) == 1
+        assert s["agents"][0]["id"] == "dev"
+
+    def test_summary_json_serializable(self, tmp_path):
+        """Summary survives JSON round-trip."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "f.txt").write_text("content")
+        repo.seal(summary="work", agent_id="dev", agent_type="agent")
+
+        s = repo.summary()
+        serialized = json.dumps(s)
+        parsed = json.loads(serialized)
+        assert parsed["total_seals"] == 1
+        assert parsed["headline"] == s["headline"]
+
+    def test_summary_convergence_warning(self, tmp_path):
+        """Diverged branches show convergence warning in summary."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        (tmp_path / "a.txt").write_text("a2")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        s = repo.summary()
+        assert s["convergence_recommended"] is True
+        assert s["diverged_branch_count"] > 0
+        assert "diverged" in s["body"]

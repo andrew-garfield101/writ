@@ -248,6 +248,30 @@ pub struct SpecProgress {
     pub latest_seal_at: Option<String>,
 }
 
+/// Per-agent activity summary for multi-agent awareness.
+///
+/// Shows which files each agent "owns" (last sealed) and their recent
+/// activity, so agents can see each other's work without filesystem
+/// inspection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentActivity {
+    /// Agent identifier.
+    pub agent_id: String,
+    /// Files this agent most recently sealed (provenance — who last touched each file).
+    pub files_owned: Vec<String>,
+    /// Number of seals by this agent in the seal history.
+    pub seal_count: usize,
+    /// Summary of their most recent seal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_summary: Option<String>,
+    /// Timestamp of their most recent seal (ISO 8601).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latest_at: Option<String>,
+    /// Spec IDs this agent has worked on.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub specs_touched: Vec<String>,
+}
+
 /// The full context output, optimized for LLM consumption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextOutput {
@@ -289,6 +313,11 @@ pub struct ContextOutput {
     /// Summary of spec completion progress when spec-scoped (omitted in full scope).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_progress: Option<SpecProgress>,
+
+    /// Per-agent file ownership and recent activity for multi-agent awareness.
+    /// Shows which agent last sealed each file, enabling cross-agent coordination.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub agent_activity: Vec<AgentActivity>,
 
     /// Available writ operations for agent discoverability.
     pub available_operations: Vec<String>,

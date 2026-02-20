@@ -41,4 +41,5 @@ __all__ = [
     "detect_frameworks",
     "install_hooks",
     "__version__",
+    "sdk",
 ]

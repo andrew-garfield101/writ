@@ -239,9 +239,50 @@ class Phase:
         return self._agent.seal(msg, status="complete", allow_empty=True)
 
 
+FULL_PHASES = ("specification", "design", "implementation", "testing", "review", "finalize")
+COMPACT_PHASES = ("spec-and-design", "implementation", "test-and-review", "finalize")
+
+
+def estimate_complexity(description: str, file_scope: Optional[List[str]] = None) -> str:
+    """Estimate feature complexity from its description and scope.
+
+    Returns "full" for complex features (6 phases) or "compact" for
+    simple ones (4 collapsed phases).
+
+    Heuristics:
+    - More than 5 scoped files -> full
+    - Description mentions architecture, migration, refactor -> full
+    - Description under 200 chars with no complexity signals -> compact
+    """
+    complex_signals = [
+        "architect", "migration", "refactor", "redesign",
+        "infrastructure", "database", "schema", "security audit",
+        "authentication", "authorization", "multi-",
+    ]
+
+    desc_lower = description.lower()
+    if any(s in desc_lower for s in complex_signals):
+        return "full"
+
+    if file_scope and len(file_scope) > 5:
+        return "full"
+
+    if len(description) > 500:
+        return "full"
+
+    return "compact"
+
+
 class Pipeline:
     """
     Decorator-based pipeline for autonomous spec-driven workflows.
+
+    Supports two modes:
+    - **full** (6 phases): spec -> design -> implement -> test -> review -> finalize
+    - **compact** (4 phases): spec+design -> implement -> test+review -> finalize
+
+    The mode is chosen automatically based on feature complexity, or can
+    be set explicitly via the ``mode`` parameter.
 
     Usage::
 
@@ -260,6 +301,15 @@ class Pipeline:
             return {"summary": "built auth module", "tests_passed": 12}
 
         results = pipeline.run(path=".")
+
+    Adaptive (auto-detect complexity)::
+
+        pipeline = Pipeline(
+            spec_id="add-footer-link",
+            spec_title="Add Footer Link",
+            spec_description="Add a privacy policy link to the footer",
+            mode="auto",  # default: auto-detects compact vs full
+        )
     """
 
     def __init__(
@@ -267,11 +317,27 @@ class Pipeline:
         spec_id: str,
         spec_title: str,
         spec_description: str = "",
+        *,
+        mode: str = "auto",
+        file_scope: Optional[List[str]] = None,
     ):
         self.spec_id = spec_id
         self.spec_title = spec_title
         self.spec_description = spec_description
+        self.file_scope = file_scope
         self._phases: List[_PhaseRegistration] = []
+
+        if mode == "auto":
+            self.mode = estimate_complexity(spec_description, file_scope)
+        elif mode in ("full", "compact"):
+            self.mode = mode
+        else:
+            raise ValueError(f"mode must be 'auto', 'full', or 'compact', got '{mode}'")
+
+    @property
+    def phase_names(self) -> tuple:
+        """The phase sequence for this pipeline's mode."""
+        return FULL_PHASES if self.mode == "full" else COMPACT_PHASES
 
     def phase(
         self,
@@ -295,16 +361,23 @@ class Pipeline:
         agent.open()
 
         try:
-            agent.repo.add_spec(
+            spec_kwargs: Dict[str, Any] = dict(
                 id=self.spec_id,
                 title=self.spec_title,
                 description=self.spec_description,
             )
+            agent.repo.add_spec(**spec_kwargs)
+            if self.file_scope:
+                agent.repo.update_spec(self.spec_id, file_scope=self.file_scope)
         except writ.WritError as e:
             if "already exists" not in str(e).lower():
                 raise
 
-        results: Dict[str, Any] = {"phases": [], "spec_id": self.spec_id}
+        results: Dict[str, Any] = {
+            "phases": [],
+            "spec_id": self.spec_id,
+            "mode": self.mode,
+        }
 
         for registration in self._phases:
             with Phase(agent, registration.name, agent_id=registration.agent_id) as p:

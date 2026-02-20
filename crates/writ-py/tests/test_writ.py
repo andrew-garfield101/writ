@@ -1168,6 +1168,111 @@ class TestSpecScopedContextFiltering:
         assert "unrelated.py" not in ctx["working_state"]["modified_files"]
 
 
+class TestAgentActivity:
+    """P1: agent_activity in context shows per-agent file ownership and provenance."""
+
+    def test_empty_when_no_seals(self, tmp_path):
+        """No agent_activity when repo has no seals."""
+        repo = writ.Repository.init(str(tmp_path))
+        ctx = repo.context()
+        assert ctx.get("agent_activity", []) == []
+
+    def test_single_agent_owns_files(self, tmp_path):
+        """Single agent appears with all files they sealed."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("aaa")
+        (tmp_path / "b.txt").write_text("bbb")
+        repo.seal(summary="init", agent_id="worker-1", agent_type="agent")
+
+        ctx = repo.context()
+        activity = ctx["agent_activity"]
+        assert len(activity) == 1
+        assert activity[0]["agent_id"] == "worker-1"
+        assert "a.txt" in activity[0]["files_owned"]
+        assert "b.txt" in activity[0]["files_owned"]
+        assert activity[0]["seal_count"] == 1
+
+    def test_multi_agent_provenance(self, tmp_path):
+        """File ownership reflects the most recent sealer."""
+        repo = writ.Repository.init(str(tmp_path))
+
+        # Agent A creates shared.txt and a.txt.
+        (tmp_path / "shared.txt").write_text("v1")
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="a work", agent_id="agent-a", agent_type="agent")
+
+        # Agent B modifies shared.txt and creates b.txt.
+        (tmp_path / "shared.txt").write_text("v2")
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="b work", agent_id="agent-b", agent_type="agent")
+
+        ctx = repo.context()
+        activity = {a["agent_id"]: a for a in ctx["agent_activity"]}
+
+        # Agent A still owns a.txt.
+        assert "a.txt" in activity["agent-a"]["files_owned"]
+        # Agent B owns shared.txt (more recent) and b.txt.
+        assert "shared.txt" in activity["agent-b"]["files_owned"]
+        assert "b.txt" in activity["agent-b"]["files_owned"]
+        # Agent A lost ownership of shared.txt.
+        assert "shared.txt" not in activity["agent-a"]["files_owned"]
+
+    def test_has_latest_summary(self, tmp_path):
+        """Agent activity includes the most recent seal summary."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("v1")
+        repo.seal(summary="first", agent_id="dev", agent_type="agent")
+        (tmp_path / "a.txt").write_text("v2")
+        repo.seal(summary="second", agent_id="dev", agent_type="agent")
+
+        ctx = repo.context()
+        assert ctx["agent_activity"][0]["latest_summary"] == "second"
+        assert ctx["agent_activity"][0]["seal_count"] == 2
+
+    def test_tracks_specs(self, tmp_path):
+        """Agent activity includes specs touched."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="auth", title="Auth")
+        repo.add_spec(id="ui", title="UI")
+
+        (tmp_path / "auth.py").write_text("pass")
+        repo.seal(summary="auth", agent_id="dev", agent_type="agent", spec_id="auth")
+        (tmp_path / "ui.py").write_text("pass")
+        repo.seal(summary="ui", agent_id="dev", agent_type="agent", spec_id="ui")
+
+        ctx = repo.context()
+        specs = ctx["agent_activity"][0]["specs_touched"]
+        assert "auth" in specs
+        assert "ui" in specs
+
+    def test_spec_scoped_filters_files(self, tmp_path):
+        """Spec-scoped context filters agent_activity to spec-relevant files."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="api", title="API")
+        repo.update_spec("api", file_scope=["api.py"])
+
+        (tmp_path / "api.py").write_text("v1")
+        (tmp_path / "config.py").write_text("v1")
+        repo.seal(summary="work", agent_id="dev", agent_type="agent", spec_id="api")
+
+        ctx = repo.context(spec="api")
+        activity = ctx["agent_activity"][0]
+        assert "api.py" in activity["files_owned"]
+        assert "config.py" not in activity["files_owned"]
+
+    def test_json_serializable(self, tmp_path):
+        """Agent activity survives JSON round-trip."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("hello")
+        repo.seal(summary="work", agent_id="worker", agent_type="agent")
+
+        ctx = repo.context()
+        serialized = json.dumps(ctx)
+        parsed = json.loads(serialized)
+        assert len(parsed["agent_activity"]) == 1
+        assert parsed["agent_activity"][0]["agent_id"] == "worker"
+
+
 class TestFileScopeWarning:
     def test_no_warning_when_no_scope(self, tmp_path):
         """No warning when spec has no file_scope set."""

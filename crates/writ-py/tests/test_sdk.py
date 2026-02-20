@@ -6,7 +6,7 @@ import os
 import pytest
 
 import writ
-from writ.sdk import Agent, Phase, Pipeline
+from writ.sdk import Agent, Phase, Pipeline, estimate_complexity, FULL_PHASES, COMPACT_PHASES
 
 
 @pytest.fixture
@@ -237,3 +237,117 @@ class TestSecurityIntegration:
         with Agent("bad agent!", path=repo_dir) as agent:
             with pytest.raises(writ.WritError):
                 agent.seal("should fail")
+
+
+class TestAdaptivePipeline:
+    def test_estimate_compact_for_simple(self):
+        assert estimate_complexity("Add a link to the footer") == "compact"
+        assert estimate_complexity("Fix typo in README") == "compact"
+        assert estimate_complexity("Update CSS colors") == "compact"
+
+    def test_estimate_full_for_complex(self):
+        assert estimate_complexity("Migrate database schema to PostgreSQL") == "full"
+        assert estimate_complexity("Refactor the authentication module") == "full"
+        assert estimate_complexity("Build multi-tenant infrastructure") == "full"
+
+    def test_estimate_full_for_large_scope(self):
+        scope = ["a.py", "b.py", "c.py", "d.py", "e.py", "f.py"]
+        assert estimate_complexity("small change", file_scope=scope) == "full"
+
+    def test_estimate_compact_for_small_scope(self):
+        scope = ["footer.astro"]
+        assert estimate_complexity("add link", file_scope=scope) == "compact"
+
+    def test_estimate_full_for_long_description(self):
+        desc = "x" * 501
+        assert estimate_complexity(desc) == "full"
+
+    def test_pipeline_auto_mode_compact(self, repo_dir):
+        p = Pipeline(
+            spec_id="small-feat",
+            spec_title="Small Feature",
+            spec_description="Add a link to the footer",
+        )
+        assert p.mode == "compact"
+        assert p.phase_names == COMPACT_PHASES
+
+    def test_pipeline_auto_mode_full(self, repo_dir):
+        p = Pipeline(
+            spec_id="big-feat",
+            spec_title="Big Feature",
+            spec_description="Refactor the authentication system",
+        )
+        assert p.mode == "full"
+        assert p.phase_names == FULL_PHASES
+
+    def test_pipeline_explicit_mode(self):
+        p = Pipeline(
+            spec_id="feat",
+            spec_title="Feature",
+            spec_description="anything",
+            mode="full",
+        )
+        assert p.mode == "full"
+
+    def test_pipeline_invalid_mode_raises(self):
+        with pytest.raises(ValueError, match="mode must be"):
+            Pipeline(
+                spec_id="feat",
+                spec_title="Feature",
+                mode="invalid",
+            )
+
+    def test_pipeline_compact_run(self, repo_dir):
+        p = Pipeline(
+            spec_id="small-feat",
+            spec_title="Small Feature",
+            spec_description="Add a footer link",
+            mode="compact",
+        )
+
+        @p.phase("spec-and-design", agent_id="planner")
+        def plan(ctx):
+            with open(os.path.join(repo_dir, "footer.txt"), "w") as f:
+                f.write("link added")
+            return {"summary": "planned and designed footer link"}
+
+        @p.phase("implementation", agent_id="implementer")
+        def impl(ctx):
+            with open(os.path.join(repo_dir, "footer.txt"), "w") as f:
+                f.write("link implemented")
+            return {"summary": "implemented footer link"}
+
+        @p.phase("test-and-review", agent_id="verifier")
+        def verify(ctx):
+            with open(os.path.join(repo_dir, "test_results.txt"), "w") as f:
+                f.write("1 passed, 0 failed")
+            return {"summary": "tested and reviewed", "tests_passed": 1}
+
+        results = p.run(path=repo_dir)
+        assert results["mode"] == "compact"
+        phase_names = [ph["name"] for ph in results["phases"]]
+        assert "spec-and-design" in phase_names
+        assert "test-and-review" in phase_names
+        assert "finalize" in phase_names
+        assert len(results["phases"]) == 4
+
+    def test_pipeline_sets_file_scope(self, repo_dir):
+        p = Pipeline(
+            spec_id="scoped-feat",
+            spec_title="Scoped Feature",
+            spec_description="Small change",
+            file_scope=["src/components/"],
+            mode="compact",
+        )
+
+        @p.phase("implementation", agent_id="impl")
+        def impl(ctx):
+            with open(os.path.join(repo_dir, "f.txt"), "w") as f:
+                f.write("done")
+            return {"summary": "implemented"}
+
+        results = p.run(path=repo_dir)
+
+        repo = writ.Repository.open(repo_dir)
+        spec = repo.get_spec("scoped-feat")
+        assert spec["file_scope"] == ["src/components/"]

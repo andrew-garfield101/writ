@@ -16,8 +16,8 @@ use crate::convergence::{
 };
 use crate::lock::RepoLock;
 use crate::context::{
-    ContextFilter, ContextOutput, ContextScope, DepStatus, DiffSummary, SealNudge, SealSummary,
-    SpecProgress, WorkingStateSummary,
+    AgentActivity, ContextFilter, ContextOutput, ContextScope, DepStatus, DiffSummary, SealNudge,
+    SealSummary, SpecProgress, WorkingStateSummary,
 };
 use crate::diff::{self, DiffOutput, FileDiff};
 use crate::error::{WritError, WritResult};
@@ -655,6 +655,95 @@ impl Repository {
         })
     }
 
+    /// Build per-agent activity summaries from seal history.
+    ///
+    /// Walks seals newest-first to determine file provenance (who last sealed
+    /// each file). If `scope_filter` is provided, only files matching that
+    /// scope are included in the per-agent `files_owned` lists.
+    fn build_agent_activity(
+        seals: &[Seal],
+        scope_filter: Option<&dyn Fn(&str) -> bool>,
+    ) -> Vec<AgentActivity> {
+        use std::collections::HashMap;
+
+        // File provenance: walk newest-first, first agent seen per file wins.
+        let mut file_owner: HashMap<String, String> = HashMap::new();
+        for seal in seals {
+            for change in &seal.changes {
+                file_owner
+                    .entry(change.path.clone())
+                    .or_insert_with(|| seal.agent.id.clone());
+            }
+        }
+
+        // Per-agent aggregation.
+        struct Stats {
+            seal_count: usize,
+            latest_summary: Option<String>,
+            latest_at: Option<String>,
+            specs_touched: Vec<String>,
+        }
+
+        let mut agent_stats: HashMap<String, Stats> = HashMap::new();
+        for seal in seals {
+            let entry = agent_stats
+                .entry(seal.agent.id.clone())
+                .or_insert_with(|| Stats {
+                    seal_count: 0,
+                    latest_summary: None,
+                    latest_at: None,
+                    specs_touched: Vec::new(),
+                });
+            entry.seal_count += 1;
+            // First encounter is newest (seals are newest-first).
+            if entry.latest_summary.is_none() {
+                entry.latest_summary = Some(seal.summary.clone());
+                entry.latest_at = Some(seal.timestamp.to_rfc3339());
+            }
+            if let Some(ref sid) = seal.spec_id {
+                if !entry.specs_touched.contains(sid) {
+                    entry.specs_touched.push(sid.clone());
+                }
+            }
+        }
+
+        // Collect files_owned per agent, optionally filtered by scope.
+        let mut agent_files: HashMap<String, Vec<String>> = HashMap::new();
+        for (path, agent_id) in &file_owner {
+            let include = match scope_filter {
+                Some(f) => f(path),
+                None => true,
+            };
+            if include {
+                agent_files
+                    .entry(agent_id.clone())
+                    .or_default()
+                    .push(path.clone());
+            }
+        }
+
+        // Build final output, sorted by most recent activity.
+        let mut result: Vec<AgentActivity> = agent_stats
+            .into_iter()
+            .map(|(agent_id, stats)| {
+                let mut files = agent_files.remove(&agent_id).unwrap_or_default();
+                files.sort();
+                AgentActivity {
+                    agent_id,
+                    files_owned: files,
+                    seal_count: stats.seal_count,
+                    latest_summary: stats.latest_summary,
+                    latest_at: stats.latest_at,
+                    specs_touched: stats.specs_touched,
+                }
+            })
+            .collect();
+
+        // Sort by latest_at descending (most recently active first).
+        result.sort_by(|a, b| b.latest_at.cmp(&a.latest_at));
+        result
+    }
+
     /// Generate a structured context dump optimized for LLM consumption.
     ///
     /// `filter` narrows the seal history by status and/or agent. The filter
@@ -761,6 +850,8 @@ impl Repository {
                 let file_scope: Vec<String> = index.entries.keys().cloned().collect();
                 let tracked_files = index.entries.len();
 
+                let agent_activity = Self::build_agent_activity(&seals, None);
+
                 Ok(ContextOutput {
                     writ_version: "0.1.0".to_string(),
                     active_spec: None,
@@ -773,6 +864,7 @@ impl Repository {
                     tracked_files,
                     dependency_status: None,
                     spec_progress: None,
+                    agent_activity,
                     available_operations,
                 })
             }
@@ -915,6 +1007,21 @@ impl Repository {
                     None
                 };
 
+                // Build agent activity using ALL seals for provenance, filtered
+                // to spec-relevant files so agents only see relevant ownership.
+                let agent_activity = if has_scope_filter {
+                    let scope_ref = &file_scope;
+                    let scope_fn = |path: &str| -> bool {
+                        scope_ref.iter().any(|scope_entry| {
+                            path == scope_entry
+                                || (scope_entry.ends_with('/') && path.starts_with(scope_entry.as_str()))
+                        })
+                    };
+                    Self::build_agent_activity(&seals, Some(&scope_fn))
+                } else {
+                    Self::build_agent_activity(&seals, None)
+                };
+
                 Ok(ContextOutput {
                     writ_version: "0.1.0".to_string(),
                     active_spec: Some(spec),
@@ -927,6 +1034,7 @@ impl Repository {
                     tracked_files,
                     dependency_status,
                     spec_progress,
+                    agent_activity,
                     available_operations,
                 })
             }
@@ -6602,6 +6710,218 @@ mod spec_scoped_context_tests {
 
         assert!(ctx.working_state.modified_files.contains(&"src/components/Button.tsx".to_string()));
         assert!(!ctx.working_state.modified_files.contains(&"src/utils.ts".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod agent_activity_tests {
+    use super::*;
+    use crate::context::ContextScope;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_agent_activity_empty_when_no_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert!(ctx.agent_activity.is_empty());
+    }
+
+    #[test]
+    fn test_single_agent_owns_all_files() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "aaa").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "bbb").unwrap();
+        repo.seal(
+            agent("worker-1"), "initial".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert_eq!(ctx.agent_activity.len(), 1);
+        let activity = &ctx.agent_activity[0];
+        assert_eq!(activity.agent_id, "worker-1");
+        assert_eq!(activity.seal_count, 1);
+        assert!(activity.files_owned.contains(&"a.txt".to_string()));
+        assert!(activity.files_owned.contains(&"b.txt".to_string()));
+    }
+
+    #[test]
+    fn test_multi_agent_file_provenance() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Agent A creates file a.txt and shared.txt.
+        std::fs::write(dir.path().join("a.txt"), "a-v1").unwrap();
+        std::fs::write(dir.path().join("shared.txt"), "shared-v1").unwrap();
+        repo.seal(
+            agent("agent-a"), "a's work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Agent B creates b.txt and modifies shared.txt.
+        std::fs::write(dir.path().join("b.txt"), "b-v1").unwrap();
+        std::fs::write(dir.path().join("shared.txt"), "shared-v2").unwrap();
+        repo.seal(
+            agent("agent-b"), "b's work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert_eq!(ctx.agent_activity.len(), 2);
+
+        let a = ctx.agent_activity.iter().find(|a| a.agent_id == "agent-a").unwrap();
+        let b = ctx.agent_activity.iter().find(|a| a.agent_id == "agent-b").unwrap();
+
+        // Agent A owns a.txt (created it, no one else touched it).
+        assert!(a.files_owned.contains(&"a.txt".to_string()));
+        // Agent B owns b.txt and shared.txt (last to seal them).
+        assert!(b.files_owned.contains(&"b.txt".to_string()));
+        assert!(b.files_owned.contains(&"shared.txt".to_string()));
+        // Agent A does NOT own shared.txt (B sealed it more recently).
+        assert!(!a.files_owned.contains(&"shared.txt".to_string()));
+    }
+
+    #[test]
+    fn test_agent_activity_has_latest_summary() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "v1").unwrap();
+        repo.seal(
+            agent("dev"), "first commit".into(), None,
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "v2").unwrap();
+        repo.seal(
+            agent("dev"), "second commit".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert_eq!(ctx.agent_activity.len(), 1);
+        let activity = &ctx.agent_activity[0];
+        assert_eq!(activity.seal_count, 2);
+        assert_eq!(activity.latest_summary.as_deref(), Some("second commit"));
+    }
+
+    #[test]
+    fn test_agent_activity_tracks_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("auth".into(), "Auth".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("ui".into(), "UI".into(), "".into())).unwrap();
+
+        std::fs::write(dir.path().join("auth.py"), "pass").unwrap();
+        repo.seal(
+            agent("dev"), "auth work".into(), Some("auth".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("button.py"), "pass").unwrap();
+        repo.seal(
+            agent("dev"), "ui work".into(), Some("ui".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        let activity = &ctx.agent_activity[0];
+        assert!(activity.specs_touched.contains(&"auth".to_string()));
+        assert!(activity.specs_touched.contains(&"ui".to_string()));
+    }
+
+    #[test]
+    fn test_agent_activity_sorted_by_most_recent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Agent A seals first.
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("agent-a"), "a work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Agent B seals second (more recent).
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            agent("agent-b"), "b work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        // Most recently active agent should come first.
+        assert_eq!(ctx.agent_activity[0].agent_id, "agent-b");
+        assert_eq!(ctx.agent_activity[1].agent_id, "agent-a");
+    }
+
+    #[test]
+    fn test_spec_scoped_agent_activity_filters_files() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let mut spec = Spec::new("api".into(), "API".into(), "".into());
+        spec.file_scope = vec!["api.py".to_string()];
+        repo.add_spec(&spec).unwrap();
+
+        // Agent A touches api.py (in scope) and config.py (out of scope).
+        std::fs::write(dir.path().join("api.py"), "pass").unwrap();
+        std::fs::write(dir.path().join("config.py"), "cfg").unwrap();
+        repo.seal(
+            agent("agent-a"), "a work".into(), Some("api".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Agent B touches only config.py (out of scope).
+        std::fs::write(dir.path().join("config.py"), "cfg v2").unwrap();
+        repo.seal(
+            agent("agent-b"), "b work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(
+            ContextScope::Spec("api".into()), 10, &ContextFilter::default(),
+        ).unwrap();
+
+        // Agent A should own api.py in the filtered view.
+        let a = ctx.agent_activity.iter().find(|a| a.agent_id == "agent-a").unwrap();
+        assert!(a.files_owned.contains(&"api.py".to_string()));
+        assert!(!a.files_owned.contains(&"config.py".to_string()));
+
+        // Agent B should have empty files_owned since config.py is out of scope.
+        let b = ctx.agent_activity.iter().find(|a| a.agent_id == "agent-b").unwrap();
+        assert!(b.files_owned.is_empty());
+    }
+
+    #[test]
+    fn test_agent_activity_json_serializable() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        repo.seal(
+            agent("worker"), "work".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(json.contains("agent_activity"));
+        assert!(json.contains("worker"));
+        assert!(json.contains("files_owned"));
     }
 }
 

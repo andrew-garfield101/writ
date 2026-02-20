@@ -179,8 +179,10 @@ This project uses **writ** for AI-native version control. Use writ alongside git
 ```bash
 writ context                                              # project state
 writ context --spec my-feature                            # scoped to a spec
-writ seal -s "what you did" --agent your-id --spec feat   # checkpoint
+writ seal -s "what you did" --agent your-id --spec feat   # checkpoint (status: in-progress)
+writ seal -s "done" --agent your-id --spec feat --status complete  # final seal
 writ log --limit 5                                        # recent seals
+writ log --spec my-feature                                # spec-scoped history
 ```
 
 ### Python API
@@ -195,15 +197,19 @@ repo.seal(summary="what you did", agent_id="your-id", agent_type="agent", spec_i
 ### Workflow
 
 1. Run `writ context` at the start of every task to understand project state
-2. Do your work
-3. Run `writ seal` when you reach a meaningful checkpoint
-4. Check `writ context` again to see what other agents have done
+2. Do your work in small increments
+3. Run `writ seal` after each meaningful chunk (defaults to status: in-progress)
+4. Check `writ context` periodically to see what other agents have done
+5. Use `--status complete` only on your final seal for a spec
 
 ### Rules
 
 - Always seal your work before finishing a task
 - Use --spec to link seals to specs
+- Use --status in-progress for intermediate work (this is the default)
+- Use --status complete only when the spec is fully done
 - Include test results when available (--tests-passed N --tests-failed M)
+- If context shows diverged branches, consider running `writ converge`
 - If context shows unsealed changes, seal before starting new work
 "#.to_string()
 }
@@ -219,10 +225,16 @@ This project uses **writ** for AI-native version control.
 writ context --spec your-spec-id
 ```
 
-### After completing work
+### After each chunk of work
 
 ```bash
-writ seal -s "description of changes" --agent your-id --spec your-spec-id --status complete --tests-passed N
+writ seal -s "description of changes" --agent your-id --spec your-spec-id --tests-passed N
+```
+
+### When finishing a spec
+
+```bash
+writ seal -s "spec complete" --agent your-id --spec your-spec-id --status complete
 ```
 
 ### Python API (alternative)
@@ -237,9 +249,11 @@ repo.seal(summary="changes", agent_id="your-id", agent_type="agent", spec_id="yo
 ### Guidelines
 
 - Always run `writ context` first to understand project state
-- Seal after every meaningful unit of work
+- Seal after every meaningful unit of work (defaults to status: in-progress)
+- Use `--status complete` only on your final seal for a spec
 - Link seals to specs with --spec
 - Include verification data (--tests-passed, --tests-failed, --linted)
+- If context shows diverged branches, consider running `writ converge`
 "#.to_string()
 }
 

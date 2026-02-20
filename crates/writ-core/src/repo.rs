@@ -16,8 +16,8 @@ use crate::convergence::{
 };
 use crate::lock::RepoLock;
 use crate::context::{
-    AgentActivity, ContextFilter, ContextOutput, ContextScope, DepStatus, DiffSummary, SealNudge,
-    SealSummary, SpecProgress, WorkingStateSummary,
+    AgentActivity, ContextFilter, ContextOutput, ContextScope, DepStatus, DiffSummary,
+    DivergedBranchWarning, SealNudge, SealSummary, SpecProgress, WorkingStateSummary,
 };
 use crate::diff::{self, DiffOutput, FileDiff};
 use crate::error::{WritError, WritResult};
@@ -503,6 +503,65 @@ impl Repository {
         self.read_spec_head(spec_id)
     }
 
+    /// Detect spec branches whose tip seals are not reachable from global HEAD.
+    ///
+    /// Returns a list of `(spec_id, branch_tip, seal_count)` for each
+    /// diverged branch. Used to warn about "ghost agent" situations where
+    /// concurrent agents sealed on spec-scoped branches that were never
+    /// converged into the main HEAD chain.
+    pub fn diverged_branches(&self) -> WritResult<Vec<DivergedBranch>> {
+        let head_chain: std::collections::HashSet<String> = {
+            let mut set = std::collections::HashSet::new();
+            let mut current = self.read_head()?;
+            while let Some(id) = current {
+                let seal = self.load_seal(&id)?;
+                set.insert(id);
+                current = seal.parent;
+            }
+            set
+        };
+
+        let heads_dir = self.writ_dir.join("heads");
+        if !heads_dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut diverged = Vec::new();
+        for entry in fs::read_dir(&heads_dir)? {
+            let entry = entry?;
+            let spec_id = entry
+                .file_name()
+                .to_string_lossy()
+                .to_string();
+            if let Some(tip) = self.read_spec_head(&spec_id)? {
+                if !head_chain.contains(&tip) {
+                    let branch_seals = self.spec_log(&spec_id)?;
+                    let not_on_head: Vec<_> = branch_seals
+                        .iter()
+                        .filter(|s| !head_chain.contains(&s.id))
+                        .collect();
+                    if !not_on_head.is_empty() {
+                        let agents: Vec<String> = not_on_head
+                            .iter()
+                            .map(|s| s.agent.id.clone())
+                            .collect::<std::collections::HashSet<_>>()
+                            .into_iter()
+                            .collect();
+                        diverged.push(DivergedBranch {
+                            spec_id: spec_id.clone(),
+                            tip_seal: tip[..12.min(tip.len())].to_string(),
+                            seal_count: not_on_head.len(),
+                            agents,
+                        });
+                    }
+                }
+            }
+        }
+
+        diverged.sort_by(|a, b| a.spec_id.cmp(&b.spec_id));
+        Ok(diverged)
+    }
+
     /// Add a new spec to the repository.
     pub fn add_spec(&self, spec: &Spec) -> WritResult<()> {
         self.save_spec(spec)
@@ -655,6 +714,47 @@ impl Repository {
         })
     }
 
+    /// Collect seals from ALL heads (global + spec branches), deduped.
+    ///
+    /// Walks global HEAD chain first, then each spec head. Seals already seen
+    /// (from the global chain or an earlier spec) are skipped. Result is sorted
+    /// newest-first by timestamp.
+    fn collect_all_seals(&self) -> WritResult<Vec<Seal>> {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut all_seals: Vec<Seal> = Vec::new();
+
+        // 1. Walk global HEAD chain.
+        let head_seals = self.log()?;
+        for seal in head_seals {
+            seen.insert(seal.id.clone());
+            all_seals.push(seal);
+        }
+
+        // 2. Walk each spec head chain, adding unseen seals.
+        let heads_dir = self.writ_dir.join("heads");
+        if heads_dir.exists() {
+            let mut spec_ids: Vec<String> = Vec::new();
+            for entry in fs::read_dir(&heads_dir)? {
+                let entry = entry?;
+                spec_ids.push(entry.file_name().to_string_lossy().to_string());
+            }
+            spec_ids.sort(); // Deterministic order.
+
+            for spec_id in spec_ids {
+                let branch_seals = self.spec_log(&spec_id)?;
+                for seal in branch_seals {
+                    if seen.insert(seal.id.clone()) {
+                        all_seals.push(seal);
+                    }
+                }
+            }
+        }
+
+        // Sort newest-first by timestamp.
+        all_seals.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        Ok(all_seals)
+    }
+
     /// Build per-agent activity summaries from seal history.
     ///
     /// Walks seals newest-first to determine file provenance (who last sealed
@@ -667,12 +767,15 @@ impl Repository {
         use std::collections::HashMap;
 
         // File provenance: walk newest-first, first agent seen per file wins.
+        // Deletes are excluded — removing a file shouldn't make you its "owner".
         let mut file_owner: HashMap<String, String> = HashMap::new();
         for seal in seals {
             for change in &seal.changes {
-                file_owner
-                    .entry(change.path.clone())
-                    .or_insert_with(|| seal.agent.id.clone());
+                if change.change_type != ChangeType::Deleted {
+                    file_owner
+                        .entry(change.path.clone())
+                        .or_insert_with(|| seal.agent.id.clone());
+                }
             }
         }
 
@@ -850,7 +953,31 @@ impl Repository {
                 let file_scope: Vec<String> = index.entries.keys().cloned().collect();
                 let tracked_files = index.entries.len();
 
-                let agent_activity = Self::build_agent_activity(&seals, None);
+                // Walk ALL heads (global + spec branches) for agent activity,
+                // so agents on diverged branches aren't invisible.
+                let all_seals = self.collect_all_seals()?;
+                let agent_activity = Self::build_agent_activity(&all_seals, None);
+
+                // Detect diverged branches and build warnings.
+                let diverged = self.diverged_branches()?;
+                let diverged_branches: Vec<DivergedBranchWarning> = diverged
+                    .into_iter()
+                    .map(|db| {
+                        let recommendation = format!(
+                            "Run converge() to merge spec '{}' ({} seal(s) by {}) into the main branch",
+                            db.spec_id,
+                            db.seal_count,
+                            db.agents.join(", "),
+                        );
+                        DivergedBranchWarning {
+                            spec_id: db.spec_id,
+                            tip_seal: db.tip_seal,
+                            seal_count: db.seal_count,
+                            agents: db.agents,
+                            recommendation,
+                        }
+                    })
+                    .collect();
 
                 Ok(ContextOutput {
                     writ_version: "0.1.0".to_string(),
@@ -865,6 +992,7 @@ impl Repository {
                     dependency_status: None,
                     spec_progress: None,
                     agent_activity,
+                    diverged_branches,
                     available_operations,
                 })
             }
@@ -1007,8 +1135,9 @@ impl Repository {
                     None
                 };
 
-                // Build agent activity using ALL seals for provenance, filtered
-                // to spec-relevant files so agents only see relevant ownership.
+                // Walk ALL heads for agent activity so diverged agents are visible,
+                // filtered to spec-relevant files so agents only see relevant ownership.
+                let all_seals = self.collect_all_seals()?;
                 let agent_activity = if has_scope_filter {
                     let scope_ref = &file_scope;
                     let scope_fn = |path: &str| -> bool {
@@ -1017,9 +1146,9 @@ impl Repository {
                                 || (scope_entry.ends_with('/') && path.starts_with(scope_entry.as_str()))
                         })
                     };
-                    Self::build_agent_activity(&seals, Some(&scope_fn))
+                    Self::build_agent_activity(&all_seals, Some(&scope_fn))
                 } else {
-                    Self::build_agent_activity(&seals, None)
+                    Self::build_agent_activity(&all_seals, None)
                 };
 
                 Ok(ContextOutput {
@@ -1035,6 +1164,7 @@ impl Repository {
                     dependency_status,
                     spec_progress,
                     agent_activity,
+                    diverged_branches: Vec::new(),
                     available_operations,
                 })
             }
@@ -2879,6 +3009,19 @@ pub struct FileScopeWarning {
     pub out_of_scope_files: Vec<String>,
     /// Changed files that are within scope.
     pub in_scope_files: Vec<String>,
+}
+
+/// A spec branch whose tip seal is not reachable from global HEAD.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DivergedBranch {
+    /// The spec this branch belongs to.
+    pub spec_id: String,
+    /// Short ID of the branch tip seal.
+    pub tip_seal: String,
+    /// Number of seals on this branch not reachable from HEAD.
+    pub seal_count: usize,
+    /// Agent IDs that sealed on this branch.
+    pub agents: Vec<String>,
 }
 
 /// Returned by `seal()` when HEAD moved since the agent started working.
@@ -6922,6 +7065,223 @@ mod agent_activity_tests {
         assert!(json.contains("agent_activity"));
         assert!(json.contains("worker"));
         assert!(json.contains("files_owned"));
+    }
+
+    #[test]
+    fn test_agent_activity_excludes_deletes_from_ownership() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Agent creates two files.
+        std::fs::write(dir.path().join("keep.txt"), "keep").unwrap();
+        std::fs::write(dir.path().join("remove.txt"), "gone").unwrap();
+        repo.seal(
+            agent("creator"), "add files".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Agent deletes one file.
+        std::fs::remove_file(dir.path().join("remove.txt")).unwrap();
+        repo.seal(
+            agent("deleter"), "remove file".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        let deleter = ctx.agent_activity.iter().find(|a| a.agent_id == "deleter").unwrap();
+
+        // Deleter should NOT own remove.txt — deletes shouldn't grant ownership.
+        assert!(!deleter.files_owned.contains(&"remove.txt".to_string()));
+
+        // Creator still owns keep.txt.
+        let creator = ctx.agent_activity.iter().find(|a| a.agent_id == "creator").unwrap();
+        assert!(creator.files_owned.contains(&"keep.txt".to_string()));
+    }
+
+    #[test]
+    fn test_agent_activity_walks_all_heads() {
+        // Simulates the "ghost agent" scenario from test run 5:
+        // Agent A seals on spec "alpha", then Agent B seals on spec "beta",
+        // then Agent A seals again on "alpha". Agent B's seals end up on a
+        // diverged branch. Agent activity should still include Agent B.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+
+        // Agent A: first seal on spec alpha.
+        std::fs::write(dir.path().join("a1.txt"), "a1").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha first".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent B: seal on spec beta — parent comes from global HEAD.
+        std::fs::write(dir.path().join("b1.txt"), "b1").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta work".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent A: second seal on spec alpha — parent comes from heads/alpha (not global HEAD).
+        // This makes global HEAD point to this seal, with parent = first alpha seal.
+        // Agent B's seal is now orphaned from the HEAD chain.
+        std::fs::write(dir.path().join("a2.txt"), "a2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha second".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+
+        // Agent B should appear in agent_activity even though their seal is
+        // on a diverged branch (not reachable from global HEAD).
+        let b = ctx.agent_activity.iter().find(|a| a.agent_id == "agent-b");
+        assert!(b.is_some(), "agent-b should appear in agent_activity despite diverged branch");
+        let b = b.unwrap();
+        assert_eq!(b.seal_count, 1);
+        assert!(b.files_owned.contains(&"b1.txt".to_string()));
+    }
+
+    #[test]
+    fn test_diverged_branches_detected_in_context() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+
+        // Agent A: seal on alpha → HEAD + heads/alpha both point to seal1.
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha work".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent B: seal on beta → HEAD + heads/beta point to seal2.
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta work".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent A: seal on alpha again → HEAD = seal3 (parent = seal1 from heads/alpha).
+        // seal2 (heads/beta) is now diverged — not reachable from HEAD chain.
+        std::fs::write(dir.path().join("a.txt"), "a-v2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha done".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+
+        // Should have exactly one diverged branch: beta.
+        assert_eq!(ctx.diverged_branches.len(), 1, "expected 1 diverged branch");
+        let db = &ctx.diverged_branches[0];
+        assert_eq!(db.spec_id, "beta");
+        assert_eq!(db.seal_count, 1);
+        assert!(db.agents.contains(&"agent-b".to_string()));
+        assert!(db.recommendation.contains("converge"));
+    }
+
+    #[test]
+    fn test_no_diverged_branches_when_linear() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+
+        // All seals on the same spec — HEAD chain stays linear.
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("agent-a"), "first".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a-v2").unwrap();
+        repo.seal(
+            agent("agent-a"), "second".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+        assert!(ctx.diverged_branches.is_empty(), "no diverged branches expected for linear chain");
+    }
+
+    #[test]
+    fn test_diverged_branch_warning_has_recommendation() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("main-spec".into(), "Main".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("feature".into(), "Feature".into(), "".into())).unwrap();
+
+        // Agent A seals on main-spec → HEAD=seal1, heads/main-spec=seal1.
+        std::fs::write(dir.path().join("x.txt"), "x").unwrap();
+        repo.seal(
+            agent("main-agent"), "main work".into(), Some("main-spec".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Agent B seals on feature → parent=HEAD=seal1. HEAD=seal2, heads/feature=seal2.
+        std::fs::write(dir.path().join("y.txt"), "y").unwrap();
+        repo.seal(
+            agent("feature-agent"), "feature work".into(), Some("feature".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        // Agent A seals on main-spec again → parent=heads/main-spec=seal1.
+        // HEAD=seal3 (parent=seal1). heads/feature=seal2 is now diverged.
+        std::fs::write(dir.path().join("x.txt"), "x-v2").unwrap();
+        repo.seal(
+            agent("main-agent"), "main done".into(), Some("main-spec".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 10, &ContextFilter::default()).unwrap();
+
+        // Should detect diverged "feature" branch.
+        assert!(!ctx.diverged_branches.is_empty(), "expected diverged branches");
+        let db = ctx.diverged_branches.iter().find(|d| d.spec_id == "feature").unwrap();
+        assert!(db.recommendation.contains("converge"));
+        assert!(db.recommendation.contains("feature"));
+        assert!(db.agents.contains(&"feature-agent".to_string()));
+    }
+
+    #[test]
+    fn test_diverged_branches_empty_in_spec_scoped_context() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+
+        // Create divergence as above.
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha work".into(), Some("alpha".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta work".into(), Some("beta".into()),
+            TaskStatus::InProgress, Verification::default(), false,
+        ).unwrap();
+
+        std::fs::write(dir.path().join("a.txt"), "a-v2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha done".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Spec-scoped context omits diverged_branches.
+        let ctx = repo.context(
+            ContextScope::Spec("alpha".into()), 10, &ContextFilter::default(),
+        ).unwrap();
+        assert!(ctx.diverged_branches.is_empty(),
+            "spec-scoped context should not include diverged_branches");
     }
 }
 

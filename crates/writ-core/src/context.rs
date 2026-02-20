@@ -248,6 +248,24 @@ pub struct SpecProgress {
     pub latest_seal_at: Option<String>,
 }
 
+/// A spec branch whose tip is not reachable from global HEAD.
+///
+/// Surfaces "ghost agent" situations where concurrent agents sealed on
+/// spec-scoped branches that were never converged into the main chain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DivergedBranchWarning {
+    /// The spec this branch belongs to.
+    pub spec_id: String,
+    /// Short ID of the branch tip seal.
+    pub tip_seal: String,
+    /// Number of seals on this branch not reachable from HEAD.
+    pub seal_count: usize,
+    /// Agent IDs that sealed on this branch.
+    pub agents: Vec<String>,
+    /// Suggested action for the user/orchestrator.
+    pub recommendation: String,
+}
+
 /// Per-agent activity summary for multi-agent awareness.
 ///
 /// Shows which files each agent "owns" (last sealed) and their recent
@@ -318,6 +336,12 @@ pub struct ContextOutput {
     /// Shows which agent last sealed each file, enabling cross-agent coordination.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub agent_activity: Vec<AgentActivity>,
+
+    /// Warnings about spec branches that diverged from global HEAD.
+    /// Non-empty means there are "ghost agent" branches with unmerged work.
+    /// Agents should consider running `converge()` to unify these branches.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub diverged_branches: Vec<DivergedBranchWarning>,
 
     /// Available writ operations for agent discoverability.
     pub available_operations: Vec<String>,

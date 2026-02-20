@@ -1273,6 +1273,168 @@ class TestAgentActivity:
         assert parsed["agent_activity"][0]["agent_id"] == "worker"
 
 
+class TestDeletesExcludedFromOwnership:
+    """Sprint 1: Deleting a file shouldn't make you its owner."""
+
+    def test_deleter_does_not_own_removed_file(self, tmp_path):
+        """Deleting a file should not grant ownership of that file."""
+        repo = writ.Repository.init(str(tmp_path))
+
+        # Create two files.
+        (tmp_path / "keep.txt").write_text("keep")
+        (tmp_path / "remove.txt").write_text("gone")
+        repo.seal(summary="add files", agent_id="creator", agent_type="agent")
+
+        # Delete one file.
+        (tmp_path / "remove.txt").unlink()
+        repo.seal(summary="cleanup", agent_id="deleter", agent_type="agent")
+
+        ctx = repo.context()
+        activity = {a["agent_id"]: a for a in ctx["agent_activity"]}
+
+        # Deleter should NOT own remove.txt.
+        assert "remove.txt" not in activity["deleter"]["files_owned"]
+        # Creator still owns keep.txt.
+        assert "keep.txt" in activity["creator"]["files_owned"]
+
+    def test_delete_then_recreate_ownership(self, tmp_path):
+        """If file is deleted then recreated, the re-creator owns it."""
+        repo = writ.Repository.init(str(tmp_path))
+
+        (tmp_path / "file.txt").write_text("v1")
+        repo.seal(summary="create", agent_id="author", agent_type="agent")
+
+        (tmp_path / "file.txt").unlink()
+        repo.seal(summary="delete", agent_id="cleaner", agent_type="agent")
+
+        (tmp_path / "file.txt").write_text("v2")
+        repo.seal(summary="recreate", agent_id="rebuilder", agent_type="agent")
+
+        ctx = repo.context()
+        activity = {a["agent_id"]: a for a in ctx["agent_activity"]}
+
+        # Rebuilder owns the file now (most recent non-delete seal).
+        assert "file.txt" in activity["rebuilder"]["files_owned"]
+
+
+class TestDivergedBranchDetection:
+    """Sprint 1: Context surfaces diverged spec branches (ghost agent detection)."""
+
+    def test_no_diverged_branches_when_linear(self, tmp_path):
+        """Linear chain has no diverged branches."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+
+        (tmp_path / "a.txt").write_text("v1")
+        repo.seal(summary="first", agent_id="dev", agent_type="agent", spec_id="alpha")
+        (tmp_path / "a.txt").write_text("v2")
+        repo.seal(summary="second", agent_id="dev", agent_type="agent", spec_id="alpha")
+
+        ctx = repo.context()
+        assert ctx.get("diverged_branches", []) == []
+
+    def test_detects_diverged_branch(self, tmp_path):
+        """Diverged spec branch is surfaced in context."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+
+        # Agent A seals on alpha.
+        (tmp_path / "a.txt").write_text("a1")
+        repo.seal(summary="alpha first", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        # Agent B seals on beta — parent from HEAD.
+        (tmp_path / "b.txt").write_text("b1")
+        repo.seal(summary="beta work", agent_id="agent-b", agent_type="agent", spec_id="beta")
+
+        # Agent A seals on alpha again — parent from heads/alpha, not global HEAD.
+        # This makes beta's seal orphaned from the HEAD chain.
+        (tmp_path / "a.txt").write_text("a2")
+        repo.seal(summary="alpha second", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        ctx = repo.context()
+        diverged = ctx.get("diverged_branches", [])
+        assert len(diverged) == 1
+        assert diverged[0]["spec_id"] == "beta"
+        assert diverged[0]["seal_count"] == 1
+        assert "agent-b" in diverged[0]["agents"]
+
+    def test_diverged_branch_has_recommendation(self, tmp_path):
+        """Each diverged branch warning includes a recommendation to converge."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="main-spec", title="Main")
+        repo.add_spec(id="feature", title="Feature")
+
+        (tmp_path / "x.txt").write_text("x")
+        repo.seal(summary="main", agent_id="main-dev", agent_type="agent", spec_id="main-spec")
+
+        (tmp_path / "y.txt").write_text("y")
+        repo.seal(summary="feature", agent_id="feat-dev", agent_type="agent", spec_id="feature")
+
+        (tmp_path / "x.txt").write_text("x2")
+        repo.seal(summary="main done", agent_id="main-dev", agent_type="agent", spec_id="main-spec")
+
+        ctx = repo.context()
+        diverged = ctx["diverged_branches"]
+        assert len(diverged) >= 1
+        feat_branch = [d for d in diverged if d["spec_id"] == "feature"][0]
+        assert "converge" in feat_branch["recommendation"].lower()
+
+    def test_ghost_agent_visible_in_activity(self, tmp_path):
+        """Agent on diverged branch still appears in agent_activity."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+
+        (tmp_path / "a.txt").write_text("a2")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        ctx = repo.context()
+        agent_ids = [a["agent_id"] for a in ctx["agent_activity"]]
+        assert "agent-b" in agent_ids, "ghost agent should be visible in agent_activity"
+
+    def test_diverged_branches_empty_in_spec_scoped(self, tmp_path):
+        """Spec-scoped context omits diverged_branches."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        (tmp_path / "a.txt").write_text("a2")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        ctx = repo.context(spec="alpha")
+        assert ctx.get("diverged_branches", []) == []
+
+    def test_diverged_branch_json_serializable(self, tmp_path):
+        """Context with diverged branches survives JSON round-trip."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+
+        (tmp_path / "a.txt").write_text("a")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        (tmp_path / "b.txt").write_text("b")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        (tmp_path / "a.txt").write_text("a2")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+
+        ctx = repo.context()
+        serialized = json.dumps(ctx)
+        parsed = json.loads(serialized)
+        assert len(parsed["diverged_branches"]) == 1
+        assert parsed["diverged_branches"][0]["spec_id"] == "beta"
+
+
 class TestFileScopeWarning:
     def test_no_warning_when_no_scope(self, tmp_path):
         """No warning when spec has no file_scope set."""

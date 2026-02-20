@@ -42,7 +42,8 @@ enum Commands {
         #[arg(long, short)]
         summary: String,
 
-        /// Agent or human identifier.
+        /// Agent or human identifier. Defaults to "human" (sets agent_type=human).
+        /// Any other value sets agent_type=agent.
         #[arg(long, default_value = "human")]
         agent: String,
 
@@ -51,7 +52,7 @@ enum Commands {
         spec: Option<String>,
 
         /// Task status: in-progress, complete, or blocked.
-        #[arg(long, default_value = "complete")]
+        #[arg(long, default_value = "in-progress")]
         status: String,
 
         /// Seal only these paths (comma-separated). Remaining changes stay pending.
@@ -102,6 +103,10 @@ enum Commands {
         /// Maximum number of seals to show.
         #[arg(long, short)]
         limit: Option<usize>,
+
+        /// Show seals for a specific spec (uses spec-scoped head).
+        #[arg(long)]
+        spec: Option<String>,
     },
 
     /// Show what changed (content-level diff).
@@ -393,7 +398,7 @@ fn main() {
             diff,
             format,
         } => cmd_show(&cwd, &seal_id, diff, &format),
-        Commands::Log { format, limit } => cmd_log(&cwd, &format, limit),
+        Commands::Log { format, limit, spec } => cmd_log(&cwd, &format, limit, spec),
         Commands::Diff { from, to, format } => cmd_diff(&cwd, from, to, &format),
         Commands::Context {
             spec,
@@ -642,17 +647,21 @@ fn cmd_seal(
 
     let agent = AgentIdentity {
         id: agent_id.to_string(),
-        agent_type: if agent_id.starts_with("agent") {
-            AgentType::Agent
-        } else {
+        agent_type: if agent_id == "human" {
             AgentType::Human
+        } else {
+            AgentType::Agent
         },
     };
 
     let task_status = match status {
         "in-progress" => TaskStatus::InProgress,
         "blocked" => TaskStatus::Blocked,
-        _ => TaskStatus::Complete,
+        "complete" => TaskStatus::Complete,
+        other => {
+            eprintln!("WARNING: unknown status '{other}', using 'in-progress'");
+            TaskStatus::InProgress
+        }
     };
 
     let verification = Verification {
@@ -751,9 +760,13 @@ fn cmd_log(
     cwd: &PathBuf,
     format: &str,
     limit: Option<usize>,
+    spec: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
-    let mut seals = repo.log()?;
+    let mut seals = match &spec {
+        Some(spec_id) => repo.spec_log(spec_id)?,
+        None => repo.log()?,
+    };
 
     if let Some(n) = limit {
         seals.truncate(n);
@@ -805,7 +818,34 @@ fn cmd_log(
         }
     }
 
+    print_diverged_branch_warnings(&repo);
+
     Ok(())
+}
+
+fn print_diverged_branch_warnings(repo: &Repository) {
+    if let Ok(diverged) = repo.diverged_branches() {
+        if !diverged.is_empty() {
+            let total_seals: usize = diverged.iter().map(|b| b.seal_count).sum();
+            eprintln!();
+            eprintln!(
+                "  WARNING: {} diverged branch(es) with {} seal(s) not reachable from HEAD:",
+                diverged.len(),
+                total_seals,
+            );
+            for b in &diverged {
+                eprintln!(
+                    "    branch '{}': {} seal(s) by {} (tip: {})",
+                    b.spec_id,
+                    b.seal_count,
+                    b.agents.join(", "),
+                    b.tip_seal,
+                );
+            }
+            eprintln!("  Run 'writ converge' to merge, or 'writ log --spec <id>' to inspect.");
+            eprintln!();
+        }
+    }
 }
 
 fn cmd_diff(
@@ -1017,6 +1057,8 @@ fn cmd_context(
                     println!("  {op}");
                 }
             }
+
+            print_diverged_branch_warnings(&repo);
         }
         _ => {
             println!("{}", serde_json::to_string_pretty(&ctx)?);

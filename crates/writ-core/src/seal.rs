@@ -72,7 +72,6 @@ pub enum TaskStatus {
 
 /// A seal — writ's structured, verified checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Seal {
     /// Unique identifier (SHA-256 of the seal's content).
     pub id: String,
@@ -94,6 +93,9 @@ pub struct Seal {
     pub verification: Verification,
     /// Human/agent-readable summary of what changed.
     pub summary: String,
+    /// Warnings generated at seal time (scope violations, ghost work, etc.).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl Seal {
@@ -110,6 +112,7 @@ impl Seal {
         changes: Vec<FileChange>,
         verification: Verification,
         summary: String,
+        warnings: Vec<String>,
     ) -> Self {
         let mut seal = Seal {
             id: String::new(),
@@ -122,6 +125,7 @@ impl Seal {
             changes,
             verification,
             summary,
+            warnings,
         };
 
         // Compute the seal's ID from its content

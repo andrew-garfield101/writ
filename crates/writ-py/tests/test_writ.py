@@ -540,6 +540,157 @@ class TestConvergeAll:
         report = repo.converge_all()
         assert report["strategy"] == "three-way-merge"
 
+    def _setup_content_conflict(self, tmp_path):
+        """Create a repo where two specs conflict on the same file with
+        different content sizes. Big spec has more lines than small."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "page.html").write_text(
+            "<html>\n<body>\nHello\n</body>\n</html>\n"
+        )
+        repo.seal(summary="baseline", agent_id="setup")
+
+        repo.add_spec(id="small", title="Small changes")
+        repo.add_spec(id="big", title="Big changes")
+
+        # Small: minimal content (3 lines).
+        (tmp_path / "page.html").write_text(
+            "<html>\n<body>Small</body>\n</html>\n"
+        )
+        repo.seal(summary="small change", agent_id="small-dev", spec_id="small")
+
+        # Big: richer content (8 lines).
+        (tmp_path / "page.html").write_text(
+            "<html>\n<head><title>Big</title></head>\n<body>\n<nav>\n"
+            "<li>Home</li>\n<li>About</li>\n</nav>\n</body>\n</html>\n"
+        )
+        repo.seal(summary="big change", agent_id="big-dev", spec_id="big")
+
+        # Advance HEAD past big.
+        (tmp_path / "page.html").write_text(
+            "<html>\n<body>Small</body>\n</html>\n"
+        )
+        (tmp_path / "small-only.txt").write_text("extra\n")
+        repo.seal(summary="small extra", agent_id="small-dev", spec_id="small")
+        repo.update_spec("small", status="complete")
+
+        return repo
+
+    def test_converge_all_most_complete_resolves_conflicts(self, tmp_path):
+        """MostComplete strategy picks the version with more lines."""
+        repo = self._setup_content_conflict(tmp_path)
+        report = repo.converge_all(strategy="most-complete", apply=True)
+        assert report["is_clean"] is True
+        assert report["total_resolutions"] > 0
+        assert report["strategy"] == "most-complete"
+
+        # Big version (more content) should win.
+        content = (tmp_path / "page.html").read_text()
+        assert "<nav>" in content
+
+    def test_converge_all_most_complete_has_resolution_records(self, tmp_path):
+        """MostComplete strategy creates resolution records."""
+        repo = self._setup_content_conflict(tmp_path)
+        report = repo.converge_all(strategy="most-complete")
+        has_mc = any(
+            r["strategy"] == "most-complete"
+            for step in report["merges"]
+            for r in step.get("resolutions", [])
+        )
+        assert has_mc, "should have most-complete resolution records"
+
+    def test_converge_all_most_complete_warns(self, tmp_path):
+        """MostComplete warns about discarded content."""
+        repo = self._setup_content_conflict(tmp_path)
+        report = repo.converge_all(strategy="most-complete")
+        assert any("more content" in w for w in report["warnings"])
+
+    def test_quality_report_present(self, tmp_path):
+        """converge_all always returns a quality_report."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge_all()
+        assert "quality_report" in report
+        qr = report["quality_report"]
+        assert "file_decisions" in qr
+        assert "quality_score" in qr
+        assert "summary" in qr
+        assert isinstance(qr["quality_score"], int)
+        assert qr["quality_score"] <= 100
+
+    def test_quality_report_file_decisions(self, tmp_path):
+        """Quality report tracks per-file decisions."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge_all()
+        qr = report["quality_report"]
+        assert len(qr["file_decisions"]) > 0
+        d = qr["file_decisions"][0]
+        assert "path" in d
+        assert "decision" in d
+        assert "chosen_lines" in d
+
+    def test_quality_report_with_strategy_decisions(self, tmp_path):
+        """Quality report records strategy-resolved conflict decisions."""
+        repo = self._setup_content_conflict(tmp_path)
+        report = repo.converge_all(strategy="most-complete")
+        qr = report["quality_report"]
+        mc_decisions = [d for d in qr["file_decisions"] if d["decision"] == "most-complete"]
+        assert len(mc_decisions) > 0
+        d = mc_decisions[0]
+        assert d["chosen_lines"] > 0
+        assert d["chosen_spec"] is not None
+        assert len(d["alternatives"]) > 0
+
+    def test_quality_report_serializable(self, tmp_path):
+        """Quality report is JSON-serializable."""
+        repo = self._setup_content_conflict(tmp_path)
+        report = repo.converge_all(strategy="most-complete")
+        result = json.dumps(report)
+        assert "quality_report" in result
+        assert "file_decisions" in result
+        assert "quality_score" in result
+
+    def test_quality_report_consistency_checks(self, tmp_path):
+        """Quality report detects HTML consistency issues when applied."""
+        repo = writ.Repository.init(str(tmp_path))
+        # Two HTML files with same nav.
+        (tmp_path / "index.html").write_text(
+            "<html><ul><li>Home</li><li>About</li></ul></html>\n"
+        )
+        (tmp_path / "about.html").write_text(
+            "<html><ul><li>Home</li><li>About</li></ul></html>\n"
+        )
+        repo.seal(summary="baseline", agent_id="setup")
+
+        repo.add_spec(id="nav", title="Nav update")
+        repo.add_spec(id="content", title="Content")
+
+        # Nav agent adds items to index only.
+        (tmp_path / "index.html").write_text(
+            "<html><ul><li>Home</li><li>About</li><li>Blog</li>"
+            "<li>Contact</li><li>FAQ</li></ul></html>\n"
+        )
+        repo.seal(summary="nav items", agent_id="nav-dev", spec_id="nav")
+
+        # Content agent modifies about.
+        (tmp_path / "about.html").write_text(
+            "<html><ul><li>Home</li><li>About</li></ul><p>Content</p></html>\n"
+        )
+        repo.seal(summary="content", agent_id="content-dev", spec_id="content")
+
+        # Advance HEAD.
+        (tmp_path / "nav-extra.txt").write_text("x\n")
+        repo.seal(summary="extra", agent_id="nav-dev", spec_id="nav")
+        repo.update_spec("nav", status="complete")
+
+        report = repo.converge_all(strategy="most-complete", apply=True)
+        qr = report["quality_report"]
+        assert "consistency_checks" in qr
+
+        nav_checks = [c for c in qr["consistency_checks"] if c["metric"] == "nav_item_count"]
+        if len(nav_checks) > 0:
+            check = nav_checks[0]
+            assert check["consistent"] is False
+            assert check["warning"] is not None
+
 
 class TestAllowEmpty:
     def test_seal_allow_empty(self, tmp_repo):

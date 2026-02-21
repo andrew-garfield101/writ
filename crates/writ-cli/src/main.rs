@@ -876,6 +876,11 @@ fn cmd_log(
                 println!("  status:  {:?}", seal.status);
                 println!("  summary: {}", seal.summary);
                 println!("  changes: {} file(s)", seal.changes.len());
+                if !seal.warnings.is_empty() {
+                    for w in &seal.warnings {
+                        println!("  WARNING: {w}");
+                    }
+                }
             }
         }
     }
@@ -1400,6 +1405,12 @@ fn cmd_show(
                 };
                 println!("    {marker} {}", c.path);
             }
+            if !seal.warnings.is_empty() {
+                println!("  warnings:");
+                for w in &seal.warnings {
+                    println!("    ! {w}");
+                }
+            }
 
             if show_diff {
                 let diff = repo.diff_seal(seal_id)?;
@@ -1676,15 +1687,26 @@ fn cmd_converge_all(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = match strategy_str {
         "most-recent" => writ_core::convergence::ConvergeStrategy::MostRecent,
+        "most-complete" => writ_core::convergence::ConvergeStrategy::MostComplete,
         "three-way-merge" => writ_core::convergence::ConvergeStrategy::ThreeWayMerge,
         other => {
             return Err(format!(
-                "unknown strategy '{}' (use 'three-way-merge' or 'most-recent')", other
+                "unknown strategy '{}' (use 'three-way-merge', 'most-recent', or 'most-complete')", other
             ).into());
         }
     };
 
     let repo = Repository::open(cwd)?;
+
+    // Capture pre-convergence risk for delta reporting.
+    let pre_risk = {
+        let ctx = repo.context(
+            writ_core::context::ContextScope::Full,
+            50,
+            &writ_core::context::ContextFilter::default(),
+        )?;
+        ctx.integration_risk.clone()
+    };
 
     // Dry run: run without apply, then show the report.
     let effective_apply = apply && !dry_run;
@@ -1767,6 +1789,33 @@ fn cmd_converge_all(
                 println!("  (dry run — no changes applied)");
                 println!("  Run with --apply to merge: writ converge-all --apply --strategy {strategy_str}");
             } else if effective_apply {
+                // Post-convergence risk re-evaluation.
+                let post_risk = {
+                    let ctx = repo.context(
+                        writ_core::context::ContextScope::Full,
+                        50,
+                        &writ_core::context::ContextFilter::default(),
+                    )?;
+                    ctx.integration_risk.clone()
+                };
+
+                let pre_score = pre_risk.as_ref().map(|r| r.score).unwrap_or(0);
+                let post_score = post_risk.as_ref().map(|r| r.score).unwrap_or(0);
+                let pre_level = pre_risk.as_ref().map(|r| r.level.as_str()).unwrap_or("low");
+                let post_level = post_risk.as_ref().map(|r| r.level.as_str()).unwrap_or("low");
+
+                println!();
+                println!("  INTEGRATION RISK: {} ({}) -> {} ({})",
+                    pre_level.to_uppercase(), pre_score,
+                    post_level.to_uppercase(), post_score,
+                );
+                if post_score < pre_score {
+                    println!("    Risk reduced by {} points", pre_score - post_score);
+                } else if post_score == 0 {
+                    println!("    All clear — no remaining integration risk");
+                }
+
+                println!();
                 println!("  All merges applied. Seal the converged state:");
                 println!(
                     "    writ seal -s \"converge-all: merged {} branch(es)\" --agent convergence-bot --status complete",

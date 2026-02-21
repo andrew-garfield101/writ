@@ -101,6 +101,10 @@ pub enum ConvergeStrategy {
     ThreeWayMerge,
     /// For conflicts, prefer the version from the most recently sealed branch.
     MostRecent,
+    /// For conflicts, prefer the version with the most content (line count).
+    /// Designed for high-contention files where later versions accumulate
+    /// more features (nav items, CSS includes, etc.).
+    MostComplete,
 }
 
 impl Default for ConvergeStrategy {
@@ -133,6 +137,9 @@ pub struct ConvergeAllReport {
     /// Warnings about potential content loss or semantic inconsistency.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub warnings: Vec<String>,
+    /// Post-convergence quality assessment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_report: Option<ConvergenceQualityReport>,
 }
 
 /// Result of a single merge step in `converge_all`.
@@ -176,6 +183,74 @@ pub struct ResolutionRecord {
     /// Warning about content that may have been lost.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lost_content_warning: Option<String>,
+}
+
+/// Post-convergence quality report — shows what was chosen, what was
+/// discarded, and consistency metrics so humans/orchestrators can verify
+/// the merged result makes sense.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConvergenceQualityReport {
+    /// Per-file details of what version was chosen and what alternatives existed.
+    pub file_decisions: Vec<FileDecision>,
+    /// Consistency metrics across related files (e.g., nav item counts in HTML).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub consistency_checks: Vec<ConsistencyCheck>,
+    /// Overall quality score (0-100).
+    pub quality_score: u32,
+    /// Human-readable summary of the quality assessment.
+    pub summary: String,
+}
+
+/// Record of how a specific file was resolved during convergence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileDecision {
+    /// File path.
+    pub path: String,
+    /// How this file was handled: "auto-merged", "left-only", "right-only",
+    /// "most-recent", "most-complete", "unchanged".
+    pub decision: String,
+    /// Line count of the chosen version.
+    pub chosen_lines: usize,
+    /// Which spec's version was chosen (if applicable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_spec: Option<String>,
+    /// Alternative versions that were discarded.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub alternatives: Vec<FileAlternative>,
+}
+
+/// A discarded alternative version of a file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAlternative {
+    /// Which spec had this version.
+    pub spec: String,
+    /// Line count of this alternative.
+    pub lines: usize,
+    /// Why it was discarded.
+    pub reason: String,
+}
+
+/// A consistency check across related files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsistencyCheck {
+    /// What was checked (e.g., "nav_item_count", "css_link_count").
+    pub metric: String,
+    /// Per-file values for this metric.
+    pub values: Vec<FileMetricValue>,
+    /// Whether the check passed (all values are consistent).
+    pub consistent: bool,
+    /// Human-readable description of the inconsistency.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// A metric value for a single file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMetricValue {
+    /// File path.
+    pub path: String,
+    /// The metric value.
+    pub value: usize,
 }
 
 // ---------------------------------------------------------------------------

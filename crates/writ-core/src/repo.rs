@@ -12,8 +12,10 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::convergence::{
-    self, ConvergeAllReport, ConvergeStrategy, ConvergenceReport, FileConflict, FileResolution,
-    FileMergeResult, MergeStepResult, MergedFile, ResolutionRecord,
+    self, ConsistencyCheck, ConvergeAllReport, ConvergeStrategy,
+    ConvergenceQualityReport, ConvergenceReport, FileAlternative, FileConflict,
+    FileDecision, FileMetricValue, FileResolution, FileMergeResult, MergeStepResult,
+    MergedFile, ResolutionRecord,
 };
 use crate::lock::RepoLock;
 use crate::context::{
@@ -369,6 +371,26 @@ impl Repository {
         let tree_hash = self.objects.store(tree_json.as_bytes())?;
         let parent = self.resolve_parent(spec_id.as_deref())?;
 
+        let mut seal_warnings: Vec<String> = Vec::new();
+
+        if let Some(ref sid) = spec_id {
+            let changed_paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+            if let Some(scope_warn) = self.check_file_scope(sid, &changed_paths) {
+                seal_warnings.push(format!(
+                    "FILE_SCOPE: {} file(s) outside declared scope for spec '{}': {}",
+                    scope_warn.out_of_scope_files.len(),
+                    sid,
+                    scope_warn.out_of_scope_files.join(", "),
+                ));
+            }
+        }
+
+        if changes.is_empty() && !summary.is_empty() && !allow_empty {
+            seal_warnings.push(
+                "GHOST_WORK: seal has a summary but 0 file changes — work may have been captured by another agent's seal".to_string(),
+            );
+        }
+
         let seal = Seal::new(
             parent,
             tree_hash,
@@ -378,6 +400,7 @@ impl Repository {
             changes,
             verification,
             summary,
+            seal_warnings,
         );
 
         self.save_seal(&seal)?;
@@ -1671,6 +1694,13 @@ impl Repository {
             fs::write(&file_path, &resolution.content)?;
         }
 
+        // Advance the right (diverged) spec's head pointer to the left
+        // spec's latest seal. This puts the right spec "on" the HEAD chain
+        // so diverged_branches() no longer reports it as diverged.
+        // We use left_seal_id because that's the seal on the HEAD chain
+        // that the merge was based against.
+        self.write_spec_head(&report.right_spec, &report.left_seal_id)?;
+
         Ok(())
     }
 
@@ -1702,6 +1732,7 @@ impl Repository {
                 is_clean: true,
                 applied: false,
                 warnings: Vec::new(),
+                quality_report: None,
             });
         }
 
@@ -1741,6 +1772,7 @@ impl Repository {
         let mut total_resolutions = 0usize;
         let mut warnings: Vec<String> = Vec::new();
         let mut all_clean = true;
+        let mut file_decisions: Vec<FileDecision> = Vec::new();
 
         for branch in &ordered {
             let spec_id = &branch.spec_id;
@@ -1756,6 +1788,35 @@ impl Repository {
 
                     let conflict_files: Vec<String> =
                         report.conflicts.iter().map(|c| c.path.clone()).collect();
+
+                    // Collect file decisions for non-conflict files.
+                    for mf in &report.auto_merged {
+                        file_decisions.push(FileDecision {
+                            path: mf.path.clone(),
+                            decision: "auto-merged".to_string(),
+                            chosen_lines: mf.content.lines().count(),
+                            chosen_spec: None,
+                            alternatives: vec![],
+                        });
+                    }
+                    for p in &report.left_only {
+                        file_decisions.push(FileDecision {
+                            path: p.clone(),
+                            decision: "left-only".to_string(),
+                            chosen_lines: 0,
+                            chosen_spec: Some(base_spec.clone()),
+                            alternatives: vec![],
+                        });
+                    }
+                    for p in &report.right_only {
+                        file_decisions.push(FileDecision {
+                            path: p.clone(),
+                            decision: "right-only".to_string(),
+                            chosen_lines: 0,
+                            chosen_spec: Some(spec_id.clone()),
+                            alternatives: vec![],
+                        });
+                    }
 
                     let mut resolutions_records: Vec<ResolutionRecord> = Vec::new();
                     let mut step_resolutions: Vec<FileResolution> = Vec::new();
@@ -1832,8 +1893,103 @@ impl Repository {
                                     resolutions_records.push(ResolutionRecord {
                                         path: conflict.path.clone(),
                                         strategy: "most-recent".to_string(),
-                                        chosen_spec: Some(chosen),
+                                        chosen_spec: Some(chosen.clone()),
                                         lost_content_warning: lost_warning,
+                                    });
+
+                                    file_decisions.push(FileDecision {
+                                        path: conflict.path.clone(),
+                                        decision: "most-recent".to_string(),
+                                        chosen_lines: if prefer_right {
+                                            conflict.right_content.lines().count()
+                                        } else {
+                                            conflict.left_content.lines().count()
+                                        },
+                                        chosen_spec: Some(chosen),
+                                        alternatives: vec![FileAlternative {
+                                            spec: other,
+                                            lines: lost.lines().count(),
+                                            reason: "discarded: not most recent".to_string(),
+                                        }],
+                                    });
+                                }
+
+                                total_resolutions += report.conflicts.len();
+                                step_clean = true;
+
+                                if apply {
+                                    self.apply_convergence(&report, &step_resolutions)?;
+                                }
+                            }
+                            ConvergeStrategy::MostComplete => {
+                                for conflict in &report.conflicts {
+                                    let left_lines = conflict.left_content.lines().count();
+                                    let right_lines = conflict.right_content.lines().count();
+                                    let prefer_right = right_lines > left_lines;
+
+                                    let (content, chosen, other) = if prefer_right {
+                                        (
+                                            conflict.right_content.clone(),
+                                            spec_id.to_string(),
+                                            base_spec.clone(),
+                                        )
+                                    } else {
+                                        (
+                                            conflict.left_content.clone(),
+                                            base_spec.clone(),
+                                            spec_id.to_string(),
+                                        )
+                                    };
+
+                                    let lost = if prefer_right {
+                                        &conflict.left_content
+                                    } else {
+                                        &conflict.right_content
+                                    };
+                                    let lost_warning = if !lost.is_empty() {
+                                        let lost_lines = lost.lines().count();
+                                        Some(format!(
+                                            "Discarded {} line(s) from spec '{}' (chose '{}' with more content)",
+                                            lost_lines, other, chosen,
+                                        ))
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(ref w) = lost_warning {
+                                        warnings.push(format!("{}: {}", conflict.path, w));
+                                    }
+
+                                    step_resolutions.push(FileResolution {
+                                        path: conflict.path.clone(),
+                                        content,
+                                    });
+
+                                    resolutions_records.push(ResolutionRecord {
+                                        path: conflict.path.clone(),
+                                        strategy: "most-complete".to_string(),
+                                        chosen_spec: Some(chosen.clone()),
+                                        lost_content_warning: lost_warning,
+                                    });
+
+                                    file_decisions.push(FileDecision {
+                                        path: conflict.path.clone(),
+                                        decision: "most-complete".to_string(),
+                                        chosen_lines: if prefer_right {
+                                            right_lines
+                                        } else {
+                                            left_lines
+                                        },
+                                        chosen_spec: Some(chosen),
+                                        alternatives: vec![FileAlternative {
+                                            spec: other,
+                                            lines: if prefer_right {
+                                                left_lines
+                                            } else {
+                                                right_lines
+                                            },
+                                            reason: "discarded: fewer lines".to_string(),
+                                        }],
                                     });
                                 }
 
@@ -1846,6 +2002,26 @@ impl Repository {
                             }
                             ConvergeStrategy::ThreeWayMerge => {
                                 // Conflicts remain unresolved.
+                                for conflict in &report.conflicts {
+                                    file_decisions.push(FileDecision {
+                                        path: conflict.path.clone(),
+                                        decision: "conflict-unresolved".to_string(),
+                                        chosen_lines: 0,
+                                        chosen_spec: None,
+                                        alternatives: vec![
+                                            FileAlternative {
+                                                spec: base_spec.clone(),
+                                                lines: conflict.left_content.lines().count(),
+                                                reason: "left side (base)".to_string(),
+                                            },
+                                            FileAlternative {
+                                                spec: spec_id.to_string(),
+                                                lines: conflict.right_content.lines().count(),
+                                                reason: "right side (diverged)".to_string(),
+                                            },
+                                        ],
+                                    });
+                                }
                                 step_clean = false;
                                 all_clean = false;
                             }
@@ -1897,6 +2073,15 @@ impl Repository {
             }
         }
 
+        // Build post-convergence quality report.
+        let quality_report = build_quality_report(
+            file_decisions,
+            &self.root,
+            apply,
+            total_conflicts,
+            total_resolutions,
+        );
+
         Ok(ConvergeAllReport {
             base_spec,
             merge_order,
@@ -1908,6 +2093,7 @@ impl Repository {
             is_clean: all_clean,
             applied: apply,
             warnings,
+            quality_report: Some(quality_report),
         })
     }
 
@@ -2013,6 +2199,26 @@ impl Repository {
         let tree_hash = self.objects.store(tree_json.as_bytes())?;
         let parent = self.resolve_parent(spec_id.as_deref())?;
 
+        let mut seal_warnings: Vec<String> = Vec::new();
+
+        if let Some(ref sid) = spec_id {
+            let changed_paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+            if let Some(scope_warn) = self.check_file_scope(sid, &changed_paths) {
+                seal_warnings.push(format!(
+                    "FILE_SCOPE: {} file(s) outside declared scope for spec '{}': {}",
+                    scope_warn.out_of_scope_files.len(),
+                    sid,
+                    scope_warn.out_of_scope_files.join(", "),
+                ));
+            }
+        }
+
+        if changes.is_empty() && !summary.is_empty() {
+            seal_warnings.push(
+                "GHOST_WORK: seal has a summary but 0 file changes — work may have been captured by another agent's seal".to_string(),
+            );
+        }
+
         let seal = Seal::new(
             parent,
             tree_hash,
@@ -2022,6 +2228,7 @@ impl Repository {
             changes,
             verification,
             summary,
+            seal_warnings,
         );
 
         self.save_seal(&seal)?;
@@ -2425,6 +2632,7 @@ impl Repository {
             changes.clone(),
             Verification::default(),
             format!("bridge import from git {short_hash}"),
+            Vec::new(),
         );
 
         self.save_seal(&seal)?;
@@ -3650,6 +3858,130 @@ fn strategy_name(strategy: ConvergeStrategy) -> String {
     match strategy {
         ConvergeStrategy::ThreeWayMerge => "three-way-merge".to_string(),
         ConvergeStrategy::MostRecent => "most-recent".to_string(),
+        ConvergeStrategy::MostComplete => "most-complete".to_string(),
+    }
+}
+
+/// Build a post-convergence quality report from collected file decisions.
+///
+/// When `apply` is true, reads applied HTML files from disk to run
+/// consistency checks (nav item counts, CSS link counts, etc.).
+fn build_quality_report(
+    file_decisions: Vec<FileDecision>,
+    root: &Path,
+    apply: bool,
+    total_conflicts: usize,
+    total_resolutions: usize,
+) -> ConvergenceQualityReport {
+    let mut consistency_checks = Vec::new();
+
+    // Run consistency checks on applied HTML files.
+    if apply {
+        let html_paths: Vec<String> = file_decisions
+            .iter()
+            .filter(|d| d.path.ends_with(".html"))
+            .map(|d| d.path.clone())
+            .collect();
+
+        if html_paths.len() >= 2 {
+            let mut li_counts: Vec<FileMetricValue> = Vec::new();
+            let mut link_counts: Vec<FileMetricValue> = Vec::new();
+
+            for path in &html_paths {
+                let full_path = root.join(path);
+                if let Ok(content) = fs::read_to_string(&full_path) {
+                    li_counts.push(FileMetricValue {
+                        path: path.clone(),
+                        value: content.matches("<li").count(),
+                    });
+                    link_counts.push(FileMetricValue {
+                        path: path.clone(),
+                        value: content.matches("<link").count(),
+                    });
+                }
+            }
+
+            if li_counts.len() >= 2 {
+                let vals: Vec<usize> = li_counts.iter().map(|v| v.value).collect();
+                let min = *vals.iter().min().unwrap_or(&0);
+                let max = *vals.iter().max().unwrap_or(&0);
+                let consistent = max <= min + 2; // allow small variance
+                let warning = if !consistent {
+                    Some(format!(
+                        "nav item counts vary from {} to {} across HTML files",
+                        min, max,
+                    ))
+                } else {
+                    None
+                };
+                consistency_checks.push(ConsistencyCheck {
+                    metric: "nav_item_count".to_string(),
+                    values: li_counts,
+                    consistent,
+                    warning,
+                });
+            }
+
+            if link_counts.len() >= 2 {
+                let vals: Vec<usize> = link_counts.iter().map(|v| v.value).collect();
+                let min = *vals.iter().min().unwrap_or(&0);
+                let max = *vals.iter().max().unwrap_or(&0);
+                let consistent = min == max;
+                let warning = if !consistent {
+                    Some(format!(
+                        "CSS link counts vary from {} to {} across HTML files",
+                        min, max,
+                    ))
+                } else {
+                    None
+                };
+                consistency_checks.push(ConsistencyCheck {
+                    metric: "css_link_count".to_string(),
+                    values: link_counts,
+                    consistent,
+                    warning,
+                });
+            }
+        }
+    }
+
+    // Compute quality score.
+    let mut score: i32 = 100;
+    let unresolved = total_conflicts.saturating_sub(total_resolutions);
+    score -= (unresolved * 15) as i32;
+    for check in &consistency_checks {
+        if !check.consistent {
+            score -= 10;
+        }
+    }
+    let score = score.max(0).min(100) as u32;
+
+    // Build summary.
+    let n_files = file_decisions.len();
+    let n_auto = file_decisions
+        .iter()
+        .filter(|d| d.decision == "auto-merged")
+        .count();
+    let n_resolved = file_decisions
+        .iter()
+        .filter(|d| matches!(d.decision.as_str(), "most-recent" | "most-complete"))
+        .count();
+    let n_unresolved = file_decisions
+        .iter()
+        .filter(|d| d.decision == "conflict-unresolved")
+        .count();
+    let n_inconsistent = consistency_checks.iter().filter(|c| !c.consistent).count();
+
+    let summary = format!(
+        "{} file(s) processed: {} auto-merged, {} resolved by strategy, {} unresolved conflict(s), {} consistency issue(s)",
+        n_files, n_auto, n_resolved, n_unresolved, n_inconsistent,
+    );
+
+    ConvergenceQualityReport {
+        file_decisions,
+        consistency_checks,
+        quality_score: score,
+        summary,
     }
 }
 
@@ -10246,5 +10578,558 @@ mod converge_all_tests {
             assert_eq!(&step.right_spec, spec_id);
             assert_eq!(&step.left_spec, &report.base_spec);
         }
+    }
+
+    #[test]
+    fn test_converge_all_apply_clears_diverged_branches() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "base content\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "baseline".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into()))
+            .unwrap();
+
+        // Alpha modifies and seals (stays on HEAD chain).
+        fs::write(dir.path().join("alpha.txt"), "alpha work\n").unwrap();
+        let alpha_agent = AgentIdentity {
+            id: "alpha-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            alpha_agent.clone(),
+            "alpha work".into(),
+            Some("alpha".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Beta modifies different file and seals (creates diverged branch).
+        fs::write(dir.path().join("beta.txt"), "beta work\n").unwrap();
+        let beta_agent = AgentIdentity {
+            id: "beta-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            beta_agent,
+            "beta work".into(),
+            Some("beta".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Alpha seals again to advance HEAD past beta.
+        fs::write(dir.path().join("alpha2.txt"), "more alpha\n").unwrap();
+        repo.seal(
+            alpha_agent,
+            "alpha final".into(),
+            Some("alpha".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.update_spec("alpha", SpecUpdate {
+            status: Some(SpecStatus::Complete),
+            ..Default::default()
+        }).unwrap();
+
+        // Verify beta IS diverged before convergence.
+        let pre_diverged = repo.diverged_branches().unwrap();
+        assert!(
+            pre_diverged.iter().any(|b| b.spec_id == "beta"),
+            "beta should be diverged before converge_all"
+        );
+
+        // Apply convergence.
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, true)
+            .unwrap();
+        assert!(report.applied);
+
+        // After convergence, beta should no longer be diverged.
+        let post_diverged = repo.diverged_branches().unwrap();
+        assert!(
+            !post_diverged.iter().any(|b| b.spec_id == "beta"),
+            "beta should NOT be diverged after converge_all --apply, got: {:?}",
+            post_diverged.iter().map(|b| &b.spec_id).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn test_apply_convergence_advances_spec_head() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "original\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "init".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("base-spec".into(), "Base".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("diverged-spec".into(), "Div".into(), "".into()))
+            .unwrap();
+
+        // Base spec seals first (establishes spec head on HEAD chain).
+        fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+        let base_agent = AgentIdentity {
+            id: "base-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            base_agent.clone(),
+            "base work".into(),
+            Some("base-spec".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Diverged spec seals (chains from global HEAD at this point).
+        fs::write(dir.path().join("div.txt"), "diverged\n").unwrap();
+        let div_agent = AgentIdentity {
+            id: "div-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            div_agent,
+            "diverged work".into(),
+            Some("diverged-spec".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Base spec seals AGAIN — its parent comes from its spec head, not
+        // global HEAD, so this new seal's chain skips the diverged seal.
+        fs::write(dir.path().join("base2.txt"), "more base\n").unwrap();
+        repo.seal(
+            base_agent,
+            "base final".into(),
+            Some("base-spec".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Verify diverged.
+        let diverged = repo.diverged_branches().unwrap();
+        assert!(
+            diverged.iter().any(|b| b.spec_id == "diverged-spec"),
+            "diverged-spec should be diverged before convergence"
+        );
+
+        // Run converge + apply_convergence.
+        let report = repo.converge("base-spec", "diverged-spec").unwrap();
+        repo.apply_convergence(&report, &[]).unwrap();
+
+        // After apply_convergence, spec head should be updated.
+        let post_diverged = repo.diverged_branches().unwrap();
+        assert!(
+            !post_diverged.iter().any(|b| b.spec_id == "diverged-spec"),
+            "diverged-spec should be resolved after apply_convergence"
+        );
+    }
+
+    /// Helper: set up a repo with conflicting file versions of different sizes.
+    /// Left has a shorter version, right has a longer version.
+    fn setup_content_size_conflict() -> (tempfile::TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("page.html"), "<html>\n<body>\nHello\n</body>\n</html>\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            setup, "baseline".into(), None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        repo.add_spec(&Spec::new("small".into(), "Small changes".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("big".into(), "Big changes".into(), "".into())).unwrap();
+
+        // Small spec: minimal change (3 lines).
+        fs::write(dir.path().join("page.html"), "<html>\n<body>Small</body>\n</html>\n").unwrap();
+        let small_agent = AgentIdentity {
+            id: "small-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            small_agent.clone(), "small change".into(),
+            Some("small".into()), crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        // Big spec: richer content (8 lines).
+        fs::write(
+            dir.path().join("page.html"),
+            "<html>\n<head><title>Big</title></head>\n<body>\n<nav>\n<li>Home</li>\n<li>About</li>\n</nav>\n</body>\n</html>\n",
+        ).unwrap();
+        let big_agent = AgentIdentity {
+            id: "big-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            big_agent, "big change".into(),
+            Some("big".into()), crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        // Small seals again to advance HEAD past big.
+        fs::write(dir.path().join("page.html"), "<html>\n<body>Small</body>\n</html>\n").unwrap();
+        fs::write(dir.path().join("small-only.txt"), "extra\n").unwrap();
+        repo.seal(
+            small_agent, "small extra".into(),
+            Some("small".into()), crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        repo.update_spec("small", SpecUpdate {
+            status: Some(SpecStatus::Complete),
+            ..Default::default()
+        }).unwrap();
+
+        (dir, repo)
+    }
+
+    #[test]
+    fn test_converge_all_most_complete_picks_longer_version() {
+        let (dir, repo) = setup_content_size_conflict();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostComplete, true)
+            .unwrap();
+
+        assert!(report.is_clean, "MostComplete should resolve all conflicts");
+        assert!(report.total_resolutions > 0);
+        assert_eq!(report.strategy, "most-complete");
+
+        // The big version (more lines) should win.
+        let content = fs::read_to_string(dir.path().join("page.html")).unwrap();
+        assert!(content.contains("<nav>"), "MostComplete should pick the version with more content");
+    }
+
+    #[test]
+    fn test_converge_all_most_complete_resolution_records() {
+        let (_dir, repo) = setup_content_size_conflict();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostComplete, false)
+            .unwrap();
+
+        let has_most_complete_resolution = report.merges.iter().any(|m| {
+            m.resolutions.iter().any(|r| r.strategy == "most-complete")
+        });
+        assert!(has_most_complete_resolution, "should have most-complete resolution records");
+    }
+
+    #[test]
+    fn test_converge_all_most_complete_warns_about_lost_content() {
+        let (_dir, repo) = setup_content_size_conflict();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostComplete, false)
+            .unwrap();
+
+        let has_loss_warning = report.warnings.iter().any(|w| w.contains("more content"));
+        assert!(has_loss_warning, "should warn about discarded content, got: {:?}", report.warnings);
+    }
+
+    #[test]
+    fn test_converge_all_most_complete_equal_lines_picks_left() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Both versions have the same line count but different content.
+        fs::write(dir.path().join("eq.txt"), "original\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            setup, "baseline".into(), None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        repo.add_spec(&Spec::new("left".into(), "Left".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("right".into(), "Right".into(), "".into())).unwrap();
+
+        fs::write(dir.path().join("eq.txt"), "LEFT_V\n").unwrap();
+        let left_agent = AgentIdentity {
+            id: "left-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            left_agent.clone(), "left".into(),
+            Some("left".into()), crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        fs::write(dir.path().join("eq.txt"), "RIGHT_\n").unwrap();
+        let right_agent = AgentIdentity {
+            id: "right-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            right_agent, "right".into(),
+            Some("right".into()), crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        // Advance HEAD past right.
+        fs::write(dir.path().join("eq.txt"), "LEFT_V\n").unwrap();
+        fs::write(dir.path().join("extra.txt"), "x\n").unwrap();
+        repo.seal(
+            left_agent, "advance".into(),
+            Some("left".into()), crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        repo.update_spec("left", SpecUpdate {
+            status: Some(SpecStatus::Complete),
+            ..Default::default()
+        }).unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostComplete, true)
+            .unwrap();
+
+        // Equal lines → prefer_right is false (right_lines > left_lines is false).
+        // So left (base) wins.
+        let content = fs::read_to_string(dir.path().join("eq.txt")).unwrap();
+        assert!(content.contains("LEFT_V"), "equal line count should prefer left (base)");
+    }
+
+    // ---- Quality report tests ----
+
+    #[test]
+    fn test_quality_report_present_on_converge_all() {
+        let (_dir, repo) = setup_multi_diverged();
+        let report = repo
+            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
+            .unwrap();
+
+        assert!(report.quality_report.is_some(), "quality report should always be present");
+        let qr = report.quality_report.unwrap();
+        assert!(!qr.summary.is_empty());
+        assert!(qr.quality_score <= 100);
+    }
+
+    #[test]
+    fn test_quality_report_tracks_file_decisions() {
+        let (_dir, repo) = setup_multi_diverged();
+        let report = repo
+            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
+            .unwrap();
+
+        let qr = report.quality_report.unwrap();
+        assert!(!qr.file_decisions.is_empty(), "should have file decisions");
+
+        // Should have right-only decisions for beta.txt and gamma.txt.
+        let right_only: Vec<_> = qr.file_decisions.iter()
+            .filter(|d| d.decision == "right-only")
+            .collect();
+        assert!(!right_only.is_empty(), "should have right-only decisions");
+    }
+
+    #[test]
+    fn test_quality_report_conflict_decisions_with_strategy() {
+        let (_dir, repo) = setup_content_size_conflict();
+        let report = repo
+            .converge_all(ConvergeStrategy::MostComplete, false)
+            .unwrap();
+
+        let qr = report.quality_report.unwrap();
+        let most_complete_decisions: Vec<_> = qr.file_decisions.iter()
+            .filter(|d| d.decision == "most-complete")
+            .collect();
+        assert!(!most_complete_decisions.is_empty(), "should have most-complete decisions");
+
+        let d = &most_complete_decisions[0];
+        assert!(d.chosen_lines > 0, "chosen_lines should be non-zero");
+        assert!(d.chosen_spec.is_some(), "chosen_spec should be set");
+        assert!(!d.alternatives.is_empty(), "should record discarded alternatives");
+        assert!(d.alternatives[0].lines > 0, "alternative should have line count");
+    }
+
+    #[test]
+    fn test_quality_report_unresolved_conflicts_lower_score() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "original\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            setup, "baseline".into(), None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        repo.add_spec(&Spec::new("left".into(), "Left".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("right".into(), "Right".into(), "".into())).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "LEFT\n").unwrap();
+        let la = AgentIdentity { id: "l".into(), agent_type: crate::seal::AgentType::Agent };
+        repo.seal(la.clone(), "l".into(), Some("left".into()),
+            crate::seal::TaskStatus::Complete, crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "RIGHT\n").unwrap();
+        let ra = AgentIdentity { id: "r".into(), agent_type: crate::seal::AgentType::Agent };
+        repo.seal(ra, "r".into(), Some("right".into()),
+            crate::seal::TaskStatus::Complete, crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "LEFT\n").unwrap();
+        fs::write(dir.path().join("extra.txt"), "x\n").unwrap();
+        repo.seal(la, "advance".into(), Some("left".into()),
+            crate::seal::TaskStatus::Complete, crate::seal::Verification::default(), false,
+        ).unwrap();
+        repo.update_spec("left", SpecUpdate {
+            status: Some(SpecStatus::Complete),
+            ..Default::default()
+        }).unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
+            .unwrap();
+
+        let qr = report.quality_report.unwrap();
+        assert!(qr.quality_score < 100, "unresolved conflicts should lower score, got {}", qr.quality_score);
+
+        let unresolved: Vec<_> = qr.file_decisions.iter()
+            .filter(|d| d.decision == "conflict-unresolved")
+            .collect();
+        assert!(!unresolved.is_empty(), "should have unresolved conflict decisions");
+    }
+
+    #[test]
+    fn test_quality_report_serializable() {
+        let (_dir, repo) = setup_content_size_conflict();
+        let report = repo
+            .converge_all(ConvergeStrategy::MostComplete, false)
+            .unwrap();
+
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(json.contains("quality_report"));
+        assert!(json.contains("file_decisions"));
+        assert!(json.contains("quality_score"));
+        assert!(json.contains("summary"));
+
+        // Roundtrip.
+        let parsed: ConvergeAllReport = serde_json::from_str(&json).unwrap();
+        assert!(parsed.quality_report.is_some());
+        let qr = parsed.quality_report.unwrap();
+        assert!(!qr.file_decisions.is_empty());
+    }
+
+    #[test]
+    fn test_quality_report_consistency_checks_on_html() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create two HTML files with same nav structure.
+        fs::write(dir.path().join("index.html"), "<html>\n<ul>\n<li>Home</li>\n<li>About</li>\n</ul>\n</html>\n").unwrap();
+        fs::write(dir.path().join("about.html"), "<html>\n<ul>\n<li>Home</li>\n<li>About</li>\n</ul>\n</html>\n").unwrap();
+
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            setup, "baseline".into(), None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        repo.add_spec(&Spec::new("nav".into(), "Nav update".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("content".into(), "Content".into(), "".into())).unwrap();
+
+        // Nav agent adds items to index but not about.
+        fs::write(dir.path().join("index.html"), "<html>\n<ul>\n<li>Home</li>\n<li>About</li>\n<li>Blog</li>\n<li>Contact</li>\n<li>FAQ</li>\n</ul>\n</html>\n").unwrap();
+        let nav_a = AgentIdentity { id: "nav-dev".into(), agent_type: crate::seal::AgentType::Agent };
+        repo.seal(
+            nav_a.clone(), "add nav items".into(),
+            Some("nav".into()), crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        // Content agent modifies about.html only.
+        fs::write(dir.path().join("about.html"), "<html>\n<ul>\n<li>Home</li>\n<li>About</li>\n</ul>\n<p>Content here</p>\n</html>\n").unwrap();
+        let content_a = AgentIdentity { id: "content-dev".into(), agent_type: crate::seal::AgentType::Agent };
+        repo.seal(
+            content_a, "add content".into(),
+            Some("content".into()), crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+
+        // Advance HEAD.
+        fs::write(dir.path().join("nav-extra.txt"), "x\n").unwrap();
+        repo.seal(
+            nav_a, "extra".into(),
+            Some("nav".into()), crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(), false,
+        ).unwrap();
+        repo.update_spec("nav", SpecUpdate {
+            status: Some(SpecStatus::Complete),
+            ..Default::default()
+        }).unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostComplete, true)
+            .unwrap();
+
+        let qr = report.quality_report.unwrap();
+
+        // Should have nav_item_count consistency check.
+        let nav_check = qr.consistency_checks.iter()
+            .find(|c| c.metric == "nav_item_count");
+        assert!(nav_check.is_some(), "should check nav item consistency, checks: {:?}", qr.consistency_checks);
+
+        let check = nav_check.unwrap();
+        // index.html has 5 <li, about.html has 2 — should be inconsistent.
+        assert!(!check.consistent, "nav items should be inconsistent (5 vs 2)");
+        assert!(check.warning.is_some());
     }
 }

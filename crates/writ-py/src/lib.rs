@@ -563,6 +563,7 @@ impl PyRepository {
     ) -> PyResult<PyObject> {
         let strat = match strategy {
             "most-recent" => writ_core::convergence::ConvergeStrategy::MostRecent,
+            "most-complete" => writ_core::convergence::ConvergeStrategy::MostComplete,
             _ => writ_core::convergence::ConvergeStrategy::ThreeWayMerge,
         };
         let report = self.inner.converge_all(strat, apply).map_err(writ_err)?;

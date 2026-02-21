@@ -1,6 +1,6 @@
 """writ — AI-native version control for agentic workflows.
 
-Install: pip install writ
+Install: pip install writ-vcs
 Docs:    https://github.com/agarfield/writ
 
 Basic usage::

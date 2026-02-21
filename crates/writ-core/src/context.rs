@@ -393,8 +393,8 @@ pub struct ContextOutput {
     /// Top-level integration risk assessment.
     /// Computed from diverged branches, file contention, and scope violations.
     /// Agents/orchestrators can check `integration_risk.level` before starting work.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub integration_risk: Option<IntegrationRisk>,
+    /// Always present (level "low" when no risk factors).
+    pub integration_risk: IntegrationRisk,
 
     /// True when all specs in the repository are marked complete.
     /// Signals to agents/humans that work is done and `writ summary` is available.

@@ -94,7 +94,8 @@ pub struct Seal {
     /// Human/agent-readable summary of what changed.
     pub summary: String,
     /// Warnings generated at seal time (scope violations, ghost work, etc.).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Always present (empty array when no warnings).
+    #[serde(default)]
     pub warnings: Vec<String>,
 }
 

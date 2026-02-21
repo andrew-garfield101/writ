@@ -2291,12 +2291,15 @@ class TestIntegrationRisk:
     """Tests for the integration_risk field in context output."""
 
     def test_no_risk_clean_repo(self, tmp_path):
-        """A clean repo with no divergence has no integration_risk."""
+        """A clean repo with no divergence has low integration_risk."""
         repo = writ.Repository.init(str(tmp_path))
         (tmp_path / "a.txt").write_text("hello")
         repo.seal(summary="init", agent_id="dev", agent_type="agent")
         ctx = repo.context()
-        assert ctx.get("integration_risk") is None
+        risk = ctx.get("integration_risk")
+        assert risk is not None
+        assert risk["level"] == "low"
+        assert risk["score"] == 0
 
     def test_risk_present_when_diverged(self, tmp_path):
         """Diverged branches trigger integration_risk in context."""
@@ -2350,14 +2353,17 @@ class TestIntegrationRisk:
         assert "score" in parsed
         assert "factors" in parsed
 
-    def test_risk_not_in_spec_scoped_context(self, tmp_path):
-        """Spec-scoped context does not include integration_risk."""
+    def test_risk_low_in_spec_scoped_context(self, tmp_path):
+        """Spec-scoped context has low integration_risk (always present)."""
         repo = writ.Repository.init(str(tmp_path))
         repo.add_spec(id="feat", title="Feature")
         (tmp_path / "a.txt").write_text("hello")
         repo.seal(summary="init", agent_id="dev", agent_type="agent", spec_id="feat")
         ctx = repo.context(spec="feat")
-        assert ctx.get("integration_risk") is None
+        risk = ctx.get("integration_risk")
+        assert risk is not None
+        assert risk["level"] == "low"
+        assert risk["score"] == 0
 
 
 class TestConvergence:

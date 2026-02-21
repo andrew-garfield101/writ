@@ -27,6 +27,19 @@ enum Commands {
         /// Output format: "human" (default) or "json".
         #[arg(long, default_value = "human")]
         format: String,
+
+        /// Create a spec during install (convenience shortcut).
+        /// Example: --spec auth --title "Authentication" --description "JWT auth system"
+        #[arg(long)]
+        spec: Option<String>,
+
+        /// Title for the spec created with --spec. Defaults to the spec ID.
+        #[arg(long, requires = "spec")]
+        title: Option<String>,
+
+        /// Description for the spec created with --spec.
+        #[arg(long, requires = "spec")]
+        description: Option<String>,
     },
 
     /// Show working directory state.
@@ -208,7 +221,7 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Conflict resolution strategy: "three-way-merge" (default) or "most-recent".
+        /// Conflict resolution strategy: "three-way-merge" (default), "most-recent", or "most-complete".
         #[arg(long, default_value = "three-way-merge")]
         strategy: String,
     },
@@ -414,7 +427,7 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init => cmd_init(&cwd),
-        Commands::Install { format } => cmd_install(&cwd, &format),
+        Commands::Install { format, spec, title, description } => cmd_install(&cwd, &format, spec, title, description),
         Commands::State { format } => cmd_state(&cwd, &format),
         Commands::Seal {
             summary,
@@ -536,7 +549,13 @@ fn cmd_init(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_install(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_install(
+    cwd: &PathBuf,
+    format: &str,
+    spec_id: Option<String>,
+    spec_title: Option<String>,
+    spec_description: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let result = Repository::install(cwd)?;
 
     match format {
@@ -544,19 +563,16 @@ fn cmd_install(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Er
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         _ => {
-            // Init status
             if result.initialized {
                 println!("initialized writ repository in .writ/");
             } else {
                 println!("writ repository already exists");
             }
 
-            // .writignore
             if result.writignore_created {
                 println!("created .writignore");
             }
 
-            // Git status
             if result.git_detected {
                 let branch = result.git_branch.as_deref().unwrap_or("(detached)");
                 let head = result.git_head_short.as_deref().unwrap_or("unknown");
@@ -573,7 +589,6 @@ fn cmd_install(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Er
                 println!("no git repository detected");
             }
 
-            // Import status
             if result.git_imported {
                 let seal_short = result
                     .imported_seal_id
@@ -597,10 +612,8 @@ fn cmd_install(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Er
                 eprintln!("import error: {}", err);
             }
 
-            // Tracked files
             println!("tracked: {} file(s)", result.tracked_files);
 
-            // Frameworks
             let detected: Vec<_> = result
                 .frameworks_detected
                 .iter()
@@ -614,7 +627,6 @@ fn cmd_install(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Er
                 );
             }
 
-            // Hooks
             for hook in &result.hooks_installed {
                 for f in &hook.files_created {
                     println!("  + {f}");
@@ -623,13 +635,29 @@ fn cmd_install(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Er
                     println!("  ~ {f}");
                 }
             }
+        }
+    }
 
-            // Next steps
-            println!();
-            println!("ready. next steps:");
-            for op in &result.available_operations {
-                println!("  {}", op);
-            }
+    // Create a spec if --spec was provided.
+    if let Some(ref id) = spec_id {
+        let repo = Repository::open(cwd)?;
+        let title = spec_title
+            .as_deref()
+            .unwrap_or(id);
+        let desc = spec_description
+            .as_deref()
+            .unwrap_or("");
+        repo.add_spec(&Spec::new(id.clone(), title.to_string(), desc.to_string()))?;
+        if format != "json" {
+            println!("spec: created '{}' ({})", id, title);
+        }
+    }
+
+    if format != "json" {
+        println!();
+        println!("ready. next steps:");
+        for op in &result.available_operations {
+            println!("  {}", op);
         }
     }
 
@@ -1145,7 +1173,8 @@ fn cmd_context(
                 }
             }
 
-            if let Some(ref risk) = ctx.integration_risk {
+            {
+                let risk = &ctx.integration_risk;
                 println!();
                 println!("  INTEGRATION RISK: {} (score: {})", risk.level.to_uppercase(), risk.score);
                 for f in &risk.factors {
@@ -1785,6 +1814,40 @@ fn cmd_converge_all(
                 report.total_resolutions,
             );
 
+            if let Some(ref qr) = report.quality_report {
+                println!();
+                println!("  QUALITY REPORT (score: {}/100)", qr.quality_score);
+                println!("    {}", qr.summary);
+                if !qr.file_decisions.is_empty() {
+                    println!();
+                    println!("    File decisions:");
+                    for d in &qr.file_decisions {
+                        let spec_info = d.chosen_spec.as_deref().unwrap_or("-");
+                        println!(
+                            "      {:30} {:18} {:4} lines  (spec: {})",
+                            d.path, d.decision, d.chosen_lines, spec_info,
+                        );
+                        for alt in &d.alternatives {
+                            println!(
+                                "        discarded: {} ({} lines) — {}",
+                                alt.spec, alt.lines, alt.reason,
+                            );
+                        }
+                    }
+                }
+                if !qr.consistency_checks.is_empty() {
+                    println!();
+                    println!("    Consistency checks:");
+                    for c in &qr.consistency_checks {
+                        let status = if c.consistent { "PASS" } else { "FAIL" };
+                        println!("      {} {}", status, c.metric);
+                        if let Some(ref w) = c.warning {
+                            println!("        {w}");
+                        }
+                    }
+                }
+            }
+
             if dry_run {
                 println!("  (dry run — no changes applied)");
                 println!("  Run with --apply to merge: writ converge-all --apply --strategy {strategy_str}");
@@ -1799,10 +1862,10 @@ fn cmd_converge_all(
                     ctx.integration_risk.clone()
                 };
 
-                let pre_score = pre_risk.as_ref().map(|r| r.score).unwrap_or(0);
-                let post_score = post_risk.as_ref().map(|r| r.score).unwrap_or(0);
-                let pre_level = pre_risk.as_ref().map(|r| r.level.as_str()).unwrap_or("low");
-                let post_level = post_risk.as_ref().map(|r| r.level.as_str()).unwrap_or("low");
+                let pre_score = pre_risk.score;
+                let post_score = post_risk.score;
+                let pre_level = pre_risk.level.as_str();
+                let post_level = post_risk.level.as_str();
 
                 println!();
                 println!("  INTEGRATION RISK: {} ({}) -> {} ({})",

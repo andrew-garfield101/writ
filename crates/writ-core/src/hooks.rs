@@ -174,15 +174,14 @@ fn writ_claude_md_section() -> String {
 
 This project uses **writ** for AI-native version control. Use writ alongside git.
 
-### CLI (preferred)
+### Quick reference
 
 ```bash
-writ context                                              # project state
+writ context                                              # full project state
 writ context --spec my-feature                            # scoped to a spec
-writ seal -s "what you did" --agent your-id --spec feat   # checkpoint (status: in-progress)
+writ seal -s "what you did" --agent your-id --spec feat   # checkpoint
 writ seal -s "done" --agent your-id --spec feat --status complete  # final seal
 writ log --limit 5                                        # recent seals
-writ log --spec my-feature                                # spec-scoped history
 ```
 
 ### Python API
@@ -205,24 +204,39 @@ repo.seal(summary="what you did", agent_id="your-id", agent_type="agent", spec_i
 ### Rules
 
 - Always seal your work before finishing a task
-- Use --spec to link seals to specs
+- Use --spec to link seals to specs when working on a defined spec
 - Use --status in-progress for intermediate work (this is the default)
 - Use --status complete only when the spec is fully done
 - Include test results when available (--tests-passed N --tests-failed M)
 - Use `writ log --all` to see seals from all branches (including diverged ones)
 - If context shows unsealed changes, seal before starting new work
-- When context shows `session_complete: true`, all specs are done — run `writ summary` for the full report
-- Summary files (.writ/summary.json, .writ/summary.txt) are auto-generated when all specs complete
+- When context shows `session_complete: true`, all specs are done — run `writ summary`
 - Seal results include `hints` array and `file_scope_warning` — check these after each seal
-- If seal returns 0 file changes, another agent may have sealed your work — check `writ context`
+- If seal returns 0 file changes, another agent may have captured your work — check `writ context`
+
+### Rollback and recovery
+
+If something goes wrong — tests fail, work goes sideways, convergence produces bad output:
+
+```bash
+writ log --all                        # find the last known-good seal
+writ show SEAL_ID --diff              # inspect it to confirm
+writ restore SEAL_ID                  # rewind working directory to that seal's state
+writ seal -s "rolled back to SEAL_ID" --agent your-id  # seal the rollback
+```
+
+Every seal is an immutable snapshot. Restoring doesn't delete history — all previous seals
+remain in the log. Use restore as a safety net when your changes cause regressions.
 
 ### Convergence (multi-agent)
 
 When multiple agents work in parallel, their seals may diverge. Check for this:
 - `writ context` shows `convergence_recommended: true` and `integration_risk` level
 - `writ converge-all --dry-run` previews what will be merged
-- `writ converge-all --apply` merges all diverged branches (newest-first ordering)
+- `writ converge-all --apply --strategy most-complete` merges all diverged branches
 - After convergence, seal the result: `writ seal -s "converged N branches" --agent convergence-bot`
+
+Available strategies: `three-way-merge` (default, leaves conflicts unresolved), `most-recent` (prefers newest), `most-complete` (prefers version with more content).
 
 For two-branch convergence: `writ converge <left-spec> <right-spec> --apply`
 
@@ -230,14 +244,15 @@ For two-branch convergence: `writ converge <left-spec> <right-spec> --apply`
 
 Context includes an `integration_risk` field with level (low/medium/high), score (0-100), and factors.
 Check this before starting work on shared files. High risk means multiple diverged branches
-and files touched by 5+ agents — convergence is critical before further work.
+and files touched by many agents — converge before further work.
 
-### Git integration workflow
+### Human round-trip (git integration)
+
+When you're done, the human developer commits your work to git:
 
 ```bash
-writ summary --format commit     # concise one-line commit message
-writ summary --format pr         # full PR description with spec/agent breakdown
-writ summary --format commit | git commit -F -   # pipe directly to git
+git commit -m "$(writ summary --format commit)"          # one-line commit message
+gh pr create --body "$(writ summary --format pr)"         # full PR description
 ```
 "#.to_string()
 }
@@ -279,20 +294,38 @@ repo.seal(summary="changes", agent_id="your-id", agent_type="agent", spec_id="yo
 - Always run `writ context` first to understand project state
 - Seal after every meaningful unit of work (defaults to status: in-progress)
 - Use `--status complete` only on your final seal for a spec
-- Link seals to specs with --spec
+- Link seals to specs with --spec when working on a defined spec
 - Include verification data (--tests-passed, --tests-failed, --linted)
 - Use `writ log --all` to see unified history across all branches
-- When context shows `session_complete: true`, all specs are done — run `writ summary` for the full report
-- Summary files (.writ/summary.json, .writ/summary.txt) are auto-generated when all specs complete
+- When context shows `session_complete: true`, all specs are done — run `writ summary`
 - Check seal results for `hints` and `file_scope_warning` fields after each seal
 - If seal returns 0 file changes, another agent may have captured your work first
+
+### Rollback and recovery
+
+If tests fail or work goes wrong, restore to a previous seal:
+
+```bash
+writ log --all                        # find the last known-good seal
+writ restore SEAL_ID                  # rewind working directory to that state
+writ seal -s "rolled back" --agent your-id  # seal the rollback
+```
+
+Every seal is immutable — restoring doesn't delete history.
 
 ### Convergence (multi-agent)
 
 - Check `integration_risk` field in context for divergence risk assessment
-- `writ converge-all --dry-run` to preview merges, `--apply` to execute
+- `writ converge-all --dry-run` to preview, `--apply` to execute
+- Strategies: `most-complete` (prefers more content), `most-recent` (prefers newest), `three-way-merge` (default, leaves conflicts unresolved)
 - After convergence, seal: `writ seal -s "converged" --agent convergence-bot`
-- `writ summary --format commit` for git, `--format pr` for PR descriptions
+
+### Human round-trip
+
+```bash
+git commit -m "$(writ summary --format commit)"          # one-line commit message
+gh pr create --body "$(writ summary --format pr)"         # full PR description
+```
 "#.to_string()
 }
 
@@ -395,5 +428,43 @@ mod tests {
         let results = install_hooks(dir.path()).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].framework, Framework::ClaudeCode);
+    }
+
+    #[test]
+    fn test_claude_md_section_has_restore_guidance() {
+        let section = writ_claude_md_section();
+        assert!(section.contains("writ restore"), "missing restore command");
+        assert!(section.contains("Rollback and recovery"), "missing rollback section");
+        assert!(section.contains("immutable"), "missing immutability note");
+    }
+
+    #[test]
+    fn test_claude_md_section_has_round_trip_commands() {
+        let section = writ_claude_md_section();
+        assert!(section.contains("git commit -m \"$(writ summary --format commit)\""),
+            "missing correct git commit command");
+        assert!(section.contains("gh pr create"), "missing gh pr command");
+    }
+
+    #[test]
+    fn test_claude_md_section_has_convergence_strategies() {
+        let section = writ_claude_md_section();
+        assert!(section.contains("most-complete"), "missing most-complete strategy");
+        assert!(section.contains("most-recent"), "missing most-recent strategy");
+        assert!(section.contains("three-way-merge"), "missing three-way-merge strategy");
+    }
+
+    #[test]
+    fn test_agents_md_section_has_restore_guidance() {
+        let section = writ_agents_md_section();
+        assert!(section.contains("writ restore"), "missing restore command");
+        assert!(section.contains("immutable"), "missing immutability note");
+    }
+
+    #[test]
+    fn test_agents_md_section_has_round_trip_commands() {
+        let section = writ_agents_md_section();
+        assert!(section.contains("git commit -m \"$(writ summary --format commit)\""),
+            "missing correct git commit command");
     }
 }

@@ -764,13 +764,40 @@ impl Repository {
                 let entry = entry?;
                 spec_ids.push(entry.file_name().to_string_lossy().to_string());
             }
-            spec_ids.sort(); // Deterministic order.
+            spec_ids.sort();
 
             for spec_id in spec_ids {
                 let branch_seals = self.spec_log(&spec_id)?;
                 for seal in branch_seals {
                     if seen.insert(seal.id.clone()) {
                         all_seals.push(seal);
+                    }
+                }
+            }
+        }
+
+        // 3. Walk archived pre-convergence branch tips. These chains were
+        //    orphaned when apply_convergence advanced spec heads, but the
+        //    seals still exist in the object store.
+        let merged_heads_path = self.writ_dir.join("merged-heads");
+        if merged_heads_path.exists() {
+            let contents = fs::read_to_string(&merged_heads_path)?;
+            for line in contents.lines() {
+                let tip = line.trim();
+                if tip.is_empty() || seen.contains(tip) {
+                    continue;
+                }
+                let mut current: Option<String> = Some(tip.to_string());
+                while let Some(seal_id) = current {
+                    if !seen.insert(seal_id.clone()) {
+                        break;
+                    }
+                    match self.load_seal(&seal_id) {
+                        Ok(seal) => {
+                            current = seal.parent.clone();
+                            all_seals.push(seal);
+                        }
+                        Err(_) => break,
                     }
                 }
             }
@@ -1081,11 +1108,7 @@ impl Repository {
                     file_scope_violations.len(),
                     file_contention.len(),
                 );
-                let integration_risk_opt = if integration_risk.level == "low" && integration_risk.factors.is_empty() {
-                    None
-                } else {
-                    Some(integration_risk)
-                };
+                // Always include integration risk (even when low) so agents always see the field.
 
                 let mut result = ContextOutput {
                     writ_version: "0.1.0".to_string(),
@@ -1104,7 +1127,7 @@ impl Repository {
                     convergence_recommended,
                     file_scope_violations,
                     file_contention,
-                    integration_risk: integration_risk_opt,
+                    integration_risk,
                     session_complete: false,
                     session_summary: None,
                     available_operations,
@@ -1328,7 +1351,7 @@ impl Repository {
                     convergence_recommended: false,
                     file_scope_violations: Vec::new(),
                     file_contention: Vec::new(),
-                    integration_risk: None,
+                    integration_risk: IntegrationRisk::compute(0, 0, 0, 0),
                     session_complete: false,
                     session_summary: None,
                     available_operations,
@@ -1694,11 +1717,16 @@ impl Repository {
             fs::write(&file_path, &resolution.content)?;
         }
 
+        // Archive the right spec's current head before advancing it.
+        // This preserves the diverged seal chain so log_all() / summary()
+        // can still enumerate seals from pre-convergence branches.
+        if let Some(old_head) = self.read_spec_head(&report.right_spec)? {
+            self.archive_merged_head(&old_head)?;
+        }
+
         // Advance the right (diverged) spec's head pointer to the left
         // spec's latest seal. This puts the right spec "on" the HEAD chain
         // so diverged_branches() no longer reports it as diverged.
-        // We use left_seal_id because that's the seal on the HEAD chain
-        // that the merge was based against.
         self.write_spec_head(&report.right_spec, &report.left_seal_id)?;
 
         Ok(())
@@ -2306,6 +2334,26 @@ impl Repository {
             fs::create_dir_all(&heads_dir)?;
         }
         atomic_write(&heads_dir.join(spec_id), seal_id.as_bytes())
+    }
+
+    /// Record a pre-convergence branch tip so `log_all()` can still walk
+    /// orphaned seal chains after convergence advances the spec head.
+    fn archive_merged_head(&self, seal_id: &str) -> WritResult<()> {
+        let path = self.writ_dir.join("merged-heads");
+        let mut contents = if path.exists() {
+            fs::read_to_string(&path)?
+        } else {
+            String::new()
+        };
+        if !contents.lines().any(|l| l == seal_id) {
+            if !contents.is_empty() && !contents.ends_with('\n') {
+                contents.push('\n');
+            }
+            contents.push_str(seal_id);
+            contents.push('\n');
+            atomic_write(&path, contents.as_bytes())?;
+        }
+        Ok(())
     }
 
     /// Determine the parent seal for a new seal. Uses spec-scoped head
@@ -9051,6 +9099,95 @@ mod summary_tests {
         assert_eq!(summary.total_seals, 1, "bridge seal should be excluded");
         assert_eq!(summary.agents.len(), 1);
         assert_eq!(summary.agents[0].id, "dev");
+    }
+
+    #[test]
+    fn test_summary_preserves_all_specs_after_convergence() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha Feature".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta Feature".into(), "".into())).unwrap();
+
+        // Seal 1: baseline.
+        fs::write(dir.path().join("shared.txt"), "base").unwrap();
+        repo.seal(
+            agent("setup"), "baseline".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Seal 2: agent-a works on alpha. HEAD=seal2, heads/alpha=seal2.
+        fs::write(dir.path().join("shared.txt"), "alpha-v1").unwrap();
+        fs::write(dir.path().join("alpha.txt"), "a").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha work".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+        repo.update_spec("alpha", crate::spec::SpecUpdate {
+            status: Some(crate::spec::SpecStatus::Complete),
+            ..Default::default()
+        }).unwrap();
+
+        // Seal 3: agent-b works on beta. parent=HEAD(seal2), HEAD=seal3,
+        // heads/beta=seal3.
+        fs::write(dir.path().join("shared.txt"), "beta-v1").unwrap();
+        fs::write(dir.path().join("beta.txt"), "b").unwrap();
+        repo.seal(
+            agent("agent-b"), "beta work".into(), Some("beta".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+        repo.update_spec("beta", crate::spec::SpecUpdate {
+            status: Some(crate::spec::SpecStatus::Complete),
+            ..Default::default()
+        }).unwrap();
+
+        // Seal 4: agent-a seals again on alpha. parent=heads/alpha(seal2),
+        // HEAD=seal4. HEAD chain: seal4→seal2→seal1. seal3 is NOT on chain.
+        // → beta is DIVERGED.
+        fs::write(dir.path().join("shared.txt"), "alpha-v2").unwrap();
+        repo.seal(
+            agent("agent-a"), "alpha polish".into(), Some("alpha".into()),
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Verify divergence exists.
+        let diverged = repo.diverged_branches().unwrap();
+        assert!(!diverged.is_empty(), "beta should be diverged");
+
+        // Pre-convergence: summary sees both specs because log_all walks
+        // both HEAD chain and spec heads.
+        let pre = repo.summary().unwrap();
+        assert_eq!(pre.specs_summary.len(), 2, "pre-converge should see 2 specs");
+
+        // Converge with apply.
+        let report = repo.converge_all(ConvergeStrategy::MostRecent, true).unwrap();
+        assert!(report.applied);
+
+        // Seal the convergence result (write a marker to ensure changes exist).
+        fs::write(dir.path().join("CONVERGED"), "1").unwrap();
+        repo.seal(
+            AgentIdentity { id: "convergence-bot".into(), agent_type: AgentType::Agent },
+            "converged alpha + beta".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Post-convergence: summary must still see BOTH specs + all agents.
+        let post = repo.summary().unwrap();
+        assert_eq!(
+            post.specs_summary.len(), 2,
+            "post-converge summary must include all specs, got: {:?}",
+            post.specs_summary.iter().map(|s| &s.id).collect::<Vec<_>>(),
+        );
+        assert!(post.total_seals >= 4, "should have at least 4 seals (setup + alpha*2 + beta + convergence)");
+        let agent_ids: Vec<&str> = post.agents.iter().map(|a| a.id.as_str()).collect();
+        assert!(agent_ids.contains(&"agent-a"), "agent-a missing from summary");
+        assert!(agent_ids.contains(&"agent-b"), "agent-b missing from summary");
+
+        // The beta spec's seal must be in the summary — this was the bug
+        // where convergence orphaned the beta chain.
+        let beta_entry = post.specs_summary.iter().find(|s| s.id == "beta");
+        assert!(beta_entry.is_some(), "beta spec must appear in summary after convergence");
+        assert!(beta_entry.unwrap().seal_count >= 1, "beta should have at least 1 seal");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # writ
 
-**writ-vcs™ — AI-native version control for agentic systems.**
+**writ-vcs™ AI-native version control for agentic systems.**
 
 > *"Every minute an agent spends figuring out 'what happened before me' is wasted compute. Writ minimizes that."*
 >

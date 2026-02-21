@@ -86,8 +86,7 @@ fn parse_spec_status(s: &str) -> PyResult<writ_core::spec::SpecStatus> {
 // ---------------------------------------------------------------------------
 
 fn to_pydict<T: serde::Serialize>(py: Python, value: &T) -> PyResult<PyObject> {
-    let obj = pythonize::pythonize(py, value)
-        .map_err(|e| WritError::new_err(e.to_string()))?;
+    let obj = pythonize::pythonize(py, value).map_err(|e| WritError::new_err(e.to_string()))?;
     Ok(obj.unbind())
 }
 
@@ -109,11 +108,7 @@ fn build_seal_result(
     conflict_warning: Option<writ_core::repo::SealConflictWarning>,
 ) -> SealResult {
     let file_scope_warning = seal.spec_id.as_ref().and_then(|sid| {
-        let changed: Vec<String> = seal
-            .changes
-            .iter()
-            .map(|c| c.path.clone())
-            .collect();
+        let changed: Vec<String> = seal.changes.iter().map(|c| c.path.clone()).collect();
         repo.check_file_scope(sid, &changed)
     });
 
@@ -124,7 +119,12 @@ fn build_seal_result(
             "SCOPE: {} file(s) outside spec '{}' scope: {}",
             w.out_of_scope_files.len(),
             w.spec_id,
-            w.out_of_scope_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+            w.out_of_scope_files
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
         ));
     }
 
@@ -132,7 +132,8 @@ fn build_seal_result(
         hints.push(
             "GHOST_WORK: 0 file changes detected but summary is non-empty. \
              Another agent may have sealed overlapping files first. \
-             Check `writ context` for file ownership.".to_string(),
+             Check `writ context` for file ownership."
+                .to_string(),
         );
     }
 
@@ -224,7 +225,8 @@ impl PyRepository {
         let tracked_head = self.inner.last_context_head();
 
         if let Some(ref p) = paths {
-            let seal = self.inner
+            let seal = self
+                .inner
                 .seal_paths(
                     agent,
                     summary.to_string(),
@@ -239,7 +241,8 @@ impl PyRepository {
             let result = build_seal_result(&self.inner, seal, None);
             to_pydict(py, &result)
         } else if tracked_head.is_some() {
-            let (seal, warning) = self.inner
+            let (seal, warning) = self
+                .inner
                 .seal_with_check(
                     agent,
                     summary.to_string(),
@@ -254,7 +257,8 @@ impl PyRepository {
             let result = build_seal_result(&self.inner, seal, warning);
             to_pydict(py, &result)
         } else {
-            let seal = self.inner
+            let seal = self
+                .inner
                 .seal(
                     agent,
                     summary.to_string(),
@@ -439,11 +443,7 @@ impl PyRepository {
         design_notes: Option<Vec<String>>,
         tech_stack: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
-        let mut spec = Spec::new(
-            id.to_string(),
-            title.to_string(),
-            description.to_string(),
-        );
+        let mut spec = Spec::new(id.to_string(), title.to_string(), description.to_string());
         if let Some(ac) = acceptance_criteria {
             spec.acceptance_criteria = ac;
         }
@@ -555,12 +555,7 @@ impl PyRepository {
     ///
     /// When `apply` is True, merged files are written to the working directory.
     #[pyo3(signature = (strategy="three-way-merge", apply=false))]
-    fn converge_all(
-        &self,
-        py: Python,
-        strategy: &str,
-        apply: bool,
-    ) -> PyResult<PyObject> {
+    fn converge_all(&self, py: Python, strategy: &str, apply: bool) -> PyResult<PyObject> {
         let strat = match strategy {
             "most-recent" => writ_core::convergence::ConvergeStrategy::MostRecent,
             "most-complete" => writ_core::convergence::ConvergeStrategy::MostComplete,
@@ -583,7 +578,10 @@ impl PyRepository {
             id: agent_id.to_string(),
             agent_type: parse_agent_type(agent_type)?,
         };
-        let result = self.inner.bridge_import(Some(git_ref), agent).map_err(writ_err)?;
+        let result = self
+            .inner
+            .bridge_import(Some(git_ref), agent)
+            .map_err(writ_err)?;
         to_pydict(py, &result)
     }
 

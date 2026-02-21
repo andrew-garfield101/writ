@@ -69,7 +69,10 @@ impl fmt::Display for WritError {
             WritError::SpecNotFound(id) => write!(f, "spec not found: {id}"),
             WritError::SpecHasNoSeals(id) => write!(f, "spec has no seals: {id}"),
             WritError::UnresolvedConflicts(n) => {
-                write!(f, "{n} unresolved conflict(s) — provide resolutions before applying")
+                write!(
+                    f,
+                    "{n} unresolved conflict(s) — provide resolutions before applying"
+                )
             }
             WritError::LockTimeout => write!(f, "could not acquire repository lock within timeout"),
             WritError::NoGitRepo => write!(f, "no git repository found"),

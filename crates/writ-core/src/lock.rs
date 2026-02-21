@@ -116,7 +116,7 @@ mod tests {
         });
 
         barrier.wait(); // Wait for thread to acquire lock.
-        // The thread holds the lock for ~100ms — we give ourselves 2s to acquire.
+                        // The thread holds the lock for ~100ms — we give ourselves 2s to acquire.
         let lock2 = RepoLock::acquire(&dir_path, Duration::from_secs(2));
         assert!(lock2.is_ok());
 

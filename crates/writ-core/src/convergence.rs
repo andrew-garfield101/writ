@@ -384,10 +384,8 @@ pub fn three_way_merge(base: &str, left: &str, right: &str) -> FileMergeResult {
         right.lines().collect()
     };
 
-    let (left_actions, left_inserts, left_after) =
-        build_action_table(&base_lines, &left_lines);
-    let (right_actions, right_inserts, right_after) =
-        build_action_table(&base_lines, &right_lines);
+    let (left_actions, left_inserts, left_after) = build_action_table(&base_lines, &left_lines);
+    let (right_actions, right_inserts, right_after) = build_action_table(&base_lines, &right_lines);
 
     let mut result: Vec<String> = Vec::new();
     let mut conflicts: Vec<ConflictRegion> = Vec::new();
@@ -469,12 +467,18 @@ pub fn three_way_merge(base: &str, left: &str, right: &str) -> FileMergeResult {
     // Handle inserts after the last base line.
     // Also check inserts_before[base_lines.len()] for trailing inserts.
     let left_trailing = {
-        let mut t = left_inserts.get(base_lines.len()).cloned().unwrap_or_default();
+        let mut t = left_inserts
+            .get(base_lines.len())
+            .cloned()
+            .unwrap_or_default();
         t.extend(left_after.iter().cloned());
         t
     };
     let right_trailing = {
-        let mut t = right_inserts.get(base_lines.len()).cloned().unwrap_or_default();
+        let mut t = right_inserts
+            .get(base_lines.len())
+            .cloned()
+            .unwrap_or_default();
         t.extend(right_after.iter().cloned());
         t
     };

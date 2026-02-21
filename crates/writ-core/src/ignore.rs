@@ -100,7 +100,14 @@ impl IgnoreRules {
 }
 
 /// All default directory names written to a generated `.writignore`.
-const WRITIGNORE_DEFAULTS: &[&str] = &[".writ", ".git", "target", "node_modules", ".venv", "__pycache__"];
+const WRITIGNORE_DEFAULTS: &[&str] = &[
+    ".writ",
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+];
 
 /// Create a `.writignore` file in the repo root if one doesn't exist.
 ///
@@ -292,7 +299,11 @@ mod tests {
     #[test]
     fn test_create_writignore_deduplicates() {
         let dir = tempfile::tempdir().unwrap();
-        fs::write(dir.path().join(".gitignore"), "target\nnode_modules/\nbuild\n").unwrap();
+        fs::write(
+            dir.path().join(".gitignore"),
+            "target\nnode_modules/\nbuild\n",
+        )
+        .unwrap();
         let created = create_writignore(dir.path()).unwrap();
         assert!(created);
         let content = fs::read_to_string(dir.path().join(".writignore")).unwrap();

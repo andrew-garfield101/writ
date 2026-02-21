@@ -439,7 +439,12 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init => cmd_init(&cwd),
-        Commands::Install { format, spec, title, description } => cmd_install(&cwd, &format, spec, title, description),
+        Commands::Install {
+            format,
+            spec,
+            title,
+            description,
+        } => cmd_install(&cwd, &format, spec, title, description),
         Commands::State { format } => cmd_state(&cwd, &format),
         Commands::Seal {
             summary,
@@ -452,13 +457,30 @@ fn main() {
             linted,
             allow_empty,
             expected_head,
-        } => cmd_seal(&cwd, &summary, &agent, spec, &status, paths, tests_passed, tests_failed, linted, allow_empty, expected_head),
+        } => cmd_seal(
+            &cwd,
+            &summary,
+            &agent,
+            spec,
+            &status,
+            paths,
+            tests_passed,
+            tests_failed,
+            linted,
+            allow_empty,
+            expected_head,
+        ),
         Commands::Show {
             seal_id,
             diff,
             format,
         } => cmd_show(&cwd, &seal_id, diff, &format),
-        Commands::Log { format, limit, spec, all } => cmd_log(&cwd, &format, limit, spec, all),
+        Commands::Log {
+            format,
+            limit,
+            spec,
+            all,
+        } => cmd_log(&cwd, &format, limit, spec, all),
         Commands::Diff { from, to, format } => cmd_diff(&cwd, from, to, &format),
         Commands::Context {
             spec,
@@ -532,9 +554,11 @@ fn main() {
                 agent,
                 format,
             } => cmd_bridge_import(&cwd, &git_ref, &agent, &format),
-            BridgeCommands::Export { branch, pr_body, format } => {
-                cmd_bridge_export(&cwd, &branch, pr_body, &format)
-            }
+            BridgeCommands::Export {
+                branch,
+                pr_body,
+                format,
+            } => cmd_bridge_export(&cwd, &branch, pr_body, &format),
             BridgeCommands::Status { format } => cmd_bridge_status(&cwd, &format),
         },
         Commands::Push { remote, format } => cmd_push(&cwd, &remote, &format),
@@ -544,9 +568,7 @@ fn main() {
             RemoteCommands::Add { name, path } => cmd_remote_add(&cwd, &name, &path),
             RemoteCommands::Remove { name } => cmd_remote_remove(&cwd, &name),
             RemoteCommands::List => cmd_remote_list(&cwd),
-            RemoteCommands::Status { remote, format } => {
-                cmd_remote_status(&cwd, &remote, &format)
-            }
+            RemoteCommands::Status { remote, format } => cmd_remote_status(&cwd, &remote, &format),
         },
     };
 
@@ -611,9 +633,15 @@ fn cmd_install(
                 let files = result.imported_files.unwrap_or(0);
 
                 if result.reimported {
-                    println!("re-imported git baseline: {} file(s), seal {}", files, seal_short);
+                    println!(
+                        "re-imported git baseline: {} file(s), seal {}",
+                        files, seal_short
+                    );
                 } else {
-                    println!("imported git baseline: {} file(s), seal {}", files, seal_short);
+                    println!(
+                        "imported git baseline: {} file(s), seal {}",
+                        files, seal_short
+                    );
                 }
             } else if result.already_imported {
                 println!("git baseline already synced");
@@ -633,11 +661,7 @@ fn cmd_install(
                 .filter(|f| f.detected)
                 .collect();
             for f in &detected {
-                println!(
-                    "detected {:?} ({})",
-                    f.framework,
-                    f.indicators.join(", ")
-                );
+                println!("detected {:?} ({})", f.framework, f.indicators.join(", "));
             }
 
             for hook in &result.hooks_installed {
@@ -654,12 +678,8 @@ fn cmd_install(
     // Create a spec if --spec was provided.
     if let Some(ref id) = spec_id {
         let repo = Repository::open(cwd)?;
-        let title = spec_title
-            .as_deref()
-            .unwrap_or(id);
-        let desc = spec_description
-            .as_deref()
-            .unwrap_or("");
+        let title = spec_title.as_deref().unwrap_or(id);
+        let desc = spec_description.as_deref().unwrap_or("");
         repo.add_spec(&Spec::new(id.clone(), title.to_string(), desc.to_string()))?;
         if format != "json" {
             println!("spec: created '{}' ({})", id, title);
@@ -790,11 +810,15 @@ fn cmd_seal(
 
     if let Some(ref w) = conflict_warning {
         if w.is_clean {
-            println!("  note: HEAD moved ({} intervening seal(s)), but no file overlap",
-                w.intervening_seals.len());
+            println!(
+                "  note: HEAD moved ({} intervening seal(s)), but no file overlap",
+                w.intervening_seals.len()
+            );
         } else {
-            println!("  WARNING: HEAD moved, {} overlapping file(s):",
-                w.overlapping_files.len());
+            println!(
+                "  WARNING: HEAD moved, {} overlapping file(s):",
+                w.overlapping_files.len()
+            );
             for f in &w.overlapping_files {
                 println!("    ! {f}");
             }
@@ -802,7 +826,10 @@ fn cmd_seal(
         }
     }
     println!("  summary: {}", seal.summary);
-    if seal.verification.tests_passed.is_some() || seal.verification.tests_failed.is_some() || seal.verification.linted {
+    if seal.verification.tests_passed.is_some()
+        || seal.verification.tests_failed.is_some()
+        || seal.verification.linted
+    {
         print!("  verified:");
         if let Some(p) = seal.verification.tests_passed {
             print!(" {p} passed");
@@ -834,8 +861,11 @@ fn cmd_seal(
     if let Some(ref sid) = seal.spec_id {
         let changed: Vec<String> = seal.changes.iter().map(|c| c.path.clone()).collect();
         if let Some(w) = repo.check_file_scope(sid, &changed) {
-            println!("  SCOPE: {} file(s) outside spec '{}' scope:",
-                w.out_of_scope_files.len(), w.spec_id);
+            println!(
+                "  SCOPE: {} file(s) outside spec '{}' scope:",
+                w.out_of_scope_files.len(),
+                w.spec_id
+            );
             for f in &w.out_of_scope_files {
                 println!("    ! {f}");
             }
@@ -843,11 +873,13 @@ fn cmd_seal(
 
         if seal.status == TaskStatus::Complete {
             let prior_seals = repo.spec_log(sid).unwrap_or_default();
-            let has_in_progress = prior_seals.iter().any(|s| {
-                s.id != seal.id && s.status == TaskStatus::InProgress
-            });
+            let has_in_progress = prior_seals
+                .iter()
+                .any(|s| s.id != seal.id && s.status == TaskStatus::InProgress);
             if !has_in_progress && prior_seals.len() <= 1 {
-                eprintln!("  HINT: This is the only seal for spec '{sid}' and it's marked 'complete'.");
+                eprintln!(
+                    "  HINT: This is the only seal for spec '{sid}' and it's marked 'complete'."
+                );
                 eprintln!("        Consider using --status in-progress for intermediate work,");
                 eprintln!("        reserving --status complete for the final checkpoint.");
             }
@@ -992,10 +1024,7 @@ fn cmd_diff(
                         ChangeType::Modified => "~",
                         ChangeType::Deleted => "-",
                     };
-                    println!(
-                        "  {marker} {} (+{}, -{})",
-                        f.path, f.additions, f.deletions
-                    );
+                    println!("  {marker} {} (+{}, -{})", f.path, f.additions, f.deletions);
                 }
             }
         }
@@ -1055,7 +1084,10 @@ fn cmd_context(
         Some("complete") => Some(TaskStatus::Complete),
         Some("blocked") => Some(TaskStatus::Blocked),
         Some(other) => {
-            return Err(format!("unknown status filter: '{other}' (use in-progress, complete, or blocked)").into());
+            return Err(format!(
+                "unknown status filter: '{other}' (use in-progress, complete, or blocked)"
+            )
+            .into());
         }
         None => None,
     };
@@ -1178,7 +1210,10 @@ fn cmd_context(
                 for v in &ctx.file_scope_violations {
                     println!(
                         "  seal {} ({}) — {} file(s) outside spec '{}' scope:",
-                        v.seal_id, v.agent_id, v.out_of_scope_files.len(), v.spec_id
+                        v.seal_id,
+                        v.agent_id,
+                        v.out_of_scope_files.len(),
+                        v.spec_id
                     );
                     for f in &v.out_of_scope_files {
                         println!("    ! {f}");
@@ -1189,7 +1224,11 @@ fn cmd_context(
             {
                 let risk = &ctx.integration_risk;
                 println!();
-                println!("  INTEGRATION RISK: {} (score: {})", risk.level.to_uppercase(), risk.score);
+                println!(
+                    "  INTEGRATION RISK: {} (score: {})",
+                    risk.level.to_uppercase(),
+                    risk.score
+                );
                 for f in &risk.factors {
                     println!("    - {f}");
                 }
@@ -1211,10 +1250,7 @@ fn cmd_context(
     Ok(())
 }
 
-fn cmd_summary(
-    cwd: &PathBuf,
-    format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_summary(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
     let summary = repo.summary()?;
 
@@ -1225,7 +1261,10 @@ fn cmd_summary(
         "commit" => {
             let files = summary.files_changed.len();
             if summary.convergence_recommended {
-                println!("{} ({} files, {} diverged)", summary.headline, files, summary.diverged_branch_count);
+                println!(
+                    "{} ({} files, {} diverged)",
+                    summary.headline, files, summary.diverged_branch_count
+                );
             } else {
                 println!("{} ({} files)", summary.headline, files);
             }
@@ -1252,7 +1291,9 @@ fn cmd_summary(
                     };
                     println!(
                         "    {icon} {:<25} [{}] {} seal(s) by {}",
-                        s.id, s.status, s.seal_count,
+                        s.id,
+                        s.status,
+                        s.seal_count,
                         s.agents.join(", "),
                     );
                     println!("      {}", s.title);
@@ -1265,7 +1306,8 @@ fn cmd_summary(
                 for a in &summary.agents {
                     println!(
                         "    {:<20} {} seal(s) on {}",
-                        a.id, a.seal_count,
+                        a.id,
+                        a.seal_count,
                         a.specs_touched.join(", "),
                     );
                 }
@@ -1288,8 +1330,10 @@ fn cmd_summary(
 
             if summary.convergence_recommended {
                 println!();
-                println!("  ⚠ {} diverged branch(es) — run `writ converge` before committing.",
-                    summary.diverged_branch_count);
+                println!(
+                    "  ⚠ {} diverged branch(es) — run `writ converge` before committing.",
+                    summary.diverged_branch_count
+                );
             }
 
             println!();
@@ -1300,7 +1344,10 @@ fn cmd_summary(
             let files = summary.files_changed.len();
             if summary.convergence_recommended {
                 println!("  {}", summary.headline);
-                println!("  ({} files, {} diverged branch(es))", files, summary.diverged_branch_count);
+                println!(
+                    "  ({} files, {} diverged branch(es))",
+                    files, summary.diverged_branch_count
+                );
             } else {
                 println!("  {} ({} files)", summary.headline, files);
             }
@@ -1314,11 +1361,7 @@ fn cmd_summary(
     Ok(())
 }
 
-fn cmd_finish(
-    cwd: &PathBuf,
-    full: bool,
-    dry_run: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_finish(cwd: &PathBuf, full: bool, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
     let summary = repo.summary()?;
 
@@ -1340,7 +1383,10 @@ fn cmd_finish(
         println!("DRY RUN — would execute:");
         println!();
         println!("  git add .");
-        println!("  git commit -m \"{}\"", commit_message.lines().next().unwrap_or(""));
+        println!(
+            "  git commit -m \"{}\"",
+            commit_message.lines().next().unwrap_or("")
+        );
         if full {
             println!();
             println!("Full commit message:");
@@ -1349,7 +1395,10 @@ fn cmd_finish(
             println!("──────────────────────────────────────────────────────────────");
         }
         println!();
-        println!("Files that would be staged ({}):", summary.files_to_stage.len());
+        println!(
+            "Files that would be staged ({}):",
+            summary.files_to_stage.len()
+        );
         for f in &summary.files_to_stage {
             println!("  {f}");
         }
@@ -1419,9 +1468,7 @@ fn cmd_restore(
 
     if !force {
         let short = &seal_id[..std::cmp::min(12, seal_id.len())];
-        eprintln!(
-            "warning: this will overwrite your working directory to match seal {short}"
-        );
+        eprintln!("warning: this will overwrite your working directory to match seal {short}");
         eprintln!("  any unsealed changes will be lost");
         eprint!("continue? [y/N] ");
 
@@ -1504,7 +1551,10 @@ fn cmd_show(
         _ => {
             println!("seal {}", &seal.id[..12]);
             println!("  full id:   {}", seal.id);
-            println!("  agent:     {} ({:?})", seal.agent.id, seal.agent.agent_type);
+            println!(
+                "  agent:     {} ({:?})",
+                seal.agent.id, seal.agent.agent_type
+            );
             println!(
                 "  time:      {}",
                 seal.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
@@ -1519,7 +1569,10 @@ fn cmd_show(
                 println!("  spec:      {spec}");
             }
             println!("  status:    {:?}", seal.status);
-            if seal.verification.tests_passed.is_some() || seal.verification.tests_failed.is_some() || seal.verification.linted {
+            if seal.verification.tests_passed.is_some()
+                || seal.verification.tests_failed.is_some()
+                || seal.verification.linted
+            {
                 print!("  verified: ");
                 if let Some(p) = seal.verification.tests_passed {
                     print!(" {p} passed");
@@ -1727,10 +1780,7 @@ fn cmd_converge(
             );
         }
         _ => {
-            println!(
-                "convergence: {} + {}",
-                report.left_spec, report.right_spec
-            );
+            println!("convergence: {} + {}", report.left_spec, report.right_spec);
 
             if let Some(ref base) = report.base_seal_id {
                 println!("  base: seal {}", &base[..12.min(base.len())]);
@@ -1828,8 +1878,10 @@ fn cmd_converge_all(
         "three-way-merge" => writ_core::convergence::ConvergeStrategy::ThreeWayMerge,
         other => {
             return Err(format!(
-                "unknown strategy '{}' (use 'three-way-merge', 'most-recent', or 'most-complete')", other
-            ).into());
+                "unknown strategy '{}' (use 'three-way-merge', 'most-recent', or 'most-complete')",
+                other
+            )
+            .into());
         }
     };
 
@@ -1976,9 +2028,12 @@ fn cmd_converge_all(
                 let post_level = post_risk.level.as_str();
 
                 println!();
-                println!("  INTEGRATION RISK: {} ({}) -> {} ({})",
-                    pre_level.to_uppercase(), pre_score,
-                    post_level.to_uppercase(), post_score,
+                println!(
+                    "  INTEGRATION RISK: {} ({}) -> {} ({})",
+                    pre_level.to_uppercase(),
+                    pre_score,
+                    post_level.to_uppercase(),
+                    post_score,
                 );
                 if post_score < pre_score {
                     println!("    Risk reduced by {} points", pre_score - post_score);
@@ -2046,7 +2101,11 @@ fn cmd_bridge_import(
     match format {
         "json" => println!("{}", serde_json::to_string_pretty(&result)?),
         _ => {
-            println!("imported git {} as seal {}", &result.git_commit[..12], &result.seal_id[..12]);
+            println!(
+                "imported git {} as seal {}",
+                &result.git_commit[..12],
+                &result.seal_id[..12]
+            );
             println!("  ref:   {}", result.git_ref);
             println!("  files: {}", result.files_imported);
         }
@@ -2076,7 +2135,12 @@ fn cmd_bridge_export(
                     result.seals_exported, result.branch
                 );
                 for e in &result.exported {
-                    println!("  {} → {} — {}", &e.seal_id[..12], &e.git_commit[..12], e.summary);
+                    println!(
+                        "  {} → {} — {}",
+                        &e.seal_id[..12],
+                        &e.git_commit[..12],
+                        e.summary
+                    );
                 }
             }
         }
@@ -2085,7 +2149,10 @@ fn cmd_bridge_export(
     if pr_body && !result.exported.is_empty() {
         println!("\n--- PR Body ---\n");
         println!("## Agent Work Summary\n");
-        println!("Exported {} seal(s) from writ to branch `{}`.\n", result.seals_exported, result.branch);
+        println!(
+            "Exported {} seal(s) from writ to branch `{}`.\n",
+            result.seals_exported, result.branch
+        );
         println!("| Seal | Agent | Summary |");
         println!("|------|-------|---------|");
         for e in &result.exported {
@@ -2098,10 +2165,7 @@ fn cmd_bridge_export(
     Ok(())
 }
 
-fn cmd_bridge_status(
-    cwd: &PathBuf,
-    format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_bridge_status(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
 
     let status = repo.bridge_status()?;
@@ -2113,11 +2177,20 @@ fn cmd_bridge_status(
                 println!("bridge not initialized — run `writ bridge import` first");
             } else {
                 if let Some(ref imp) = status.last_import {
-                    println!("last import: git {} → seal {}", &imp.git_commit[..12], &imp.seal_id[..12]);
+                    println!(
+                        "last import: git {} → seal {}",
+                        &imp.git_commit[..12],
+                        &imp.seal_id[..12]
+                    );
                     println!("  ref: {}", imp.git_ref);
                 }
                 if let Some(ref exp) = status.last_export {
-                    println!("last export: seal {} → git {} (branch: {})", &exp.seal_id[..12], &exp.git_commit[..12], exp.branch);
+                    println!(
+                        "last export: seal {} → git {} (branch: {})",
+                        &exp.seal_id[..12],
+                        &exp.git_commit[..12],
+                        exp.branch
+                    );
                 }
                 println!("pending: {} seal(s) to export", status.pending_export_count);
             }
@@ -2127,11 +2200,7 @@ fn cmd_bridge_status(
     Ok(())
 }
 
-fn cmd_push(
-    cwd: &PathBuf,
-    remote: &str,
-    format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_push(cwd: &PathBuf, remote: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
     let result = repo.push(remote)?;
 
@@ -2161,11 +2230,7 @@ fn cmd_push(
     Ok(())
 }
 
-fn cmd_pull(
-    cwd: &PathBuf,
-    remote: &str,
-    format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_pull(cwd: &PathBuf, remote: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
     let result = repo.pull(remote)?;
 
@@ -2191,7 +2256,10 @@ fn cmd_pull(
                 if !result.spec_conflicts.is_empty() {
                     println!("  spec conflicts: {}", result.spec_conflicts.len());
                     for c in &result.spec_conflicts {
-                        println!("    {} — field '{}': local='{}' remote='{}'", c.spec_id, c.field, c.local_value, c.remote_value);
+                        println!(
+                            "    {} — field '{}': local='{}' remote='{}'",
+                            c.spec_id, c.field, c.local_value, c.remote_value
+                        );
                     }
                 }
             }
@@ -2207,21 +2275,14 @@ fn cmd_remote_init(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_remote_add(
-    cwd: &PathBuf,
-    name: &str,
-    path: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_remote_add(cwd: &PathBuf, name: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
     repo.remote_add(name, path)?;
     println!("remote '{name}' added → {path}");
     Ok(())
 }
 
-fn cmd_remote_remove(
-    cwd: &PathBuf,
-    name: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_remote_remove(cwd: &PathBuf, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
     repo.remote_remove(name)?;
     println!("remote '{name}' removed");

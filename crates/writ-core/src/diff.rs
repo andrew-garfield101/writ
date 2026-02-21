@@ -173,12 +173,7 @@ pub fn compute_line_diff(old: &str, new: &str, context_lines: usize) -> Vec<Diff
                 ));
             }
             EditOp::Insert(ni) => {
-                tagged.push((
-                    LineOp::Add,
-                    new_lines[*ni].to_string(),
-                    None,
-                    Some(*ni + 1),
-                ));
+                tagged.push((LineOp::Add, new_lines[*ni].to_string(), None, Some(*ni + 1)));
             }
         }
     }

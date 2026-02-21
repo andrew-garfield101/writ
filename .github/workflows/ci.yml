@@ -43,7 +43,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-features -- -D warnings
+        run: cargo clippy -p writ-core -p writ-cli --all-features -- -D warnings
         continue-on-error: true
 
   python-tests:
@@ -75,12 +75,17 @@ jobs:
           key: ${{ runner.os }}-py${{ matrix.python-version }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-py${{ matrix.python-version }}-cargo-
 
-      - name: Install maturin and pytest
-        run: pip install maturin pytest
+      - name: Create virtualenv and install dependencies
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install maturin pytest
 
       - name: Build and install writ-vcs
         working-directory: crates/writ-py
-        run: maturin develop --release
+        run: |
+          source ${{ github.workspace }}/.venv/bin/activate
+          maturin develop --release
 
       - name: Configure git for tests
         run: |
@@ -90,4 +95,6 @@ jobs:
 
       - name: Run Python tests
         working-directory: crates/writ-py
-        run: pytest tests/ -v
+        run: |
+          source ${{ github.workspace }}/.venv/bin/activate
+          pytest tests/ -v

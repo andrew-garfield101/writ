@@ -1,5 +1,7 @@
 # writ
 
+[![CI](https://github.com/andrew-garfield101/writ/actions/workflows/ci.yml/badge.svg)](https://github.com/andrew-garfield101/writ/actions/workflows/ci.yml)
+
 **writ-vcs™ AI-native version control for agentic systems.**
 
 > *"Every minute an agent spends figuring out 'what happened before me' is wasted compute. Writ minimizes that."*

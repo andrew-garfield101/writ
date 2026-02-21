@@ -50,10 +50,8 @@ impl Index {
 
     /// Update or insert an entry for a file.
     pub fn upsert(&mut self, rel_path: &str, hash: String, size: u64) {
-        self.entries.insert(
-            rel_path.to_string(),
-            IndexEntry { hash, size },
-        );
+        self.entries
+            .insert(rel_path.to_string(), IndexEntry { hash, size });
     }
 
     /// Remove a file from the index.

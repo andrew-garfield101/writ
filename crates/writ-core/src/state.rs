@@ -56,9 +56,21 @@ impl WorkingState {
             return "clean".to_string();
         }
 
-        let new_count = self.changes.iter().filter(|f| f.status == FileStatus::New).count();
-        let mod_count = self.changes.iter().filter(|f| f.status == FileStatus::Modified).count();
-        let del_count = self.changes.iter().filter(|f| f.status == FileStatus::Deleted).count();
+        let new_count = self
+            .changes
+            .iter()
+            .filter(|f| f.status == FileStatus::New)
+            .count();
+        let mod_count = self
+            .changes
+            .iter()
+            .filter(|f| f.status == FileStatus::Modified)
+            .count();
+        let del_count = self
+            .changes
+            .iter()
+            .filter(|f| f.status == FileStatus::Deleted)
+            .count();
 
         let mut parts = Vec::new();
         if new_count > 0 {

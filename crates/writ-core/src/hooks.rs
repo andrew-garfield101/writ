@@ -39,10 +39,7 @@ pub struct HookResult {
 
 /// Detect which agent frameworks are present in a project.
 pub fn detect_frameworks(root: &Path) -> Vec<FrameworkDetection> {
-    vec![
-        detect_claude_code(root),
-        detect_codex(root),
-    ]
+    vec![detect_claude_code(root), detect_codex(root)]
 }
 
 fn detect_claude_code(root: &Path) -> FrameworkDetection {
@@ -363,7 +360,10 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("CLAUDE.md"), "# Project").unwrap();
         let detections = detect_frameworks(dir.path());
-        let claude = detections.iter().find(|d| d.framework == Framework::ClaudeCode).unwrap();
+        let claude = detections
+            .iter()
+            .find(|d| d.framework == Framework::ClaudeCode)
+            .unwrap();
         assert!(claude.detected);
         assert!(claude.indicators.contains(&"CLAUDE.md".to_string()));
     }
@@ -373,7 +373,10 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("AGENTS.md"), "# Agents").unwrap();
         let detections = detect_frameworks(dir.path());
-        let codex = detections.iter().find(|d| d.framework == Framework::Codex).unwrap();
+        let codex = detections
+            .iter()
+            .find(|d| d.framework == Framework::Codex)
+            .unwrap();
         assert!(codex.detected);
     }
 
@@ -389,15 +392,23 @@ mod tests {
         let dir = tempdir().unwrap();
         let result = hook_claude_code(dir.path()).unwrap();
         assert!(result.files_created.contains(&"CLAUDE.md".to_string()));
-        assert!(result.files_created.contains(&".claude/commands/writ-seal.md".to_string()));
-        assert!(result.files_created.contains(&".claude/commands/writ-context.md".to_string()));
+        assert!(result
+            .files_created
+            .contains(&".claude/commands/writ-seal.md".to_string()));
+        assert!(result
+            .files_created
+            .contains(&".claude/commands/writ-context.md".to_string()));
         assert!(dir.path().join("CLAUDE.md").exists());
     }
 
     #[test]
     fn test_hook_claude_code_appends_to_existing() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("CLAUDE.md"), "# My Project\n\nExisting content.").unwrap();
+        fs::write(
+            dir.path().join("CLAUDE.md"),
+            "# My Project\n\nExisting content.",
+        )
+        .unwrap();
         let result = hook_claude_code(dir.path()).unwrap();
         assert!(result.files_updated.contains(&"CLAUDE.md".to_string()));
         let content = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
@@ -434,24 +445,38 @@ mod tests {
     fn test_claude_md_section_has_restore_guidance() {
         let section = writ_claude_md_section();
         assert!(section.contains("writ restore"), "missing restore command");
-        assert!(section.contains("Rollback and recovery"), "missing rollback section");
+        assert!(
+            section.contains("Rollback and recovery"),
+            "missing rollback section"
+        );
         assert!(section.contains("immutable"), "missing immutability note");
     }
 
     #[test]
     fn test_claude_md_section_has_round_trip_commands() {
         let section = writ_claude_md_section();
-        assert!(section.contains("git commit -m \"$(writ summary --format commit)\""),
-            "missing correct git commit command");
+        assert!(
+            section.contains("git commit -m \"$(writ summary --format commit)\""),
+            "missing correct git commit command"
+        );
         assert!(section.contains("gh pr create"), "missing gh pr command");
     }
 
     #[test]
     fn test_claude_md_section_has_convergence_strategies() {
         let section = writ_claude_md_section();
-        assert!(section.contains("most-complete"), "missing most-complete strategy");
-        assert!(section.contains("most-recent"), "missing most-recent strategy");
-        assert!(section.contains("three-way-merge"), "missing three-way-merge strategy");
+        assert!(
+            section.contains("most-complete"),
+            "missing most-complete strategy"
+        );
+        assert!(
+            section.contains("most-recent"),
+            "missing most-recent strategy"
+        );
+        assert!(
+            section.contains("three-way-merge"),
+            "missing three-way-merge strategy"
+        );
     }
 
     #[test]
@@ -464,7 +489,9 @@ mod tests {
     #[test]
     fn test_agents_md_section_has_round_trip_commands() {
         let section = writ_agents_md_section();
-        assert!(section.contains("git commit -m \"$(writ summary --format commit)\""),
-            "missing correct git commit command");
+        assert!(
+            section.contains("git commit -m \"$(writ summary --format commit)\""),
+            "missing correct git commit command"
+        );
     }
 }

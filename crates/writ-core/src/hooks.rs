@@ -209,11 +209,36 @@ repo.seal(summary="what you did", agent_id="your-id", agent_type="agent", spec_i
 - Use --status in-progress for intermediate work (this is the default)
 - Use --status complete only when the spec is fully done
 - Include test results when available (--tests-passed N --tests-failed M)
-- If context shows `convergence_recommended: true`, run `writ converge` to merge diverged branches
 - Use `writ log --all` to see seals from all branches (including diverged ones)
 - If context shows unsealed changes, seal before starting new work
 - When context shows `session_complete: true`, all specs are done — run `writ summary` for the full report
 - Summary files (.writ/summary.json, .writ/summary.txt) are auto-generated when all specs complete
+- Seal results include `hints` array and `file_scope_warning` — check these after each seal
+- If seal returns 0 file changes, another agent may have sealed your work — check `writ context`
+
+### Convergence (multi-agent)
+
+When multiple agents work in parallel, their seals may diverge. Check for this:
+- `writ context` shows `convergence_recommended: true` and `integration_risk` level
+- `writ converge-all --dry-run` previews what will be merged
+- `writ converge-all --apply` merges all diverged branches (newest-first ordering)
+- After convergence, seal the result: `writ seal -s "converged N branches" --agent convergence-bot`
+
+For two-branch convergence: `writ converge <left-spec> <right-spec> --apply`
+
+### Integration risk
+
+Context includes an `integration_risk` field with level (low/medium/high), score (0-100), and factors.
+Check this before starting work on shared files. High risk means multiple diverged branches
+and files touched by 5+ agents — convergence is critical before further work.
+
+### Git integration workflow
+
+```bash
+writ summary --format commit     # concise one-line commit message
+writ summary --format pr         # full PR description with spec/agent breakdown
+writ summary --format commit | git commit -F -   # pipe directly to git
+```
 "#.to_string()
 }
 
@@ -256,10 +281,18 @@ repo.seal(summary="changes", agent_id="your-id", agent_type="agent", spec_id="yo
 - Use `--status complete` only on your final seal for a spec
 - Link seals to specs with --spec
 - Include verification data (--tests-passed, --tests-failed, --linted)
-- If context shows `convergence_recommended: true`, run `writ converge` to merge diverged branches
 - Use `writ log --all` to see unified history across all branches
 - When context shows `session_complete: true`, all specs are done — run `writ summary` for the full report
 - Summary files (.writ/summary.json, .writ/summary.txt) are auto-generated when all specs complete
+- Check seal results for `hints` and `file_scope_warning` fields after each seal
+- If seal returns 0 file changes, another agent may have captured your work first
+
+### Convergence (multi-agent)
+
+- Check `integration_risk` field in context for divergence risk assessment
+- `writ converge-all --dry-run` to preview merges, `--apply` to execute
+- After convergence, seal: `writ seal -s "converged" --agent convergence-bot`
+- `writ summary --format commit` for git, `--format pr` for PR descriptions
 "#.to_string()
 }
 

@@ -282,6 +282,20 @@ pub struct DivergedBranchWarning {
     pub recommendation: String,
 }
 
+/// A file touched by multiple agents — signals integration risk.
+///
+/// Surfaced in context so agents starting work can see which files
+/// are "hot" (modified by 2+ agents) and plan accordingly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileContention {
+    /// Relative path of the contested file.
+    pub path: String,
+    /// Agent IDs that have sealed changes to this file.
+    pub agents: Vec<String>,
+    /// Total number of seals that include this file.
+    pub total_seals: usize,
+}
+
 /// Per-agent activity summary for multi-agent awareness.
 ///
 /// Shows which files each agent "owns" (last sealed) and their recent
@@ -370,6 +384,18 @@ pub struct ContextOutput {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub file_scope_violations: Vec<FileScopeViolation>,
 
+    /// Files touched by 2+ agents — signals integration risk.
+    /// Sorted by agent count descending, capped at top 10.
+    /// Helps agents identify "hot" files before starting work.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub file_contention: Vec<FileContention>,
+
+    /// Top-level integration risk assessment.
+    /// Computed from diverged branches, file contention, and scope violations.
+    /// Agents/orchestrators can check `integration_risk.level` before starting work.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub integration_risk: Option<IntegrationRisk>,
+
     /// True when all specs in the repository are marked complete.
     /// Signals to agents/humans that work is done and `writ summary` is available.
     #[serde(skip_serializing_if = "std::ops::Not::not", default)]
@@ -382,6 +408,79 @@ pub struct ContextOutput {
 
     /// Available writ operations for agent discoverability.
     pub available_operations: Vec<String>,
+}
+
+/// Top-level integration risk assessment computed from context signals.
+///
+/// Gives agents/orchestrators a single field to check before starting work
+/// or after convergence to gauge how risky the current state is.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrationRisk {
+    /// Overall risk level: "low", "medium", or "high".
+    pub level: String,
+    /// Human/agent-readable factors contributing to the risk level.
+    pub factors: Vec<String>,
+    /// Numeric score (0-100) for programmatic comparison.
+    pub score: u32,
+}
+
+impl IntegrationRisk {
+    /// Compute integration risk from context signals.
+    pub fn compute(
+        diverged_count: usize,
+        max_file_agents: usize,
+        scope_violation_count: usize,
+        contention_file_count: usize,
+    ) -> Self {
+        let mut score: u32 = 0;
+        let mut factors = Vec::new();
+
+        if diverged_count > 3 {
+            score += 40;
+            factors.push(format!("{diverged_count} diverged branches (>3)"));
+        } else if diverged_count > 0 {
+            score += 15 * diverged_count as u32;
+            factors.push(format!("{diverged_count} diverged branch(es)"));
+        }
+
+        if max_file_agents >= 5 {
+            score += 30;
+            factors.push(format!("file touched by {max_file_agents} agents (>=5)"));
+        } else if max_file_agents >= 3 {
+            score += 15;
+            factors.push(format!("file touched by {max_file_agents} agents (>=3)"));
+        }
+
+        if scope_violation_count > 5 {
+            score += 20;
+            factors.push(format!("{scope_violation_count} scope violations (>5)"));
+        } else if scope_violation_count > 0 {
+            score += 5 * scope_violation_count as u32;
+            factors.push(format!("{scope_violation_count} scope violation(s)"));
+        }
+
+        if contention_file_count > 5 {
+            score += 10;
+            factors.push(format!("{contention_file_count} contested files"));
+        }
+
+        score = score.min(100);
+
+        let level = if score >= 50 {
+            "high"
+        } else if score > 0 {
+            "medium"
+        } else {
+            "low"
+        }
+        .to_string();
+
+        IntegrationRisk {
+            level,
+            factors,
+            score,
+        }
+    }
 }
 
 /// Compact inline summary shown in context when all specs are complete.

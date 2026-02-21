@@ -99,6 +99,8 @@ struct SealResult {
     conflict_warning: Option<writ_core::repo::SealConflictWarning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file_scope_warning: Option<writ_core::repo::FileScopeWarning>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hints: Vec<String>,
 }
 
 fn build_seal_result(
@@ -114,10 +116,31 @@ fn build_seal_result(
             .collect();
         repo.check_file_scope(sid, &changed)
     });
+
+    let mut hints = Vec::new();
+
+    if let Some(ref w) = file_scope_warning {
+        hints.push(format!(
+            "SCOPE: {} file(s) outside spec '{}' scope: {}",
+            w.out_of_scope_files.len(),
+            w.spec_id,
+            w.out_of_scope_files.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
+        ));
+    }
+
+    if seal.changes.is_empty() && !seal.summary.is_empty() {
+        hints.push(
+            "GHOST_WORK: 0 file changes detected but summary is non-empty. \
+             Another agent may have sealed overlapping files first. \
+             Check `writ context` for file ownership.".to_string(),
+        );
+    }
+
     SealResult {
         seal,
         conflict_warning,
         file_scope_warning,
+        hints,
     }
 }
 
@@ -323,6 +346,12 @@ impl PyRepository {
         to_pydict(py, &seals)
     }
 
+    /// Get diverged branch information for multi-agent convergence.
+    fn diverged_branches(&self, py: Python) -> PyResult<PyObject> {
+        let diverged = self.inner.diverged_branches().map_err(writ_err)?;
+        to_pydict(py, &diverged)
+    }
+
     /// Get the tip seal ID for a specific spec.
     fn spec_head(&self, spec_id: &str) -> PyResult<Option<String>> {
         self.inner.spec_head(spec_id).map_err(writ_err)
@@ -513,6 +542,31 @@ impl PyRepository {
             .map_err(writ_err)?;
 
         Ok(())
+    }
+
+    /// Converge ALL diverged branches in sequence.
+    ///
+    /// Returns a ConvergeAllReport dict with per-step merge results,
+    /// conflict resolutions, and warnings about potential content loss.
+    ///
+    /// `strategy` controls conflict resolution: "three-way-merge" (default)
+    /// leaves conflicts unresolved; "most-recent" auto-resolves by preferring
+    /// the version from the more recently sealed branch.
+    ///
+    /// When `apply` is True, merged files are written to the working directory.
+    #[pyo3(signature = (strategy="three-way-merge", apply=false))]
+    fn converge_all(
+        &self,
+        py: Python,
+        strategy: &str,
+        apply: bool,
+    ) -> PyResult<PyObject> {
+        let strat = match strategy {
+            "most-recent" => writ_core::convergence::ConvergeStrategy::MostRecent,
+            _ => writ_core::convergence::ConvergeStrategy::ThreeWayMerge,
+        };
+        let report = self.inner.converge_all(strat, apply).map_err(writ_err)?;
+        to_pydict(py, &report)
     }
 
     /// Import git state as a writ baseline seal.

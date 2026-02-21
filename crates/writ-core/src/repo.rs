@@ -12,13 +12,14 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::convergence::{
-    self, ConvergenceReport, FileConflict, FileResolution, FileMergeResult, MergedFile,
+    self, ConvergeAllReport, ConvergeStrategy, ConvergenceReport, FileConflict, FileResolution,
+    FileMergeResult, MergeStepResult, MergedFile, ResolutionRecord,
 };
 use crate::lock::RepoLock;
 use crate::context::{
     AgentActivity, ContextFilter, ContextOutput, ContextScope, DepStatus, DiffSummary,
-    DivergedBranchWarning, FileScopeViolation, SealNudge, SealSummary, SessionSummary,
-    SpecProgress, WorkingStateSummary,
+    DivergedBranchWarning, FileContention, FileScopeViolation, IntegrationRisk, SealNudge,
+    SealSummary, SessionSummary, SpecProgress, WorkingStateSummary,
 };
 use crate::diff::{self, DiffOutput, FileDiff};
 use crate::error::{WritError, WritResult};
@@ -849,6 +850,48 @@ impl Repository {
         result
     }
 
+    /// Build file contention map: files touched by 2+ agents.
+    ///
+    /// Excludes bridge seals. Sorted by agent count descending, capped at 10.
+    fn build_file_contention(seals: &[Seal]) -> Vec<FileContention> {
+        use std::collections::HashMap;
+
+        // Map: file path → (set of agent IDs, total seal count).
+        let mut file_agents: HashMap<String, (HashSet<String>, usize)> = HashMap::new();
+
+        for seal in seals {
+            if seal.agent.id == "writ-bridge" {
+                continue;
+            }
+            for change in &seal.changes {
+                let entry = file_agents
+                    .entry(change.path.clone())
+                    .or_insert_with(|| (HashSet::new(), 0));
+                entry.0.insert(seal.agent.id.clone());
+                entry.1 += 1;
+            }
+        }
+
+        // Filter to files with 2+ agents, sort by agent count desc.
+        let mut contention: Vec<FileContention> = file_agents
+            .into_iter()
+            .filter(|(_, (agents, _))| agents.len() >= 2)
+            .map(|(path, (agents, total_seals))| {
+                let mut agents_vec: Vec<String> = agents.into_iter().collect();
+                agents_vec.sort();
+                FileContention {
+                    path,
+                    agents: agents_vec,
+                    total_seals,
+                }
+            })
+            .collect();
+
+        contention.sort_by(|a, b| b.agents.len().cmp(&a.agents.len()).then(a.path.cmp(&b.path)));
+        contention.truncate(10);
+        contention
+    }
+
     /// Generate a structured context dump optimized for LLM consumption.
     ///
     /// `filter` narrows the seal history by status and/or agent. The filter
@@ -1001,6 +1044,26 @@ impl Repository {
                     })
                     .collect();
 
+                // Build file contention map: files touched by 2+ agents.
+                let file_contention = Self::build_file_contention(&all_seals);
+
+                let max_file_agents = file_contention
+                    .iter()
+                    .map(|fc| fc.agents.len())
+                    .max()
+                    .unwrap_or(0);
+                let integration_risk = IntegrationRisk::compute(
+                    diverged_branches.len(),
+                    max_file_agents,
+                    file_scope_violations.len(),
+                    file_contention.len(),
+                );
+                let integration_risk_opt = if integration_risk.level == "low" && integration_risk.factors.is_empty() {
+                    None
+                } else {
+                    Some(integration_risk)
+                };
+
                 let mut result = ContextOutput {
                     writ_version: "0.1.0".to_string(),
                     active_spec: None,
@@ -1017,6 +1080,8 @@ impl Repository {
                     diverged_branches,
                     convergence_recommended,
                     file_scope_violations,
+                    file_contention,
+                    integration_risk: integration_risk_opt,
                     session_complete: false,
                     session_summary: None,
                     available_operations,
@@ -1239,6 +1304,8 @@ impl Repository {
                     diverged_branches: Vec::new(),
                     convergence_recommended: false,
                     file_scope_violations: Vec::new(),
+                    file_contention: Vec::new(),
+                    integration_risk: None,
                     session_complete: false,
                     session_summary: None,
                     available_operations,
@@ -1605,6 +1672,243 @@ impl Repository {
         }
 
         Ok(())
+    }
+
+    /// Converge ALL diverged branches in sequence.
+    ///
+    /// Finds the base spec (on HEAD chain), orders diverged branches by
+    /// most-seals-first, and merges each into the base. Returns a structured
+    /// report with per-step results, conflict resolutions, and warnings.
+    ///
+    /// When `apply` is true, merged files are written to the working directory.
+    /// With `ConvergeStrategy::MostRecent`, conflicts are auto-resolved by
+    /// preferring the version from the more recently sealed branch.
+    pub fn converge_all(
+        &self,
+        strategy: ConvergeStrategy,
+        apply: bool,
+    ) -> WritResult<ConvergeAllReport> {
+        let diverged = self.diverged_branches()?;
+
+        if diverged.is_empty() {
+            return Ok(ConvergeAllReport {
+                base_spec: String::new(),
+                merge_order: Vec::new(),
+                merges: Vec::new(),
+                strategy: strategy_name(strategy),
+                total_auto_merged: 0,
+                total_conflicts: 0,
+                total_resolutions: 0,
+                is_clean: true,
+                applied: false,
+                warnings: Vec::new(),
+            });
+        }
+
+        // Sort diverged branches: most seals first (highest impact merged last
+        // means their content is more likely to survive in the final state).
+        let mut ordered: Vec<_> = diverged.into_iter().collect();
+        ordered.sort_by(|a, b| b.seal_count.cmp(&a.seal_count));
+
+        // Find a base spec that IS on the HEAD chain.
+        let specs = self.list_specs()?;
+        let diverged_ids: HashSet<String> =
+            ordered.iter().map(|b| b.spec_id.clone()).collect();
+        let on_head: Vec<_> = specs
+            .iter()
+            .filter(|s| {
+                !diverged_ids.contains(&s.id)
+                    && matches!(s.status, crate::spec::SpecStatus::Complete)
+            })
+            .collect();
+
+        let base_spec = if let Some(s) = on_head.first() {
+            s.id.clone()
+        } else if let Some(first) = ordered.first() {
+            let id = first.spec_id.clone();
+            ordered.remove(0);
+            id
+        } else {
+            return Err(WritError::Other(
+                "No specs available for convergence base".to_string(),
+            ));
+        };
+
+        let merge_order: Vec<String> = ordered.iter().map(|b| b.spec_id.clone()).collect();
+        let mut merges = Vec::new();
+        let mut total_auto_merged = 0usize;
+        let mut total_conflicts = 0usize;
+        let mut total_resolutions = 0usize;
+        let mut warnings: Vec<String> = Vec::new();
+        let mut all_clean = true;
+
+        for branch in &ordered {
+            let spec_id = &branch.spec_id;
+
+            match self.converge(&base_spec, spec_id) {
+                Ok(report) => {
+                    let n_auto = report.auto_merged.len();
+                    let n_conflict = report.conflicts.len();
+                    let n_left = report.left_only.len();
+                    let n_right = report.right_only.len();
+                    total_auto_merged += n_auto;
+                    total_conflicts += n_conflict;
+
+                    let conflict_files: Vec<String> =
+                        report.conflicts.iter().map(|c| c.path.clone()).collect();
+
+                    let mut resolutions_records: Vec<ResolutionRecord> = Vec::new();
+                    let mut step_resolutions: Vec<FileResolution> = Vec::new();
+                    let step_clean;
+
+                    if report.is_clean {
+                        step_clean = true;
+                        if apply {
+                            self.apply_convergence(&report, &[])?;
+                        }
+                    } else {
+                        match strategy {
+                            ConvergeStrategy::MostRecent => {
+                                // Resolve conflicts by comparing seal timestamps.
+                                // The right spec is the diverged branch with unreachable work.
+                                let left_spec_data = self.load_spec(&base_spec).ok();
+                                let right_spec_data = self.load_spec(spec_id).ok();
+
+                                let left_ts = left_spec_data
+                                    .and_then(|s| s.sealed_by.last().cloned())
+                                    .and_then(|id| self.load_seal(&id).ok())
+                                    .map(|s| s.timestamp);
+                                let right_ts = right_spec_data
+                                    .and_then(|s| s.sealed_by.last().cloned())
+                                    .and_then(|id| self.load_seal(&id).ok())
+                                    .map(|s| s.timestamp);
+
+                                let prefer_right = match (left_ts, right_ts) {
+                                    (Some(l), Some(r)) => r >= l,
+                                    (None, Some(_)) => true,
+                                    _ => false,
+                                };
+
+                                for conflict in &report.conflicts {
+                                    let (content, chosen, other) = if prefer_right {
+                                        (
+                                            conflict.right_content.clone(),
+                                            spec_id.to_string(),
+                                            base_spec.clone(),
+                                        )
+                                    } else {
+                                        (
+                                            conflict.left_content.clone(),
+                                            base_spec.clone(),
+                                            spec_id.to_string(),
+                                        )
+                                    };
+
+                                    // Warn about lost content.
+                                    let lost = if prefer_right {
+                                        &conflict.left_content
+                                    } else {
+                                        &conflict.right_content
+                                    };
+                                    let lost_warning = if !lost.is_empty() {
+                                        let lost_lines = lost.lines().count();
+                                        Some(format!(
+                                            "Discarded {} line(s) from spec '{}' in favor of '{}'",
+                                            lost_lines, other, chosen,
+                                        ))
+                                    } else {
+                                        None
+                                    };
+
+                                    if let Some(ref w) = lost_warning {
+                                        warnings.push(format!("{}: {}", conflict.path, w));
+                                    }
+
+                                    step_resolutions.push(FileResolution {
+                                        path: conflict.path.clone(),
+                                        content,
+                                    });
+
+                                    resolutions_records.push(ResolutionRecord {
+                                        path: conflict.path.clone(),
+                                        strategy: "most-recent".to_string(),
+                                        chosen_spec: Some(chosen),
+                                        lost_content_warning: lost_warning,
+                                    });
+                                }
+
+                                total_resolutions += report.conflicts.len();
+                                step_clean = true;
+
+                                if apply {
+                                    self.apply_convergence(&report, &step_resolutions)?;
+                                }
+                            }
+                            ConvergeStrategy::ThreeWayMerge => {
+                                // Conflicts remain unresolved.
+                                step_clean = false;
+                                all_clean = false;
+                            }
+                        }
+                    }
+
+                    merges.push(MergeStepResult {
+                        left_spec: base_spec.clone(),
+                        right_spec: spec_id.clone(),
+                        auto_merged: n_auto,
+                        conflicts: n_conflict,
+                        left_only: n_left,
+                        right_only: n_right,
+                        conflict_files,
+                        resolutions: resolutions_records,
+                        clean: step_clean,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    all_clean = false;
+                    merges.push(MergeStepResult {
+                        left_spec: base_spec.clone(),
+                        right_spec: spec_id.clone(),
+                        auto_merged: 0,
+                        conflicts: 0,
+                        left_only: 0,
+                        right_only: 0,
+                        conflict_files: Vec::new(),
+                        resolutions: Vec::new(),
+                        clean: false,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+
+        // Add high-contention file warnings.
+        let all_seals = self.log_all().unwrap_or_default();
+        let contention = Self::build_file_contention(&all_seals);
+        for fc in &contention {
+            if fc.agents.len() >= 3 {
+                warnings.push(format!(
+                    "{}: touched by {} agents ({}) — review for semantic consistency",
+                    fc.path,
+                    fc.agents.len(),
+                    fc.agents.join(", "),
+                ));
+            }
+        }
+
+        Ok(ConvergeAllReport {
+            base_spec,
+            merge_order,
+            merges,
+            strategy: strategy_name(strategy),
+            total_auto_merged,
+            total_conflicts,
+            total_resolutions,
+            is_clean: all_clean,
+            applied: apply,
+            warnings,
+        })
     }
 
     // -------------------------------------------------------------------
@@ -3339,6 +3643,14 @@ pub struct DivergedBranch {
     pub seal_count: usize,
     /// Agent IDs that sealed on this branch.
     pub agents: Vec<String>,
+}
+
+/// Convert a ConvergeStrategy to a human-readable string.
+fn strategy_name(strategy: ConvergeStrategy) -> String {
+    match strategy {
+        ConvergeStrategy::ThreeWayMerge => "three-way-merge".to_string(),
+        ConvergeStrategy::MostRecent => "most-recent".to_string(),
+    }
 }
 
 /// Returned by `seal()` when HEAD moved since the agent started working.
@@ -8796,5 +9108,1143 @@ mod install_tests {
         let result = Repository::install(dir.path()).unwrap();
         assert_eq!(result.git_dirty, Some(true));
         assert!(result.git_dirty_count.unwrap() >= 1);
+    }
+}
+
+#[cfg(test)]
+mod file_contention_tests {
+    use super::*;
+    use crate::context::{ContextFilter, ContextScope};
+    use crate::seal::AgentType;
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_no_contention_single_agent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("feat".into(), "Feature".into(), "".into())).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "content").unwrap();
+        repo.seal(agent("alice"), "Add a".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 50, &ContextFilter::default()).unwrap();
+        assert!(ctx.file_contention.is_empty(), "single agent = no contention");
+    }
+
+    #[test]
+    fn test_contention_two_agents_same_file() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("feat".into(), "Feature".into(), "".into())).unwrap();
+
+        // Alice writes a.txt
+        fs::write(dir.path().join("a.txt"), "alice v1").unwrap();
+        repo.seal(agent("alice"), "Alice work".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        // Bob modifies a.txt
+        fs::write(dir.path().join("a.txt"), "bob v1").unwrap();
+        repo.seal(agent("bob"), "Bob work".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 50, &ContextFilter::default()).unwrap();
+        assert_eq!(ctx.file_contention.len(), 1);
+        assert_eq!(ctx.file_contention[0].path, "a.txt");
+        assert_eq!(ctx.file_contention[0].agents.len(), 2);
+        assert!(ctx.file_contention[0].agents.contains(&"alice".to_string()));
+        assert!(ctx.file_contention[0].agents.contains(&"bob".to_string()));
+        assert_eq!(ctx.file_contention[0].total_seals, 2);
+    }
+
+    #[test]
+    fn test_contention_excludes_bridge_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("feat".into(), "Feature".into(), "".into())).unwrap();
+
+        // Bridge agent writes a.txt
+        fs::write(dir.path().join("a.txt"), "bridge v1").unwrap();
+        repo.seal(agent("writ-bridge"), "Import".into(), None,
+            TaskStatus::Complete, Verification::default(), false).unwrap();
+
+        // Alice modifies a.txt
+        fs::write(dir.path().join("a.txt"), "alice v1").unwrap();
+        repo.seal(agent("alice"), "Alice work".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 50, &ContextFilter::default()).unwrap();
+        // Only alice touched a.txt (bridge excluded) → no contention
+        assert!(ctx.file_contention.is_empty());
+    }
+
+    #[test]
+    fn test_contention_sorted_by_agent_count_desc() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("feat".into(), "Feature".into(), "".into())).unwrap();
+
+        // Create files touched by different agent combos.
+        // hot.txt: 3 agents (alice, bob, charlie)
+        // warm.txt: 2 agents (alice, bob)
+        fs::write(dir.path().join("hot.txt"), "alice").unwrap();
+        fs::write(dir.path().join("warm.txt"), "alice").unwrap();
+        repo.seal(agent("alice"), "Alice".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        fs::write(dir.path().join("hot.txt"), "bob").unwrap();
+        fs::write(dir.path().join("warm.txt"), "bob").unwrap();
+        repo.seal(agent("bob"), "Bob".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        fs::write(dir.path().join("hot.txt"), "charlie").unwrap();
+        repo.seal(agent("charlie"), "Charlie".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 50, &ContextFilter::default()).unwrap();
+        assert_eq!(ctx.file_contention.len(), 2);
+        // hot.txt first (3 agents), warm.txt second (2 agents)
+        assert_eq!(ctx.file_contention[0].path, "hot.txt");
+        assert_eq!(ctx.file_contention[0].agents.len(), 3);
+        assert_eq!(ctx.file_contention[1].path, "warm.txt");
+        assert_eq!(ctx.file_contention[1].agents.len(), 2);
+    }
+
+    #[test]
+    fn test_contention_capped_at_10() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("feat".into(), "Feature".into(), "".into())).unwrap();
+
+        // Create 12 files, all touched by 2 agents.
+        for i in 0..12 {
+            fs::write(dir.path().join(format!("file{i}.txt")), "alice").unwrap();
+        }
+        repo.seal(agent("alice"), "Alice batch".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        for i in 0..12 {
+            fs::write(dir.path().join(format!("file{i}.txt")), "bob").unwrap();
+        }
+        repo.seal(agent("bob"), "Bob batch".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 50, &ContextFilter::default()).unwrap();
+        assert_eq!(ctx.file_contention.len(), 10, "capped at 10");
+    }
+
+    #[test]
+    fn test_contention_not_in_spec_scoped_context() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("feat".into(), "Feature".into(), "".into())).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "alice").unwrap();
+        repo.seal(agent("alice"), "Alice".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "bob").unwrap();
+        repo.seal(agent("bob"), "Bob".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        let ctx = repo.context(
+            ContextScope::Spec("feat".into()), 50, &ContextFilter::default()
+        ).unwrap();
+        // Spec-scoped context doesn't include contention (forward-looking, full-scope only)
+        assert!(ctx.file_contention.is_empty());
+    }
+
+    #[test]
+    fn test_contention_serializable() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("feat".into(), "Feature".into(), "".into())).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "alice").unwrap();
+        repo.seal(agent("alice"), "Alice".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "bob").unwrap();
+        repo.seal(agent("bob"), "Bob".into(), Some("feat".into()),
+            TaskStatus::InProgress, Verification::default(), false).unwrap();
+
+        let ctx = repo.context(ContextScope::Full, 50, &ContextFilter::default()).unwrap();
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(json.contains("file_contention"));
+        assert!(json.contains("a.txt"));
+    }
+}
+
+#[cfg(test)]
+mod convergence_integration_tests {
+    use super::*;
+    use crate::convergence::FileResolution;
+    use crate::context::{ContextFilter, ContextScope};
+    use crate::seal::AgentType;
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    /// Set up a repo with baseline + two specs. Both agents modify
+    /// index.html (different sections), then agent A seals again to
+    /// create genuine branch divergence.
+    ///
+    /// After setup:
+    /// - HEAD chain: nav-dev-seal-2 → nav-dev-seal-1 → setup
+    /// - heads/footer-update = footer-dev-seal (NOT on HEAD chain) → DIVERGED
+    /// - Index has nav-dev's second change but NOT footer-dev's index.html change
+    fn setup_diverged_repo() -> (tempfile::TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let base_content = "\
+<html>
+<head><title>Portfolio</title></head>
+<body>
+<nav>Home | About</nav>
+<main>
+  <h1>Welcome</h1>
+  <p>Base content</p>
+</main>
+<footer>Copyright 2026</footer>
+</body>
+</html>";
+        fs::write(dir.path().join("index.html"), base_content).unwrap();
+        fs::write(dir.path().join("style.css"), "body { margin: 0; }").unwrap();
+
+        // Seal 1: baseline
+        repo.seal(
+            agent("setup"), "Initial baseline".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        repo.add_spec(&Spec::new("nav-update".into(), "Update navigation".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("footer-update".into(), "Update footer".into(), "".into())).unwrap();
+
+        // Seal 2: nav-dev modifies nav line. HEAD = seal2, heads/nav-update = seal2
+        let nav_content = "\
+<html>
+<head><title>Portfolio</title></head>
+<body>
+<nav>Home | About | Projects | Blog</nav>
+<main>
+  <h1>Welcome</h1>
+  <p>Base content</p>
+</main>
+<footer>Copyright 2026</footer>
+</body>
+</html>";
+        fs::write(dir.path().join("index.html"), nav_content).unwrap();
+        repo.seal(
+            agent("nav-dev"), "Updated navigation links".into(),
+            Some("nav-update".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        // Seal 3: footer-dev modifies footer line.
+        // Simulates concurrent work: footer-dev starts from baseline, NOT
+        // nav-dev's version. So we write footer-only changes (nav is base).
+        // parent = HEAD (seal2, since footer-update has no spec head yet)
+        // HEAD = seal3, heads/footer-update = seal3
+        let footer_only_content = "\
+<html>
+<head><title>Portfolio</title></head>
+<body>
+<nav>Home | About</nav>
+<main>
+  <h1>Welcome</h1>
+  <p>Base content</p>
+</main>
+<footer>Copyright 2026 - All rights reserved</footer>
+</body>
+</html>";
+        fs::write(dir.path().join("index.html"), footer_only_content).unwrap();
+        fs::write(dir.path().join("footer.css"), ".footer { padding: 1em; }").unwrap();
+        repo.seal(
+            agent("footer-dev"), "Updated footer".into(),
+            Some("footer-update".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        // Seal 4: nav-dev seals again on nav-update.
+        // Restores nav version of index.html + adds nav.js.
+        // resolve_parent("nav-update") → spec head = seal2 (NOT seal3)
+        // → parent = seal2, HEAD = seal4
+        // HEAD chain: seal4 → seal2 → seal1
+        // heads/footer-update = seal3 → NOT on chain → DIVERGED!
+        //
+        // Tree snapshot has nav version of index.html (not footer-only).
+        fs::write(dir.path().join("index.html"), nav_content).unwrap();
+        fs::write(dir.path().join("nav.js"), "// Navigation script\n").unwrap();
+        repo.seal(
+            agent("nav-dev"), "Added nav script".into(),
+            Some("nav-update".into()), TaskStatus::InProgress,
+            Verification::default(), false,
+        ).unwrap();
+
+        (dir, repo)
+    }
+
+    #[test]
+    fn test_setup_creates_divergence() {
+        let (_dir, repo) = setup_diverged_repo();
+
+        let diverged = repo.diverged_branches().unwrap();
+        let diverged_specs: Vec<&str> = diverged.iter().map(|d| d.spec_id.as_str()).collect();
+        assert!(
+            diverged_specs.contains(&"footer-update"),
+            "footer-update should be diverged, got: {:?}", diverged_specs
+        );
+    }
+
+    #[test]
+    fn test_converge_clean_non_overlapping_changes() {
+        let (dir, repo) = setup_diverged_repo();
+
+        // Run convergence between the two specs.
+        let report = repo.converge("nav-update", "footer-update").unwrap();
+
+        // Nav changed the nav line, footer changed the footer line → clean merge.
+        assert!(report.is_clean, "non-overlapping changes should merge cleanly");
+        assert!(report.conflicts.is_empty());
+
+        // Verify the merged index.html has both changes.
+        let merged_html = report.auto_merged.iter().find(|m| m.path == "index.html");
+        assert!(merged_html.is_some(), "index.html should be in auto_merged");
+        let merged = merged_html.unwrap();
+        assert!(merged.content.contains("Projects | Blog"), "should have nav changes");
+        assert!(merged.content.contains("All rights reserved"), "should have footer changes");
+
+        // Apply convergence to working directory.
+        repo.apply_convergence(&report, &[]).unwrap();
+
+        // Verify files on disk.
+        let disk_html = fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(disk_html.contains("Projects | Blog"));
+        assert!(disk_html.contains("All rights reserved"));
+    }
+
+    #[test]
+    fn test_converge_then_seal_captures_merged_state() {
+        let (dir, repo) = setup_diverged_repo();
+
+        let report = repo.converge("nav-update", "footer-update").unwrap();
+        assert!(report.is_clean);
+        repo.apply_convergence(&report, &[]).unwrap();
+
+        // The merged index.html differs from what's in the current index
+        // (current index has nav-dev's version without footer changes).
+        // So seal() should capture the merged file.
+        let merge_seal = repo.seal(
+            agent("orchestrator"),
+            "Converged nav-update + footer-update".into(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        ).unwrap();
+
+        let changed_paths: Vec<&str> = merge_seal.changes.iter().map(|c| c.path.as_str()).collect();
+        assert!(changed_paths.contains(&"index.html"),
+            "merge seal should capture the merged index.html, got: {:?}", changed_paths);
+
+        // Verify the sealed content has both changes.
+        let disk_html = fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(disk_html.contains("Projects | Blog"));
+        assert!(disk_html.contains("All rights reserved"));
+    }
+
+    #[test]
+    fn test_converge_with_conflict_and_resolution() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline with a shared file.
+        fs::write(dir.path().join("index.html"), "line1\nline2\nline3\n").unwrap();
+        repo.seal(
+            agent("setup"), "Baseline".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        repo.add_spec(&Spec::new("spec-a".into(), "Spec A".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("spec-b".into(), "Spec B".into(), "".into())).unwrap();
+
+        // Agent A changes line 2.
+        fs::write(dir.path().join("index.html"), "line1\nLEFT\nline3\n").unwrap();
+        repo.seal(
+            agent("agent-a"), "Left change".into(),
+            Some("spec-a".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        // Agent B changes line 2 differently.
+        fs::write(dir.path().join("index.html"), "line1\nRIGHT\nline3\n").unwrap();
+        repo.seal(
+            agent("agent-b"), "Right change".into(),
+            Some("spec-b".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        let report = repo.converge("spec-a", "spec-b").unwrap();
+        assert!(!report.is_clean, "overlapping changes should conflict");
+        assert!(!report.conflicts.is_empty());
+
+        let conflict = &report.conflicts[0];
+        assert_eq!(conflict.path, "index.html");
+        assert!(!conflict.regions.is_empty());
+
+        // Resolve by combining both.
+        let resolutions = vec![FileResolution {
+            path: "index.html".to_string(),
+            content: "line1\nLEFT + RIGHT\nline3\n".to_string(),
+        }];
+
+        repo.apply_convergence(&report, &resolutions).unwrap();
+
+        let disk = fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(disk.contains("LEFT + RIGHT"));
+    }
+
+    #[test]
+    fn test_converge_unresolved_conflict_errors() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "base").unwrap();
+        repo.seal(
+            agent("setup"), "Baseline".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        repo.add_spec(&Spec::new("spec-a".into(), "A".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("spec-b".into(), "B".into(), "".into())).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "LEFT").unwrap();
+        repo.seal(
+            agent("agent-a"), "Left".into(),
+            Some("spec-a".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "RIGHT").unwrap();
+        repo.seal(
+            agent("agent-b"), "Right".into(),
+            Some("spec-b".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        let report = repo.converge("spec-a", "spec-b").unwrap();
+        assert!(!report.is_clean);
+
+        let result = repo.apply_convergence(&report, &[]);
+        assert!(result.is_err(), "unresolved conflicts should error");
+    }
+
+    #[test]
+    fn test_converge_left_only_and_right_only_files() {
+        let (dir, repo) = setup_diverged_repo();
+
+        let report = repo.converge("nav-update", "footer-update").unwrap();
+
+        // nav.js was added by nav-dev only → left_only
+        assert!(report.left_only.contains(&"nav.js".to_string()),
+            "nav.js should be left_only, got: {:?}", report.left_only);
+        // footer.css was added by footer-dev only → right_only
+        assert!(report.right_only.contains(&"footer.css".to_string()),
+            "footer.css should be right_only, got: {:?}", report.right_only);
+    }
+
+    #[test]
+    fn test_converge_reduces_diverged_branch_count() {
+        let (dir, repo) = setup_diverged_repo();
+
+        // Verify divergence exists.
+        let before = repo.diverged_branches().unwrap();
+        assert!(!before.is_empty(), "should have diverged branches before convergence");
+
+        // Converge, apply, seal (bringing footer-dev's work into the HEAD chain).
+        let report = repo.converge("nav-update", "footer-update").unwrap();
+        repo.apply_convergence(&report, &[]).unwrap();
+        repo.seal(
+            agent("orchestrator"), "Merged nav + footer".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // After convergence seal, both spec's content is in HEAD.
+        // The footer.css file should be on disk.
+        assert!(dir.path().join("footer.css").exists());
+
+        // Context should be obtainable.
+        let ctx = repo.context(ContextScope::Full, 50, &ContextFilter::default()).unwrap();
+        assert!(!ctx.recent_seals.is_empty());
+    }
+
+    #[test]
+    fn test_converge_report_has_all_metadata() {
+        let (_dir, repo) = setup_diverged_repo();
+
+        let report = repo.converge("nav-update", "footer-update").unwrap();
+
+        assert_eq!(report.left_spec, "nav-update");
+        assert_eq!(report.right_spec, "footer-update");
+        assert!(!report.left_seal_id.is_empty());
+        assert!(!report.right_seal_id.is_empty());
+        assert!(report.base_seal_id.is_some());
+    }
+
+    #[test]
+    fn test_converge_report_serializable() {
+        let (_dir, repo) = setup_diverged_repo();
+
+        let report = repo.converge("nav-update", "footer-update").unwrap();
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(json.contains("nav-update"));
+        assert!(json.contains("footer-update"));
+        assert!(json.contains("is_clean"));
+
+        // Roundtrip
+        let parsed: crate::convergence::ConvergenceReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.left_spec, report.left_spec);
+        assert_eq!(parsed.is_clean, report.is_clean);
+    }
+
+    #[test]
+    fn test_converge_three_specs_sequential() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline with a shared file.
+        fs::write(dir.path().join("index.html"), "line1\nline2\nline3\nline4\nline5\n").unwrap();
+        repo.seal(
+            agent("setup"), "Baseline".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        repo.add_spec(&Spec::new("spec-a".into(), "Spec A".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("spec-b".into(), "Spec B".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("spec-c".into(), "Spec C".into(), "".into())).unwrap();
+
+        // Each agent modifies a different line in the same file.
+        fs::write(dir.path().join("index.html"), "AAAA\nline2\nline3\nline4\nline5\n").unwrap();
+        repo.seal(
+            agent("agent-a"), "Change line 1".into(),
+            Some("spec-a".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        fs::write(dir.path().join("index.html"), "AAAA\nline2\nCCCC\nline4\nline5\n").unwrap();
+        repo.seal(
+            agent("agent-b"), "Change line 3".into(),
+            Some("spec-b".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        fs::write(dir.path().join("index.html"), "AAAA\nline2\nCCCC\nline4\nEEEE\n").unwrap();
+        repo.seal(
+            agent("agent-c"), "Change line 5".into(),
+            Some("spec-c".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        // Sequential convergence: merge A+B first.
+        let report_ab = repo.converge("spec-a", "spec-b").unwrap();
+        assert!(report_ab.is_clean, "A (line1) and B (line3) should merge cleanly");
+
+        // Then merge A+C (A's tree is the reference for both merges).
+        let report_ac = repo.converge("spec-a", "spec-c").unwrap();
+        assert!(report_ac.is_clean, "A (line1) and C (line5) should merge cleanly");
+
+        // Verify the merge results contain the expected content.
+        if let Some(merged) = report_ab.auto_merged.iter().find(|m| m.path == "index.html") {
+            assert!(merged.content.contains("AAAA"), "should have A's line1");
+            assert!(merged.content.contains("CCCC"), "should have B's line3");
+        }
+        if let Some(merged) = report_ac.auto_merged.iter().find(|m| m.path == "index.html") {
+            assert!(merged.content.contains("AAAA"), "should have A's line1");
+            assert!(merged.content.contains("EEEE"), "should have C's line5");
+        }
+    }
+
+    #[test]
+    fn test_converge_spec_with_no_seals_errors() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("has-seals".into(), "Has work".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("no-seals".into(), "No work".into(), "".into())).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "content").unwrap();
+        repo.seal(
+            agent("worker"), "Work".into(),
+            Some("has-seals".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        let result = repo.converge("has-seals", "no-seals");
+        assert!(result.is_err(), "converging spec with no seals should error");
+    }
+
+    #[test]
+    fn test_converge_identical_changes_clean() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "original\n").unwrap();
+        repo.seal(
+            agent("setup"), "Baseline".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        repo.add_spec(&Spec::new("spec-a".into(), "A".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("spec-b".into(), "B".into(), "".into())).unwrap();
+
+        // Agent A changes shared.txt + adds a unique file.
+        fs::write(dir.path().join("shared.txt"), "identical change\n").unwrap();
+        fs::write(dir.path().join("only-a.txt"), "a stuff\n").unwrap();
+        repo.seal(
+            agent("agent-a"), "A changes".into(),
+            Some("spec-a".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        // Agent B changes shared.txt identically + adds a different unique file.
+        // (shared.txt is already "identical change" on disk, so we also add
+        // a unique file so the seal captures changes.)
+        fs::write(dir.path().join("only-b.txt"), "b stuff\n").unwrap();
+        repo.seal(
+            agent("agent-b"), "B changes".into(),
+            Some("spec-b".into()), TaskStatus::Complete,
+            Verification::default(), false,
+        ).unwrap();
+
+        let report = repo.converge("spec-a", "spec-b").unwrap();
+        // shared.txt was changed identically by both → clean merge.
+        assert!(report.is_clean, "identical changes should merge cleanly");
+    }
+
+    #[test]
+    fn test_converge_full_cycle_diverge_merge_context() {
+        // End-to-end integration: create divergence, converge, seal, verify
+        // context shows the merged state without diverged branches for those specs.
+        let (dir, repo) = setup_diverged_repo();
+
+        // Before convergence: footer-update is diverged.
+        let before_ctx = repo.context(ContextScope::Full, 50, &ContextFilter::default()).unwrap();
+        assert!(before_ctx.convergence_recommended,
+            "should recommend convergence before merge");
+
+        // Converge.
+        let report = repo.converge("nav-update", "footer-update").unwrap();
+        assert!(report.is_clean);
+        repo.apply_convergence(&report, &[]).unwrap();
+
+        // Seal the merged result.
+        let merge_seal = repo.seal(
+            agent("orchestrator"), "Convergence merge".into(), None,
+            TaskStatus::Complete, Verification::default(), false,
+        ).unwrap();
+
+        // Verify the merge seal captured the merged index.html.
+        assert!(merge_seal.changes.iter().any(|c| c.path == "index.html"),
+            "merge seal should include merged index.html");
+
+        // After convergence, verify disk state has all content.
+        let html = fs::read_to_string(dir.path().join("index.html")).unwrap();
+        assert!(html.contains("Projects | Blog"), "nav changes should be present");
+        assert!(html.contains("All rights reserved"), "footer changes should be present");
+        assert!(dir.path().join("nav.js").exists(), "nav.js should exist");
+        assert!(dir.path().join("footer.css").exists(), "footer.css should exist");
+    }
+}
+
+#[cfg(test)]
+mod converge_all_tests {
+    use super::*;
+    use crate::convergence::ConvergeStrategy;
+    use crate::seal::AgentIdentity;
+    use crate::spec::{Spec, SpecStatus};
+    use crate::spec::SpecUpdate;
+    use tempfile::tempdir;
+
+    /// Helper: set up a repo with 3 specs where 2 are on diverged branches.
+    /// Returns (TempDir, Repository).
+    fn setup_multi_diverged() -> (tempfile::TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline file.
+        fs::write(dir.path().join("shared.txt"), "line1\nline2\nline3\n").unwrap();
+
+        let base_agent = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            base_agent,
+            "baseline".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Add 3 specs.
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("gamma".into(), "Gamma".into(), "".into())).unwrap();
+
+        // Alpha seals on HEAD (stays on main chain).
+        fs::write(dir.path().join("alpha.txt"), "alpha content\n").unwrap();
+        let alpha_agent = AgentIdentity {
+            id: "alpha-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            alpha_agent.clone(),
+            "alpha work".into(),
+            Some("alpha".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Beta seals — diverges from HEAD because alpha advanced it.
+        fs::write(dir.path().join("beta.txt"), "beta content\n").unwrap();
+        let beta_agent = AgentIdentity {
+            id: "beta-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            beta_agent,
+            "beta work".into(),
+            Some("beta".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Gamma seals — also diverges.
+        fs::write(dir.path().join("gamma.txt"), "gamma content\n").unwrap();
+        let gamma_agent = AgentIdentity {
+            id: "gamma-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            gamma_agent,
+            "gamma work".into(),
+            Some("gamma".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Alpha seals again to advance HEAD past beta/gamma.
+        fs::write(dir.path().join("alpha2.txt"), "alpha part 2\n").unwrap();
+        repo.seal(
+            alpha_agent,
+            "alpha complete".into(),
+            Some("alpha".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Mark alpha as Complete so it's eligible as base spec on HEAD.
+        repo.update_spec("alpha", SpecUpdate {
+            status: Some(SpecStatus::Complete),
+            ..Default::default()
+        }).unwrap();
+
+        (dir, repo)
+    }
+
+    #[test]
+    fn test_converge_all_no_diverged() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+        let agent = AgentIdentity {
+            id: "dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            agent,
+            "work".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
+            .unwrap();
+        assert!(report.is_clean);
+        assert!(report.merges.is_empty());
+        assert_eq!(report.strategy, "three-way-merge");
+    }
+
+    #[test]
+    fn test_converge_all_clean_multi_branch() {
+        let (_dir, repo) = setup_multi_diverged();
+        let report = repo
+            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
+            .unwrap();
+
+        assert!(report.is_clean, "disjoint files should merge cleanly");
+        assert!(!report.merge_order.is_empty());
+        assert!(!report.merges.is_empty());
+        assert_eq!(report.base_spec, "alpha");
+        assert!(report.total_conflicts == 0);
+    }
+
+    #[test]
+    fn test_converge_all_with_apply() {
+        let (dir, repo) = setup_multi_diverged();
+        let report = repo
+            .converge_all(ConvergeStrategy::ThreeWayMerge, true)
+            .unwrap();
+
+        assert!(report.applied);
+        assert!(report.is_clean);
+
+        // Verify files from diverged branches exist on disk.
+        assert!(dir.path().join("beta.txt").exists());
+        assert!(dir.path().join("gamma.txt").exists());
+    }
+
+    #[test]
+    fn test_converge_all_most_recent_resolves_conflicts() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Base file.
+        fs::write(dir.path().join("shared.txt"), "original\n").unwrap();
+        let base_agent = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            base_agent,
+            "baseline".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Two specs that both modify shared.txt — creating a conflict.
+        repo.add_spec(&Spec::new("left".into(), "Left".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("right".into(), "Right".into(), "".into())).unwrap();
+
+        // Left modifies.
+        fs::write(dir.path().join("shared.txt"), "LEFT_VERSION\n").unwrap();
+        let left_agent = AgentIdentity {
+            id: "left-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            left_agent.clone(),
+            "left change".into(),
+            Some("left".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Right modifies same file differently.
+        fs::write(dir.path().join("shared.txt"), "RIGHT_VERSION\n").unwrap();
+        let right_agent = AgentIdentity {
+            id: "right-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            right_agent,
+            "right change".into(),
+            Some("right".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Left seals again to advance HEAD past right's seal.
+        // IMPORTANT: Restore LEFT_VERSION on disk to avoid shared index contamination.
+        // Without this, left's tree would inherit RIGHT_VERSION from the shared index.
+        fs::write(dir.path().join("shared.txt"), "LEFT_VERSION\n").unwrap();
+        fs::write(dir.path().join("left-only.txt"), "extra\n").unwrap();
+        repo.seal(
+            left_agent,
+            "left extra".into(),
+            Some("left".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Mark left as Complete so it's the base spec on HEAD.
+        repo.update_spec("left", SpecUpdate {
+            status: Some(SpecStatus::Complete),
+            ..Default::default()
+        }).unwrap();
+
+        // Now right is diverged. Converge with MostRecent strategy.
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, true)
+            .unwrap();
+
+        assert!(report.is_clean, "MostRecent should resolve all conflicts");
+        assert!(report.total_resolutions > 0);
+        assert!(!report.warnings.is_empty(), "should warn about lost content");
+
+        // Check that resolution records exist.
+        let has_resolution = report.merges.iter().any(|m| !m.resolutions.is_empty());
+        assert!(has_resolution, "at least one step should have resolutions");
+    }
+
+    #[test]
+    fn test_converge_all_three_way_leaves_conflicts_unresolved() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "original\n").unwrap();
+        let base_agent = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            base_agent,
+            "baseline".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("left".into(), "Left".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("right".into(), "Right".into(), "".into())).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "LEFT_VERSION\n").unwrap();
+        let left_agent = AgentIdentity {
+            id: "left-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            left_agent.clone(),
+            "left change".into(),
+            Some("left".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "RIGHT_VERSION\n").unwrap();
+        let right_agent = AgentIdentity {
+            id: "right-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            right_agent,
+            "right change".into(),
+            Some("right".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Restore LEFT_VERSION to avoid shared index contamination.
+        fs::write(dir.path().join("shared.txt"), "LEFT_VERSION\n").unwrap();
+        fs::write(dir.path().join("left-extra.txt"), "extra\n").unwrap();
+        repo.seal(
+            left_agent,
+            "advance head".into(),
+            Some("left".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Mark left as Complete so it's picked as base.
+        repo.update_spec("left", SpecUpdate {
+            status: Some(SpecStatus::Complete),
+            ..Default::default()
+        }).unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
+            .unwrap();
+
+        assert!(!report.is_clean, "ThreeWayMerge should leave conflicts");
+        assert!(report.total_conflicts > 0);
+        assert_eq!(report.total_resolutions, 0);
+    }
+
+    #[test]
+    fn test_converge_all_report_serializable() {
+        let (_dir, repo) = setup_multi_diverged();
+        let report = repo
+            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
+            .unwrap();
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(json.contains("base_spec"));
+        assert!(json.contains("merge_order"));
+        assert!(json.contains("strategy"));
+    }
+
+    #[test]
+    fn test_converge_all_warnings_for_high_contention() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a shared file modified by 3+ agents.
+        fs::write(dir.path().join("hot.txt"), "base\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "baseline".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("a".into(), "A".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("b".into(), "B".into(), "".into())).unwrap();
+        repo.add_spec(&Spec::new("c".into(), "C".into(), "".into())).unwrap();
+
+        // Agent A modifies hot.txt (adds line).
+        fs::write(dir.path().join("hot.txt"), "base\nagent-a\n").unwrap();
+        let a = AgentIdentity {
+            id: "agent-a".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            a.clone(),
+            "a changes".into(),
+            Some("a".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent B modifies hot.txt.
+        fs::write(dir.path().join("hot.txt"), "base\nagent-b\n").unwrap();
+        let b = AgentIdentity {
+            id: "agent-b".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            b,
+            "b changes".into(),
+            Some("b".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent C modifies hot.txt.
+        fs::write(dir.path().join("hot.txt"), "base\nagent-c\n").unwrap();
+        let c = AgentIdentity {
+            id: "agent-c".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            c,
+            "c changes".into(),
+            Some("c".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent A seals again to advance HEAD past B and C.
+        fs::write(dir.path().join("extra.txt"), "x\n").unwrap();
+        repo.seal(
+            a,
+            "a final".into(),
+            Some("a".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, false)
+            .unwrap();
+
+        // Should have warnings about high-contention files.
+        let has_contention_warning = report
+            .warnings
+            .iter()
+            .any(|w| w.contains("touched by") && w.contains("agents"));
+        assert!(
+            has_contention_warning,
+            "should warn about high-contention files, got: {:?}",
+            report.warnings,
+        );
+    }
+
+    #[test]
+    fn test_converge_all_merge_order_tracks_specs() {
+        let (_dir, repo) = setup_multi_diverged();
+        let report = repo
+            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
+            .unwrap();
+
+        // merge_order should contain the diverged spec IDs (not the base).
+        assert!(!report.merge_order.contains(&"alpha".to_string()));
+        for spec_id in &report.merge_order {
+            assert!(
+                spec_id == "beta" || spec_id == "gamma",
+                "unexpected spec in merge_order: {spec_id}",
+            );
+        }
+    }
+
+    #[test]
+    fn test_converge_all_step_results_match_order() {
+        let (_dir, repo) = setup_multi_diverged();
+        let report = repo
+            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
+            .unwrap();
+
+        assert_eq!(report.merges.len(), report.merge_order.len());
+        for (step, spec_id) in report.merges.iter().zip(report.merge_order.iter()) {
+            assert_eq!(&step.right_spec, spec_id);
+            assert_eq!(&step.left_spec, &report.base_spec);
+        }
     }
 }

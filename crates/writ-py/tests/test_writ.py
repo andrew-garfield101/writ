@@ -426,6 +426,119 @@ class TestConvergence:
         assert isinstance(result, str)
 
 
+class TestConvergeAll:
+    def _setup_diverged(self, tmp_path):
+        """Create a repo with alpha on HEAD, beta and gamma diverged."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "shared.txt").write_text("line1\nline2\nline3\n")
+        repo.seal(summary="baseline", agent_id="setup", agent_type="agent")
+
+        repo.add_spec(id="alpha", title="Alpha")
+        repo.add_spec(id="beta", title="Beta")
+        repo.add_spec(id="gamma", title="Gamma")
+
+        # Alpha seals (stays on HEAD chain).
+        (tmp_path / "alpha.txt").write_text("alpha content\n")
+        repo.seal(summary="alpha work", agent_id="alpha-dev", spec_id="alpha")
+
+        # Beta seals — diverges from HEAD because alpha advanced it.
+        (tmp_path / "beta.txt").write_text("beta content\n")
+        repo.seal(summary="beta work", agent_id="beta-dev", spec_id="beta")
+
+        # Gamma seals — also diverges.
+        (tmp_path / "gamma.txt").write_text("gamma content\n")
+        repo.seal(summary="gamma work", agent_id="gamma-dev", spec_id="gamma")
+
+        # Alpha seals again to advance HEAD past beta/gamma.
+        (tmp_path / "alpha2.txt").write_text("alpha part 2\n")
+        repo.seal(summary="alpha complete", agent_id="alpha-dev", spec_id="alpha")
+
+        # Mark alpha Complete so it's eligible as base spec.
+        repo.update_spec("alpha", status="complete")
+
+        return repo
+
+    def test_converge_all_no_diverged(self, tmp_repo):
+        """converge_all on a repo with no diverged branches returns empty."""
+        repo, path = tmp_repo
+        (path / "a.txt").write_text("content\n")
+        repo.seal(summary="work", agent_id="dev")
+        report = repo.converge_all()
+        assert isinstance(report, dict)
+        assert report["is_clean"] is True
+        assert len(report["merges"]) == 0
+
+    def test_converge_all_clean_multi_branch(self, tmp_path):
+        """converge_all merges disjoint diverged branches cleanly."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge_all()
+        assert report["is_clean"] is True
+        assert report["base_spec"] == "alpha"
+        assert len(report["merge_order"]) > 0
+        assert report["total_conflicts"] == 0
+
+    def test_converge_all_with_apply(self, tmp_path):
+        """converge_all with apply=True writes files to disk."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge_all(apply=True)
+        assert report["applied"] is True
+        assert (tmp_path / "beta.txt").exists()
+        assert (tmp_path / "gamma.txt").exists()
+
+    def test_converge_all_most_recent_resolves_conflicts(self, tmp_path):
+        """MostRecent strategy auto-resolves conflicts."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "shared.txt").write_text("original\n")
+        repo.seal(summary="baseline", agent_id="setup")
+
+        repo.add_spec(id="left", title="Left")
+        repo.add_spec(id="right", title="Right")
+
+        (tmp_path / "shared.txt").write_text("LEFT_VERSION\n")
+        repo.seal(summary="left change", agent_id="left-dev", spec_id="left")
+
+        (tmp_path / "shared.txt").write_text("RIGHT_VERSION\n")
+        repo.seal(summary="right change", agent_id="right-dev", spec_id="right")
+
+        # Restore LEFT on disk before left's second seal.
+        (tmp_path / "shared.txt").write_text("LEFT_VERSION\n")
+        (tmp_path / "left-only.txt").write_text("extra\n")
+        repo.seal(summary="left extra", agent_id="left-dev", spec_id="left")
+        repo.update_spec("left", status="complete")
+
+        report = repo.converge_all(strategy="most-recent", apply=True)
+        assert report["is_clean"] is True
+        assert report["total_resolutions"] > 0
+        assert len(report["warnings"]) > 0
+
+    def test_converge_all_report_serializable(self, tmp_path):
+        """converge_all report is JSON-serializable."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge_all()
+        result = json.dumps(report)
+        assert isinstance(result, str)
+        assert "base_spec" in result
+        assert "strategy" in result
+
+    def test_converge_all_step_results(self, tmp_path):
+        """Each merge step has expected fields."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge_all()
+        assert len(report["merges"]) == len(report["merge_order"])
+        for step in report["merges"]:
+            assert "left_spec" in step
+            assert "right_spec" in step
+            assert "auto_merged" in step
+            assert "conflicts" in step
+            assert "clean" in step
+
+    def test_converge_all_default_strategy(self, tmp_path):
+        """Default strategy is three-way-merge."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge_all()
+        assert report["strategy"] == "three-way-merge"
+
+
 class TestAllowEmpty:
     def test_seal_allow_empty(self, tmp_repo):
         """allow_empty=True on a clean repo succeeds."""
@@ -1917,3 +2030,274 @@ class TestSummary:
         assert s["convergence_recommended"] is True
         assert s["diverged_branch_count"] > 0
         assert "diverged" in s["body"]
+
+
+class TestFileContention:
+    """Tests for the file contention map in context output."""
+
+    def test_no_contention_single_agent(self, tmp_path):
+        """Single agent → no contention."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+        (tmp_path / "a.txt").write_text("content")
+        repo.seal(summary="work", agent_id="alice", agent_type="agent", spec_id="feat")
+
+        ctx = repo.context()
+        assert ctx.get("file_contention", []) == []
+
+    def test_contention_two_agents_same_file(self, tmp_path):
+        """Two agents touching the same file → contention entry."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+
+        (tmp_path / "shared.txt").write_text("alice v1")
+        repo.seal(summary="alice", agent_id="alice", agent_type="agent", spec_id="feat")
+
+        (tmp_path / "shared.txt").write_text("bob v1")
+        repo.seal(summary="bob", agent_id="bob", agent_type="agent", spec_id="feat")
+
+        ctx = repo.context()
+        contention = ctx.get("file_contention", [])
+        assert len(contention) == 1
+        assert contention[0]["path"] == "shared.txt"
+        assert len(contention[0]["agents"]) == 2
+        assert "alice" in contention[0]["agents"]
+        assert "bob" in contention[0]["agents"]
+
+    def test_contention_excludes_bridge(self, tmp_path):
+        """Bridge seals don't count for contention."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+
+        (tmp_path / "a.txt").write_text("bridge")
+        repo.seal(summary="import", agent_id="writ-bridge", agent_type="agent")
+
+        (tmp_path / "a.txt").write_text("alice")
+        repo.seal(summary="work", agent_id="alice", agent_type="agent", spec_id="feat")
+
+        ctx = repo.context()
+        assert ctx.get("file_contention", []) == []
+
+    def test_contention_sorted_by_agent_count(self, tmp_path):
+        """Files with more agents appear first."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+
+        # hot.txt: 3 agents, warm.txt: 2 agents
+        (tmp_path / "hot.txt").write_text("a")
+        (tmp_path / "warm.txt").write_text("a")
+        repo.seal(summary="a", agent_id="alice", agent_type="agent", spec_id="feat")
+
+        (tmp_path / "hot.txt").write_text("b")
+        (tmp_path / "warm.txt").write_text("b")
+        repo.seal(summary="b", agent_id="bob", agent_type="agent", spec_id="feat")
+
+        (tmp_path / "hot.txt").write_text("c")
+        repo.seal(summary="c", agent_id="charlie", agent_type="agent", spec_id="feat")
+
+        ctx = repo.context()
+        contention = ctx.get("file_contention", [])
+        assert len(contention) == 2
+        assert contention[0]["path"] == "hot.txt"
+        assert len(contention[0]["agents"]) == 3
+        assert contention[1]["path"] == "warm.txt"
+        assert len(contention[1]["agents"]) == 2
+
+    def test_contention_json_serializable(self, tmp_path):
+        """Contention data survives JSON roundtrip."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+
+        (tmp_path / "a.txt").write_text("alice")
+        repo.seal(summary="a", agent_id="alice", agent_type="agent", spec_id="feat")
+
+        (tmp_path / "a.txt").write_text("bob")
+        repo.seal(summary="b", agent_id="bob", agent_type="agent", spec_id="feat")
+
+        ctx = repo.context()
+        serialized = json.dumps(ctx)
+        parsed = json.loads(serialized)
+        assert len(parsed.get("file_contention", [])) == 1
+
+    def test_contention_not_in_spec_context(self, tmp_path):
+        """Spec-scoped context doesn't include contention."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+
+        (tmp_path / "a.txt").write_text("alice")
+        repo.seal(summary="a", agent_id="alice", agent_type="agent", spec_id="feat")
+
+        (tmp_path / "a.txt").write_text("bob")
+        repo.seal(summary="b", agent_id="bob", agent_type="agent", spec_id="feat")
+
+        ctx = repo.context(spec="feat")
+        assert ctx.get("file_contention", []) == []
+
+
+class TestConvergence:
+    """Tests for the convergence workflow via Python SDK."""
+
+    def _setup_diverged(self, tmp_path):
+        """Create a repo with two diverged spec branches.
+
+        Returns (repo, tmp_path) with:
+        - nav-update: modified index.html nav + added nav.js
+        - footer-update: modified index.html footer + added footer.css
+        - Branches are properly diverged (footer-update not on HEAD chain).
+        """
+        repo = writ.Repository.init(str(tmp_path))
+        base = "<html>\n<nav>Home</nav>\n<main>Content</main>\n<footer>2026</footer>\n</html>\n"
+        (tmp_path / "index.html").write_text(base)
+        (tmp_path / "style.css").write_text("body{}")
+        repo.seal(summary="baseline", agent_id="setup", agent_type="agent")
+
+        repo.add_spec(id="nav-update", title="Update nav")
+        repo.add_spec(id="footer-update", title="Update footer")
+
+        # Agent A: nav changes
+        nav = "<html>\n<nav>Home | Blog</nav>\n<main>Content</main>\n<footer>2026</footer>\n</html>\n"
+        (tmp_path / "index.html").write_text(nav)
+        repo.seal(summary="nav links", agent_id="nav-dev", agent_type="agent", spec_id="nav-update")
+
+        # Agent B: footer changes (from baseline, not nav version)
+        footer = "<html>\n<nav>Home</nav>\n<main>Content</main>\n<footer>2026 All rights reserved</footer>\n</html>\n"
+        (tmp_path / "index.html").write_text(footer)
+        (tmp_path / "footer.css").write_text(".footer{}")
+        repo.seal(summary="footer", agent_id="footer-dev", agent_type="agent", spec_id="footer-update")
+
+        # Agent A seals again → creates divergence (HEAD forks past B's seal)
+        (tmp_path / "index.html").write_text(nav)
+        (tmp_path / "nav.js").write_text("// nav")
+        repo.seal(summary="nav script", agent_id="nav-dev", agent_type="agent", spec_id="nav-update")
+
+        return repo
+
+    def test_converge_returns_report(self, tmp_path):
+        """converge() returns a structured report dict."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge("nav-update", "footer-update")
+
+        assert isinstance(report, dict)
+        assert report["left_spec"] == "nav-update"
+        assert report["right_spec"] == "footer-update"
+        assert "is_clean" in report
+        assert "auto_merged" in report
+        assert "conflicts" in report
+        assert "left_only" in report
+        assert "right_only" in report
+
+    def test_converge_clean_merge(self, tmp_path):
+        """Non-overlapping changes merge cleanly."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge("nav-update", "footer-update")
+
+        assert report["is_clean"] is True
+        assert len(report["conflicts"]) == 0
+
+        # index.html should be in auto_merged with both changes
+        merged = [m for m in report["auto_merged"] if m["path"] == "index.html"]
+        assert len(merged) == 1
+        assert "Blog" in merged[0]["content"]
+        assert "All rights reserved" in merged[0]["content"]
+
+    def test_apply_convergence_writes_to_disk(self, tmp_path):
+        """apply_convergence writes merged files to the working directory."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge("nav-update", "footer-update")
+        repo.apply_convergence(report)
+
+        html = (tmp_path / "index.html").read_text()
+        assert "Blog" in html
+        assert "All rights reserved" in html
+
+    def test_converge_then_seal(self, tmp_path):
+        """After convergence, seal captures the merged state."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge("nav-update", "footer-update")
+        repo.apply_convergence(report)
+
+        seal = repo.seal(
+            summary="Merged nav + footer",
+            agent_id="orchestrator",
+            agent_type="agent",
+        )
+        paths = [c["path"] for c in seal["changes"]]
+        assert "index.html" in paths
+
+    def test_converge_with_conflict(self, tmp_path):
+        """Conflicting changes produce conflicts in the report."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("base\n")
+        repo.seal(summary="base", agent_id="setup", agent_type="agent")
+
+        repo.add_spec(id="spec-a", title="A")
+        repo.add_spec(id="spec-b", title="B")
+
+        (tmp_path / "a.txt").write_text("LEFT\n")
+        repo.seal(summary="left", agent_id="a", agent_type="agent", spec_id="spec-a")
+
+        (tmp_path / "a.txt").write_text("RIGHT\n")
+        repo.seal(summary="right", agent_id="b", agent_type="agent", spec_id="spec-b")
+
+        report = repo.converge("spec-a", "spec-b")
+        assert report["is_clean"] is False
+        assert len(report["conflicts"]) > 0
+        assert report["conflicts"][0]["path"] == "a.txt"
+
+    def test_apply_with_resolution(self, tmp_path):
+        """Conflicts can be resolved by providing resolutions."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("base\n")
+        repo.seal(summary="base", agent_id="setup", agent_type="agent")
+
+        repo.add_spec(id="spec-a", title="A")
+        repo.add_spec(id="spec-b", title="B")
+
+        (tmp_path / "a.txt").write_text("LEFT\n")
+        repo.seal(summary="left", agent_id="a", agent_type="agent", spec_id="spec-a")
+
+        (tmp_path / "a.txt").write_text("RIGHT\n")
+        repo.seal(summary="right", agent_id="b", agent_type="agent", spec_id="spec-b")
+
+        report = repo.converge("spec-a", "spec-b")
+        resolutions = [{"path": "a.txt", "content": "RESOLVED\n"}]
+        repo.apply_convergence(report, resolutions)
+
+        assert (tmp_path / "a.txt").read_text() == "RESOLVED\n"
+
+    def test_apply_unresolved_conflict_errors(self, tmp_path):
+        """Applying without resolving conflicts raises an error."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("base\n")
+        repo.seal(summary="base", agent_id="setup", agent_type="agent")
+
+        repo.add_spec(id="spec-a", title="A")
+        repo.add_spec(id="spec-b", title="B")
+
+        (tmp_path / "a.txt").write_text("LEFT\n")
+        repo.seal(summary="left", agent_id="a", agent_type="agent", spec_id="spec-a")
+
+        (tmp_path / "a.txt").write_text("RIGHT\n")
+        repo.seal(summary="right", agent_id="b", agent_type="agent", spec_id="spec-b")
+
+        report = repo.converge("spec-a", "spec-b")
+        with pytest.raises(writ.WritError):
+            repo.apply_convergence(report)
+
+    def test_converge_report_json_serializable(self, tmp_path):
+        """Convergence report survives JSON roundtrip."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge("nav-update", "footer-update")
+
+        serialized = json.dumps(report)
+        parsed = json.loads(serialized)
+        assert parsed["left_spec"] == "nav-update"
+        assert parsed["is_clean"] == report["is_clean"]
+
+    def test_converge_left_right_only(self, tmp_path):
+        """Left-only and right-only files are reported correctly."""
+        repo = self._setup_diverged(tmp_path)
+        report = repo.converge("nav-update", "footer-update")
+
+        assert "nav.js" in report["left_only"]
+        assert "footer.css" in report["right_only"]

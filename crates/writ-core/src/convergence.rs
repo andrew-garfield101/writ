@@ -93,6 +93,91 @@ pub enum FileMergeResult {
     Conflict(Vec<ConflictRegion>),
 }
 
+/// Strategy for resolving conflicts during `converge_all`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConvergeStrategy {
+    /// Standard three-way merge. Conflicts remain unresolved.
+    ThreeWayMerge,
+    /// For conflicts, prefer the version from the most recently sealed branch.
+    MostRecent,
+}
+
+impl Default for ConvergeStrategy {
+    fn default() -> Self {
+        ConvergeStrategy::ThreeWayMerge
+    }
+}
+
+/// Result of `converge_all` — multi-branch convergence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConvergeAllReport {
+    /// Spec used as merge base (on HEAD chain).
+    pub base_spec: String,
+    /// Spec IDs in the order they were merged.
+    pub merge_order: Vec<String>,
+    /// Per-merge step results.
+    pub merges: Vec<MergeStepResult>,
+    /// Strategy used for conflict resolution.
+    pub strategy: String,
+    /// Total files auto-merged across all steps.
+    pub total_auto_merged: usize,
+    /// Total conflicts encountered across all steps.
+    pub total_conflicts: usize,
+    /// Total conflicts resolved by the chosen strategy.
+    pub total_resolutions: usize,
+    /// True if all merges are clean (or all conflicts were resolved).
+    pub is_clean: bool,
+    /// Whether changes were applied to the working directory.
+    pub applied: bool,
+    /// Warnings about potential content loss or semantic inconsistency.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
+}
+
+/// Result of a single merge step in `converge_all`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MergeStepResult {
+    /// Left spec (base side).
+    pub left_spec: String,
+    /// Right spec (being merged in).
+    pub right_spec: String,
+    /// Number of files auto-merged cleanly.
+    pub auto_merged: usize,
+    /// Number of conflicts.
+    pub conflicts: usize,
+    /// Number of left-only files.
+    pub left_only: usize,
+    /// Number of right-only files.
+    pub right_only: usize,
+    /// Paths of conflicted files.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub conflict_files: Vec<String>,
+    /// How each conflict was resolved (if strategy was applied).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub resolutions: Vec<ResolutionRecord>,
+    /// True if this step had no conflicts (or all were resolved).
+    pub clean: bool,
+    /// Error message if this merge step failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Record of how a specific file conflict was resolved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolutionRecord {
+    /// Path of the resolved file.
+    pub path: String,
+    /// Strategy used: "auto-merged", "most-recent", "left-wins", "right-wins".
+    pub strategy: String,
+    /// Which spec's version was chosen (for most-recent).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chosen_spec: Option<String>,
+    /// Warning about content that may have been lost.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lost_content_warning: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Three-way merge algorithm
 // ---------------------------------------------------------------------------

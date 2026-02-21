@@ -155,8 +155,9 @@ enum Commands {
     /// Human-readable summary of all work done in this writ session.
     /// Designed for the round-trip: writ install -> agents work -> writ summary -> git commit.
     Summary {
-        /// Output format: "human" (default), "json", or "commit".
-        /// "commit" outputs just the suggested git commit message.
+        /// Output format: "human" (default), "json", "commit", or "pr".
+        /// "commit" outputs a concise one-line commit message.
+        /// "pr" outputs a detailed PR description with full spec/agent breakdown.
         #[arg(long, default_value = "human")]
         format: String,
     },
@@ -190,6 +191,26 @@ enum Commands {
         /// Apply the convergence result to the working directory (clean merges only).
         #[arg(long)]
         apply: bool,
+    },
+
+    /// Converge ALL diverged branches in sequence (newest-first ordering).
+    /// This is the recommended way to merge after multi-agent parallel work.
+    ConvergeAll {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+
+        /// Automatically apply clean merges and resolve conflicts per strategy.
+        #[arg(long)]
+        apply: bool,
+
+        /// Dry run: show what would be merged without applying.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Conflict resolution strategy: "three-way-merge" (default) or "most-recent".
+        #[arg(long, default_value = "three-way-merge")]
+        strategy: String,
     },
 
     /// Manage specs (requirements).
@@ -433,6 +454,12 @@ fn main() {
             format,
             apply,
         } => cmd_converge(&cwd, &left_spec, &right_spec, &format, apply),
+        Commands::ConvergeAll {
+            format,
+            apply,
+            dry_run,
+            strategy,
+        } => cmd_converge_all(&cwd, &format, apply, dry_run, &strategy),
         Commands::Spec { action } => match action {
             SpecCommands::Add {
                 id,
@@ -757,13 +784,19 @@ fn cmd_seal(
         println!("    {marker} {}", c.path);
     }
 
+    if seal.changes.is_empty() && !seal.summary.is_empty() && !allow_empty {
+        println!("  HINT: 0 file changes but summary is non-empty.");
+        println!("        Another agent may have sealed overlapping files first.");
+        println!("        Check `writ context` for file ownership.");
+    }
+
     if let Some(ref sid) = seal.spec_id {
         let changed: Vec<String> = seal.changes.iter().map(|c| c.path.clone()).collect();
         if let Some(w) = repo.check_file_scope(sid, &changed) {
-            eprintln!("  WARNING: {} file(s) outside spec '{}' file_scope {:?}:",
-                w.out_of_scope_files.len(), w.spec_id, w.declared_scope);
+            println!("  SCOPE: {} file(s) outside spec '{}' scope:",
+                w.out_of_scope_files.len(), w.spec_id);
             for f in &w.out_of_scope_files {
-                eprintln!("    ! {f}");
+                println!("    ! {f}");
             }
         }
 
@@ -1107,6 +1140,14 @@ fn cmd_context(
                 }
             }
 
+            if let Some(ref risk) = ctx.integration_risk {
+                println!();
+                println!("  INTEGRATION RISK: {} (score: {})", risk.level.to_uppercase(), risk.score);
+                for f in &risk.factors {
+                    println!("    - {f}");
+                }
+            }
+
             if ctx.convergence_recommended {
                 println!();
                 println!("  *** CONVERGENCE RECOMMENDED ***");
@@ -1135,6 +1176,14 @@ fn cmd_summary(
             println!("{}", serde_json::to_string_pretty(&summary)?);
         }
         "commit" => {
+            let files = summary.files_changed.len();
+            if summary.convergence_recommended {
+                println!("{} ({} files, {} diverged)", summary.headline, files, summary.diverged_branch_count);
+            } else {
+                println!("{} ({} files)", summary.headline, files);
+            }
+        }
+        "pr" => {
             println!("{}", summary.commit_message);
         }
         _ => {
@@ -1198,10 +1247,18 @@ fn cmd_summary(
 
             println!();
             println!("──────────────────────────────────────────────────────────────");
-            println!("  Suggested commit message:");
+            println!("  Commit message (use `writ summary --format commit`):");
             println!("──────────────────────────────────────────────────────────────");
             println!();
-            println!("{}", summary.commit_message);
+            let files = summary.files_changed.len();
+            if summary.convergence_recommended {
+                println!("  {}", summary.headline);
+                println!("  ({} files, {} diverged branch(es))", files, summary.diverged_branch_count);
+            } else {
+                println!("  {} ({} files)", summary.headline, files);
+            }
+            println!();
+            println!("  For full PR description: writ summary --format pr");
             println!();
             println!("══════════════════════════════════════════════════════════════");
         }
@@ -1604,6 +1661,115 @@ fn cmd_converge(
         if format != "json" {
             println!("\n  applied — merged files written to working directory");
             println!("  seal with `writ seal` to capture the converged state");
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_converge_all(
+    cwd: &PathBuf,
+    format: &str,
+    apply: bool,
+    dry_run: bool,
+    strategy_str: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let strategy = match strategy_str {
+        "most-recent" => writ_core::convergence::ConvergeStrategy::MostRecent,
+        "three-way-merge" | _ => writ_core::convergence::ConvergeStrategy::ThreeWayMerge,
+    };
+
+    let repo = Repository::open(cwd)?;
+
+    // Dry run: run without apply, then show the report.
+    let effective_apply = apply && !dry_run;
+    let report = repo.converge_all(strategy, effective_apply)?;
+
+    if report.merges.is_empty() {
+        match format {
+            "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+            _ => println!("No diverged branches — nothing to converge."),
+        }
+        return Ok(());
+    }
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        _ => {
+            println!(
+                "converge-all: {} branch(es), strategy: {}",
+                report.merge_order.len(),
+                report.strategy,
+            );
+            println!("  base: spec '{}'", report.base_spec);
+            println!("  merging: {}", report.merge_order.join(", "));
+            println!();
+
+            if dry_run {
+                println!("  DRY RUN — showing merge plan without applying:");
+                println!();
+            }
+
+            for step in &report.merges {
+                println!("  --- {} <- {} ---", step.left_spec, step.right_spec);
+                if let Some(ref err) = step.error {
+                    println!("    ERROR: {err}");
+                } else {
+                    println!("    clean: {}", step.clean);
+                    println!(
+                        "    auto-merged: {}, left-only: {}, right-only: {}, conflicts: {}",
+                        step.auto_merged, step.left_only, step.right_only, step.conflicts,
+                    );
+                    if !step.conflict_files.is_empty() {
+                        for path in &step.conflict_files {
+                            println!("      CONFLICT: {path}");
+                        }
+                    }
+                    for res in &step.resolutions {
+                        println!(
+                            "      resolved: {} (strategy: {}, chose: {})",
+                            res.path,
+                            res.strategy,
+                            res.chosen_spec.as_deref().unwrap_or("n/a"),
+                        );
+                    }
+                    if effective_apply && step.clean {
+                        println!("    applied");
+                    }
+                }
+                println!();
+            }
+
+            if !report.warnings.is_empty() {
+                println!("  WARNINGS:");
+                for w in &report.warnings {
+                    println!("    - {w}");
+                }
+                println!();
+            }
+
+            println!(
+                "  SUMMARY: {} branch(es) processed, {} auto-merged file(s), {} conflict(s), {} resolved",
+                report.merge_order.len(),
+                report.total_auto_merged,
+                report.total_conflicts,
+                report.total_resolutions,
+            );
+
+            if dry_run {
+                println!("  (dry run — no changes applied)");
+                println!("  Run with --apply to merge: writ converge-all --apply --strategy {strategy_str}");
+            } else if effective_apply {
+                println!("  All merges applied. Seal the converged state:");
+                println!(
+                    "    writ seal -s \"converge-all: merged {} branch(es)\" --agent convergence-bot --status complete",
+                    report.merge_order.len(),
+                );
+            } else {
+                println!("  Run with --apply to merge: writ converge-all --apply --strategy {strategy_str}");
+            }
         }
     }
 

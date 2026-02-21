@@ -175,6 +175,18 @@ enum Commands {
         format: String,
     },
 
+    /// One-command round-trip: generate summary, git add, git commit.
+    /// Equivalent to: git add . && git commit -m "$(writ summary --format commit)"
+    Finish {
+        /// Use the full PR-style description as the commit body instead of a one-liner.
+        #[arg(long)]
+        full: bool,
+
+        /// Dry run: show what would be committed without actually committing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Restore working directory to a specific seal's state.
     Restore {
         /// Seal ID to restore to (supports short prefix).
@@ -456,6 +468,7 @@ fn main() {
             format,
         } => cmd_context(&cwd, spec, seal_limit, status, agent, &format),
         Commands::Summary { format } => cmd_summary(&cwd, &format),
+        Commands::Finish { full, dry_run } => cmd_finish(&cwd, full, dry_run),
         Commands::Restore {
             seal_id,
             force,
@@ -1297,6 +1310,101 @@ fn cmd_summary(
             println!("══════════════════════════════════════════════════════════════");
         }
     }
+
+    Ok(())
+}
+
+fn cmd_finish(
+    cwd: &PathBuf,
+    full: bool,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    let summary = repo.summary()?;
+
+    let commit_message = if full {
+        summary.commit_message.clone()
+    } else {
+        let files = summary.files_changed.len();
+        if summary.convergence_recommended {
+            format!(
+                "{} ({} files, {} diverged)",
+                summary.headline, files, summary.diverged_branch_count
+            )
+        } else {
+            format!("{} ({} files)", summary.headline, files)
+        }
+    };
+
+    if dry_run {
+        println!("DRY RUN — would execute:");
+        println!();
+        println!("  git add .");
+        println!("  git commit -m \"{}\"", commit_message.lines().next().unwrap_or(""));
+        if full {
+            println!();
+            println!("Full commit message:");
+            println!("──────────────────────────────────────────────────────────────");
+            println!("{commit_message}");
+            println!("──────────────────────────────────────────────────────────────");
+        }
+        println!();
+        println!("Files that would be staged ({}):", summary.files_to_stage.len());
+        for f in &summary.files_to_stage {
+            println!("  {f}");
+        }
+        return Ok(());
+    }
+
+    // Verify git is available.
+    let git_check = std::process::Command::new("git")
+        .arg("rev-parse")
+        .arg("--is-inside-work-tree")
+        .current_dir(cwd)
+        .output();
+
+    match git_check {
+        Ok(output) if output.status.success() => {}
+        _ => {
+            eprintln!("error: not inside a git repository. `writ finish` requires git.");
+            eprintln!("hint: use `writ summary --format commit` to get the message manually.");
+            std::process::exit(1);
+        }
+    }
+
+    // git add .
+    let add = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(cwd)
+        .output()?;
+
+    if !add.status.success() {
+        let stderr = String::from_utf8_lossy(&add.stderr);
+        eprintln!("error: git add failed: {stderr}");
+        std::process::exit(1);
+    }
+
+    // git commit -m "<message>"
+    let commit = std::process::Command::new("git")
+        .args(["commit", "-m", &commit_message])
+        .current_dir(cwd)
+        .output()?;
+
+    if !commit.status.success() {
+        let stderr = String::from_utf8_lossy(&commit.stderr);
+        if stderr.contains("nothing to commit") {
+            println!("nothing to commit — working tree clean");
+            return Ok(());
+        }
+        eprintln!("error: git commit failed: {stderr}");
+        std::process::exit(1);
+    }
+
+    let stdout = String::from_utf8_lossy(&commit.stdout);
+    println!("{}", stdout.trim());
+    println!();
+    println!("committed with message:");
+    println!("  {}", commit_message.lines().next().unwrap_or(""));
 
     Ok(())
 }

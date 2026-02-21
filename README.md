@@ -35,7 +35,10 @@ writ seal -s "tests passing" --agent tester --spec auth --tests-passed 42 --stat
 # One call gives agents everything they need: specs, seals, state, risk
 writ context --format json
 
-# When done, generate the commit message from the full session history
+# When done, commit everything in one shot
+writ finish
+
+# Or manually: generate the commit message from the full session history
 git commit -m "$(writ summary --format commit)"
 
 # Or a detailed PR description
@@ -282,6 +285,9 @@ writ context [--spec ID] [--format]   # structured context dump (json, human, br
 writ log [--all] [--spec ID]          # seal history (--all includes diverged branches)
 writ summary --format commit          # one-line commit message with full provenance
 writ summary --format pr              # full PR description with spec/agent breakdown
+writ finish                           # one-command: summary → git add → git commit
+writ finish --full                    # same, but with PR-style commit body
+writ finish --dry-run                 # preview without committing
 writ converge LEFT RIGHT [--apply]    # two-spec convergence
 writ converge-all --apply --strategy  # merge all diverged branches (most-recent, most-complete)
 writ spec add --id ID --title "..."   # register a spec
@@ -334,12 +340,12 @@ pytest tests/
 - **Security hardening.** Path traversal protection, hash validation, input sanitization.
 - **Remote sync.** `writ push` / `writ pull` for distributed workflows.
 - **CI/CD.** GitHub Actions for automated testing and PyPI publishing on release.
+- **`writ finish`.** One-command round-trip: `writ finish` runs summary + git add + git commit. Supports `--full` for PR-style body and `--dry-run` for preview.
+- **`writ install --spec`.** Create a spec during install for zero-friction setup: `writ install --spec auth --title "Authentication" --description "JWT auth"`.
 
 ### Ahead
 
 - **Homebrew distribution.** `brew install writ` via tap.
-- **`writ finish`.** One-command round-trip: summary + git add + git commit.
-- **Auto-spec on install.** `writ install --spec ID --description "..."` for zero-friction setup.
 - **Agent-scoped context.** `writ context --for-agent=X` filters to only relevant specs/seals.
 - **Shared file annotations.** Cross-cutting concern declarations for files every agent touches.
 - **MCP server.** Model Context Protocol integration for IDE-native writ access.

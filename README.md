@@ -1,8 +1,14 @@
 # writ
 
-**AI-native version control for agentic systems.**
+**writ-vcs™ — AI-native version control for agentic systems.**
 
-Structured checkpoints, spec-driven development, and multi-agent coordination — designed for LLMs, not humans.
+> *"Every minute an agent spends figuring out 'what happened before me' is wasted compute. Writ minimizes that."*
+>
+> *"One `writ context` call and I know who did what, which specs are complete, where branches diverged, and what files are contested. That is genuinely valuable and unlike anything available in git alone."*
+>
+> — AAIS_8, orchestrator agent reviewing a 14-agent, 40-seal project
+
+Structured checkpoints, spec-driven development, and multi-agent coordination — designed for LLMs, not humans. Writ works alongside git, not instead of it.
 
 ## Install
 
@@ -90,7 +96,7 @@ Writ puts agent-native metadata inside the VCS:
 | (nothing) | **File contention** | Which files are touched by which agents, sorted by risk |
 | (nothing) | **Session summary** | Auto-generated commit messages and PR descriptions from seal history |
 
-## `writ context` — the killer feature
+## `writ context`
 
 The most expensive thing in an agent's workflow is building situational awareness. With git, that means multiple tool calls — `git log`, `git diff`, reading files — each returning text that needs parsing. With writ:
 
@@ -110,13 +116,24 @@ One call. One structured dict. Everything an agent needs:
 - **Scope violations** — seals that touched files outside their spec's declared scope
 - **Session status** — whether all specs are complete, with inline summary
 
-> *"One `writ context` call and I know who did what, which specs are complete, where branches diverged, and what files are contested. That is genuinely valuable and unlike anything available in git alone."*
->
-> — AAIS_8, orchestrator agent reviewing a 14-agent, 40-seal project
+## Multi-agent workflow
 
-## Multi-agent convergence
+Three agents, different specs, working concurrently. Sealing is serialized via advisory file locks, so agents queue safely.
 
-When multiple agents work concurrently on overlapping files, convergence handles the merge:
+```python
+# Agent A: auth migration
+repo.seal(summary="token refresh", agent_id="auth-dev", spec_id="auth-migration")
+
+# Agent B: payments (concurrent, different spec)
+repo.seal(summary="stripe integration", agent_id="pay-dev", spec_id="payments", status="complete")
+
+# Agent C: testing (concurrent, cross-cutting)
+repo.seal(summary="42 tests passing", agent_id="test-bot", spec_id="test-suite", tests_passed=42)
+```
+
+### Convergence
+
+When specs overlap, convergence handles the merge:
 
 ```bash
 # Merge ALL diverged branches at once
@@ -150,19 +167,32 @@ writ context --format human
 #   - 6 scope violations (>5)
 ```
 
-## Restore and rollback
+## Going back
 
-Every seal is an immutable snapshot. If an agent goes off the rails:
+Something broke. An agent went off the rails. A convergence produced garbage. You need to undo. Writ handles this the same way a VCS should — every seal is an immutable snapshot of the entire working directory, and you can restore to any of them.
+
+### Human in the loop
 
 ```bash
-# See the full history
+# See the full history — find the seal before things went wrong
 writ log --all
 
-# Restore to a known-good seal
+# Inspect a specific seal to confirm it's the right one
+writ show a3f8b2 --diff
+
+# Restore the working directory to that seal's state
 writ restore a3f8b2
 ```
 
-Agents can self-correct programmatically:
+After restoring, seal the restored state to record why you went back:
+
+```bash
+writ seal -s "reverted to pre-convergence state — nav was broken" --agent human --status in-progress
+```
+
+### Agent self-correction
+
+Agents can do the same thing programmatically. If an agent detects that something went wrong (tests failing, scope violations piling up), it can walk the seal history and restore:
 
 ```python
 seals = repo.log(limit=10)
@@ -173,11 +203,28 @@ for s in seals:
         break
 ```
 
-Restoring doesn't delete history. Every seal still exists in the log. The object store is content-addressable — files from any seal can always be retrieved.
+### What's preserved
+
+- Every seal is **immutable** — restoring doesn't delete history. The old seals still exist in the log.
+- The restore itself doesn't create a seal. You decide whether to seal the restored state (recommended).
+- Object store is content-addressable — files from any seal can always be retrieved, even after restore.
+- `writ log --all` always shows the complete history including the seals you restored past.
+
+### Safety net with git
+
+Since writ works alongside git, you always have the git safety net:
+
+```bash
+# Before a risky agent run, commit what you have
+git add . && git commit -m "checkpoint before agent work"
+
+# If writ restore isn't enough, git is still there
+git checkout -- .
+```
 
 ## `writ install`
 
-One command. No config files, no setup wizards.
+One command. That's it. No config files, no setup wizards, no 12-step onboarding.
 
 ```bash
 writ install

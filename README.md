@@ -195,6 +195,123 @@ $ writ summary --format human
   For full PR description: writ summary --format pr
 ```
 
+## Going back
+
+Something broke. An agent went off the rails. A convergence produced garbage. You need to undo. Writ handles this the same way a VCS should — every seal is an immutable snapshot of the entire working directory, and you can restore to any of them.
+
+### Human in the loop
+
+```bash
+# See the full history — find the seal before things went wrong
+writ log --all
+
+# Inspect a specific seal to confirm it's the right one
+writ show a3f8b2 --diff
+
+# Restore the working directory to that seal's state
+writ restore a3f8b2
+```
+
+`writ restore` rewrites the working directory, index, and HEAD to match the target seal exactly. Files that shouldn't exist get deleted, files that should exist get created or reverted. It's the equivalent of `git checkout <commit> -- .` but for the writ world.
+
+After restoring, you can seal the restored state to record why you went back:
+
+```bash
+writ seal -s "reverted to pre-convergence state — nav was broken" --agent human --status in-progress
+```
+
+### Agent self-correction
+
+An agent can do the same thing programmatically. If an agent detects that something went wrong (tests failing, scope violations piling up), it can walk the seal history and restore:
+
+```python
+repo = writ.Repository.open(".")
+
+# Find the last known-good seal
+seals = repo.log(limit=10)
+for s in seals:
+    if s["verification"].get("tests_passed", 0) > 0:
+        good_seal = s["id"]
+        break
+
+# Restore to it
+result = repo.restore(good_seal)
+print(f"Restored to {good_seal[:12]}: {result['total_files']} files")
+
+# Seal the rollback
+repo.seal(summary=f"Rolled back to {good_seal[:12]} — tests were failing", agent_id="fixer-bot")
+```
+
+### What's preserved
+
+- Every seal is **immutable** — restoring doesn't delete history. The old seals still exist in the log.
+- The restore itself doesn't create a seal. You decide whether to seal the restored state (recommended).
+- Object store is content-addressable — files from any seal can always be retrieved, even after restore.
+- `writ log --all` always shows the complete history including the seals you restored past.
+
+### Safety net with git
+
+Since writ works alongside git, you always have the git safety net:
+
+```bash
+# Before a risky agent run, commit what you have
+git add . && git commit -m "checkpoint before agent work"
+
+# If writ restore isn't enough, git is still there
+git checkout -- .
+```
+
+## `writ install`
+
+One command. That's it. No config files, no setup wizards, no 12-step onboarding.
+
+```bash
+writ install
+```
+
+What it does (all idempotent — safe to run multiple times):
+
+1. **Init** — creates `.writ/` directory if it doesn't exist
+2. **`.writignore`** — creates a sensible default (`.git/`, `node_modules/`, etc.) if missing
+3. **Git detection** — finds git repo, reads branch name and HEAD commit
+4. **Bridge import** — imports the git working tree as a baseline seal (skips if already synced, re-imports if HEAD moved)
+5. **Framework hooks** — detects Claude Code (`CLAUDE.md`), Codex (`AGENTS.md`), and installs writ workflow instructions
+6. **File tracking** — reports how many files are now tracked
+7. **Next steps** — prints available commands
+
+Works in any directory. With git or without. Fresh repo or existing project. First run or tenth run. The output tells you exactly what happened:
+
+```
+initialized writ repository in .writ/
+created .writignore
+git: main @ a3f8b2c1
+imported git baseline: 47 file(s), seal d81a5736e16d
+detected ClaudeCode (CLAUDE.md)
+  + .claude/commands/writ-seal.md
+  + .claude/commands/writ-context.md
+  ~ CLAUDE.md
+tracked: 47 file(s)
+
+ready. next steps:
+  writ context
+  writ state
+  writ seal --summary '...'
+  writ log
+  writ diff
+```
+
+### Framework support
+
+`writ install` auto-detects and configures these agent frameworks:
+
+| Framework | Detection | What gets installed |
+|-----------|-----------|-------------------|
+| **Claude Code** | `CLAUDE.md` or `.claude/` exists | Appends writ workflow section to `CLAUDE.md`, creates `/writ-seal` and `/writ-context` slash commands |
+| **Codex** | `AGENTS.md` or `.codex/` exists | Appends writ workflow section to `AGENTS.md` |
+| **Any agent** | Always | `.writignore`, baseline seal, writ CLI available in PATH |
+
+The hooks tell agents how to use writ: run `context` first, seal after each chunk, use `--status in-progress` for intermediate work, check for convergence recommendations, and generate summaries when done. Agents that read their framework config file will follow the writ workflow without any human prompting.
+
 ## Why not just git?
 
 Git's data model is built around **branches** (a pointer to a commit). Commits carry no structured metadata about which task they serve, which agent made them, or whether tests passed. You can bolt conventions on top, but conventions are things some agents follow and others don't.
@@ -207,6 +324,7 @@ Writ puts agent-native metadata inside the VCS, not layered on top:
 | Commit | **Seal** | Checkpoint with agent identity, spec linkage, verification, status lifecycle |
 | `git status` | `writ context` | One call returns everything an agent needs — not text to parse |
 | `git merge` | `writ converge-all` | Multi-branch convergence with strategy selection and structured conflict reports |
+| `git checkout <ref>` | `writ restore` | Restore working directory to any seal — every seal is an immutable snapshot |
 | (nothing) | **Integration risk** | Automatic risk scoring from divergence, contention, and scope violations |
 | (nothing) | **File contention** | Which files are touched by which agents, sorted by risk |
 | (nothing) | **Session summary** | Auto-generated commit messages and PR descriptions from seal history |
@@ -280,6 +398,7 @@ pytest tests/
 - **Git bridge.** Import/export with metadata trailers preserving full provenance.
 - **Agent framework hooks.** Auto-detection and configuration for Claude Code (CLAUDE.md) and Codex (AGENTS.md).
 - **Agent SDK.** `Agent`, `Phase`, `Pipeline` abstractions with auto-summary on completion.
+- **Restore / rollback.** `writ restore SEAL_ID` restores working directory to any seal's state. Immutable history preserved.
 - **Security hardening.** Path traversal protection, hash validation, input sanitization.
 - **Remote sync.** `writ push` / `writ pull` for distributed workflows.
 

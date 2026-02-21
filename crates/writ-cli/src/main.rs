@@ -1676,7 +1676,12 @@ fn cmd_converge_all(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = match strategy_str {
         "most-recent" => writ_core::convergence::ConvergeStrategy::MostRecent,
-        "three-way-merge" | _ => writ_core::convergence::ConvergeStrategy::ThreeWayMerge,
+        "three-way-merge" => writ_core::convergence::ConvergeStrategy::ThreeWayMerge,
+        other => {
+            return Err(format!(
+                "unknown strategy '{}' (use 'three-way-merge' or 'most-recent')", other
+            ).into());
+        }
     };
 
     let repo = Repository::open(cwd)?;

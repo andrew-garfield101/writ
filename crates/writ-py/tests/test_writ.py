@@ -332,7 +332,9 @@ class TestVerification:
         assert seal["verification"]["linted"] is False
 
 
-class TestConvergence:
+class TestConvergenceBasic:
+    """Basic convergence tests — clean merges, conflicts, apply, error handling."""
+
     def _setup_base_and_specs(self, repo, path):
         """Helper: create a base file and two specs."""
         (path / "shared.py").write_text("line1\nline2\nline3\nline4\nline5\n")
@@ -2132,6 +2134,79 @@ class TestFileContention:
 
         ctx = repo.context(spec="feat")
         assert ctx.get("file_contention", []) == []
+
+
+class TestIntegrationRisk:
+    """Tests for the integration_risk field in context output."""
+
+    def test_no_risk_clean_repo(self, tmp_path):
+        """A clean repo with no divergence has no integration_risk."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("hello")
+        repo.seal(summary="init", agent_id="dev", agent_type="agent")
+        ctx = repo.context()
+        assert ctx.get("integration_risk") is None
+
+    def test_risk_present_when_diverged(self, tmp_path):
+        """Diverged branches trigger integration_risk in context."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("base")
+        repo.seal(summary="base", agent_id="setup", agent_type="agent")
+
+        repo.add_spec(id="spec-a", title="A")
+        repo.add_spec(id="spec-b", title="B")
+
+        (tmp_path / "a.txt").write_text("left")
+        repo.seal(summary="left", agent_id="dev-a", agent_type="agent", spec_id="spec-a")
+
+        (tmp_path / "a.txt").write_text("right")
+        repo.seal(summary="right", agent_id="dev-b", agent_type="agent", spec_id="spec-b")
+
+        # Seal again on spec-a to create divergence
+        (tmp_path / "a.txt").write_text("left2")
+        repo.seal(summary="left2", agent_id="dev-a", agent_type="agent", spec_id="spec-a")
+
+        ctx = repo.context()
+        risk = ctx.get("integration_risk")
+        assert risk is not None
+        assert risk["level"] in ("low", "medium", "high")
+        assert isinstance(risk["score"], int)
+        assert isinstance(risk["factors"], list)
+        assert len(risk["factors"]) > 0
+
+    def test_risk_has_correct_structure(self, tmp_path):
+        """integration_risk has level, score, and factors fields."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("base")
+        repo.seal(summary="base", agent_id="setup", agent_type="agent")
+
+        repo.add_spec(id="s1", title="S1")
+        repo.add_spec(id="s2", title="S2")
+
+        (tmp_path / "a.txt").write_text("v1")
+        repo.seal(summary="v1", agent_id="a1", agent_type="agent", spec_id="s1")
+        (tmp_path / "a.txt").write_text("v2")
+        repo.seal(summary="v2", agent_id="a2", agent_type="agent", spec_id="s2")
+        (tmp_path / "a.txt").write_text("v3")
+        repo.seal(summary="v3", agent_id="a1", agent_type="agent", spec_id="s1")
+
+        ctx = repo.context()
+        risk = ctx.get("integration_risk")
+        assert risk is not None
+        serialized = json.dumps(risk)
+        parsed = json.loads(serialized)
+        assert "level" in parsed
+        assert "score" in parsed
+        assert "factors" in parsed
+
+    def test_risk_not_in_spec_scoped_context(self, tmp_path):
+        """Spec-scoped context does not include integration_risk."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+        (tmp_path / "a.txt").write_text("hello")
+        repo.seal(summary="init", agent_id="dev", agent_type="agent", spec_id="feat")
+        ctx = repo.context(spec="feat")
+        assert ctx.get("integration_risk") is None
 
 
 class TestConvergence:

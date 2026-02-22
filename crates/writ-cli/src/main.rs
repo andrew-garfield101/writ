@@ -148,6 +148,11 @@ enum Commands {
         #[arg(long)]
         spec: Option<String>,
 
+        /// Scope entire context to an agent's world (their specs, files, risks).
+        /// Unlike --agent which filters seal history, --for-agent scopes everything.
+        #[arg(long)]
+        for_agent: Option<String>,
+
         /// Maximum number of recent seals to include.
         #[arg(long, default_value = "10")]
         seal_limit: usize,
@@ -485,11 +490,12 @@ fn main() {
         Commands::Diff { from, to, format } => cmd_diff(&cwd, from, to, &format),
         Commands::Context {
             spec,
+            for_agent,
             seal_limit,
             status,
             agent,
             format,
-        } => cmd_context(&cwd, spec, seal_limit, status, agent, &format),
+        } => cmd_context(&cwd, spec, for_agent, seal_limit, status, agent, &format),
         Commands::Summary { format } => cmd_summary(&cwd, &format),
         Commands::Finish { full, dry_run } => cmd_finish(&cwd, full, dry_run),
         Commands::Restore {
@@ -1068,6 +1074,7 @@ fn cmd_diff(
 fn cmd_context(
     cwd: &PathBuf,
     spec: Option<String>,
+    for_agent: Option<String>,
     seal_limit: usize,
     status: Option<String>,
     agent: Option<String>,
@@ -1075,9 +1082,12 @@ fn cmd_context(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
 
-    let scope = match spec {
-        Some(id) => ContextScope::Spec(id),
-        None => ContextScope::Full,
+    let scope = if let Some(id) = spec {
+        ContextScope::Spec(id)
+    } else if let Some(id) = for_agent {
+        ContextScope::Agent(id)
+    } else {
+        ContextScope::Full
     };
 
     let filter_status = match status.as_deref() {

@@ -803,8 +803,12 @@ impl Repository {
 
         // File provenance: walk newest-first, first agent seen per file wins.
         // Deletes are excluded — removing a file shouldn't make you its "owner".
+        // Bridge seals are excluded — import baselines shouldn't claim ownership.
         let mut file_owner: HashMap<String, String> = HashMap::new();
         for seal in seals {
+            if seal.agent.id == "writ-bridge" {
+                continue;
+            }
             for change in &seal.changes {
                 if change.change_type != ChangeType::Deleted {
                     file_owner
@@ -814,7 +818,7 @@ impl Repository {
             }
         }
 
-        // Per-agent aggregation.
+        // Per-agent aggregation (excludes bridge seals).
         struct Stats {
             seal_count: usize,
             latest_summary: Option<String>,
@@ -824,6 +828,9 @@ impl Repository {
 
         let mut agent_stats: HashMap<String, Stats> = HashMap::new();
         for seal in seals {
+            if seal.agent.id == "writ-bridge" {
+                continue;
+            }
             let entry = agent_stats
                 .entry(seal.agent.id.clone())
                 .or_insert_with(|| Stats {
@@ -1098,7 +1105,7 @@ impl Repository {
 
         // Track HEAD for automatic conflict detection in seal().
         let tracked_head = match &scope {
-            ContextScope::Full => self.read_head()?,
+            ContextScope::Full | ContextScope::Agent(_) => self.read_head()?,
             ContextScope::Spec(spec_id) => self.resolve_parent(Some(spec_id))?,
         };
         if let Ok(mut guard) = self.last_context_head.lock() {
@@ -1549,6 +1556,282 @@ impl Repository {
                     available_operations,
                 })
             }
+            ContextScope::Agent(agent_id) => {
+                // Agent-scoped context: derive the agent's world from their seals.
+                let all_seals = self.log_all()?;
+
+                // 1. Find all specs this agent has worked on.
+                let agent_spec_ids: Vec<String> = {
+                    let mut spec_set: HashSet<String> = HashSet::new();
+                    for seal in &all_seals {
+                        if seal.agent.id == agent_id {
+                            if let Some(ref sid) = seal.spec_id {
+                                spec_set.insert(sid.clone());
+                            }
+                        }
+                    }
+                    spec_set.into_iter().collect()
+                };
+
+                // 2. Load specs and build file scope.
+                let agent_specs: Vec<Spec> = agent_spec_ids
+                    .iter()
+                    .filter_map(|sid| self.load_spec(sid).ok())
+                    .collect();
+
+                // File scope = union of specs' declared file_scope + files agent actually sealed.
+                let mut file_scope_set: HashSet<String> = HashSet::new();
+                for spec in &agent_specs {
+                    for f in &spec.file_scope {
+                        file_scope_set.insert(f.clone());
+                    }
+                }
+                for seal in &all_seals {
+                    if seal.agent.id == agent_id {
+                        for c in &seal.changes {
+                            file_scope_set.insert(c.path.clone());
+                        }
+                    }
+                }
+                let file_scope: Vec<String> = file_scope_set.into_iter().collect();
+                let has_scope_filter = !file_scope.is_empty();
+
+                // 3. Filter seal history (respects ContextFilter for status/agent filtering).
+                let recent_seals: Vec<SealSummary> = all_seals
+                    .iter()
+                    .filter(|s| {
+                        // Include seals on agent's specs (by any agent — cross-agent awareness).
+                        s.spec_id
+                            .as_ref()
+                            .map_or(false, |sid| agent_spec_ids.contains(sid))
+                    })
+                    .filter(apply_filter)
+                    .take(seal_limit)
+                    .map(SealSummary::from_seal)
+                    .collect();
+
+                // 4. Filter working state to agent's file scope.
+                let (filtered_ws, filtered_pending, filtered_nudge) = if has_scope_filter {
+                    let scope_ref = &file_scope;
+                    let matches_scope = |path: &str| -> bool {
+                        scope_ref.iter().any(|scope_entry| {
+                            path == scope_entry
+                                || (scope_entry.ends_with('/')
+                                    && path.starts_with(scope_entry.as_str()))
+                        })
+                    };
+
+                    let filtered_state = WorkingStateSummary {
+                        clean: ws_summary
+                            .new_files
+                            .iter()
+                            .chain(ws_summary.modified_files.iter())
+                            .chain(ws_summary.deleted_files.iter())
+                            .all(|p| !matches_scope(p)),
+                        new_files: ws_summary
+                            .new_files
+                            .iter()
+                            .filter(|p| matches_scope(p))
+                            .cloned()
+                            .collect(),
+                        modified_files: ws_summary
+                            .modified_files
+                            .iter()
+                            .filter(|p| matches_scope(p))
+                            .cloned()
+                            .collect(),
+                        deleted_files: ws_summary
+                            .deleted_files
+                            .iter()
+                            .filter(|p| matches_scope(p))
+                            .cloned()
+                            .collect(),
+                        tracked_count: ws_summary.tracked_count,
+                    };
+
+                    let filtered_pending = pending_changes.map(|pc| {
+                        let filtered_files: Vec<_> = pc
+                            .files
+                            .into_iter()
+                            .filter(|f| matches_scope(&f.path))
+                            .collect();
+                        let total_add: usize = filtered_files.iter().map(|f| f.additions).sum();
+                        let total_del: usize = filtered_files.iter().map(|f| f.deletions).sum();
+                        DiffSummary {
+                            files_changed: filtered_files.len(),
+                            total_additions: total_add,
+                            total_deletions: total_del,
+                            files: filtered_files,
+                        }
+                    });
+
+                    let agent_change_count = filtered_state.new_files.len()
+                        + filtered_state.modified_files.len()
+                        + filtered_state.deleted_files.len();
+                    let filtered_nudge = if agent_change_count > 0 {
+                        Some(SealNudge {
+                            unsealed_file_count: agent_change_count,
+                            message: format!(
+                                "{agent_change_count} file(s) in your scope changed since last seal — consider checkpointing"
+                            ),
+                        })
+                    } else {
+                        None
+                    };
+
+                    (filtered_state, filtered_pending, filtered_nudge)
+                } else {
+                    (ws_summary, pending_changes, seal_nudge)
+                };
+
+                let tracked_files = file_scope.len();
+
+                // 5. Agent activity: ALL agents shown for cross-agent coordination,
+                //    but file ownership filtered to agent's scope.
+                let agent_activity = if has_scope_filter {
+                    let scope_ref = &file_scope;
+                    let scope_fn = |path: &str| -> bool {
+                        scope_ref.iter().any(|scope_entry| {
+                            path == scope_entry
+                                || (scope_entry.ends_with('/')
+                                    && path.starts_with(scope_entry.as_str()))
+                        })
+                    };
+                    Self::build_agent_activity(&all_seals, Some(&scope_fn))
+                } else {
+                    Self::build_agent_activity(&all_seals, None)
+                };
+
+                // 6. Diverged branches: only for agent's specs.
+                let all_diverged = self.diverged_branches()?;
+                let diverged_branches: Vec<DivergedBranchWarning> = all_diverged
+                    .into_iter()
+                    .filter(|db| agent_spec_ids.contains(&db.spec_id))
+                    .map(|db| {
+                        let recommendation = format!(
+                            "Run converge() to merge spec '{}' ({} seal(s) by {}) into the main branch",
+                            db.spec_id,
+                            db.seal_count,
+                            db.agents.join(", "),
+                        );
+                        DivergedBranchWarning {
+                            spec_id: db.spec_id,
+                            tip_seal: db.tip_seal,
+                            seal_count: db.seal_count,
+                            agents: db.agents,
+                            recommendation,
+                        }
+                    })
+                    .collect();
+                let convergence_recommended = !diverged_branches.is_empty();
+
+                // 7. File contention: filtered to agent's file scope.
+                let all_contention = Self::build_file_contention(&all_seals);
+                let file_contention: Vec<FileContention> = if has_scope_filter {
+                    let scope_ref = &file_scope;
+                    all_contention
+                        .into_iter()
+                        .filter(|fc| {
+                            scope_ref.iter().any(|scope_entry| {
+                                fc.path == *scope_entry
+                                    || (scope_entry.ends_with('/')
+                                        && fc.path.starts_with(scope_entry.as_str()))
+                            })
+                        })
+                        .collect()
+                } else {
+                    all_contention
+                };
+
+                // 8. Scope violations: only for agent's seals.
+                let file_scope_violations: Vec<FileScopeViolation> = all_seals
+                    .iter()
+                    .filter(|s| s.agent.id == agent_id)
+                    .take(seal_limit)
+                    .filter_map(|seal| {
+                        let spec_id = seal.spec_id.as_ref()?;
+                        let changed: Vec<String> =
+                            seal.changes.iter().map(|c| c.path.clone()).collect();
+                        let warning = self.check_file_scope(spec_id, &changed)?;
+                        Some(FileScopeViolation {
+                            seal_id: seal.id[..12].to_string(),
+                            agent_id: seal.agent.id.clone(),
+                            spec_id: spec_id.clone(),
+                            out_of_scope_files: warning.out_of_scope_files,
+                            declared_scope: warning.declared_scope,
+                        })
+                    })
+                    .collect();
+
+                // 9. Dependency status: union of all agent specs' dependencies.
+                let all_dep_ids: HashSet<String> = agent_specs
+                    .iter()
+                    .flat_map(|spec| spec.depends_on.iter().cloned())
+                    .collect();
+                let dependency_status = if !all_dep_ids.is_empty() {
+                    let deps: Vec<DepStatus> = all_dep_ids
+                        .iter()
+                        .map(|dep_id| match self.load_spec(dep_id) {
+                            Ok(dep_spec) => DepStatus::from_spec(dep_id, &dep_spec.status),
+                            Err(_) => DepStatus::not_found(dep_id),
+                        })
+                        .collect();
+                    Some(deps)
+                } else {
+                    None
+                };
+
+                // 10. Integration risk from agent-scoped signals.
+                let max_file_agents = file_contention
+                    .iter()
+                    .map(|fc| fc.agents.len())
+                    .max()
+                    .unwrap_or(0);
+                let integration_risk = IntegrationRisk::compute(
+                    diverged_branches.len(),
+                    max_file_agents,
+                    file_scope_violations.len(),
+                    file_contention.len(),
+                );
+
+                // 11. Recommended action.
+                let recommended_action = Self::compute_recommended_action(
+                    &dependency_status,
+                    convergence_recommended,
+                    diverged_branches.len(),
+                    &integration_risk,
+                    &filtered_nudge,
+                    false, // agent scope is partial view — never session_complete
+                );
+
+                Ok(ContextOutput {
+                    writ_version: "0.1.0".to_string(),
+                    active_spec: None, // agent may have multiple specs
+                    all_specs: if agent_specs.is_empty() {
+                        None
+                    } else {
+                        Some(agent_specs)
+                    },
+                    working_state: filtered_ws,
+                    recent_seals,
+                    pending_changes: filtered_pending,
+                    seal_nudge: filtered_nudge,
+                    file_scope,
+                    tracked_files,
+                    dependency_status,
+                    spec_progress: None, // no single spec to show progress for
+                    agent_activity,
+                    diverged_branches,
+                    convergence_recommended,
+                    file_scope_violations,
+                    file_contention,
+                    integration_risk,
+                    session_complete: false, // agent scope is partial view
+                    session_summary: None,
+                    recommended_action,
+                    available_operations,
+                })
+            }
         }
     }
 
@@ -1626,6 +1909,12 @@ impl Repository {
 
         target_index.save(&self.writ_dir.join("index.json"))?;
         atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
+
+        // Update the spec head if the restored seal is spec-scoped, so
+        // diverged_branches() reflects the restored state accurately.
+        if let Some(ref spec_id) = seal.spec_id {
+            self.write_spec_head(spec_id, &seal.id)?;
+        }
 
         let total_files = target_index.entries.len();
 
@@ -2016,6 +2305,23 @@ impl Repository {
             fs::write(&file_path, &resolution.content)?;
         }
 
+        // Update the index so state() reflects the converged working directory.
+        let mut written_paths: Vec<String> = Vec::new();
+        written_paths.extend(report.auto_merged.iter().map(|m| m.path.clone()));
+        written_paths.extend(report.left_only.iter().cloned());
+        written_paths.extend(report.right_only.iter().cloned());
+        written_paths.extend(resolutions.iter().map(|r| r.path.clone()));
+
+        let mut index = self.load_index()?;
+        for path in &written_paths {
+            let file_path = self.validate_path(path)?;
+            let content = fs::read(&file_path)?;
+            let hash = self.objects.store(&content)?;
+            let size = content.len() as u64;
+            index.upsert(path, hash, size);
+        }
+        index.save(&self.writ_dir.join("index.json"))?;
+
         // Archive the right spec's current head before advancing it.
         // This preserves the diverged seal chain so log_all() / summary()
         // can still enumerate seals from pre-convergence branches.
@@ -2027,6 +2333,9 @@ impl Repository {
         // spec's latest seal. This puts the right spec "on" the HEAD chain
         // so diverged_branches() no longer reports it as diverged.
         self.write_spec_head(&report.right_spec, &report.left_seal_id)?;
+
+        // Refresh summary.json so it reflects post-convergence state.
+        self.check_all_specs_complete();
 
         Ok(())
     }
@@ -2237,6 +2546,7 @@ impl Repository {
                             chosen_lines: right.lines().count(),
                             chosen_spec: Some(spec_id.clone()),
                             alternatives: vec![],
+                            confidence: Some(1.0),
                         });
                         continue;
                     }
@@ -2253,6 +2563,7 @@ impl Repository {
                                 chosen_lines: content.lines().count(),
                                 chosen_spec: None,
                                 alternatives: vec![],
+                                confidence: Some(1.0),
                             });
                             accumulated.insert(path.clone(), content);
                             accumulated_modified.insert(path.clone());
@@ -2318,6 +2629,7 @@ impl Repository {
                                             ),
                                         },
                                     ],
+                                    confidence: Some(avg_confidence),
                                 });
 
                                 total_resolutions += 1;
@@ -2393,6 +2705,7 @@ impl Repository {
                                                 lines: lost.lines().count(),
                                                 reason: "discarded: not most recent".to_string(),
                                             }],
+                                            confidence: Some(0.7),
                                         });
 
                                         total_resolutions += 1;
@@ -2415,6 +2728,7 @@ impl Repository {
                                                     reason: "right side (diverged)".to_string(),
                                                 },
                                             ],
+                                            confidence: Some(0.0),
                                         });
                                         step_clean = false;
                                         all_clean = false;
@@ -2438,6 +2752,7 @@ impl Repository {
                         chosen_lines: 0,
                         chosen_spec: Some(base_spec.clone()),
                         alternatives: vec![],
+                        confidence: None,
                     });
                 }
 
@@ -2453,6 +2768,7 @@ impl Repository {
                         chosen_lines: 0,
                         chosen_spec: Some(spec_id.clone()),
                         alternatives: vec![],
+                        confidence: None,
                     });
                 }
 
@@ -2497,7 +2813,8 @@ impl Repository {
         }
 
         // ── Apply accumulated result ──────────────────────────────────
-        if apply && all_clean {
+        let did_apply = apply && all_clean;
+        if did_apply {
             let _lock = self.lock()?;
 
             for (path, content) in &accumulated {
@@ -2508,6 +2825,17 @@ impl Repository {
                 fs::write(&file_path, content)?;
             }
 
+            // Update the index so state() reflects the converged working directory.
+            // Without this, context() would report false pending_changes for every
+            // converged file because the index still has pre-convergence hashes.
+            let mut index = self.load_index()?;
+            for (path, content) in &accumulated {
+                let hash = self.objects.store(content.as_bytes())?;
+                let size = content.len() as u64;
+                index.upsert(path, hash, size);
+            }
+            index.save(&self.writ_dir.join("index.json"))?;
+
             // Update diverged specs' heads so they're no longer diverged.
             for (spec_id, _right_seal_id) in &right_seal_ids {
                 if let Some(old_head) = self.read_spec_head(spec_id)? {
@@ -2515,6 +2843,25 @@ impl Repository {
                 }
                 self.write_spec_head(spec_id, &base_spec_seal_id)?;
             }
+
+            // When the base spec was itself diverged (pulled from ordered),
+            // its head also needs updating to the current HEAD so
+            // diverged_branches() no longer flags it.
+            if diverged_ids.contains(&base_spec) {
+                let current_head = self.read_head()?;
+                if let Some(ref head_id) = current_head {
+                    if self.read_spec_head(&base_spec)?.as_ref() != Some(head_id) {
+                        if let Some(old_head) = self.read_spec_head(&base_spec)? {
+                            self.archive_merged_head(&old_head)?;
+                        }
+                        self.write_spec_head(&base_spec, head_id)?;
+                    }
+                }
+            }
+
+            // Refresh summary.json so it reflects post-convergence state
+            // (diverged branches cleared, convergence_recommended: false).
+            self.check_all_specs_complete();
         }
 
         // Add high-contention file warnings.
@@ -2586,7 +2933,7 @@ impl Repository {
             total_conflicts,
             total_resolutions,
             is_clean: all_clean,
-            applied: apply,
+            applied: did_apply,
             warnings,
             quality_report: Some(quality_report),
         })
@@ -4540,15 +4887,14 @@ fn post_convergence_validation(
             }
         }
 
-        // Import consistency: check for orphaned imports (file defines
-        // exports but nothing references them, or imports reference
-        // modules that don't exist as files).
-        // Only check Python/JS files.
+        // Import consistency: check for orphaned imports (imports reference
+        // modules that don't exist as local files, aren't in stdlib, and
+        // aren't declared as installed dependencies).
         if path.ends_with(".py") || path.ends_with(".js") || path.ends_with(".ts") {
+            let installed = installed_packages(root);
             for line in merged.lines() {
                 let trimmed = line.trim();
                 if trimmed.starts_with("from ") && trimmed.contains(" import ") {
-                    // Extract the module path: "from auth import X" → "auth"
                     if let Some(module) = trimmed
                         .strip_prefix("from ")
                         .and_then(|s| s.split_whitespace().next())
@@ -4559,6 +4905,7 @@ fn post_convergence_validation(
                             if !module_file.exists()
                                 && !module_dir.exists()
                                 && !is_stdlib_module(module)
+                                && !installed.contains(module)
                             {
                                 warnings.push(format!(
                                     "IMPORT_ORPHAN: {}: imports '{}' but no matching file found — may be orphaned after merge",
@@ -4614,6 +4961,74 @@ fn is_stdlib_module(name: &str) -> bool {
             | "enum"
             | "textwrap"
     )
+}
+
+/// Collect package names declared in dependency files (requirements.txt,
+/// pyproject.toml, package.json) so we can suppress false-positive
+/// IMPORT_ORPHAN warnings for installed third-party packages.
+fn installed_packages(root: &Path) -> HashSet<String> {
+    let mut pkgs = HashSet::new();
+
+    // Python: requirements.txt — lines like "flask>=2.0", "requests", "PyJWT==2.8"
+    if let Ok(content) = fs::read_to_string(root.join("requirements.txt")) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
+                continue;
+            }
+            // Strip version specifiers and extras: "flask[async]>=2.0" → "flask"
+            let name: String = trimmed
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if !name.is_empty() {
+                // Python package names are case-insensitive; import names
+                // use lowercase with hyphens mapped to underscores.
+                pkgs.insert(name.to_lowercase().replace('-', "_"));
+            }
+        }
+    }
+
+    // Python: pyproject.toml — look for lines in [project.dependencies]
+    // Simple heuristic: grab quoted package names from dependency arrays.
+    if let Ok(content) = fs::read_to_string(root.join("pyproject.toml")) {
+        for line in content.lines() {
+            let trimmed = line.trim().trim_start_matches('-').trim();
+            // Match "flask>=2.0", 'requests', etc. inside dependency arrays.
+            let cleaned = trimmed.trim_matches(|c: char| c == '"' || c == '\'' || c == ',');
+            if cleaned.is_empty() {
+                continue;
+            }
+            let name: String = cleaned
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
+                .collect();
+            if name.len() >= 2 && name.chars().next().map_or(false, |c| c.is_alphabetic()) {
+                pkgs.insert(name.to_lowercase().replace('-', "_"));
+            }
+        }
+    }
+
+    // JS/TS: package.json — extract keys from "dependencies" and "devDependencies".
+    if let Ok(content) = fs::read_to_string(root.join("package.json")) {
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&content) {
+            for section in &["dependencies", "devDependencies"] {
+                if let Some(deps) = parsed.get(section).and_then(|v| v.as_object()) {
+                    for key in deps.keys() {
+                        // Strip npm scope: "@types/react" → "react" for import matching.
+                        let name = key
+                            .strip_prefix('@')
+                            .and_then(|s| s.split('/').nth(1))
+                            .unwrap_or(key);
+                        pkgs.insert(name.to_string());
+                        pkgs.insert(key.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    pkgs
 }
 
 /// Build a post-convergence quality report from collected file decisions.
@@ -4754,6 +5169,29 @@ fn build_quality_report(
             score -= penalty;
         }
     }
+
+    // Compute per-file confidence stats.
+    let confidences: Vec<f64> = file_decisions.iter().filter_map(|d| d.confidence).collect();
+    let min_confidence = confidences.iter().copied().fold(f64::INFINITY, f64::min);
+    let min_confidence = if min_confidence.is_infinite() {
+        1.0
+    } else {
+        min_confidence
+    };
+    let avg_confidence = if confidences.is_empty() {
+        1.0
+    } else {
+        confidences.iter().sum::<f64>() / confidences.len() as f64
+    };
+
+    // Penalize low confidence in quality score.
+    if min_confidence < 0.85 {
+        score -= 10;
+    }
+    if min_confidence < 0.5 {
+        score -= 15; // additional penalty for very low confidence
+    }
+
     let score = score.max(0).min(100) as u32;
 
     // Build summary.
@@ -4781,6 +5219,8 @@ fn build_quality_report(
         file_decisions,
         consistency_checks,
         quality_score: score,
+        min_confidence,
+        avg_confidence,
         summary,
     }
 }
@@ -10168,6 +10608,889 @@ mod recommended_action_tests {
     }
 }
 
+/// End-to-end context stress test: exercises every recommended_action
+/// transition and spec-scoped signal across a realistic 3-agent workflow
+/// with dependencies, shared files, scope violations, and convergence.
+#[cfg(test)]
+mod context_stress_tests {
+    use super::*;
+    use crate::context::{ContextFilter, ContextScope};
+    use crate::convergence::ConvergeStrategy;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use crate::spec::{Spec, SpecStatus, SpecUpdate};
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    fn ctx(repo: &Repository, scope: ContextScope) -> ContextOutput {
+        repo.context(scope, 20, &ContextFilter::default()).unwrap()
+    }
+
+    /// CC's test plan: "3 Agents, Shared Files, Blocking Dependencies"
+    ///
+    /// Hits every recommended_action priority level and every spec-scoped
+    /// risk signal in a single linear workflow:
+    ///   wait_for_dependency → seal → converge → finish
+    #[test]
+    fn test_context_stress_full_workflow() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // ── Step 1: Setup specs with dependencies and file scopes ──
+
+        let mut database_spec = Spec::new("database".into(), "Database schema".into(), "".into());
+        database_spec.file_scope = vec!["schema.py".into(), "models.py".into()];
+        repo.add_spec(&database_spec).unwrap();
+
+        let mut api_spec = Spec::new("api".into(), "REST API".into(), "".into());
+        api_spec.depends_on = vec!["database".into()];
+        api_spec.file_scope = vec!["routes.py".into(), "models.py".into()];
+        repo.add_spec(&api_spec).unwrap();
+
+        let mut tests_spec = Spec::new("tests".into(), "Test suite".into(), "".into());
+        tests_spec.depends_on = vec!["api".into()];
+        tests_spec.file_scope = vec!["tests/".into()];
+        repo.add_spec(&tests_spec).unwrap();
+
+        // Shared file that all agents will touch.
+        fs::write(dir.path().join("models.py"), "class Base:\n    pass\n").unwrap();
+        fs::write(dir.path().join("schema.py"), "").unwrap();
+        fs::write(dir.path().join("routes.py"), "").unwrap();
+        fs::create_dir_all(dir.path().join("tests")).unwrap();
+        fs::write(dir.path().join("tests/test_api.py"), "").unwrap();
+
+        // Baseline seal.
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // ── Step 2: Context for api spec BEFORE any work ──
+        // database is still pending → api should be told to wait.
+        {
+            let c = ctx(&repo, ContextScope::Spec("api".into()));
+            let action = c
+                .recommended_action
+                .as_ref()
+                .expect("api should have a recommended_action");
+            assert_eq!(
+                action.action, "wait_for_dependency",
+                "api should wait for database (step 2)"
+            );
+            assert!(
+                action.message.contains("database"),
+                "message should mention blocking dep"
+            );
+            assert_eq!(action.priority, "high");
+
+            let deps = c
+                .dependency_status
+                .as_ref()
+                .expect("spec-scoped context should include dependency_status");
+            assert!(!deps.is_empty());
+            let db_dep = deps.iter().find(|d| d.spec_id == "database").unwrap();
+            assert!(!db_dep.resolved, "database not yet resolved");
+        }
+
+        // ── Step 3: db-dev seals first work on database ──
+        fs::write(dir.path().join("schema.py"), "CREATE_TABLE = 'books'\n").unwrap();
+        fs::write(
+            dir.path().join("models.py"),
+            "class Base:\n    pass\n\nclass BookModel:\n    title: str\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("db-dev"),
+            "schema and book model".into(),
+            Some("database".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // ── Step 4: Context for api — dependency still pending ──
+        {
+            let c = ctx(&repo, ContextScope::Spec("api".into()));
+            let action = c
+                .recommended_action
+                .as_ref()
+                .expect("api should still have recommended_action");
+            assert_eq!(
+                action.action, "wait_for_dependency",
+                "database is InProgress, not Complete (step 4)"
+            );
+        }
+
+        // ── Step 5: db-dev seals database with status complete ──
+        fs::write(
+            dir.path().join("schema.py"),
+            "CREATE_TABLE = 'books'\nCREATE_INDEX = 'books_title'\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("db-dev"),
+            "schema finalized".into(),
+            Some("database".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "database",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // ── Step 6: Context for api — dependency resolved ──
+        {
+            let c = ctx(&repo, ContextScope::Spec("api".into()));
+            if let Some(action) = &c.recommended_action {
+                assert_ne!(
+                    action.action, "wait_for_dependency",
+                    "database is complete, api should not be blocked (step 6)"
+                );
+            }
+
+            let deps = c.dependency_status.as_ref().unwrap();
+            let db_dep = deps.iter().find(|d| d.spec_id == "database").unwrap();
+            assert!(db_dep.resolved, "database should be resolved now");
+        }
+
+        // ── Step 7: api-dev seals work on api ──
+        fs::write(
+            dir.path().join("routes.py"),
+            "from flask import Flask\napp = Flask(__name__)\n\n@app.route('/books')\ndef list_books():\n    return []\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("models.py"),
+            "class Base:\n    pass\n\nclass BookModel:\n    title: str\n\nclass BookResponse:\n    data: list\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("api-dev"),
+            "initial routes".into(),
+            Some("api".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // ── Step 8: api-dev modifies routes.py but doesn't seal ──
+        fs::write(
+            dir.path().join("routes.py"),
+            "from flask import Flask, request\napp = Flask(__name__)\n\n@app.route('/books')\ndef list_books():\n    return []\n\n@app.route('/books', methods=['POST'])\ndef create_book():\n    return {}\n",
+        )
+        .unwrap();
+
+        {
+            let c = ctx(&repo, ContextScope::Spec("api".into()));
+            let action = c
+                .recommended_action
+                .as_ref()
+                .expect("api should recommend sealing (step 8)");
+            assert_eq!(
+                action.action, "seal",
+                "unsealed changes should trigger seal recommendation"
+            );
+            assert!(c.seal_nudge.is_some(), "seal_nudge should be present");
+        }
+
+        // ── Step 9: api-dev seals that work ──
+        repo.seal(
+            agent("api-dev"),
+            "CRUD routes".into(),
+            Some("api".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // ── Step 9b: Mark api as Complete (needed so it can be convergence base) ──
+        repo.update_spec(
+            "api",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // ── Step 10: db-dev seals more work on database ──
+        // Because database spec already has a head (from step 5), this
+        // seal's parent = database spec head, NOT the global HEAD.
+        // This creates a fork in the seal DAG.
+        fs::write(
+            dir.path().join("models.py"),
+            "class Base:\n    pass\n\nclass BookModel:\n    title: str\n    isbn: str\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("db-dev"),
+            "add isbn field".into(),
+            Some("database".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // ── Step 11: api-dev seals on api ──
+        // api spec's head was set in step 9. This seal's parent = api spec
+        // head (step 9), skipping db-dev's step 10 seal. HEAD now follows
+        // api's chain. db-dev's step 10 seal is off the HEAD chain → diverged.
+        fs::write(
+            dir.path().join("routes.py"),
+            "from flask import Flask, request, jsonify\napp = Flask(__name__)\n\n@app.route('/books')\ndef list_books():\n    return jsonify([])\n\n@app.route('/books', methods=['POST'])\ndef create_book():\n    return jsonify({})\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("api-dev"),
+            "use jsonify".into(),
+            Some("api".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // ── Step 12: Context for api — divergence + convergence recommended ──
+        {
+            let c = ctx(&repo, ContextScope::Spec("api".into()));
+            assert!(
+                !c.diverged_branches.is_empty(),
+                "should detect diverged branches (step 12)"
+            );
+            assert!(
+                c.convergence_recommended,
+                "convergence should be recommended (step 12)"
+            );
+
+            let action = c
+                .recommended_action
+                .as_ref()
+                .expect("should have recommended_action (step 12)");
+            assert_eq!(
+                action.action, "converge",
+                "should recommend convergence (step 12)"
+            );
+
+            let contention_paths: Vec<&str> = c
+                .file_contention
+                .iter()
+                .map(|fc| fc.path.as_str())
+                .collect();
+            assert!(
+                contention_paths.contains(&"models.py"),
+                "models.py should be in file_contention (step 12): {:?}",
+                contention_paths
+            );
+
+            assert!(
+                c.integration_risk.score > 0,
+                "integration risk should be >0 with diverged branches (step 12)"
+            );
+        }
+
+        // ── Step 13: Full-scope context — same signals visible ──
+        {
+            let c = ctx(&repo, ContextScope::Full);
+            assert!(
+                !c.diverged_branches.is_empty(),
+                "full scope should also see diverged branches (step 13)"
+            );
+            assert!(
+                c.convergence_recommended,
+                "full scope should recommend convergence (step 13)"
+            );
+
+            let action = c
+                .recommended_action
+                .as_ref()
+                .expect("full scope should have recommended_action (step 13)");
+            assert_eq!(
+                action.action, "converge",
+                "full scope should recommend converge (step 13)"
+            );
+        }
+
+        // ── Step 14: Converge ──
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, true)
+            .unwrap();
+        assert!(report.applied, "convergence should apply");
+
+        // ── Step 15: Context for api — post-convergence ──
+        {
+            let c = ctx(&repo, ContextScope::Spec("api".into()));
+            assert!(
+                c.diverged_branches.is_empty(),
+                "diverged branches should be cleared post-convergence (step 15)"
+            );
+            assert!(
+                !c.convergence_recommended,
+                "convergence should no longer be recommended (step 15)"
+            );
+
+            if let Some(action) = &c.recommended_action {
+                assert_ne!(
+                    action.action, "converge",
+                    "should not recommend converge post-convergence (step 15)"
+                );
+            }
+        }
+
+        // ── Step 16: api-dev seals final refinement (api already Complete from 9b) ──
+        fs::write(
+            dir.path().join("routes.py"),
+            "from flask import Flask, request, jsonify\napp = Flask(__name__)\n\n@app.route('/books')\ndef list_books():\n    return jsonify([])\n\n@app.route('/books', methods=['POST'])\ndef create_book():\n    return jsonify(request.json)\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("api-dev"),
+            "api final polish".into(),
+            Some("api".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // ── Step 17: Context for tests spec — dependency resolved ──
+        {
+            let c = ctx(&repo, ContextScope::Spec("tests".into()));
+            if let Some(action) = &c.recommended_action {
+                assert_ne!(
+                    action.action, "wait_for_dependency",
+                    "api is complete, tests should not be blocked (step 17)"
+                );
+            }
+
+            let deps = c.dependency_status.as_ref().unwrap();
+            let api_dep = deps.iter().find(|d| d.spec_id == "api").unwrap();
+            assert!(api_dep.resolved, "api dependency should be resolved");
+        }
+
+        // ── Step 18: test-dev seals on tests (touches models.py — scope violation) ──
+        fs::write(
+            dir.path().join("tests/test_api.py"),
+            "def test_list_books():\n    assert True\n",
+        )
+        .unwrap();
+        // Intentional scope violation: test-dev touches models.py.
+        fs::write(
+            dir.path().join("models.py"),
+            "class Base:\n    pass\n\nclass BookModel:\n    title: str\n    isbn: str\n\nclass TestFixture:\n    pass\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("test-dev"),
+            "api tests and fixture".into(),
+            Some("tests".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // ── Step 19: Context for tests — scope violation detected ──
+        {
+            let c = ctx(&repo, ContextScope::Spec("tests".into()));
+            assert!(
+                !c.file_scope_violations.is_empty(),
+                "test-dev touched models.py outside tests/ scope (step 19): violations={:?}",
+                c.file_scope_violations
+            );
+
+            let violation_files: Vec<&str> = c
+                .file_scope_violations
+                .iter()
+                .flat_map(|v| v.out_of_scope_files.iter().map(|s| s.as_str()))
+                .collect();
+            assert!(
+                violation_files.contains(&"models.py"),
+                "models.py should be flagged as out-of-scope (step 19): {:?}",
+                violation_files
+            );
+        }
+
+        // ── Step 20: test-dev seals tests complete ──
+        fs::write(
+            dir.path().join("tests/test_models.py"),
+            "def test_book_model():\n    assert True\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("test-dev"),
+            "tests finalized".into(),
+            Some("tests".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "tests",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // ── Step 21: Full-scope context — session complete ──
+        {
+            let c = ctx(&repo, ContextScope::Full);
+
+            assert!(
+                c.diverged_branches.is_empty(),
+                "no diverged branches should remain at step 21: {:?}",
+                c.diverged_branches
+                    .iter()
+                    .map(|d| format!("{}(tip={}, seals={})", d.spec_id, d.tip_seal, d.seal_count))
+                    .collect::<Vec<_>>()
+            );
+            assert!(
+                !c.convergence_recommended,
+                "convergence should NOT be recommended at step 21"
+            );
+
+            assert!(
+                c.session_complete,
+                "all 3 specs complete → session_complete (step 21)"
+            );
+            assert!(
+                c.session_summary.is_some(),
+                "session_summary should be present when complete (step 21)"
+            );
+
+            let action = c
+                .recommended_action
+                .as_ref()
+                .expect("should recommend finish (step 21)");
+            assert_eq!(
+                action.action, "finish",
+                "should recommend finish when session complete (step 21)"
+            );
+        }
+
+        // ── Step 22: Summary includes all spec titles ──
+        {
+            let summary = repo.summary().unwrap();
+            let headline = &summary.headline;
+            // Headline uses spec *titles* not IDs.
+            for spec_title in &["database", "rest api", "test suite"] {
+                assert!(
+                    headline.to_lowercase().contains(spec_title),
+                    "summary headline should mention '{}': {}",
+                    spec_title,
+                    headline
+                );
+            }
+        }
+    }
+
+    /// Validates that summary.json is refreshed after converge-all --apply.
+    ///
+    /// Reproduces the TR17 bug: all specs complete → summary.json written
+    /// with diverged state → convergence clears branches → summary.json
+    /// should be refreshed to reflect the resolved state.
+    #[test]
+    fn test_summary_refreshed_after_convergence() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into()))
+            .unwrap();
+
+        // Baseline.
+        fs::write(dir.path().join("shared.txt"), "baseline\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // alpha-dev seals and completes.
+        fs::write(dir.path().join("alpha.txt"), "alpha work\n").unwrap();
+        repo.seal(
+            agent("alpha-dev"),
+            "alpha work".into(),
+            Some("alpha".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // beta-dev seals.
+        fs::write(dir.path().join("beta.txt"), "beta work\n").unwrap();
+        repo.seal(
+            agent("beta-dev"),
+            "beta work".into(),
+            Some("beta".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // alpha-dev seals again → creates divergence (alpha spec head
+        // becomes parent, skipping beta's seal).
+        fs::write(dir.path().join("alpha.txt"), "alpha part 2\n").unwrap();
+        repo.seal(
+            agent("alpha-dev"),
+            "alpha continued".into(),
+            Some("alpha".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Verify divergence exists.
+        let diverged = repo.diverged_branches().unwrap();
+        assert!(!diverged.is_empty(), "beta should be diverged");
+
+        // Now mark beta complete → triggers summary.json write.
+        fs::write(dir.path().join("beta.txt"), "beta final\n").unwrap();
+        repo.seal(
+            agent("beta-dev"),
+            "beta done".into(),
+            Some("beta".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Read the pre-convergence summary.json.
+        let summary_path = dir.path().join(".writ/summary.json");
+        assert!(
+            summary_path.exists(),
+            "summary.json should exist after all specs complete"
+        );
+        let pre: SummaryOutput =
+            serde_json::from_str(&fs::read_to_string(&summary_path).unwrap()).unwrap();
+        assert!(
+            pre.convergence_recommended,
+            "pre-convergence summary should recommend convergence"
+        );
+        assert!(
+            pre.diverged_branch_count > 0,
+            "pre-convergence summary should report diverged branches"
+        );
+
+        // Converge.
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, true)
+            .unwrap();
+        assert!(report.applied, "should apply");
+
+        // Read the post-convergence summary.json — should be refreshed.
+        let post: SummaryOutput =
+            serde_json::from_str(&fs::read_to_string(&summary_path).unwrap()).unwrap();
+        assert!(
+            !post.convergence_recommended,
+            "post-convergence summary should NOT recommend convergence"
+        );
+        assert_eq!(
+            post.diverged_branch_count, 0,
+            "post-convergence summary should report 0 diverged branches"
+        );
+    }
+
+    /// When the diverged branch IS selected as convergence base (no on-HEAD
+    /// Complete spec exists), its head must also be updated so
+    /// diverged_branches() no longer flags it.
+    #[test]
+    fn test_converge_all_updates_base_spec_head_when_diverged() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into()))
+            .unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "baseline\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // alpha seals.
+        fs::write(dir.path().join("alpha.txt"), "alpha v1\n").unwrap();
+        repo.seal(
+            agent("alpha-dev"),
+            "alpha work".into(),
+            Some("alpha".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // beta seals.
+        fs::write(dir.path().join("beta.txt"), "beta v1\n").unwrap();
+        repo.seal(
+            agent("beta-dev"),
+            "beta work".into(),
+            Some("beta".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // alpha seals again → HEAD chain skips beta's seal → beta diverged.
+        fs::write(dir.path().join("alpha.txt"), "alpha v2\n").unwrap();
+        repo.seal(
+            agent("alpha-dev"),
+            "alpha more".into(),
+            Some("alpha".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // beta seals again → HEAD chain skips alpha's latest → alpha diverged.
+        fs::write(dir.path().join("beta.txt"), "beta v2\n").unwrap();
+        repo.seal(
+            agent("beta-dev"),
+            "beta more".into(),
+            Some("beta".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let pre = repo.diverged_branches().unwrap();
+        assert!(
+            !pre.is_empty(),
+            "should have diverged branches before convergence"
+        );
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, true)
+            .unwrap();
+        assert!(report.applied, "should apply");
+
+        // The key assertion: ALL diverged branches cleared, including whichever
+        // one was selected as the base.
+        let post = repo.diverged_branches().unwrap();
+        assert!(
+            post.is_empty(),
+            "all diverged branches should be cleared after convergence, still diverged: {:?}",
+            post.iter()
+                .map(|d| format!("{}(tip={})", d.spec_id, d.tip_seal))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// IMPORT_ORPHAN should NOT fire for packages listed in requirements.txt.
+    #[test]
+    fn test_import_orphan_suppressed_by_requirements_txt() {
+        let dir = tempdir().unwrap();
+
+        // Create a requirements.txt with flask and requests.
+        fs::write(
+            dir.path().join("requirements.txt"),
+            "flask>=2.0\nrequests\nPyJWT==2.8\n",
+        )
+        .unwrap();
+
+        // Create a Python file that imports flask (no local flask.py).
+        fs::write(
+            dir.path().join("app.py"),
+            "from flask import Flask\nfrom requests import get\nfrom auth import require_auth\n",
+        )
+        .unwrap();
+
+        // Also create auth.py so that import is NOT orphaned.
+        fs::write(dir.path().join("auth.py"), "def require_auth(): pass\n").unwrap();
+
+        let decisions = vec![FileDecision {
+            path: "app.py".to_string(),
+            decision: "auto-merged".to_string(),
+            chosen_lines: 3,
+            chosen_spec: None,
+            alternatives: vec![],
+            confidence: Some(1.0),
+        }];
+
+        let warnings = post_convergence_validation(
+            dir.path(),
+            &decisions,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        let orphan_warnings: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("IMPORT_ORPHAN"))
+            .collect();
+
+        assert!(
+            orphan_warnings.is_empty(),
+            "flask and requests are in requirements.txt, auth.py exists — no orphans expected, got: {:?}",
+            orphan_warnings
+        );
+    }
+
+    /// IMPORT_ORPHAN should still fire for genuinely missing modules.
+    #[test]
+    fn test_import_orphan_fires_for_missing_module() {
+        let dir = tempdir().unwrap();
+
+        // requirements.txt only has flask.
+        fs::write(dir.path().join("requirements.txt"), "flask\n").unwrap();
+
+        // app.py imports a module that doesn't exist anywhere.
+        fs::write(
+            dir.path().join("app.py"),
+            "from flask import Flask\nfrom nonexistent import magic\n",
+        )
+        .unwrap();
+
+        let decisions = vec![FileDecision {
+            path: "app.py".to_string(),
+            decision: "auto-merged".to_string(),
+            chosen_lines: 2,
+            chosen_spec: None,
+            alternatives: vec![],
+            confidence: Some(1.0),
+        }];
+
+        let warnings = post_convergence_validation(
+            dir.path(),
+            &decisions,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        let orphan_warnings: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("IMPORT_ORPHAN"))
+            .collect();
+
+        assert_eq!(
+            orphan_warnings.len(),
+            1,
+            "nonexistent module should be flagged, got: {:?}",
+            orphan_warnings
+        );
+        assert!(orphan_warnings[0].contains("nonexistent"));
+
+        // flask should NOT be flagged.
+        assert!(
+            !orphan_warnings.iter().any(|w| w.contains("flask")),
+            "flask is in requirements.txt and should not be flagged"
+        );
+    }
+
+    /// `ConvergeAllReport.applied` should be false when apply was requested
+    /// but conflicts prevented actual writes (all_clean == false).
+    #[test]
+    fn test_converge_all_applied_false_when_not_clean() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("left".into(), "Left".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("right".into(), "Right".into(), "".into()))
+            .unwrap();
+
+        fs::write(dir.path().join("conflict.txt"), "base content\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // left rewrites the file.
+        fs::write(dir.path().join("conflict.txt"), "left version\n").unwrap();
+        repo.seal(
+            agent("left-dev"),
+            "left rewrite".into(),
+            Some("left".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // right rewrites the same file differently.
+        fs::write(dir.path().join("conflict.txt"), "right version\n").unwrap();
+        repo.seal(
+            agent("right-dev"),
+            "right rewrite".into(),
+            Some("right".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // left re-asserts its version and adds a file → divergence with
+        // genuinely different content for conflict.txt in each tree.
+        fs::write(dir.path().join("conflict.txt"), "left version\n").unwrap();
+        fs::write(dir.path().join("left-extra.txt"), "extra\n").unwrap();
+        repo.seal(
+            agent("left-dev"),
+            "left extra".into(),
+            Some("left".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Use Manual strategy so conflicts stay unresolved → all_clean = false.
+        let report = repo.converge_all(ConvergeStrategy::Manual, true).unwrap();
+
+        assert!(!report.is_clean, "should have unresolved conflicts");
+        assert!(
+            !report.applied,
+            "applied should be false when conflicts prevent writes"
+        );
+    }
+}
+
 #[cfg(test)]
 mod log_all_tests {
     use super::*;
@@ -12628,28 +13951,8 @@ mod convergence_integration_tests {
         assert!(report.is_clean);
         repo.apply_convergence(&report, &[]).unwrap();
 
-        // The merged index.html differs from what's in the current index
-        // (current index has nav-dev's version without footer changes).
-        // So seal() should capture the merged file.
-        let merge_seal = repo
-            .seal(
-                agent("orchestrator"),
-                "Converged nav-update + footer-update".into(),
-                None,
-                TaskStatus::Complete,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-
-        let changed_paths: Vec<&str> = merge_seal.changes.iter().map(|c| c.path.as_str()).collect();
-        assert!(
-            changed_paths.contains(&"index.html"),
-            "merge seal should capture the merged index.html, got: {:?}",
-            changed_paths
-        );
-
-        // Verify the sealed content has both changes.
+        // apply_convergence now updates the index, so the working directory
+        // is clean.  Verify the merged content directly on disk.
         let disk_html = fs::read_to_string(dir.path().join("index.html")).unwrap();
         assert!(disk_html.contains("Projects | Blog"));
         assert!(disk_html.contains("All rights reserved"));
@@ -12802,21 +14105,11 @@ mod convergence_integration_tests {
             "should have diverged branches before convergence"
         );
 
-        // Converge, apply, seal (bringing footer-dev's work into the HEAD chain).
+        // Converge and apply (index is updated automatically).
         let report = repo.converge("nav-update", "footer-update").unwrap();
         repo.apply_convergence(&report, &[]).unwrap();
-        repo.seal(
-            agent("orchestrator"),
-            "Merged nav + footer".into(),
-            None,
-            TaskStatus::Complete,
-            Verification::default(),
-            false,
-        )
-        .unwrap();
 
-        // After convergence seal, both spec's content is in HEAD.
-        // The footer.css file should be on disk.
+        // After convergence, both specs' content should be on disk.
         assert!(dir.path().join("footer.css").exists());
 
         // Context should be obtainable.
@@ -13058,28 +14351,10 @@ mod convergence_integration_tests {
             "should recommend convergence before merge"
         );
 
-        // Converge.
+        // Converge and apply (index updated automatically).
         let report = repo.converge("nav-update", "footer-update").unwrap();
         assert!(report.is_clean);
         repo.apply_convergence(&report, &[]).unwrap();
-
-        // Seal the merged result.
-        let merge_seal = repo
-            .seal(
-                agent("orchestrator"),
-                "Convergence merge".into(),
-                None,
-                TaskStatus::Complete,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-
-        // Verify the merge seal captured the merged index.html.
-        assert!(
-            merge_seal.changes.iter().any(|c| c.path == "index.html"),
-            "merge seal should include merged index.html"
-        );
 
         // After convergence, verify disk state has all content.
         let html = fs::read_to_string(dir.path().join("index.html")).unwrap();
@@ -14739,5 +16014,857 @@ export default App;
             dir.path().join("src/Header.tsx").exists(),
             "Header.tsx missing"
         );
+    }
+}
+
+/// Tests that mutations leave metadata consistent for context().
+#[cfg(test)]
+mod convergence_metadata_tests {
+    use super::*;
+    use crate::context::{ContextFilter, ContextScope};
+    use crate::convergence::ConvergeStrategy;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use crate::spec::{Spec, SpecStatus, SpecUpdate};
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.into(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_context_clean_after_converge_all() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline.
+        fs::write(dir.path().join("shared.py"), "x = 1\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Two specs.
+        repo.add_spec(&Spec::new("feat-a".into(), "Feature A".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("feat-b".into(), "Feature B".into(), "".into()))
+            .unwrap();
+
+        // feat-a seals first.
+        fs::write(dir.path().join("a.py"), "a = 1\n").unwrap();
+        repo.seal(
+            agent("dev-a"),
+            "feature a".into(),
+            Some("feat-a".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "feat-a",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // feat-b seals (creates a branch from HEAD).
+        fs::write(dir.path().join("b.py"), "b = 2\n").unwrap();
+        repo.seal(
+            agent("dev-b"),
+            "feature b".into(),
+            Some("feat-b".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // feat-a seals AGAIN — this advances HEAD past feat-b's seal,
+        // making feat-b's spec_head diverged from the new HEAD chain.
+        fs::write(dir.path().join("a2.py"), "a2 = 2\n").unwrap();
+        repo.seal(
+            agent("dev-a"),
+            "feature a part 2".into(),
+            Some("feat-a".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Confirm divergence exists.
+        let diverged = repo.diverged_branches().unwrap();
+        assert!(!diverged.is_empty(), "should have diverged branches");
+
+        // Converge.
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, true)
+            .unwrap();
+        assert!(report.applied, "convergence should apply");
+
+        // Context should show no false pending changes.
+        let ctx = repo
+            .context(ContextScope::Full, 10, &ContextFilter::default())
+            .unwrap();
+
+        assert!(
+            ctx.pending_changes.is_none()
+                || ctx
+                    .pending_changes
+                    .as_ref()
+                    .map_or(true, |p| p.files.is_empty()),
+            "no false pending_changes after converge_all: {:?}",
+            ctx.pending_changes
+        );
+        assert!(
+            ctx.seal_nudge.is_none(),
+            "no seal_nudge after converge_all: {:?}",
+            ctx.seal_nudge
+        );
+    }
+
+    #[test]
+    fn test_context_clean_after_apply_convergence() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline with shared file.
+        fs::write(dir.path().join("shared.py"), "base\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Two specs.
+        repo.add_spec(&Spec::new("left".into(), "Left".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("right".into(), "Right".into(), "".into()))
+            .unwrap();
+
+        // Left seals.
+        fs::write(dir.path().join("left.py"), "left = 1\n").unwrap();
+        repo.seal(
+            agent("left-dev"),
+            "left work".into(),
+            Some("left".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Right seals (diverges).
+        fs::write(dir.path().join("right.py"), "right = 2\n").unwrap();
+        repo.seal(
+            agent("right-dev"),
+            "right work".into(),
+            Some("right".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Converge two specs.
+        let report = repo.converge("left", "right").unwrap();
+        repo.apply_convergence(&report, &[]).unwrap();
+
+        // Context should show no false pending changes.
+        let ctx = repo
+            .context(ContextScope::Full, 10, &ContextFilter::default())
+            .unwrap();
+
+        assert!(
+            ctx.pending_changes.is_none()
+                || ctx
+                    .pending_changes
+                    .as_ref()
+                    .map_or(true, |p| p.files.is_empty()),
+            "no false pending_changes after apply_convergence: {:?}",
+            ctx.pending_changes
+        );
+        assert!(
+            ctx.seal_nudge.is_none(),
+            "no seal_nudge after apply_convergence: {:?}",
+            ctx.seal_nudge
+        );
+    }
+
+    #[test]
+    fn test_restore_updates_spec_head() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("feat".into(), "Feature".into(), "".into()))
+            .unwrap();
+
+        // First seal on spec.
+        fs::write(dir.path().join("f.py"), "v1\n").unwrap();
+        let seal1 = repo
+            .seal(
+                agent("dev"),
+                "v1".into(),
+                Some("feat".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        let seal1_id = seal1.id.clone();
+
+        // Second seal on spec.
+        fs::write(dir.path().join("f.py"), "v2\n").unwrap();
+        repo.seal(
+            agent("dev"),
+            "v2".into(),
+            Some("feat".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Spec head should be at seal2.
+        let head_before = repo.read_spec_head("feat").unwrap().unwrap();
+        assert_ne!(head_before, seal1_id);
+
+        // Restore to seal1.
+        repo.restore(&seal1_id).unwrap();
+
+        // Spec head should now be at seal1.
+        let head_after = repo.read_spec_head("feat").unwrap().unwrap();
+        assert_eq!(
+            head_after, seal1_id,
+            "restore should update spec head to the restored seal"
+        );
+    }
+
+    /// Quality report should have min_confidence reflecting the lowest per-file
+    /// confidence across all decisions with Some(confidence).
+    #[test]
+    fn test_quality_report_has_min_confidence() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Two specs that will diverge and have a real conflict.
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into()))
+            .unwrap();
+
+        // Baseline.
+        fs::write(dir.path().join("shared.py"), "x = 1\n").unwrap();
+        fs::write(dir.path().join("only_alpha.py"), "a = 1\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Alpha seals first (establishes alpha spec head).
+        fs::write(dir.path().join("only_alpha.py"), "a = 2\n").unwrap();
+        repo.seal(
+            agent("dev-a"),
+            "alpha initial".into(),
+            Some("alpha".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Beta seals with a change to shared.py (establishes beta spec head).
+        fs::write(
+            dir.path().join("shared.py"),
+            "x = 1\nbeta_addition = True\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("only_beta.py"), "b = 1\n").unwrap();
+        repo.seal(
+            agent("dev-b"),
+            "beta work".into(),
+            Some("beta".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "beta",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Alpha seals again with a DIFFERENT change to shared.py — creates divergence
+        // AND a real conflict on shared.py (both branches modify it differently).
+        fs::write(
+            dir.path().join("shared.py"),
+            "x = 1\nalpha_addition = True\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("dev-a"),
+            "alpha with shared change".into(),
+            Some("alpha".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "alpha",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Converge with most-recent strategy (resolves conflict at 0.7 confidence).
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, true)
+            .unwrap();
+
+        let qr = report.quality_report.expect("should have quality report");
+
+        // min_confidence should be 0.7 (from the most-recent fallback on shared.py).
+        assert!(
+            (qr.min_confidence - 0.7).abs() < 0.01,
+            "min_confidence should be 0.7 from most-recent fallback, got {}",
+            qr.min_confidence
+        );
+        // avg_confidence should be between 0.7 and 1.0 (mix of 1.0 auto-merges and 0.7 fallback).
+        assert!(
+            qr.avg_confidence >= 0.7 && qr.avg_confidence <= 1.0,
+            "avg_confidence should be between 0.7 and 1.0, got {}",
+            qr.avg_confidence
+        );
+        assert!(
+            qr.min_confidence <= qr.avg_confidence,
+            "min ({}) should be <= avg ({})",
+            qr.min_confidence,
+            qr.avg_confidence
+        );
+    }
+
+    /// Low min_confidence should penalize the quality_score.
+    #[test]
+    fn test_quality_report_confidence_affects_score() {
+        use crate::convergence::{FileAlternative, FileDecision};
+
+        // Directly test build_quality_report with controlled FileDecisions.
+        let dir = tempdir().unwrap();
+
+        // Scenario A: All high-confidence decisions → no penalty.
+        let decisions_high = vec![
+            FileDecision {
+                path: "a.py".to_string(),
+                decision: "auto-merged".to_string(),
+                chosen_lines: 5,
+                chosen_spec: None,
+                alternatives: vec![],
+                confidence: Some(1.0),
+            },
+            FileDecision {
+                path: "b.py".to_string(),
+                decision: "auto-merged".to_string(),
+                chosen_lines: 3,
+                chosen_spec: None,
+                alternatives: vec![],
+                confidence: Some(0.95),
+            },
+        ];
+        let report_high = build_quality_report(decisions_high, dir.path(), false, 0, 0);
+        assert_eq!(
+            report_high.quality_score, 100,
+            "all high-confidence → score 100, got {}",
+            report_high.quality_score
+        );
+
+        // Scenario B: One low-confidence decision (0.7 — strategy fallback) → -10.
+        let decisions_mid = vec![
+            FileDecision {
+                path: "a.py".to_string(),
+                decision: "auto-merged".to_string(),
+                chosen_lines: 5,
+                chosen_spec: None,
+                alternatives: vec![],
+                confidence: Some(1.0),
+            },
+            FileDecision {
+                path: "b.py".to_string(),
+                decision: "most-recent".to_string(),
+                chosen_lines: 3,
+                chosen_spec: Some("spec-a".into()),
+                alternatives: vec![FileAlternative {
+                    spec: "spec-b".into(),
+                    lines: 3,
+                    reason: "discarded".into(),
+                }],
+                confidence: Some(0.7),
+            },
+        ];
+        let report_mid = build_quality_report(decisions_mid, dir.path(), false, 1, 1);
+        assert_eq!(
+            report_mid.quality_score, 90,
+            "min_confidence 0.7 (< 0.85) → -10 penalty, score 90, got {}",
+            report_mid.quality_score
+        );
+
+        // Scenario C: Unresolved conflict (0.0 confidence) → -25 total (-10 + -15 for <0.5, plus -15 for unresolved).
+        let decisions_low = vec![FileDecision {
+            path: "a.py".to_string(),
+            decision: "conflict-unresolved".to_string(),
+            chosen_lines: 0,
+            chosen_spec: None,
+            alternatives: vec![],
+            confidence: Some(0.0),
+        }];
+        let report_low = build_quality_report(decisions_low, dir.path(), false, 1, 0);
+        // Penalties: -15 (unresolved conflict) + -10 (min < 0.85) + -15 (min < 0.5) = -40 → score 60.
+        assert_eq!(
+            report_low.quality_score, 60,
+            "unresolved conflict with 0.0 confidence → score 60, got {}",
+            report_low.quality_score
+        );
+    }
+
+    /// FileDecision confidence: Some for resolved conflicts, None for left-only/right-only.
+    #[test]
+    fn test_file_decision_has_confidence() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Two specs: alpha touches file A, beta touches file B. No overlap = no conflict.
+        // This gives us left-only and right-only decisions (confidence: None).
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into()))
+            .unwrap();
+
+        // Baseline seal.
+        fs::write(dir.path().join("base.py"), "base\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Alpha seals first (establishes alpha spec head).
+        fs::write(dir.path().join("alpha.py"), "alpha\n").unwrap();
+        repo.seal(
+            agent("dev-a"),
+            "alpha initial".into(),
+            Some("alpha".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Beta seals (establishes beta spec head — child of alpha's seal on main chain).
+        fs::write(dir.path().join("beta.py"), "beta\n").unwrap();
+        repo.seal(
+            agent("dev-b"),
+            "beta file".into(),
+            Some("beta".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "beta",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Alpha seals again — creates divergence (parent is alpha spec head, not beta's seal).
+        fs::write(dir.path().join("alpha.py"), "alpha v2\n").unwrap();
+        repo.seal(
+            agent("dev-a"),
+            "alpha complete".into(),
+            Some("alpha".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "alpha",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Converge — should produce left-only and right-only with confidence: None.
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, true)
+            .unwrap();
+
+        let qr = report.quality_report.expect("should have quality report");
+
+        for fd in &qr.file_decisions {
+            match fd.decision.as_str() {
+                "left-only" | "right-only" => {
+                    assert!(
+                        fd.confidence.is_none(),
+                        "{} decision '{}' should have confidence: None, got {:?}",
+                        fd.path,
+                        fd.decision,
+                        fd.confidence
+                    );
+                }
+                "auto-merged" => {
+                    assert!(
+                        fd.confidence.is_some(),
+                        "{} auto-merged should have Some confidence, got None",
+                        fd.path
+                    );
+                    assert!(
+                        fd.confidence.unwrap() >= 0.85,
+                        "{} auto-merged confidence should be >= 0.85, got {}",
+                        fd.path,
+                        fd.confidence.unwrap()
+                    );
+                }
+                other => {
+                    // Other decision types should have Some confidence.
+                    assert!(
+                        fd.confidence.is_some(),
+                        "{} decision '{}' should have Some confidence",
+                        fd.path,
+                        other
+                    );
+                }
+            }
+        }
+
+        // min_confidence should be 1.0 (only left-only/right-only with None, auto-merges at 1.0).
+        assert!(
+            (qr.min_confidence - 1.0).abs() < 0.01,
+            "no conflicts → min_confidence should be 1.0, got {}",
+            qr.min_confidence
+        );
+    }
+}
+
+#[cfg(test)]
+mod agent_scoped_context_tests {
+    use super::*;
+    use crate::context::{ContextFilter, ContextScope};
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use crate::spec::Spec;
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.into(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    /// Helper: set up a repo with two agents working on different specs.
+    fn setup_two_agent_repo() -> (tempfile::TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Two specs with different file scopes.
+        let mut auth_spec = Spec::new("auth".into(), "Authentication".into(), "".into());
+        auth_spec.file_scope = vec!["auth.py".into(), "auth_test.py".into()];
+        repo.add_spec(&auth_spec).unwrap();
+
+        let mut pay_spec = Spec::new("payments".into(), "Payments".into(), "".into());
+        pay_spec.file_scope = vec!["payments.py".into(), "payments_test.py".into()];
+        repo.add_spec(&pay_spec).unwrap();
+
+        // Agent "auth-dev" works on auth spec.
+        fs::write(dir.path().join("auth.py"), "def login(): pass\n").unwrap();
+        repo.seal(
+            agent("auth-dev"),
+            "auth initial".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent "pay-dev" works on payments spec.
+        fs::write(dir.path().join("payments.py"), "def charge(): pass\n").unwrap();
+        repo.seal(
+            agent("pay-dev"),
+            "payments initial".into(),
+            Some("payments".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // auth-dev seals again.
+        fs::write(dir.path().join("auth.py"), "def login(): return True\n").unwrap();
+        repo.seal(
+            agent("auth-dev"),
+            "auth login implemented".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        (dir, repo)
+    }
+
+    /// Agent-scoped context should only include the agent's specs.
+    #[test]
+    fn test_agent_scoped_context_filters_to_agent_specs() {
+        let (_dir, repo) = setup_two_agent_repo();
+
+        let ctx = repo
+            .context(
+                ContextScope::Agent("auth-dev".into()),
+                10,
+                &ContextFilter::default(),
+            )
+            .unwrap();
+
+        // Should only have auth spec, not payments.
+        let specs = ctx.all_specs.expect("should have specs");
+        let spec_ids: Vec<&str> = specs.iter().map(|s| s.id.as_str()).collect();
+        assert!(
+            spec_ids.contains(&"auth"),
+            "auth-dev's context should include auth spec, got: {:?}",
+            spec_ids
+        );
+        assert!(
+            !spec_ids.contains(&"payments"),
+            "auth-dev's context should NOT include payments spec, got: {:?}",
+            spec_ids
+        );
+
+        // active_spec should be None (agent may have multiple specs).
+        assert!(
+            ctx.active_spec.is_none(),
+            "agent scope has no single active_spec"
+        );
+    }
+
+    /// Agent-scoped context should filter working state to agent's file scope.
+    #[test]
+    fn test_agent_scoped_context_file_scope() {
+        let (dir, repo) = setup_two_agent_repo();
+
+        // Create a file change outside auth-dev's scope.
+        fs::write(
+            dir.path().join("payments.py"),
+            "def charge(): return True\n",
+        )
+        .unwrap();
+        // And one inside scope.
+        fs::write(dir.path().join("auth_test.py"), "def test_login(): pass\n").unwrap();
+
+        let ctx = repo
+            .context(
+                ContextScope::Agent("auth-dev".into()),
+                10,
+                &ContextFilter::default(),
+            )
+            .unwrap();
+
+        // File scope should include auth files (from spec scope + sealed files).
+        assert!(
+            ctx.file_scope.iter().any(|f| f == "auth.py"),
+            "auth.py should be in auth-dev's file scope"
+        );
+        // payments.py should NOT be in file scope.
+        assert!(
+            !ctx.file_scope.iter().any(|f| f == "payments.py"),
+            "payments.py should NOT be in auth-dev's file scope"
+        );
+
+        // Modified files in working state should only show auth-scoped changes.
+        let all_changed: Vec<String> = ctx
+            .working_state
+            .new_files
+            .iter()
+            .chain(ctx.working_state.modified_files.iter())
+            .cloned()
+            .collect();
+        assert!(
+            !all_changed.iter().any(|f| f == "payments.py"),
+            "payments.py changes should be filtered out of auth-dev's working state, got: {:?}",
+            all_changed
+        );
+    }
+
+    /// Agent-scoped context should show ALL agents for cross-agent coordination.
+    #[test]
+    fn test_agent_scoped_context_shows_all_agent_activity() {
+        let (_dir, repo) = setup_two_agent_repo();
+
+        let ctx = repo
+            .context(
+                ContextScope::Agent("auth-dev".into()),
+                10,
+                &ContextFilter::default(),
+            )
+            .unwrap();
+
+        // Agent activity should include auth-dev (for sure) and potentially
+        // other agents if they touched files in auth-dev's scope.
+        let activity_agents: Vec<&str> = ctx
+            .agent_activity
+            .iter()
+            .map(|a| a.agent_id.as_str())
+            .collect();
+        assert!(
+            activity_agents.contains(&"auth-dev"),
+            "auth-dev should appear in agent_activity, got: {:?}",
+            activity_agents
+        );
+        // pay-dev shouldn't appear if they haven't touched auth files.
+        // (pay-dev only touched payments.py which is outside auth scope)
+    }
+
+    /// File contention should be limited to agent's file scope.
+    #[test]
+    fn test_agent_scoped_contention_filtered() {
+        let (dir, repo) = setup_two_agent_repo();
+
+        // Create contention on a payments file (pay-dev and auth-dev both touch it).
+        fs::write(dir.path().join("payments.py"), "# auth-dev was here\n").unwrap();
+        repo.seal(
+            agent("auth-dev"),
+            "cross-cutting change".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Full context should show payments.py contention.
+        let full_ctx = repo
+            .context(ContextScope::Full, 10, &ContextFilter::default())
+            .unwrap();
+        let full_contested: Vec<&str> = full_ctx
+            .file_contention
+            .iter()
+            .map(|fc| fc.path.as_str())
+            .collect();
+
+        // Agent-scoped for pay-dev should include payments.py contention.
+        let pay_ctx = repo
+            .context(
+                ContextScope::Agent("pay-dev".into()),
+                10,
+                &ContextFilter::default(),
+            )
+            .unwrap();
+        let pay_contested: Vec<&str> = pay_ctx
+            .file_contention
+            .iter()
+            .map(|fc| fc.path.as_str())
+            .collect();
+
+        // payments.py should be in pay-dev's contention (it's in their scope).
+        if full_contested.contains(&"payments.py") {
+            assert!(
+                pay_contested.contains(&"payments.py"),
+                "payments.py contention should appear in pay-dev's agent-scoped context"
+            );
+        }
+
+        // auth-dev's scope includes auth.py + auth_test.py + payments.py (since they sealed it).
+        // So auth-dev should also see payments.py contention.
+        let auth_ctx = repo
+            .context(
+                ContextScope::Agent("auth-dev".into()),
+                10,
+                &ContextFilter::default(),
+            )
+            .unwrap();
+        let auth_contested: Vec<&str> = auth_ctx
+            .file_contention
+            .iter()
+            .map(|fc| fc.path.as_str())
+            .collect();
+        if full_contested.contains(&"payments.py") {
+            assert!(
+                auth_contested.contains(&"payments.py"),
+                "auth-dev touched payments.py, so contention should appear in their scope"
+            );
+        }
+    }
+
+    /// Recommended action should use agent-scoped signals.
+    #[test]
+    fn test_agent_scoped_recommended_action() {
+        let (dir, repo) = setup_two_agent_repo();
+
+        // Make a change in auth scope to trigger seal nudge.
+        fs::write(dir.path().join("auth.py"), "def login(): return 'final'\n").unwrap();
+
+        let ctx = repo
+            .context(
+                ContextScope::Agent("auth-dev".into()),
+                10,
+                &ContextFilter::default(),
+            )
+            .unwrap();
+
+        // Should have a seal nudge since auth.py changed.
+        assert!(
+            ctx.seal_nudge.is_some(),
+            "auth-dev should get seal nudge for auth.py change"
+        );
+
+        // session_complete should always be false for agent scope.
+        assert!(
+            !ctx.session_complete,
+            "agent scope should never report session_complete"
+        );
+
+        // recommended_action should be present (seal nudge → recommend seal).
+        if let Some(ref action) = ctx.recommended_action {
+            assert_eq!(
+                action.action, "seal",
+                "expected seal recommendation, got: {}",
+                action.action
+            );
+        }
     }
 }

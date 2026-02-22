@@ -383,8 +383,9 @@ impl PyRepository {
     ///
     /// Optional filters narrow the seal history before `seal_limit` is applied:
     /// - `status`: "in-progress", "complete", or "blocked"
-    /// - `agent`: agent ID string
-    #[pyo3(signature = (spec=None, seal_limit=10, status=None, agent=None))]
+    /// - `agent`: agent ID string (filters seal history)
+    /// - `for_agent`: agent ID string (scopes entire context to agent's world)
+    #[pyo3(signature = (spec=None, seal_limit=10, status=None, agent=None, for_agent=None))]
     fn context(
         &self,
         py: Python,
@@ -392,10 +393,14 @@ impl PyRepository {
         seal_limit: usize,
         status: Option<String>,
         agent: Option<String>,
+        for_agent: Option<String>,
     ) -> PyResult<PyObject> {
-        let scope = match spec {
-            Some(id) => ContextScope::Spec(id),
-            None => ContextScope::Full,
+        let scope = if let Some(id) = spec {
+            ContextScope::Spec(id)
+        } else if let Some(id) = for_agent {
+            ContextScope::Agent(id)
+        } else {
+            ContextScope::Full
         };
         let filter_status = match status.as_deref() {
             Some("in-progress") => Some(TaskStatus::InProgress),

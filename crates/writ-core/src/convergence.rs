@@ -297,18 +297,70 @@ fn is_decorator_line(line: &str) -> bool {
     false
 }
 
-/// Returns true if all non-empty lines in the slice are import-like.
+/// Returns true if all non-empty lines in the slice form import statements.
+///
+/// Handles multi-line imports by tracking brace/paren depth. For example,
+/// a JS `import {\n  foo,\n  bar\n} from 'baz';` is recognized as a single
+/// import spanning 4 lines.
 fn is_import_region(lines: &[String]) -> bool {
     if lines.is_empty() {
         return false;
     }
-    lines
-        .iter()
-        .all(|line| line.trim().is_empty() || is_import_line(line))
+
+    let mut depth: i32 = 0;
+    let mut has_import = false;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        if depth == 0 {
+            // Outside any multi-line block — line must start an import.
+            if !is_import_line(line) {
+                return false;
+            }
+            has_import = true;
+        }
+
+        // Track brace/paren depth for multi-line imports.
+        // Braces: JS/TS `import { ... }`, Rust `use crate::{ ... }`
+        // Parens: Go `import ( ... )` — only count when line is `import (`
+        //         or we're already inside a block.
+        for ch in trimmed.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth = (depth - 1).max(0),
+                '(' if trimmed == "import (" || depth > 0 => depth += 1,
+                ')' if depth > 0 => depth = (depth - 1).max(0),
+                _ => {}
+            }
+        }
+    }
+
+    has_import && depth == 0
 }
 
-/// Merge two sets of import lines: union, dedup, sort for deterministic output.
+/// Merge two sets of import lines with language-aware handling.
+///
+/// Detects the import language and dispatches to a language-specific merger
+/// when available (JS/TS gets source-module grouping), falling back to
+/// simple dedup + sort for other languages.
 fn merge_imports(left: &[String], right: &[String]) -> Vec<String> {
+    let all_lines: Vec<String> = left.iter().chain(right.iter()).cloned().collect();
+    let lang = detect_import_language(&all_lines);
+
+    match lang {
+        ImportLanguage::JavaScript => merge_js_imports(left, right),
+        ImportLanguage::Go => merge_go_imports(left, right),
+        _ => merge_imports_simple(left, right),
+    }
+}
+
+/// Simple import merge: union, dedup by trimmed content, sort.
+/// Used as the default for non-JS languages.
+fn merge_imports_simple(left: &[String], right: &[String]) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::new();
 
@@ -323,6 +375,402 @@ fn merge_imports(left: &[String], right: &[String]) -> Vec<String> {
     }
 
     result.sort();
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Language detection and JS/TS-specific import merging
+// ---------------------------------------------------------------------------
+
+/// Detected language for import-specific merge strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImportLanguage {
+    JavaScript,
+    Python,
+    Rust,
+    Go,
+    Cpp,
+    Unknown,
+}
+
+/// Detect the import language from a set of import lines.
+fn detect_import_language(lines: &[String]) -> ImportLanguage {
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // JS/TS: `from 'source'` or `from "source"`, require()
+        if trimmed.contains(" from '")
+            || trimmed.contains(" from \"")
+            || trimmed.contains("require(")
+        {
+            return ImportLanguage::JavaScript;
+        }
+        // Python: `from X import Y` (distinct from JS — `from` comes first)
+        if trimmed.starts_with("from ") && trimmed.contains(" import ") {
+            return ImportLanguage::Python;
+        }
+        // Rust: use X, pub use X
+        if trimmed.starts_with("use ") || trimmed.starts_with("pub use ") {
+            return ImportLanguage::Rust;
+        }
+        // Go: import "X" or import (
+        if trimmed.starts_with("import \"") || trimmed == "import (" {
+            return ImportLanguage::Go;
+        }
+        // C/C++: #include
+        if trimmed.starts_with("#include") {
+            return ImportLanguage::Cpp;
+        }
+    }
+    ImportLanguage::Unknown
+}
+
+/// A parsed JS/TS import statement.
+#[derive(Debug, Clone)]
+struct JsImport {
+    /// Default import name (e.g., `React` from `import React from 'react'`).
+    default_import: Option<String>,
+    /// Named imports (e.g., `["useState", "useEffect"]`).
+    named_imports: Vec<String>,
+    /// Namespace import (e.g., `React` from `import * as React from 'react'`).
+    namespace: Option<String>,
+    /// Source module string including quotes (e.g., `'react'`).
+    source: String,
+    /// Whether this is `import type` or `export type`.
+    is_type: bool,
+    /// Whether this is a side-effect import (e.g., `import 'polyfill'`).
+    is_side_effect: bool,
+    /// Whether this is an export/re-export.
+    is_export: bool,
+}
+
+/// Join multi-line import statements into single logical lines.
+///
+/// Tracks brace depth to know when a multi-line import ends.
+/// Example: `import {\n  foo,\n  bar\n} from 'baz';` becomes
+/// `import { foo, bar } from 'baz';`.
+fn join_multiline_imports(lines: &[String]) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut depth: i32 = 0;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() && depth == 0 {
+            continue;
+        }
+
+        if depth == 0 {
+            current = trimmed.to_string();
+        } else {
+            current.push(' ');
+            current.push_str(trimmed);
+        }
+
+        for ch in trimmed.chars() {
+            match ch {
+                '{' => depth += 1,
+                '}' => depth = (depth - 1).max(0),
+                _ => {}
+            }
+        }
+
+        if depth == 0 {
+            result.push(current.clone());
+            current.clear();
+        }
+    }
+
+    if !current.is_empty() {
+        result.push(current);
+    }
+
+    result
+}
+
+/// Parse a single JS/TS import statement into structured form.
+///
+/// Returns `None` for `require()` calls (which can't be consolidated
+/// by source module) or lines that aren't valid JS imports.
+fn parse_js_import(line: &str) -> Option<JsImport> {
+    let trimmed = line.trim().trim_end_matches(';').trim();
+
+    // require() calls — preserve as-is, can't consolidate
+    if trimmed.contains("require(") {
+        return None;
+    }
+
+    let (is_export, rest) = if trimmed.starts_with("export ") {
+        (true, trimmed[7..].trim())
+    } else if trimmed.starts_with("import ") {
+        (false, trimmed[7..].trim())
+    } else {
+        return None;
+    };
+
+    let (is_type, rest) = if rest.starts_with("type ") {
+        (true, rest[5..].trim())
+    } else {
+        (false, rest)
+    };
+
+    // Side-effect import: `import 'source'` (no `from`)
+    if !is_export && !rest.contains(" from ") {
+        if rest.starts_with('\'') || rest.starts_with('"') {
+            return Some(JsImport {
+                default_import: None,
+                named_imports: vec![],
+                namespace: None,
+                source: rest.to_string(),
+                is_type,
+                is_side_effect: true,
+                is_export,
+            });
+        }
+        return None;
+    }
+
+    let from_idx = rest.rfind(" from ")?;
+    let source = rest[from_idx + 6..].trim().to_string();
+    let binding_part = rest[..from_idx].trim();
+
+    let mut default_import = None;
+    let mut named_imports = Vec::new();
+    let mut namespace = None;
+
+    if binding_part.starts_with("* as ") {
+        namespace = Some(binding_part[5..].trim().to_string());
+    } else if binding_part.starts_with('{') {
+        // Named only: { X, Y }
+        let inner = binding_part
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .trim();
+        named_imports = inner
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+    } else if binding_part.contains('{') {
+        // Default + named: X, { Y, Z }
+        if let Some(brace_start) = binding_part.find('{') {
+            let default_part = binding_part[..brace_start]
+                .trim()
+                .trim_end_matches(',')
+                .trim();
+            if !default_part.is_empty() {
+                default_import = Some(default_part.to_string());
+            }
+            if let Some(brace_end) = binding_part.rfind('}') {
+                let inner = binding_part[brace_start + 1..brace_end].trim();
+                named_imports = inner
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+        }
+    } else if !binding_part.is_empty() {
+        // Default only: X
+        default_import = Some(binding_part.to_string());
+    }
+
+    Some(JsImport {
+        default_import,
+        named_imports,
+        namespace,
+        source,
+        is_type,
+        is_side_effect: false,
+        is_export,
+    })
+}
+
+/// Render a `JsImport` back to a single-line import string with semicolon.
+fn render_js_import(import: &JsImport) -> String {
+    let keyword = if import.is_export { "export" } else { "import" };
+    let type_prefix = if import.is_type { "type " } else { "" };
+
+    if import.is_side_effect {
+        return format!("{} {};", keyword, import.source);
+    }
+
+    if let Some(ns) = &import.namespace {
+        return format!(
+            "{} {}* as {} from {};",
+            keyword, type_prefix, ns, import.source
+        );
+    }
+
+    let mut parts = Vec::new();
+    if let Some(default) = &import.default_import {
+        parts.push(default.clone());
+    }
+    if !import.named_imports.is_empty() {
+        let mut sorted = import.named_imports.clone();
+        sorted.sort();
+        parts.push(format!("{{ {} }}", sorted.join(", ")));
+    }
+
+    if parts.is_empty() {
+        format!("{} {};", keyword, import.source)
+    } else {
+        format!(
+            "{} {}{} from {};",
+            keyword,
+            type_prefix,
+            parts.join(", "),
+            import.source
+        )
+    }
+}
+
+/// Merge two sets of JS/TS import lines with source-module grouping.
+///
+/// Consolidates named imports from the same module (e.g., two imports from
+/// `'react'` become one), preserves default imports, handles type imports
+/// separately from value imports, and deduplicates.
+fn merge_js_imports(left: &[String], right: &[String]) -> Vec<String> {
+    let left_joined = join_multiline_imports(left);
+    let right_joined = join_multiline_imports(right);
+
+    // Key: (source, is_type, is_export) -> merged import
+    let mut groups: std::collections::BTreeMap<(String, bool, bool), JsImport> =
+        std::collections::BTreeMap::new();
+    let mut unparsed: Vec<String> = Vec::new();
+
+    for line in left_joined.iter().chain(right_joined.iter()) {
+        if let Some(import) = parse_js_import(line) {
+            let key = (import.source.clone(), import.is_type, import.is_export);
+
+            if let Some(existing) = groups.get_mut(&key) {
+                // Merge into existing entry for this source module.
+                if import.default_import.is_some() && existing.default_import.is_none() {
+                    existing.default_import = import.default_import;
+                }
+                if import.namespace.is_some() && existing.namespace.is_none() {
+                    existing.namespace = import.namespace;
+                }
+                for named in &import.named_imports {
+                    if !existing.named_imports.contains(named) {
+                        existing.named_imports.push(named.clone());
+                    }
+                }
+            } else {
+                groups.insert(key, import);
+            }
+        } else {
+            // require() or unrecognized — dedup and preserve.
+            let trimmed = line.trim().to_string();
+            if !unparsed.iter().any(|u: &String| u.trim() == trimmed) {
+                unparsed.push(line.clone());
+            }
+        }
+    }
+
+    let mut result: Vec<String> = groups.values().map(render_js_import).collect();
+    result.extend(unparsed);
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Go-specific import merging
+// ---------------------------------------------------------------------------
+
+/// Extract Go import paths from lines, handling both single imports
+/// and `import (...)` block syntax. Returns quoted import paths.
+fn extract_go_imports(lines: &[String]) -> Vec<String> {
+    let mut imports = Vec::new();
+    let mut in_block = false;
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed == "import (" {
+            in_block = true;
+            continue;
+        }
+        if trimmed == ")" && in_block {
+            in_block = false;
+            continue;
+        }
+        if in_block {
+            // Inside import block — line is a quoted path (possibly with alias).
+            let t = trimmed.trim_end_matches(';').trim();
+            if !t.is_empty() {
+                imports.push(t.to_string());
+            }
+        } else if trimmed.starts_with("import \"") || trimmed.starts_with("import '") {
+            // Single import: `import "fmt"`
+            let path = trimmed[7..].trim().trim_end_matches(';').trim();
+            imports.push(path.to_string());
+        }
+    }
+
+    imports
+}
+
+/// Check if a Go import path is stdlib (no dot in the package path).
+/// E.g., `"fmt"` → stdlib, `"github.com/pkg/errors"` → third-party.
+fn is_go_stdlib(import_path: &str) -> bool {
+    let unquoted = import_path.trim().trim_matches('"').trim_matches('\'');
+    // Aliased imports: `alias "path"` — extract the path part.
+    let path = if unquoted.contains('"') {
+        unquoted.rsplit('"').nth(1).unwrap_or(unquoted)
+    } else {
+        unquoted
+    };
+    !path.contains('.')
+}
+
+/// Merge two sets of Go import lines with goimports-style grouping.
+///
+/// Extracts import paths from both sides (handling `import (...)` blocks),
+/// deduplicates, then outputs a single `import (...)` block with stdlib
+/// imports first (sorted), a blank line separator, and third-party imports
+/// second (sorted).
+fn merge_go_imports(left: &[String], right: &[String]) -> Vec<String> {
+    let left_imports = extract_go_imports(left);
+    let right_imports = extract_go_imports(right);
+
+    // Dedup by trimmed content.
+    let mut seen = std::collections::HashSet::new();
+    let mut all_imports: Vec<String> = Vec::new();
+    for imp in left_imports.iter().chain(right_imports.iter()) {
+        let trimmed = imp.trim().to_string();
+        if seen.insert(trimmed.clone()) {
+            all_imports.push(trimmed);
+        }
+    }
+
+    // Split into stdlib and third-party.
+    let mut stdlib: Vec<&String> = all_imports.iter().filter(|i| is_go_stdlib(i)).collect();
+    let mut third_party: Vec<&String> = all_imports.iter().filter(|i| !is_go_stdlib(i)).collect();
+    stdlib.sort();
+    third_party.sort();
+
+    // If only one import, use single-line syntax.
+    if stdlib.len() + third_party.len() == 1 {
+        let single = stdlib.first().or(third_party.first()).unwrap();
+        return vec![format!("import {}", single)];
+    }
+
+    // Build import block.
+    let mut result = vec!["import (".to_string()];
+    for imp in &stdlib {
+        result.push(format!("\t{}", imp));
+    }
+    if !stdlib.is_empty() && !third_party.is_empty() {
+        result.push(String::new()); // blank line separator
+    }
+    for imp in &third_party {
+        result.push(format!("\t{}", imp));
+    }
+    result.push(")".to_string());
     result
 }
 
@@ -344,11 +792,46 @@ fn parse_decorator_groups(lines: &[String]) -> Vec<(String, Vec<String>)> {
     groups
 }
 
+/// Consolidate multiple `#[derive(...)]` attributes into a single one.
+///
+/// When two agents both add derives to the same struct, the decorator union
+/// may contain `#[derive(Debug, Clone, Serialize)]` and `#[derive(Debug, Clone, Deserialize)]`.
+/// This function merges them into `#[derive(Clone, Debug, Deserialize, Serialize)]`.
+/// Non-derive attributes pass through unchanged.
+fn consolidate_rust_derives(decorators: &[String]) -> Vec<String> {
+    let mut derive_traits: Vec<String> = Vec::new();
+    let mut non_derive: Vec<String> = Vec::new();
+
+    for dec in decorators {
+        let trimmed = dec.trim();
+        if trimmed.starts_with("#[derive(") && trimmed.ends_with(")]") {
+            let inner = &trimmed[9..trimmed.len() - 2];
+            for trait_name in inner.split(',') {
+                let t = trait_name.trim().to_string();
+                if !t.is_empty() && !derive_traits.contains(&t) {
+                    derive_traits.push(t);
+                }
+            }
+        } else {
+            non_derive.push(dec.clone());
+        }
+    }
+
+    let mut result = Vec::new();
+    if !derive_traits.is_empty() {
+        derive_traits.sort();
+        result.push(format!("#[derive({})]", derive_traits.join(", ")));
+    }
+    result.extend(non_derive);
+    result
+}
+
 /// Merge decorator groups from both sides, preserving all decorators.
 ///
 /// For each declaration line present in either side, collects the union
 /// of decorators from both sides. Uses the longer side for declaration
 /// ordering. Returns `None` if neither side has decorator structure.
+/// For Rust `#[derive(...)]` attributes, consolidates derive lists.
 fn merge_with_decorator_preservation(
     left: &[String],
     right: &[String],
@@ -385,6 +868,8 @@ fn merge_with_decorator_preservation(
                 }
             }
         }
+        // Consolidate Rust #[derive(...)] attributes.
+        let all_decorators = consolidate_rust_derives(&all_decorators);
         result.extend(all_decorators);
         result.push(decl.clone());
     }
@@ -392,7 +877,8 @@ fn merge_with_decorator_preservation(
     // Add declarations only in secondary.
     for (decl, decorators) in secondary {
         if !seen_decls.contains(decl) {
-            result.extend(decorators.iter().cloned());
+            let decorators = consolidate_rust_derives(decorators);
+            result.extend(decorators);
             result.push(decl.clone());
         }
     }
@@ -441,28 +927,47 @@ pub fn resolve_conflict_regions(
 
         match &class {
             ConflictClass::BothInserted => {
-                let all_imports = region
-                    .left_lines
-                    .iter()
-                    .chain(region.right_lines.iter())
-                    .all(|l| is_import_line(l));
+                // Use multiline-aware import region detection.
+                let all_imports =
+                    is_import_region(&region.left_lines) && is_import_region(&region.right_lines);
 
-                let mut lines = Vec::new();
-                if left_first {
-                    lines.extend(region.left_lines.iter().cloned());
-                    lines.extend(region.right_lines.iter().cloned());
+                let lines = if all_imports {
+                    // Check if JS/TS for source-module grouping.
+                    let combined: Vec<String> = region
+                        .left_lines
+                        .iter()
+                        .chain(region.right_lines.iter())
+                        .cloned()
+                        .collect();
+                    let lang = detect_import_language(&combined);
+
+                    if matches!(lang, ImportLanguage::JavaScript) {
+                        merge_js_imports(&region.left_lines, &region.right_lines)
+                    } else {
+                        // Non-JS: keep spec-ID ordering with line-level dedup.
+                        let mut l = Vec::new();
+                        if left_first {
+                            l.extend(region.left_lines.iter().cloned());
+                            l.extend(region.right_lines.iter().cloned());
+                        } else {
+                            l.extend(region.right_lines.iter().cloned());
+                            l.extend(region.left_lines.iter().cloned());
+                        }
+                        let mut seen = std::collections::HashSet::new();
+                        l.retain(|line| seen.insert(line.clone()));
+                        l
+                    }
                 } else {
-                    lines.extend(region.right_lines.iter().cloned());
-                    lines.extend(region.left_lines.iter().cloned());
-                }
-
-                if all_imports {
-                    // Only deduplicate for import regions where exact
-                    // duplicates (e.g., both sides added the same import)
-                    // should be collapsed.
-                    let mut seen = std::collections::HashSet::new();
-                    lines.retain(|l| seen.insert(l.clone()));
-                }
+                    let mut l = Vec::new();
+                    if left_first {
+                        l.extend(region.left_lines.iter().cloned());
+                        l.extend(region.right_lines.iter().cloned());
+                    } else {
+                        l.extend(region.right_lines.iter().cloned());
+                        l.extend(region.left_lines.iter().cloned());
+                    }
+                    l
+                };
 
                 let method = if all_imports {
                     "import-accumulation"
@@ -536,6 +1041,28 @@ pub fn resolve_conflict_regions(
                             class: class.clone(),
                             method: "decorator-preservation".to_string(),
                             confidence: 0.88,
+                        });
+                        continue;
+                    }
+
+                    // Fallback: pure decorator region (no associated declaration
+                    // in the conflict — e.g., both sides modified #[derive(...)]).
+                    // Consolidate all decorators and merge Rust derives.
+                    if region.left_lines.iter().all(|l| is_decorator_line(l))
+                        && region.right_lines.iter().all(|l| is_decorator_line(l))
+                    {
+                        let mut all_decorators: Vec<String> = Vec::new();
+                        for dec in region.left_lines.iter().chain(region.right_lines.iter()) {
+                            if !all_decorators.contains(dec) {
+                                all_decorators.push(dec.clone());
+                            }
+                        }
+                        let consolidated = consolidate_rust_derives(&all_decorators);
+                        resolved_regions.push(RegionResolution {
+                            lines: consolidated,
+                            class: class.clone(),
+                            method: "decorator-consolidation".to_string(),
+                            confidence: 0.92,
                         });
                         continue;
                     }
@@ -873,6 +1400,11 @@ pub struct ConvergenceQualityReport {
     pub consistency_checks: Vec<ConsistencyCheck>,
     /// Overall quality score (0-100).
     pub quality_score: u32,
+    /// Lowest per-file confidence across all auto-resolved files (0.0-1.0).
+    /// Agents should review files where min_confidence < 0.85.
+    pub min_confidence: f64,
+    /// Average per-file confidence across all auto-resolved files (0.0-1.0).
+    pub avg_confidence: f64,
     /// Human-readable summary of the quality assessment.
     pub summary: String,
 }
@@ -893,6 +1425,11 @@ pub struct FileDecision {
     /// Alternative versions that were discarded.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub alternatives: Vec<FileAlternative>,
+    /// Per-file confidence (0.0-1.0). Some(1.0) for clean auto-merges,
+    /// Some(avg) for auto-resolved, Some(0.7) for strategy fallback,
+    /// None for left-only/right-only (no conflict).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f64>,
 }
 
 /// A discarded alternative version of a file.
@@ -1881,5 +2418,653 @@ h1 {
         assert!(content.contains(".sidebar"), "sidebar styles lost");
         assert!(content.contains(".user-avatar"), "user-avatar styles lost");
         assert!(content.contains(".sidebar a"), "sidebar a styles lost");
+    }
+
+    // -----------------------------------------------------------------------
+    // JS/TS import merge tests (Sprint 13 — Amis)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_import_accumulation_js_named() {
+        // Two agents add different named imports from the same module.
+        // Should consolidate into a single import statement.
+        let base = "import { useState } from 'react';\n\nfunction App() { return null; }";
+        let left =
+            "import { useState, useCallback } from 'react';\n\nfunction App() { return null; }";
+        let right =
+            "import { useState, useEffect } from 'react';\n\nfunction App() { return null; }";
+
+        let result = smart_merge(base, left, right, "agent-a", "agent-b");
+        match &result {
+            SmartMergeResult::Clean {
+                content,
+                resolutions,
+            } => {
+                // All three named imports should be consolidated into one statement.
+                assert!(
+                    content.contains("useCallback"),
+                    "useCallback lost: {content}"
+                );
+                assert!(content.contains("useEffect"), "useEffect lost: {content}");
+                assert!(content.contains("useState"), "useState lost: {content}");
+                // Should be a single import from 'react', not two separate ones.
+                assert_eq!(
+                    content.matches("from 'react'").count(),
+                    1,
+                    "expected one consolidated import from 'react', got:\n{content}"
+                );
+                let import_res = resolutions
+                    .iter()
+                    .find(|r| r.method == "import-accumulation");
+                assert!(import_res.is_some(), "should use import-accumulation");
+            }
+            SmartMergeResult::Partial { .. } => {
+                panic!("expected fully resolved JS named import merge");
+            }
+        }
+    }
+
+    #[test]
+    fn test_import_accumulation_js_default() {
+        // Two agents add different default imports from different modules.
+        let base = "import React from 'react';\n\nexport default function App() {}";
+        let left = "import React from 'react';\nimport axios from 'axios';\n\nexport default function App() {}";
+        let right = "import React from 'react';\nimport lodash from 'lodash';\n\nexport default function App() {}";
+
+        let result = smart_merge(base, left, right, "api-agent", "util-agent");
+        match &result {
+            SmartMergeResult::Clean { content, .. } => {
+                assert!(content.contains("axios"), "axios import lost: {content}");
+                assert!(content.contains("lodash"), "lodash import lost: {content}");
+                assert!(content.contains("React"), "React import lost: {content}");
+                // Each from a different source — should remain separate imports.
+                assert!(
+                    content.contains("from 'axios'"),
+                    "axios source lost: {content}"
+                );
+                assert!(
+                    content.contains("from 'lodash'"),
+                    "lodash source lost: {content}"
+                );
+            }
+            SmartMergeResult::Partial { .. } => {
+                panic!("expected fully resolved JS default import merge");
+            }
+        }
+    }
+
+    #[test]
+    fn test_import_accumulation_js_multiline() {
+        // Multi-line import blocks should be recognized and merged.
+        let base = "import {\n  useState\n} from 'react';\n\nfunction App() {}";
+        let left = "import {\n  useState,\n  useCallback\n} from 'react';\n\nfunction App() {}";
+        let right = "import {\n  useState,\n  useEffect\n} from 'react';\n\nfunction App() {}";
+
+        let result = smart_merge(base, left, right, "agent-a", "agent-b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        assert!(
+            content.contains("useCallback"),
+            "useCallback lost in multiline merge: {content}"
+        );
+        assert!(
+            content.contains("useEffect"),
+            "useEffect lost in multiline merge: {content}"
+        );
+        assert!(
+            content.contains("useState"),
+            "useState lost in multiline merge: {content}"
+        );
+    }
+
+    #[test]
+    fn test_import_dedup_same_source() {
+        // Both agents add the exact same import — should be deduped.
+        let base = "import React from 'react';\n\nfunction App() {}";
+        let left =
+            "import React from 'react';\nimport { useState } from 'react';\n\nfunction App() {}";
+        let right =
+            "import React from 'react';\nimport { useState } from 'react';\n\nfunction App() {}";
+
+        let result = smart_merge(base, left, right, "a", "b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        // useState should appear exactly once (deduped).
+        assert_eq!(
+            content.matches("useState").count(),
+            1,
+            "useState should be deduped, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn test_import_accumulation_js_type_imports() {
+        // Type imports and value imports from the same source stay separate.
+        let base = "import { useState } from 'react';\n\nfunction App() {}";
+        let left = "import { useState } from 'react';\nimport type { FC } from 'react';\n\nfunction App() {}";
+        let right = "import { useState, useEffect } from 'react';\n\nfunction App() {}";
+
+        let result = smart_merge(base, left, right, "a", "b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        assert!(content.contains("useEffect"), "useEffect lost: {content}");
+        assert!(content.contains("type"), "type import lost: {content}");
+        assert!(content.contains("FC"), "FC type import lost: {content}");
+    }
+
+    #[test]
+    fn test_import_accumulation_js_require() {
+        // require() calls can't be consolidated by source — just deduped.
+        let base = "const React = require('react');\n\nmodule.exports = {};";
+        let left = "const React = require('react');\nconst axios = require('axios');\n\nmodule.exports = {};";
+        let right = "const React = require('react');\nconst lodash = require('lodash');\n\nmodule.exports = {};";
+
+        let result = smart_merge(base, left, right, "a", "b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        assert!(content.contains("axios"), "axios require lost: {content}");
+        assert!(content.contains("lodash"), "lodash require lost: {content}");
+    }
+
+    #[test]
+    fn test_import_accumulation_js_mixed_default_and_named() {
+        // One agent adds a default import, the other adds named imports
+        // from the same source. Should consolidate.
+        let base = "\nfunction App() {}";
+        let left = "import React from 'react';\n\nfunction App() {}";
+        let right = "import { useState } from 'react';\n\nfunction App() {}";
+
+        let result = smart_merge(base, left, right, "a", "b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        assert!(content.contains("React"), "default import lost: {content}");
+        assert!(content.contains("useState"), "named import lost: {content}");
+        // Should consolidate into one import from 'react'.
+        assert_eq!(
+            content.matches("from 'react'").count(),
+            1,
+            "expected one consolidated import from 'react', got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn test_import_accumulation_js_namespace() {
+        // Namespace imports should be preserved.
+        let base = "\nfunction App() {}";
+        let left = "import * as React from 'react';\n\nfunction App() {}";
+        let right = "import axios from 'axios';\n\nfunction App() {}";
+
+        let result = smart_merge(base, left, right, "a", "b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        assert!(
+            content.contains("* as React"),
+            "namespace import lost: {content}"
+        );
+        assert!(content.contains("axios"), "axios import lost: {content}");
+    }
+
+    #[test]
+    fn test_import_accumulation_js_side_effect() {
+        // Side-effect imports should be preserved.
+        let base = "\nfunction setup() {}";
+        let left = "import 'polyfill';\n\nfunction setup() {}";
+        let right = "import 'normalize.css';\n\nfunction setup() {}";
+
+        let result = smart_merge(base, left, right, "a", "b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        assert!(
+            content.contains("polyfill"),
+            "polyfill side-effect import lost: {content}"
+        );
+        assert!(
+            content.contains("normalize.css"),
+            "normalize.css side-effect import lost: {content}"
+        );
+    }
+
+    #[test]
+    fn test_import_region_multiline_detection() {
+        // is_import_region should recognize multi-line JS imports.
+        let lines = vec![
+            "import {".to_string(),
+            "  useState,".to_string(),
+            "  useEffect".to_string(),
+            "} from 'react';".to_string(),
+        ];
+        assert!(
+            is_import_region(&lines),
+            "multi-line JS import not detected as import region"
+        );
+
+        // Go import block.
+        let go_lines = vec![
+            "import (".to_string(),
+            "  \"fmt\"".to_string(),
+            "  \"os\"".to_string(),
+            ")".to_string(),
+        ];
+        assert!(
+            is_import_region(&go_lines),
+            "Go import block not detected as import region"
+        );
+
+        // Rust multi-line use.
+        let rust_lines = vec![
+            "use std::{".to_string(),
+            "    io,".to_string(),
+            "    fs,".to_string(),
+            "};".to_string(),
+        ];
+        assert!(
+            is_import_region(&rust_lines),
+            "Rust multi-line use not detected as import region"
+        );
+
+        // Non-import content should fail.
+        let non_import = vec![
+            "fn main() {".to_string(),
+            "    println!(\"hello\");".to_string(),
+            "}".to_string(),
+        ];
+        assert!(
+            !is_import_region(&non_import),
+            "non-import code falsely detected as import region"
+        );
+    }
+
+    #[test]
+    fn test_join_multiline_imports() {
+        let lines = vec![
+            "import {".to_string(),
+            "  useState,".to_string(),
+            "  useEffect,".to_string(),
+            "} from 'react';".to_string(),
+            "import axios from 'axios';".to_string(),
+        ];
+        let joined = join_multiline_imports(&lines);
+        assert_eq!(joined.len(), 2);
+        assert!(joined[0].contains("useState"));
+        assert!(joined[0].contains("useEffect"));
+        assert!(joined[0].contains("from 'react'"));
+        assert_eq!(joined[1], "import axios from 'axios';");
+    }
+
+    #[test]
+    fn test_parse_js_import_named() {
+        let import = parse_js_import("import { useState, useEffect } from 'react';").unwrap();
+        assert_eq!(import.source, "'react'");
+        assert!(import.named_imports.contains(&"useState".to_string()));
+        assert!(import.named_imports.contains(&"useEffect".to_string()));
+        assert!(import.default_import.is_none());
+        assert!(!import.is_type);
+    }
+
+    #[test]
+    fn test_parse_js_import_default() {
+        let import = parse_js_import("import React from 'react';").unwrap();
+        assert_eq!(import.source, "'react'");
+        assert_eq!(import.default_import, Some("React".to_string()));
+        assert!(import.named_imports.is_empty());
+    }
+
+    #[test]
+    fn test_parse_js_import_default_plus_named() {
+        let import =
+            parse_js_import("import React, { useState, useEffect } from 'react';").unwrap();
+        assert_eq!(import.source, "'react'");
+        assert_eq!(import.default_import, Some("React".to_string()));
+        assert!(import.named_imports.contains(&"useState".to_string()));
+        assert!(import.named_imports.contains(&"useEffect".to_string()));
+    }
+
+    #[test]
+    fn test_parse_js_import_type() {
+        let import = parse_js_import("import type { FC, ReactNode } from 'react';").unwrap();
+        assert_eq!(import.source, "'react'");
+        assert!(import.is_type);
+        assert!(import.named_imports.contains(&"FC".to_string()));
+        assert!(import.named_imports.contains(&"ReactNode".to_string()));
+    }
+
+    #[test]
+    fn test_parse_js_import_side_effect() {
+        let import = parse_js_import("import 'polyfill';").unwrap();
+        assert_eq!(import.source, "'polyfill'");
+        assert!(import.is_side_effect);
+    }
+
+    #[test]
+    fn test_parse_js_import_namespace() {
+        let import = parse_js_import("import * as React from 'react';").unwrap();
+        assert_eq!(import.source, "'react'");
+        assert_eq!(import.namespace, Some("React".to_string()));
+    }
+
+    #[test]
+    fn test_parse_js_import_reexport() {
+        let import = parse_js_import("export { Button, Input } from './components';").unwrap();
+        assert_eq!(import.source, "'./components'");
+        assert!(import.is_export);
+        assert!(import.named_imports.contains(&"Button".to_string()));
+        assert!(import.named_imports.contains(&"Input".to_string()));
+    }
+
+    #[test]
+    fn test_detect_import_language() {
+        let js = vec!["import React from 'react';".to_string()];
+        assert_eq!(detect_import_language(&js), ImportLanguage::JavaScript);
+
+        let py = vec!["from flask import Flask".to_string()];
+        assert_eq!(detect_import_language(&py), ImportLanguage::Python);
+
+        let rs = vec!["use std::io;".to_string()];
+        assert_eq!(detect_import_language(&rs), ImportLanguage::Rust);
+
+        let go = vec!["import \"fmt\"".to_string()];
+        assert_eq!(detect_import_language(&go), ImportLanguage::Go);
+
+        let cpp = vec!["#include <stdio.h>".to_string()];
+        assert_eq!(detect_import_language(&cpp), ImportLanguage::Cpp);
+    }
+
+    #[test]
+    fn test_merge_js_imports_consolidation() {
+        // Direct unit test for merge_js_imports: same source → consolidated.
+        let left = vec![
+            "import { useState } from 'react';".to_string(),
+            "import axios from 'axios';".to_string(),
+        ];
+        let right = vec![
+            "import { useEffect } from 'react';".to_string(),
+            "import lodash from 'lodash';".to_string(),
+        ];
+        let merged = merge_js_imports(&left, &right);
+
+        // Should have 3 imports: consolidated react, axios, lodash
+        assert_eq!(
+            merged.len(),
+            3,
+            "expected 3 merged imports, got: {merged:?}"
+        );
+
+        let react_import = merged.iter().find(|l| l.contains("'react'")).unwrap();
+        assert!(
+            react_import.contains("useEffect"),
+            "useEffect missing from consolidated: {react_import}"
+        );
+        assert!(
+            react_import.contains("useState"),
+            "useState missing from consolidated: {react_import}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Rust merge pattern tests (Sprint 13 — Amis)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_rust_derive_accumulation() {
+        // Two agents add different derives to the same struct.
+        let base = "#[derive(Debug, Clone)]\npub struct Config {\n    pub name: String,\n}";
+        let left =
+            "#[derive(Debug, Clone, Serialize)]\npub struct Config {\n    pub name: String,\n}";
+        let right =
+            "#[derive(Debug, Clone, Deserialize)]\npub struct Config {\n    pub name: String,\n}";
+
+        let result = smart_merge(base, left, right, "agent-a", "agent-b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        assert!(
+            content.contains("Serialize"),
+            "Serialize derive lost: {content}"
+        );
+        assert!(
+            content.contains("Deserialize"),
+            "Deserialize derive lost: {content}"
+        );
+        assert!(content.contains("Debug"), "Debug derive lost: {content}");
+        assert!(content.contains("Clone"), "Clone derive lost: {content}");
+        // Should be consolidated into a single #[derive(...)].
+        assert_eq!(
+            content.matches("#[derive(").count(),
+            1,
+            "expected one consolidated derive, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn test_rust_derive_with_other_attributes() {
+        // Derives should consolidate, but other attributes should be kept separate.
+        let base = "#[derive(Debug)]\npub struct Foo {}";
+        let left =
+            "#[derive(Debug, Clone)]\n#[serde(rename_all = \"camelCase\")]\npub struct Foo {}";
+        let right = "#[derive(Debug, Serialize)]\npub struct Foo {}";
+
+        let result = smart_merge(base, left, right, "a", "b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        assert!(content.contains("Clone"), "Clone lost: {content}");
+        assert!(content.contains("Serialize"), "Serialize lost: {content}");
+        assert!(
+            content.contains("serde(rename_all"),
+            "serde attribute lost: {content}"
+        );
+        // One consolidated derive + serde attribute.
+        assert_eq!(
+            content.matches("#[derive(").count(),
+            1,
+            "derives not consolidated: {content}"
+        );
+    }
+
+    #[test]
+    fn test_rust_multiline_use_import_region() {
+        // Multi-line `use` blocks should be detected and merged.
+        let base = "use std::io;\n\nfn main() {}";
+        let left = "use std::io;\nuse std::{\n    fs,\n    path::PathBuf,\n};\n\nfn main() {}";
+        let right = "use std::io;\nuse std::collections::HashMap;\n\nfn main() {}";
+
+        let result = smart_merge(base, left, right, "a", "b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        assert!(content.contains("fs"), "fs import lost: {content}");
+        assert!(
+            content.contains("PathBuf"),
+            "PathBuf import lost: {content}"
+        );
+        assert!(
+            content.contains("HashMap"),
+            "HashMap import lost: {content}"
+        );
+    }
+
+    #[test]
+    fn test_consolidate_rust_derives_unit() {
+        // Direct unit test for consolidate_rust_derives.
+        let decorators = vec![
+            "#[derive(Debug, Clone, Serialize)]".to_string(),
+            "#[derive(Debug, Clone, Deserialize)]".to_string(),
+            "#[serde(rename_all = \"camelCase\")]".to_string(),
+        ];
+        let result = consolidate_rust_derives(&decorators);
+        assert_eq!(result.len(), 2, "expected derive + serde, got: {result:?}");
+        assert!(result[0].starts_with("#[derive("));
+        assert!(result[0].contains("Serialize"));
+        assert!(result[0].contains("Deserialize"));
+        assert!(result[0].contains("Clone"));
+        assert!(result[0].contains("Debug"));
+        // Should be sorted alphabetically.
+        let derive_line = &result[0];
+        let clone_pos = derive_line.find("Clone").unwrap();
+        let debug_pos = derive_line.find("Debug").unwrap();
+        let deser_pos = derive_line.find("Deserialize").unwrap();
+        let ser_pos = derive_line.find("Serialize").unwrap();
+        assert!(clone_pos < debug_pos);
+        assert!(debug_pos < deser_pos);
+        assert!(deser_pos < ser_pos);
+    }
+
+    // -----------------------------------------------------------------------
+    // Go merge pattern tests (Sprint 13 — Amis)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_go_import_block_merge() {
+        // Two agents add different imports to a Go file with import blocks.
+        let base = "package main\n\nimport (\n\t\"fmt\"\n)\n\nfunc main() {}";
+        let left = "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {}";
+        let right = "package main\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\nfunc main() {}";
+
+        let result = smart_merge(base, left, right, "agent-a", "agent-b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        assert!(content.contains("fmt"), "fmt import lost: {content}");
+        assert!(content.contains("os"), "os import lost: {content}");
+        assert!(
+            content.contains("strings"),
+            "strings import lost: {content}"
+        );
+    }
+
+    #[test]
+    fn test_go_import_grouped_sorting() {
+        // Go imports should group stdlib first, then third-party.
+        let left = vec![
+            "import (".to_string(),
+            "\t\"fmt\"".to_string(),
+            "\t\"github.com/pkg/errors\"".to_string(),
+            ")".to_string(),
+        ];
+        let right = vec![
+            "import (".to_string(),
+            "\t\"os\"".to_string(),
+            "\t\"github.com/stretchr/testify\"".to_string(),
+            ")".to_string(),
+        ];
+
+        let merged = merge_go_imports(&left, &right);
+
+        let content = merged.join("\n");
+        assert!(content.contains("\"fmt\""), "fmt lost: {content}");
+        assert!(content.contains("\"os\""), "os lost: {content}");
+        assert!(
+            content.contains("github.com/pkg/errors"),
+            "errors lost: {content}"
+        );
+        assert!(
+            content.contains("github.com/stretchr/testify"),
+            "testify lost: {content}"
+        );
+
+        // Stdlib should come before third-party.
+        let fmt_pos = content.find("\"fmt\"").unwrap();
+        let errors_pos = content.find("github.com/pkg/errors").unwrap();
+        assert!(
+            fmt_pos < errors_pos,
+            "stdlib should precede third-party: {content}"
+        );
+    }
+
+    #[test]
+    fn test_go_import_dedup() {
+        let left = vec![
+            "import (".to_string(),
+            "\t\"fmt\"".to_string(),
+            "\t\"os\"".to_string(),
+            ")".to_string(),
+        ];
+        let right = vec![
+            "import (".to_string(),
+            "\t\"fmt\"".to_string(),
+            "\t\"strings\"".to_string(),
+            ")".to_string(),
+        ];
+
+        let merged = merge_go_imports(&left, &right);
+        let content = merged.join("\n");
+
+        assert_eq!(
+            content.matches("\"fmt\"").count(),
+            1,
+            "fmt should be deduped: {content}"
+        );
+        assert!(content.contains("\"os\""), "os lost: {content}");
+        assert!(content.contains("\"strings\""), "strings lost: {content}");
+    }
+
+    #[test]
+    fn test_go_single_import_merge() {
+        let left = vec!["import \"fmt\"".to_string()];
+        let right = vec!["import \"os\"".to_string()];
+
+        let merged = merge_go_imports(&left, &right);
+        let content = merged.join("\n");
+        assert!(content.contains("\"fmt\""), "fmt lost: {content}");
+        assert!(content.contains("\"os\""), "os lost: {content}");
+        assert!(
+            content.contains("import ("),
+            "should use block syntax for multiple imports: {content}"
+        );
+    }
+
+    #[test]
+    fn test_is_go_stdlib() {
+        assert!(is_go_stdlib("\"fmt\""));
+        assert!(is_go_stdlib("\"os\""));
+        assert!(is_go_stdlib("\"net/http\""));
+        assert!(!is_go_stdlib("\"github.com/pkg/errors\""));
+        assert!(!is_go_stdlib("\"golang.org/x/crypto\""));
+    }
+
+    #[test]
+    fn test_extract_go_imports() {
+        let lines = vec![
+            "import (".to_string(),
+            "\t\"fmt\"".to_string(),
+            "\t\"os\"".to_string(),
+            "".to_string(),
+            "\t\"github.com/pkg/errors\"".to_string(),
+            ")".to_string(),
+        ];
+        let imports = extract_go_imports(&lines);
+        assert_eq!(imports.len(), 3);
+        assert!(imports.contains(&"\"fmt\"".to_string()));
+        assert!(imports.contains(&"\"os\"".to_string()));
+        assert!(imports.contains(&"\"github.com/pkg/errors\"".to_string()));
     }
 }

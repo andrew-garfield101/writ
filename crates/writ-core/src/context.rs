@@ -18,6 +18,8 @@ pub enum ContextScope {
     Full,
     /// Scoped to a specific spec and its related files/seals.
     Spec(String),
+    /// Scoped to a specific agent's world: their specs, files, and risks.
+    Agent(String),
 }
 
 /// Optional filters applied to the seal history in context output.

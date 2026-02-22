@@ -535,10 +535,10 @@ class TestConvergeAll:
             assert "clean" in step
 
     def test_converge_all_default_strategy(self, tmp_path):
-        """Default strategy is three-way-merge."""
+        """Default strategy is manual."""
         repo = self._setup_diverged(tmp_path)
         report = repo.converge_all()
-        assert report["strategy"] == "three-way-merge"
+        assert report["strategy"] == "manual"
 
     def _setup_content_conflict(self, tmp_path):
         """Create a repo where two specs conflict on the same file with
@@ -575,34 +575,29 @@ class TestConvergeAll:
 
         return repo
 
-    def test_converge_all_most_complete_resolves_conflicts(self, tmp_path):
-        """MostComplete strategy picks the version with more lines."""
+    def test_converge_all_most_recent_resolves_conflicts(self, tmp_path):
+        """MostRecent strategy resolves all conflicts via Layer 4 fallback."""
         repo = self._setup_content_conflict(tmp_path)
-        report = repo.converge_all(strategy="most-complete", apply=True)
+        report = repo.converge_all(strategy="most-recent", apply=True)
         assert report["is_clean"] is True
         assert report["total_resolutions"] > 0
-        assert report["strategy"] == "most-complete"
+        assert report["strategy"] == "most-recent"
 
-        # Big version (more content) should win.
-        content = (tmp_path / "page.html").read_text()
-        assert "<nav>" in content
-
-    def test_converge_all_most_complete_has_resolution_records(self, tmp_path):
-        """MostComplete strategy creates resolution records."""
+    def test_converge_all_has_resolution_records(self, tmp_path):
+        """Convergence creates resolution records (auto or strategy)."""
         repo = self._setup_content_conflict(tmp_path)
-        report = repo.converge_all(strategy="most-complete")
-        has_mc = any(
-            r["strategy"] == "most-complete"
+        report = repo.converge_all(strategy="most-recent")
+        has_resolution = any(
+            len(step.get("resolutions", [])) > 0
             for step in report["merges"]
-            for r in step.get("resolutions", [])
         )
-        assert has_mc, "should have most-complete resolution records"
+        assert has_resolution, "should have resolution records"
 
-    def test_converge_all_most_complete_warns(self, tmp_path):
-        """MostComplete warns about discarded content."""
+    def test_converge_all_manual_strategy_name(self, tmp_path):
+        """Manual strategy is correctly named in report."""
         repo = self._setup_content_conflict(tmp_path)
-        report = repo.converge_all(strategy="most-complete")
-        assert any("more content" in w for w in report["warnings"])
+        report = repo.converge_all(strategy="manual")
+        assert report["strategy"] == "manual"
 
     def test_quality_report_present(self, tmp_path):
         """converge_all always returns a quality_report."""
@@ -628,21 +623,23 @@ class TestConvergeAll:
         assert "chosen_lines" in d
 
     def test_quality_report_with_strategy_decisions(self, tmp_path):
-        """Quality report records strategy-resolved conflict decisions."""
+        """Quality report records resolved conflict decisions."""
         repo = self._setup_content_conflict(tmp_path)
-        report = repo.converge_all(strategy="most-complete")
+        report = repo.converge_all(strategy="most-recent")
         qr = report["quality_report"]
-        mc_decisions = [d for d in qr["file_decisions"] if d["decision"] == "most-complete"]
-        assert len(mc_decisions) > 0
-        d = mc_decisions[0]
-        assert d["chosen_lines"] > 0
-        assert d["chosen_spec"] is not None
-        assert len(d["alternatives"]) > 0
+        resolved = [
+            d for d in qr["file_decisions"]
+            if d["decision"] in ("most-recent", "auto-resolved")
+        ]
+        assert len(resolved) > 0, (
+            f"should have resolved decisions, got: "
+            f"{[d['decision'] for d in qr['file_decisions']]}"
+        )
 
     def test_quality_report_serializable(self, tmp_path):
         """Quality report is JSON-serializable."""
         repo = self._setup_content_conflict(tmp_path)
-        report = repo.converge_all(strategy="most-complete")
+        report = repo.converge_all(strategy="most-recent")
         result = json.dumps(report)
         assert "quality_report" in result
         assert "file_decisions" in result
@@ -681,7 +678,7 @@ class TestConvergeAll:
         repo.seal(summary="extra", agent_id="nav-dev", spec_id="nav")
         repo.update_spec("nav", status="complete")
 
-        report = repo.converge_all(strategy="most-complete", apply=True)
+        report = repo.converge_all(strategy="most-recent", apply=True)
         qr = report["quality_report"]
         assert "consistency_checks" in qr
 

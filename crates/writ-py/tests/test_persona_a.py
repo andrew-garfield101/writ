@@ -105,7 +105,8 @@ class TestCasualWorkflow:
         assert len(summary["agents"]) >= 1
         assert len(summary["files_changed"]) >= 1
         assert len(summary["headline"]) > 0
-        assert "claude-code" in summary["headline"] or "seal" in summary["headline"]
+        # Headline should be descriptive (seal summaries, not just metadata).
+        assert "added auth module" in summary["headline"] or "writ:" in summary["headline"]
 
     def test_summary_commit_format_usable(self, tmp_path):
         """The commit format headline is a valid git commit message."""

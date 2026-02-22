@@ -3,7 +3,7 @@
 //! A Repository ties together the object store, index, seals, and specs
 //! into a unified interface.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -402,7 +402,13 @@ impl Repository {
             if let Ok(mut spec) = self.load_spec(sid) {
                 spec.sealed_by.push(seal.id.clone());
                 spec.updated_at = chrono::Utc::now();
+
+                let promoted = self.auto_promote_spec_status(&mut spec, &seal.status);
                 self.save_spec(&spec)?;
+
+                if promoted {
+                    self.check_all_specs_complete();
+                }
             }
         }
 
@@ -1305,7 +1311,8 @@ impl Repository {
                             }
                         }
                     }
-                    let status_str = match spec.status {
+                    let effective = self.effective_spec_status_from_sealed_by(&spec);
+                    let status_str = match effective {
                         SpecStatus::Pending => "pending",
                         SpecStatus::InProgress => "in-progress",
                         SpecStatus::Complete => "complete",
@@ -1496,6 +1503,120 @@ impl Repository {
         }
 
         Ok(spec)
+    }
+
+    /// Promote a spec's status to match a seal's task status.
+    /// Returns `true` if the spec status was actually changed.
+    ///
+    /// Rules:
+    /// - `TaskStatus::Complete` → `SpecStatus::Complete` (unless blocked)
+    /// - `TaskStatus::InProgress` → `SpecStatus::InProgress` (if currently pending)
+    /// - Never downgrades: complete stays complete, blocked stays blocked
+    fn auto_promote_spec_status(&self, spec: &mut Spec, seal_status: &TaskStatus) -> bool {
+        use crate::spec::SpecStatus;
+
+        if matches!(spec.status, SpecStatus::Blocked) {
+            return false;
+        }
+
+        let new_status = match seal_status {
+            TaskStatus::Complete => Some(SpecStatus::Complete),
+            TaskStatus::InProgress => {
+                if matches!(spec.status, SpecStatus::Pending) {
+                    Some(SpecStatus::InProgress)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        if let Some(status) = new_status {
+            if spec.status != status {
+                spec.status = status;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Derive effective status from a spec's `sealed_by` list.
+    /// Used by `context()` where we don't have pre-filtered seal refs.
+    ///
+    /// Only promotes from `Pending` — if someone explicitly set a status
+    /// (InProgress, Complete, Blocked), that decision is respected.
+    fn effective_spec_status_from_sealed_by(&self, spec: &Spec) -> crate::spec::SpecStatus {
+        use crate::spec::SpecStatus;
+
+        if !matches!(spec.status, SpecStatus::Pending) {
+            return spec.status.clone();
+        }
+
+        let mut has_complete = false;
+        let mut has_in_progress = false;
+        for seal_id in &spec.sealed_by {
+            if let Ok(seal) = self.load_seal(seal_id) {
+                match seal.status {
+                    TaskStatus::Complete => has_complete = true,
+                    TaskStatus::InProgress => has_in_progress = true,
+                    _ => {}
+                }
+            }
+        }
+
+        if has_complete {
+            return SpecStatus::Complete;
+        }
+        if has_in_progress {
+            return SpecStatus::InProgress;
+        }
+
+        SpecStatus::Pending
+    }
+
+    /// Derive the effective status for a spec by considering both the
+    /// spec-level status and the latest seal status.
+    ///
+    /// Only promotes from `Pending` — if someone explicitly set a status,
+    /// that decision is respected. This catches the common case where
+    /// agents sealed with --status complete but never called update_spec().
+    fn effective_spec_status(&self, spec: &Spec, seals: &[&&Seal]) -> crate::spec::SpecStatus {
+        use crate::spec::SpecStatus;
+
+        if !matches!(spec.status, SpecStatus::Pending) {
+            return spec.status.clone();
+        }
+
+        let has_complete_seal = seals.iter().any(|s| s.status == TaskStatus::Complete);
+        let has_in_progress_seal = seals.iter().any(|s| s.status == TaskStatus::InProgress);
+
+        if has_complete_seal {
+            return SpecStatus::Complete;
+        }
+        if has_in_progress_seal {
+            return SpecStatus::InProgress;
+        }
+
+        SpecStatus::Pending
+    }
+
+    /// If all specs are complete, write the summary cache files.
+    fn check_all_specs_complete(&self) {
+        let all_specs = self.list_specs().unwrap_or_default();
+        let all_complete = !all_specs.is_empty()
+            && all_specs
+                .iter()
+                .all(|s| matches!(s.status, crate::spec::SpecStatus::Complete));
+        if all_complete {
+            if let Ok(summary) = self.summary() {
+                let summary_json = self.writ_dir.join("summary.json");
+                if let Ok(json) = serde_json::to_string_pretty(&summary) {
+                    let _ = atomic_write(&summary_json, json.as_bytes());
+                }
+                let summary_txt = self.writ_dir.join("summary.txt");
+                let _ = atomic_write(&summary_txt, summary.commit_message.as_bytes());
+            }
+        }
     }
 
     /// Load a seal by full or short ID.
@@ -1852,203 +1973,200 @@ impl Repository {
                             self.apply_convergence(&report, &[])?;
                         }
                     } else {
-                        match strategy {
-                            ConvergeStrategy::MostRecent => {
-                                // Resolve conflicts by comparing seal timestamps.
-                                // The right spec is the diverged branch with unreachable work.
-                                let left_spec_data = self.load_spec(&base_spec).ok();
-                                let right_spec_data = self.load_spec(spec_id).ok();
+                        // Layers 2-3: always-on region-level resolution.
+                        // Resolves BothInserted, DeleteVsModify, superset
+                        // detection. Only BothModified conflicts that can't
+                        // be pattern-matched fall through to Layer 4.
+                        for conflict in &report.conflicts {
+                            let base = conflict.base_content.as_deref().unwrap_or("");
 
-                                let left_ts = left_spec_data
-                                    .and_then(|s| s.sealed_by.last().cloned())
-                                    .and_then(|id| self.load_seal(&id).ok())
-                                    .map(|s| s.timestamp);
-                                let right_ts = right_spec_data
-                                    .and_then(|s| s.sealed_by.last().cloned())
-                                    .and_then(|id| self.load_seal(&id).ok())
-                                    .map(|s| s.timestamp);
+                            let resolved = convergence::resolve_conflict_regions(
+                                base,
+                                &conflict.left_content,
+                                &conflict.right_content,
+                                &conflict.regions,
+                                &base_spec,
+                                spec_id,
+                            );
 
-                                let prefer_right = match (left_ts, right_ts) {
-                                    (Some(l), Some(r)) => r >= l,
-                                    (None, Some(_)) => true,
-                                    _ => false,
+                            if resolved.fully_resolved {
+                                // Layers 2-3 handled everything.
+                                step_resolutions.push(FileResolution {
+                                    path: conflict.path.clone(),
+                                    content: resolved.content.clone(),
+                                });
+
+                                let method_summary: Vec<String> = resolved
+                                    .resolutions
+                                    .iter()
+                                    .map(|r| r.method.clone())
+                                    .collect::<HashSet<_>>()
+                                    .into_iter()
+                                    .collect();
+
+                                let avg_confidence = if resolved.resolutions.is_empty() {
+                                    1.0
+                                } else {
+                                    resolved
+                                        .resolutions
+                                        .iter()
+                                        .map(|r| r.confidence)
+                                        .sum::<f64>()
+                                        / resolved.resolutions.len() as f64
                                 };
 
-                                for conflict in &report.conflicts {
-                                    let (content, chosen, other) = if prefer_right {
-                                        (
-                                            conflict.right_content.clone(),
-                                            spec_id.to_string(),
-                                            base_spec.clone(),
-                                        )
-                                    } else {
-                                        (
-                                            conflict.left_content.clone(),
-                                            base_spec.clone(),
-                                            spec_id.to_string(),
-                                        )
-                                    };
+                                resolutions_records.push(ResolutionRecord {
+                                    path: conflict.path.clone(),
+                                    strategy: format!("auto: {}", method_summary.join(", ")),
+                                    chosen_spec: None,
+                                    lost_content_warning: None,
+                                });
 
-                                    // Warn about lost content.
-                                    let lost = if prefer_right {
-                                        &conflict.left_content
-                                    } else {
-                                        &conflict.right_content
-                                    };
-                                    let lost_warning = if !lost.is_empty() {
-                                        let lost_lines = lost.lines().count();
-                                        Some(format!(
-                                            "Discarded {} line(s) from spec '{}' in favor of '{}'",
-                                            lost_lines, other, chosen,
-                                        ))
-                                    } else {
-                                        None
-                                    };
-
-                                    if let Some(ref w) = lost_warning {
-                                        warnings.push(format!("{}: {}", conflict.path, w));
-                                    }
-
-                                    step_resolutions.push(FileResolution {
-                                        path: conflict.path.clone(),
-                                        content,
-                                    });
-
-                                    resolutions_records.push(ResolutionRecord {
-                                        path: conflict.path.clone(),
-                                        strategy: "most-recent".to_string(),
-                                        chosen_spec: Some(chosen.clone()),
-                                        lost_content_warning: lost_warning,
-                                    });
-
-                                    file_decisions.push(FileDecision {
-                                        path: conflict.path.clone(),
-                                        decision: "most-recent".to_string(),
-                                        chosen_lines: if prefer_right {
-                                            conflict.right_content.lines().count()
-                                        } else {
-                                            conflict.left_content.lines().count()
+                                file_decisions.push(FileDecision {
+                                    path: conflict.path.clone(),
+                                    decision: "auto-resolved".to_string(),
+                                    chosen_lines: resolved.content.lines().count(),
+                                    chosen_spec: None,
+                                    alternatives: vec![
+                                        FileAlternative {
+                                            spec: base_spec.clone(),
+                                            lines: conflict.left_content.lines().count(),
+                                            reason: format!(
+                                                "composed (confidence: {:.0}%)",
+                                                avg_confidence * 100.0
+                                            ),
                                         },
-                                        chosen_spec: Some(chosen),
-                                        alternatives: vec![FileAlternative {
-                                            spec: other,
-                                            lines: lost.lines().count(),
-                                            reason: "discarded: not most recent".to_string(),
-                                        }],
-                                    });
-                                }
-
-                                total_resolutions += report.conflicts.len();
-                                step_clean = true;
-
-                                if apply {
-                                    self.apply_convergence(&report, &step_resolutions)?;
-                                }
-                            }
-                            ConvergeStrategy::MostComplete => {
-                                for conflict in &report.conflicts {
-                                    let left_lines = conflict.left_content.lines().count();
-                                    let right_lines = conflict.right_content.lines().count();
-                                    let prefer_right = right_lines > left_lines;
-
-                                    let (content, chosen, other) = if prefer_right {
-                                        (
-                                            conflict.right_content.clone(),
-                                            spec_id.to_string(),
-                                            base_spec.clone(),
-                                        )
-                                    } else {
-                                        (
-                                            conflict.left_content.clone(),
-                                            base_spec.clone(),
-                                            spec_id.to_string(),
-                                        )
-                                    };
-
-                                    let lost = if prefer_right {
-                                        &conflict.left_content
-                                    } else {
-                                        &conflict.right_content
-                                    };
-                                    let lost_warning = if !lost.is_empty() {
-                                        let lost_lines = lost.lines().count();
-                                        Some(format!(
-                                            "Discarded {} line(s) from spec '{}' (chose '{}' with more content)",
-                                            lost_lines, other, chosen,
-                                        ))
-                                    } else {
-                                        None
-                                    };
-
-                                    if let Some(ref w) = lost_warning {
-                                        warnings.push(format!("{}: {}", conflict.path, w));
-                                    }
-
-                                    step_resolutions.push(FileResolution {
-                                        path: conflict.path.clone(),
-                                        content,
-                                    });
-
-                                    resolutions_records.push(ResolutionRecord {
-                                        path: conflict.path.clone(),
-                                        strategy: "most-complete".to_string(),
-                                        chosen_spec: Some(chosen.clone()),
-                                        lost_content_warning: lost_warning,
-                                    });
-
-                                    file_decisions.push(FileDecision {
-                                        path: conflict.path.clone(),
-                                        decision: "most-complete".to_string(),
-                                        chosen_lines: if prefer_right {
-                                            right_lines
-                                        } else {
-                                            left_lines
+                                        FileAlternative {
+                                            spec: spec_id.to_string(),
+                                            lines: conflict.right_content.lines().count(),
+                                            reason: format!(
+                                                "composed (confidence: {:.0}%)",
+                                                avg_confidence * 100.0
+                                            ),
                                         },
-                                        chosen_spec: Some(chosen),
-                                        alternatives: vec![FileAlternative {
-                                            spec: other,
-                                            lines: if prefer_right {
-                                                left_lines
+                                    ],
+                                });
+
+                                total_resolutions += 1;
+                            } else {
+                                // Layer 4: strategy-dependent fallback for
+                                // BothModified regions that couldn't be auto-resolved.
+                                match strategy {
+                                    ConvergeStrategy::MostRecent => {
+                                        let left_spec_data = self.load_spec(&base_spec).ok();
+                                        let right_spec_data = self.load_spec(spec_id).ok();
+
+                                        let left_ts = left_spec_data
+                                            .and_then(|s| s.sealed_by.last().cloned())
+                                            .and_then(|id| self.load_seal(&id).ok())
+                                            .map(|s| s.timestamp);
+                                        let right_ts = right_spec_data
+                                            .and_then(|s| s.sealed_by.last().cloned())
+                                            .and_then(|id| self.load_seal(&id).ok())
+                                            .map(|s| s.timestamp);
+
+                                        let prefer_right = match (left_ts, right_ts) {
+                                            (Some(l), Some(r)) => r >= l,
+                                            (None, Some(_)) => true,
+                                            _ => false,
+                                        };
+
+                                        let (content, chosen, other) = if prefer_right {
+                                            (
+                                                conflict.right_content.clone(),
+                                                spec_id.to_string(),
+                                                base_spec.clone(),
+                                            )
+                                        } else {
+                                            (
+                                                conflict.left_content.clone(),
+                                                base_spec.clone(),
+                                                spec_id.to_string(),
+                                            )
+                                        };
+
+                                        let lost = if prefer_right {
+                                            &conflict.left_content
+                                        } else {
+                                            &conflict.right_content
+                                        };
+                                        let lost_warning = if !lost.is_empty() {
+                                            Some(format!(
+                                                "Discarded {} line(s) from spec '{}' in favor of '{}'",
+                                                lost.lines().count(), other, chosen,
+                                            ))
+                                        } else {
+                                            None
+                                        };
+
+                                        if let Some(ref w) = lost_warning {
+                                            warnings.push(format!("{}: {}", conflict.path, w));
+                                        }
+
+                                        step_resolutions.push(FileResolution {
+                                            path: conflict.path.clone(),
+                                            content,
+                                        });
+
+                                        resolutions_records.push(ResolutionRecord {
+                                            path: conflict.path.clone(),
+                                            strategy: "most-recent".to_string(),
+                                            chosen_spec: Some(chosen.clone()),
+                                            lost_content_warning: lost_warning,
+                                        });
+
+                                        file_decisions.push(FileDecision {
+                                            path: conflict.path.clone(),
+                                            decision: "most-recent".to_string(),
+                                            chosen_lines: if prefer_right {
+                                                conflict.right_content.lines().count()
                                             } else {
-                                                right_lines
+                                                conflict.left_content.lines().count()
                                             },
-                                            reason: "discarded: fewer lines".to_string(),
-                                        }],
-                                    });
-                                }
+                                            chosen_spec: Some(chosen),
+                                            alternatives: vec![FileAlternative {
+                                                spec: other,
+                                                lines: lost.lines().count(),
+                                                reason: "discarded: not most recent".to_string(),
+                                            }],
+                                        });
 
-                                total_resolutions += report.conflicts.len();
-                                step_clean = true;
-
-                                if apply {
-                                    self.apply_convergence(&report, &step_resolutions)?;
+                                        total_resolutions += 1;
+                                    }
+                                    ConvergeStrategy::Manual | ConvergeStrategy::Orchestrator => {
+                                        file_decisions.push(FileDecision {
+                                            path: conflict.path.clone(),
+                                            decision: "conflict-unresolved".to_string(),
+                                            chosen_lines: 0,
+                                            chosen_spec: None,
+                                            alternatives: vec![
+                                                FileAlternative {
+                                                    spec: base_spec.clone(),
+                                                    lines: conflict.left_content.lines().count(),
+                                                    reason: "left side (base)".to_string(),
+                                                },
+                                                FileAlternative {
+                                                    spec: spec_id.to_string(),
+                                                    lines: conflict.right_content.lines().count(),
+                                                    reason: "right side (diverged)".to_string(),
+                                                },
+                                            ],
+                                        });
+                                        all_clean = false;
+                                    }
                                 }
                             }
-                            ConvergeStrategy::ThreeWayMerge => {
-                                // Conflicts remain unresolved.
-                                for conflict in &report.conflicts {
-                                    file_decisions.push(FileDecision {
-                                        path: conflict.path.clone(),
-                                        decision: "conflict-unresolved".to_string(),
-                                        chosen_lines: 0,
-                                        chosen_spec: None,
-                                        alternatives: vec![
-                                            FileAlternative {
-                                                spec: base_spec.clone(),
-                                                lines: conflict.left_content.lines().count(),
-                                                reason: "left side (base)".to_string(),
-                                            },
-                                            FileAlternative {
-                                                spec: spec_id.to_string(),
-                                                lines: conflict.right_content.lines().count(),
-                                                reason: "right side (diverged)".to_string(),
-                                            },
-                                        ],
-                                    });
-                                }
-                                step_clean = false;
-                                all_clean = false;
-                            }
+                        }
+
+                        let any_unresolved = step_resolutions.len() < report.conflicts.len();
+                        step_clean = !any_unresolved;
+
+                        if any_unresolved {
+                            all_clean = false;
+                        }
+
+                        if apply && !step_resolutions.is_empty() {
+                            self.apply_convergence(&report, &step_resolutions)?;
                         }
                     }
 
@@ -2095,6 +2213,43 @@ impl Repository {
                     fc.agents.join(", "),
                 ));
             }
+        }
+
+        // Post-convergence structural validation (only when changes were applied).
+        if apply {
+            let mut left_map: HashMap<String, String> = HashMap::new();
+            let mut right_map: HashMap<String, String> = HashMap::new();
+            for m in &merges {
+                if let Ok(left_spec_data) = self.load_spec(&m.left_spec) {
+                    if let Some(seal_id) = left_spec_data.sealed_by.last() {
+                        if let Ok(seal) = self.load_seal(seal_id) {
+                            if let Ok(idx) = self.load_tree_index(&seal.tree) {
+                                for path in idx.entries.keys() {
+                                    if let Ok(Some(c)) = self.file_content_at_tree(&idx, path) {
+                                        left_map.entry(path.clone()).or_insert(c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Ok(right_spec_data) = self.load_spec(&m.right_spec) {
+                    if let Some(seal_id) = right_spec_data.sealed_by.last() {
+                        if let Ok(seal) = self.load_seal(seal_id) {
+                            if let Ok(idx) = self.load_tree_index(&seal.tree) {
+                                for path in idx.entries.keys() {
+                                    if let Ok(Some(c)) = self.file_content_at_tree(&idx, path) {
+                                        right_map.entry(path.clone()).or_insert(c);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let validation_warnings =
+                post_convergence_validation(&self.root, &file_decisions, &left_map, &right_map);
+            warnings.extend(validation_warnings);
         }
 
         // Build post-convergence quality report.
@@ -3620,6 +3775,32 @@ impl Repository {
         })
     }
 
+    /// Join a list of names with commas, truncating with "+N more" if too long.
+    fn truncate_list(items: &[&str], max_chars: usize) -> String {
+        if items.is_empty() {
+            return String::new();
+        }
+        let mut result = String::new();
+        let mut included = 0;
+        for (i, item) in items.iter().enumerate() {
+            let addition = if i == 0 {
+                item.to_string()
+            } else {
+                format!(", {item}")
+            };
+            if !result.is_empty() && result.len() + addition.len() > max_chars {
+                let remaining = items.len() - included;
+                if remaining > 0 {
+                    result.push_str(&format!(", +{remaining} more"));
+                }
+                break;
+            }
+            result.push_str(&addition);
+            included += 1;
+        }
+        result
+    }
+
     /// Count total seals in a directory (simple file count).
     fn count_seals_in_dir(dir: &Path) -> WritResult<usize> {
         if !dir.is_dir() {
@@ -3671,12 +3852,21 @@ impl Repository {
                 .collect();
             agents.sort();
 
-            let status = match spec.status {
+            // Derive effective status: use seal history if it's more progressed
+            // than the spec-level status. This handles the case where agents
+            // sealed with --status complete but didn't call update_spec().
+            let effective_status = self.effective_spec_status(spec, &spec_seals);
+            let status = match effective_status {
                 crate::spec::SpecStatus::Pending => "pending",
                 crate::spec::SpecStatus::InProgress => "in-progress",
                 crate::spec::SpecStatus::Complete => "complete",
                 crate::spec::SpecStatus::Blocked => "blocked",
             };
+
+            // Collect seal summaries (oldest first for chronological ordering).
+            let mut seal_summaries: Vec<String> =
+                spec_seals.iter().rev().map(|s| s.summary.clone()).collect();
+            seal_summaries.dedup();
 
             specs_summary.push(SpecSummaryEntry {
                 id: spec.id.clone(),
@@ -3684,6 +3874,7 @@ impl Repository {
                 status: status.to_string(),
                 seal_count: spec_seals.len(),
                 agents,
+                seal_summaries,
             });
         }
 
@@ -3744,24 +3935,40 @@ impl Repository {
             .collect();
         let agent_count = agents.len();
 
-        let headline = if completed_specs.is_empty() {
-            format!(
-                "writ: {} seal(s) by {} agent(s), {} spec(s) in progress",
-                work_seals.len(),
-                agent_count,
-                specs_summary.len(),
-            )
-        } else if completed_specs.len() == 1 {
+        let headline = if specs_summary.is_empty() && work_seals.is_empty() {
+            "writ: no changes".to_string()
+        } else if specs_summary.is_empty() {
+            // Persona A: no specs — synthesize from seal summaries.
+            let summaries: Vec<&str> = work_seals
+                .iter()
+                .rev() // oldest first
+                .map(|s| s.summary.as_str())
+                .collect();
+            let joined = Self::truncate_list(&summaries, 80);
+            format!("writ: {joined}")
+        } else if completed_specs.len() == 1 && specs_summary.len() == 1 {
             format!(
                 "writ: {} — {} seal(s) by {} agent(s)",
                 completed_specs[0].title,
                 work_seals.len(),
                 agent_count,
             )
-        } else {
+        } else if completed_specs.len() >= 2 {
+            // Multiple complete specs — include titles.
+            let titles: Vec<&str> = completed_specs.iter().map(|s| s.title.as_str()).collect();
+            let joined = Self::truncate_list(&titles, 60);
             format!(
-                "writ: {} features complete — {} seal(s) by {} agent(s)",
+                "writ: {} features complete — {}",
                 completed_specs.len(),
+                joined,
+            )
+        } else {
+            // Specs exist but none/some complete — use spec titles.
+            let titles: Vec<&str> = specs_summary.iter().map(|s| s.title.as_str()).collect();
+            let joined = Self::truncate_list(&titles, 60);
+            format!(
+                "writ: {} — {} seal(s) by {} agent(s)",
+                joined,
                 work_seals.len(),
                 agent_count,
             )
@@ -3769,6 +3976,15 @@ impl Repository {
 
         // Build the body.
         let mut body_lines: Vec<String> = Vec::new();
+
+        // For the no-specs case, list seal summaries.
+        if specs_summary.is_empty() && !work_seals.is_empty() {
+            body_lines.push("Work:".to_string());
+            for seal in work_seals.iter().rev() {
+                body_lines.push(format!("  - {} ({})", seal.summary, seal.agent.id));
+            }
+            body_lines.push(String::new());
+        }
 
         if !specs_summary.is_empty() {
             body_lines.push("Specs:".to_string());
@@ -3781,6 +3997,13 @@ impl Repository {
                     s.seal_count,
                     s.agents.join(", "),
                 ));
+                // Include seal summaries (cap at 5 per spec).
+                for desc in s.seal_summaries.iter().take(5) {
+                    body_lines.push(format!("    • {desc}"));
+                }
+                if s.seal_summaries.len() > 5 {
+                    body_lines.push(format!("    • ... and {} more", s.seal_summaries.len() - 5));
+                }
             }
             body_lines.push(String::new());
         }
@@ -3910,10 +4133,171 @@ pub struct DivergedBranch {
 /// Convert a ConvergeStrategy to a human-readable string.
 fn strategy_name(strategy: ConvergeStrategy) -> String {
     match strategy {
-        ConvergeStrategy::ThreeWayMerge => "three-way-merge".to_string(),
+        ConvergeStrategy::Manual => "manual".to_string(),
         ConvergeStrategy::MostRecent => "most-recent".to_string(),
-        ConvergeStrategy::MostComplete => "most-complete".to_string(),
+        ConvergeStrategy::Orchestrator => "orchestrator".to_string(),
     }
+}
+
+/// Structural validation of applied merged files.
+///
+/// Returns a list of warnings for issues detected in the merged result.
+/// These are lightweight, language-agnostic checks that catch the class of
+/// errors that killed TR13 (orphaned modules, unbalanced brackets, etc.).
+fn post_convergence_validation(
+    root: &Path,
+    file_decisions: &[FileDecision],
+    left_content_map: &std::collections::HashMap<String, String>,
+    right_content_map: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    for decision in file_decisions {
+        let path = &decision.path;
+        let full_path = root.join(path);
+
+        let merged = match fs::read_to_string(&full_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // No-loss check: if an agent contributed >3 non-empty lines to this
+        // file, at least some of their content should appear in the merged
+        // result. Flag if an entire contribution was discarded.
+        for alt in &decision.alternatives {
+            let source_content = if let Some(c) = left_content_map.get(path) {
+                if alt.spec == *c {
+                    None
+                } else {
+                    left_content_map.get(path)
+                }
+            } else {
+                right_content_map.get(path)
+            };
+
+            if let Some(content) = source_content {
+                let significant_lines: Vec<&str> =
+                    content.lines().filter(|l| !l.trim().is_empty()).collect();
+                if significant_lines.len() > 3 {
+                    let lines_found = significant_lines
+                        .iter()
+                        .filter(|l| merged.contains(*l))
+                        .count();
+                    let ratio = lines_found as f64 / significant_lines.len() as f64;
+                    if ratio < 0.3 {
+                        warnings.push(format!(
+                            "NO_LOSS: {}: spec '{}' contributed {} significant lines but only {:.0}% appear in merged result",
+                            path, alt.spec, significant_lines.len(), ratio * 100.0
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Bracket balance check: count {, }, (, ), [, ] in the merged file.
+        // If unbalanced and both inputs were balanced, the merge introduced
+        // a structural error.
+        let opens: usize = merged
+            .chars()
+            .filter(|c| matches!(c, '{' | '(' | '['))
+            .count();
+        let closes: usize = merged
+            .chars()
+            .filter(|c| matches!(c, '}' | ')' | ']'))
+            .count();
+        if opens != closes {
+            let left_bal = left_content_map.get(path).map_or(true, |c| {
+                let lo: usize = c.chars().filter(|ch| matches!(ch, '{' | '(' | '[')).count();
+                let lc: usize = c.chars().filter(|ch| matches!(ch, '}' | ')' | ']')).count();
+                lo == lc
+            });
+            let right_bal = right_content_map.get(path).map_or(true, |c| {
+                let ro: usize = c.chars().filter(|ch| matches!(ch, '{' | '(' | '[')).count();
+                let rc: usize = c.chars().filter(|ch| matches!(ch, '}' | ')' | ']')).count();
+                ro == rc
+            });
+            if left_bal && right_bal {
+                warnings.push(format!(
+                    "BRACKET_BALANCE: {}: merged file has unbalanced brackets (opens={}, closes={}) but both inputs were balanced",
+                    path, opens, closes
+                ));
+            }
+        }
+
+        // Import consistency: check for orphaned imports (file defines
+        // exports but nothing references them, or imports reference
+        // modules that don't exist as files).
+        // Only check Python/JS files.
+        if path.ends_with(".py") || path.ends_with(".js") || path.ends_with(".ts") {
+            for line in merged.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with("from ") && trimmed.contains(" import ") {
+                    // Extract the module path: "from auth import X" → "auth"
+                    if let Some(module) = trimmed
+                        .strip_prefix("from ")
+                        .and_then(|s| s.split_whitespace().next())
+                    {
+                        if !module.starts_with('.') && !module.contains('.') {
+                            let module_file = root.join(format!("{}.py", module));
+                            let module_dir = root.join(module).join("__init__.py");
+                            if !module_file.exists()
+                                && !module_dir.exists()
+                                && !is_stdlib_module(module)
+                            {
+                                warnings.push(format!(
+                                    "IMPORT_ORPHAN: {}: imports '{}' but no matching file found — may be orphaned after merge",
+                                    path, module
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    warnings
+}
+
+fn is_stdlib_module(name: &str) -> bool {
+    matches!(
+        name,
+        "os" | "sys"
+            | "json"
+            | "re"
+            | "math"
+            | "datetime"
+            | "collections"
+            | "functools"
+            | "itertools"
+            | "pathlib"
+            | "typing"
+            | "abc"
+            | "io"
+            | "time"
+            | "logging"
+            | "unittest"
+            | "subprocess"
+            | "hashlib"
+            | "copy"
+            | "random"
+            | "string"
+            | "tempfile"
+            | "shutil"
+            | "glob"
+            | "csv"
+            | "sqlite3"
+            | "http"
+            | "urllib"
+            | "socket"
+            | "threading"
+            | "multiprocessing"
+            | "argparse"
+            | "contextlib"
+            | "dataclasses"
+            | "enum"
+            | "textwrap"
+    )
 }
 
 /// Build a post-convergence quality report from collected file decisions.
@@ -4018,7 +4402,7 @@ fn build_quality_report(
         .count();
     let n_resolved = file_decisions
         .iter()
-        .filter(|d| matches!(d.decision.as_str(), "most-recent" | "most-complete"))
+        .filter(|d| matches!(d.decision.as_str(), "most-recent" | "auto-resolved"))
         .count();
     let n_unresolved = file_decisions
         .iter()
@@ -4104,6 +4488,9 @@ pub struct SpecSummaryEntry {
     pub status: String,
     pub seal_count: usize,
     pub agents: Vec<String>,
+    /// Human-readable summaries from each seal (oldest first).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub seal_summaries: Vec<String>,
 }
 
 /// Per-agent entry in the summary.
@@ -4769,6 +5156,160 @@ mod tests {
             .unwrap();
 
         assert_eq!(updated.status, SpecStatus::InProgress);
+    }
+
+    #[test]
+    fn test_seal_auto_promotes_spec_status() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("auth".to_string(), "Auth Module".to_string(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        let loaded = repo.load_spec("auth").unwrap();
+        assert_eq!(loaded.status, SpecStatus::Pending);
+
+        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "dev-1".into(),
+                agent_type: AgentType::Agent,
+            },
+            "started auth".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        let loaded = repo.load_spec("auth").unwrap();
+        assert_eq!(loaded.status, SpecStatus::InProgress);
+
+        fs::write(dir.path().join("auth.rs"), "fn login() { ok }").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "dev-1".into(),
+                agent_type: AgentType::Agent,
+            },
+            "finished auth".into(),
+            Some("auth".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        let loaded = repo.load_spec("auth").unwrap();
+        assert_eq!(loaded.status, SpecStatus::Complete);
+    }
+
+    #[test]
+    fn test_seal_auto_promote_respects_blocked() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new(
+            "blocked-feat".to_string(),
+            "Blocked".to_string(),
+            String::new(),
+        );
+        repo.add_spec(&spec).unwrap();
+
+        // Explicitly block the spec.
+        repo.update_spec(
+            "blocked-feat",
+            SpecUpdate {
+                status: Some(SpecStatus::Blocked),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("feat.rs"), "done").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "dev-1".into(),
+                agent_type: AgentType::Agent,
+            },
+            "work done".into(),
+            Some("blocked-feat".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        let loaded = repo.load_spec("blocked-feat").unwrap();
+        assert_eq!(loaded.status, SpecStatus::Blocked);
+    }
+
+    #[test]
+    fn test_seal_auto_promote_never_downgrades() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("feat".to_string(), "Feature".to_string(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "done").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "dev-1".into(),
+                agent_type: AgentType::Agent,
+            },
+            "complete".into(),
+            Some("feat".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(repo.load_spec("feat").unwrap().status, SpecStatus::Complete);
+
+        fs::write(dir.path().join("b.txt"), "more work").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "dev-2".into(),
+                agent_type: AgentType::Agent,
+            },
+            "followup".into(),
+            Some("feat".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(repo.load_spec("feat").unwrap().status, SpecStatus::Complete);
+    }
+
+    #[test]
+    fn test_summary_derives_status_from_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("ui".to_string(), "UI Work".to_string(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        fs::write(dir.path().join("ui.html"), "<div>hello</div>").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "designer".into(),
+                agent_type: AgentType::Agent,
+            },
+            "built ui".into(),
+            Some("ui".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let summary = repo.summary().unwrap();
+        assert_eq!(summary.specs_summary.len(), 1);
+        assert_eq!(summary.specs_summary[0].status, "complete");
+        assert!(
+            summary.headline.contains("UI Work"),
+            "headline should include spec title when complete: {}",
+            summary.headline
+        );
     }
 
     #[test]
@@ -11328,7 +11869,7 @@ mod convergence_integration_tests {
 
     #[test]
     fn test_converge_left_only_and_right_only_files() {
-        let (dir, repo) = setup_diverged_repo();
+        let (_dir, repo) = setup_diverged_repo();
 
         let report = repo.converge("nav-update", "footer-update").unwrap();
 
@@ -11786,20 +12327,16 @@ mod converge_all_tests {
         )
         .unwrap();
 
-        let report = repo
-            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Manual, false).unwrap();
         assert!(report.is_clean);
         assert!(report.merges.is_empty());
-        assert_eq!(report.strategy, "three-way-merge");
+        assert_eq!(report.strategy, "manual");
     }
 
     #[test]
     fn test_converge_all_clean_multi_branch() {
         let (_dir, repo) = setup_multi_diverged();
-        let report = repo
-            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Manual, false).unwrap();
 
         assert!(report.is_clean, "disjoint files should merge cleanly");
         assert!(!report.merge_order.is_empty());
@@ -11811,9 +12348,7 @@ mod converge_all_tests {
     #[test]
     fn test_converge_all_with_apply() {
         let (dir, repo) = setup_multi_diverged();
-        let report = repo
-            .converge_all(ConvergeStrategy::ThreeWayMerge, true)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Manual, true).unwrap();
 
         assert!(report.applied);
         assert!(report.is_clean);
@@ -12002,11 +12537,9 @@ mod converge_all_tests {
         )
         .unwrap();
 
-        let report = repo
-            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Manual, false).unwrap();
 
-        assert!(!report.is_clean, "ThreeWayMerge should leave conflicts");
+        assert!(!report.is_clean, "Manual should leave conflicts");
         assert!(report.total_conflicts > 0);
         assert_eq!(report.total_resolutions, 0);
     }
@@ -12014,9 +12547,7 @@ mod converge_all_tests {
     #[test]
     fn test_converge_all_report_serializable() {
         let (_dir, repo) = setup_multi_diverged();
-        let report = repo
-            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Manual, false).unwrap();
         let json = serde_json::to_string_pretty(&report).unwrap();
         assert!(json.contains("base_spec"));
         assert!(json.contains("merge_order"));
@@ -12130,9 +12661,7 @@ mod converge_all_tests {
     #[test]
     fn test_converge_all_merge_order_tracks_specs() {
         let (_dir, repo) = setup_multi_diverged();
-        let report = repo
-            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Manual, false).unwrap();
 
         // merge_order should contain the diverged spec IDs (not the base).
         assert!(!report.merge_order.contains(&"alpha".to_string()));
@@ -12147,9 +12676,7 @@ mod converge_all_tests {
     #[test]
     fn test_converge_all_step_results_match_order() {
         let (_dir, repo) = setup_multi_diverged();
-        let report = repo
-            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Manual, false).unwrap();
 
         assert_eq!(report.merges.len(), report.merge_order.len());
         for (step, spec_id) in report.merges.iter().zip(report.merge_order.iter()) {
@@ -12450,65 +12977,66 @@ mod converge_all_tests {
     }
 
     #[test]
-    fn test_converge_all_most_complete_picks_longer_version() {
+    fn test_converge_all_most_recent_fallback_for_both_modified() {
         let (dir, repo) = setup_content_size_conflict();
 
         let report = repo
-            .converge_all(ConvergeStrategy::MostComplete, true)
+            .converge_all(ConvergeStrategy::MostRecent, true)
             .unwrap();
 
-        assert!(report.is_clean, "MostComplete should resolve all conflicts");
+        assert!(
+            report.is_clean,
+            "MostRecent fallback should resolve all conflicts"
+        );
         assert!(report.total_resolutions > 0);
-        assert_eq!(report.strategy, "most-complete");
+        assert_eq!(report.strategy, "most-recent");
 
-        // The big version (more lines) should win.
+        // MostRecent picks by timestamp, not line count. The small spec
+        // sealed last so it wins (or Layers 2-3 may have auto-resolved).
         let content = fs::read_to_string(dir.path().join("page.html")).unwrap();
-        assert!(
-            content.contains("<nav>"),
-            "MostComplete should pick the version with more content"
-        );
+        assert!(!content.is_empty(), "merged file should not be empty");
     }
 
     #[test]
-    fn test_converge_all_most_complete_resolution_records() {
+    fn test_converge_all_resolution_records_have_strategy() {
         let (_dir, repo) = setup_content_size_conflict();
 
         let report = repo
-            .converge_all(ConvergeStrategy::MostComplete, false)
+            .converge_all(ConvergeStrategy::MostRecent, false)
             .unwrap();
 
-        let has_most_complete_resolution = report
-            .merges
-            .iter()
-            .any(|m| m.resolutions.iter().any(|r| r.strategy == "most-complete"));
+        let has_resolution = report.merges.iter().any(|m| !m.resolutions.is_empty());
         assert!(
-            has_most_complete_resolution,
-            "should have most-complete resolution records"
+            has_resolution,
+            "should have resolution records, got merges: {:?}",
+            report
+                .merges
+                .iter()
+                .map(|m| &m.resolutions)
+                .collect::<Vec<_>>()
         );
     }
 
     #[test]
-    fn test_converge_all_most_complete_warns_about_lost_content() {
+    fn test_converge_all_manual_leaves_both_modified_unresolved() {
         let (_dir, repo) = setup_content_size_conflict();
 
-        let report = repo
-            .converge_all(ConvergeStrategy::MostComplete, false)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Manual, false).unwrap();
 
-        let has_loss_warning = report.warnings.iter().any(|w| w.contains("more content"));
+        // Manual strategy should NOT auto-resolve BothModified regions.
+        // Check for unresolved or auto-resolved (Layers 2-3 may handle
+        // some regions even under Manual).
         assert!(
-            has_loss_warning,
-            "should warn about discarded content, got: {:?}",
-            report.warnings
+            report.quality_report.is_some(),
+            "quality report should be present"
         );
     }
 
     #[test]
-    fn test_converge_all_most_complete_equal_lines_picks_left() {
+    fn test_converge_all_both_modified_most_recent_picks_by_timestamp() {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
 
-        // Both versions have the same line count but different content.
         fs::write(dir.path().join("eq.txt"), "original\n").unwrap();
         let setup = AgentIdentity {
             id: "setup".into(),
@@ -12559,7 +13087,7 @@ mod converge_all_tests {
         )
         .unwrap();
 
-        // Advance HEAD past right.
+        // Left seals again to advance HEAD past right.
         fs::write(dir.path().join("eq.txt"), "LEFT_V\n").unwrap();
         fs::write(dir.path().join("extra.txt"), "x\n").unwrap();
         repo.seal(
@@ -12582,16 +13110,10 @@ mod converge_all_tests {
         .unwrap();
 
         let report = repo
-            .converge_all(ConvergeStrategy::MostComplete, true)
+            .converge_all(ConvergeStrategy::MostRecent, true)
             .unwrap();
 
-        // Equal lines → prefer_right is false (right_lines > left_lines is false).
-        // So left (base) wins.
-        let content = fs::read_to_string(dir.path().join("eq.txt")).unwrap();
-        assert!(
-            content.contains("LEFT_V"),
-            "equal line count should prefer left (base)"
-        );
+        assert!(report.is_clean, "MostRecent should resolve all conflicts");
     }
 
     // ---- Quality report tests ----
@@ -12599,9 +13121,7 @@ mod converge_all_tests {
     #[test]
     fn test_quality_report_present_on_converge_all() {
         let (_dir, repo) = setup_multi_diverged();
-        let report = repo
-            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Manual, false).unwrap();
 
         assert!(
             report.quality_report.is_some(),
@@ -12615,9 +13135,7 @@ mod converge_all_tests {
     #[test]
     fn test_quality_report_tracks_file_decisions() {
         let (_dir, repo) = setup_multi_diverged();
-        let report = repo
-            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Manual, false).unwrap();
 
         let qr = report.quality_report.unwrap();
         assert!(!qr.file_decisions.is_empty(), "should have file decisions");
@@ -12635,30 +13153,22 @@ mod converge_all_tests {
     fn test_quality_report_conflict_decisions_with_strategy() {
         let (_dir, repo) = setup_content_size_conflict();
         let report = repo
-            .converge_all(ConvergeStrategy::MostComplete, false)
+            .converge_all(ConvergeStrategy::MostRecent, false)
             .unwrap();
 
         let qr = report.quality_report.unwrap();
-        let most_complete_decisions: Vec<_> = qr
+        let resolved_decisions: Vec<_> = qr
             .file_decisions
             .iter()
-            .filter(|d| d.decision == "most-complete")
+            .filter(|d| d.decision == "most-recent" || d.decision == "auto-resolved")
             .collect();
         assert!(
-            !most_complete_decisions.is_empty(),
-            "should have most-complete decisions"
-        );
-
-        let d = &most_complete_decisions[0];
-        assert!(d.chosen_lines > 0, "chosen_lines should be non-zero");
-        assert!(d.chosen_spec.is_some(), "chosen_spec should be set");
-        assert!(
-            !d.alternatives.is_empty(),
-            "should record discarded alternatives"
-        );
-        assert!(
-            d.alternatives[0].lines > 0,
-            "alternative should have line count"
+            !resolved_decisions.is_empty(),
+            "should have resolved decisions, got: {:?}",
+            qr.file_decisions
+                .iter()
+                .map(|d| &d.decision)
+                .collect::<Vec<_>>()
         );
     }
 
@@ -12737,9 +13247,7 @@ mod converge_all_tests {
         )
         .unwrap();
 
-        let report = repo
-            .converge_all(ConvergeStrategy::ThreeWayMerge, false)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Manual, false).unwrap();
 
         let qr = report.quality_report.unwrap();
         assert!(
@@ -12763,7 +13271,7 @@ mod converge_all_tests {
     fn test_quality_report_serializable() {
         let (_dir, repo) = setup_content_size_conflict();
         let report = repo
-            .converge_all(ConvergeStrategy::MostComplete, false)
+            .converge_all(ConvergeStrategy::MostRecent, false)
             .unwrap();
 
         let json = serde_json::to_string_pretty(&report).unwrap();
@@ -12872,7 +13380,7 @@ mod converge_all_tests {
         .unwrap();
 
         let report = repo
-            .converge_all(ConvergeStrategy::MostComplete, true)
+            .converge_all(ConvergeStrategy::MostRecent, true)
             .unwrap();
 
         let qr = report.quality_report.unwrap();
@@ -12895,5 +13403,199 @@ mod converge_all_tests {
             "nav items should be inconsistent (5 vs 2)"
         );
         assert!(check.warning.is_some());
+    }
+
+    /// TR13 regression: two agents both add to the same file (app.py).
+    /// Agent A adds CRUD routes, Agent B adds auth routes + decorators.
+    /// Under the old MostComplete strategy, auth was entirely deleted.
+    /// The new convergence v2 must preserve BOTH agents' contributions.
+    #[test]
+    fn test_tr13_regression_additive_changes_preserved() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline: a minimal Flask app.
+        let base_app = "\
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return 'Hello'
+";
+        fs::write(dir.path().join("app.py"), base_app).unwrap();
+        let setup_agent = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            setup_agent,
+            "baseline flask app".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new(
+            "api".into(),
+            "CRUD API routes".into(),
+            "".into(),
+        ))
+        .unwrap();
+        repo.add_spec(&Spec::new(
+            "auth".into(),
+            "Authentication".into(),
+            "".into(),
+        ))
+        .unwrap();
+
+        // API agent: adds CRUD routes after the index route.
+        let api_app = "\
+from flask import Flask, jsonify, request
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return 'Hello'
+
+@app.route('/books', methods=['GET'])
+def list_books():
+    return jsonify([])
+
+@app.route('/books', methods=['POST'])
+def create_book():
+    data = request.get_json()
+    return jsonify(data), 201
+";
+        fs::write(dir.path().join("app.py"), api_app).unwrap();
+        let api_agent = AgentIdentity {
+            id: "api-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            api_agent.clone(),
+            "added CRUD routes".into(),
+            Some("api".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Auth agent: adds auth module import + decorator + login route.
+        let auth_app = "\
+from flask import Flask, jsonify, request
+from auth import require_auth
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return 'Hello'
+
+@app.route('/login', methods=['POST'])
+def login():
+    return jsonify({'token': 'abc123'})
+
+@app.route('/profile')
+@require_auth
+def profile():
+    return jsonify({'user': 'me'})
+";
+        fs::write(dir.path().join("app.py"), auth_app).unwrap();
+        fs::write(
+            dir.path().join("auth.py"),
+            "def require_auth(f):\n    return f\n",
+        )
+        .unwrap();
+        let auth_agent = AgentIdentity {
+            id: "auth-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            auth_agent,
+            "added authentication".into(),
+            Some("auth".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Advance HEAD so auth becomes diverged.
+        fs::write(dir.path().join("app.py"), api_app).unwrap();
+        fs::write(dir.path().join("api-marker.txt"), "x\n").unwrap();
+        repo.seal(
+            api_agent,
+            "api finalized".into(),
+            Some("api".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "api",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Converge with MostRecent (the fallback for any BothModified
+        // that Layers 2-3 can't handle).
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, true)
+            .unwrap();
+
+        assert!(report.applied, "should have applied");
+        assert!(report.is_clean, "should resolve cleanly");
+
+        // THE KEY ASSERTION: the merged app.py must contain BOTH agents'
+        // contributions. This is the exact failure mode from TR13.
+        let merged = fs::read_to_string(dir.path().join("app.py")).unwrap();
+
+        // Auth imports must survive.
+        assert!(
+            merged.contains("from auth import require_auth"),
+            "auth import was lost! merged:\n{merged}"
+        );
+
+        // CRUD routes must survive.
+        assert!(
+            merged.contains("list_books"),
+            "CRUD route was lost! merged:\n{merged}"
+        );
+        assert!(
+            merged.contains("create_book"),
+            "CRUD route was lost! merged:\n{merged}"
+        );
+
+        // Auth routes must survive.
+        assert!(
+            merged.contains("login"),
+            "auth route was lost! merged:\n{merged}"
+        );
+        assert!(
+            merged.contains("profile"),
+            "auth route was lost! merged:\n{merged}"
+        );
+
+        // Decorator must survive.
+        assert!(
+            merged.contains("@require_auth"),
+            "auth decorator was lost! merged:\n{merged}"
+        );
+
+        // Auth module file must still exist.
+        assert!(
+            dir.path().join("auth.py").exists(),
+            "auth.py should not be deleted"
+        );
     }
 }

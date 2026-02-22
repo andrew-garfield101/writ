@@ -549,17 +549,18 @@ impl PyRepository {
     /// Returns a ConvergeAllReport dict with per-step merge results,
     /// conflict resolutions, and warnings about potential content loss.
     ///
-    /// `strategy` controls conflict resolution: "three-way-merge" (default)
-    /// leaves conflicts unresolved; "most-recent" auto-resolves by preferring
-    /// the version from the more recently sealed branch.
+    /// `strategy` controls the fallback for irreconcilable conflicts:
+    /// "manual" (default) leaves them unresolved; "most-recent" picks the
+    /// most recently sealed version; "orchestrator" returns structured data.
+    /// Layers 2-3 (additive composition) always run regardless of strategy.
     ///
     /// When `apply` is True, merged files are written to the working directory.
-    #[pyo3(signature = (strategy="three-way-merge", apply=false))]
+    #[pyo3(signature = (strategy="manual", apply=false))]
     fn converge_all(&self, py: Python, strategy: &str, apply: bool) -> PyResult<PyObject> {
         let strat = match strategy {
             "most-recent" => writ_core::convergence::ConvergeStrategy::MostRecent,
-            "most-complete" => writ_core::convergence::ConvergeStrategy::MostComplete,
-            _ => writ_core::convergence::ConvergeStrategy::ThreeWayMerge,
+            "orchestrator" => writ_core::convergence::ConvergeStrategy::Orchestrator,
+            _ => writ_core::convergence::ConvergeStrategy::Manual,
         };
         let report = self.inner.converge_all(strat, apply).map_err(writ_err)?;
         to_pydict(py, &report)

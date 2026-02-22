@@ -203,11 +203,11 @@ repo.seal(summary="what you did", agent_id="your-id", agent_type="agent", spec_i
 - Always seal your work before finishing a task
 - Use --spec to link seals to specs when working on a defined spec
 - Use --status in-progress for intermediate work (this is the default)
-- Use --status complete only when the spec is fully done
+- Use --status complete only when the spec is fully done — this automatically marks the spec as complete
 - Include test results when available (--tests-passed N --tests-failed M)
 - Use `writ log --all` to see seals from all branches (including diverged ones)
 - If context shows unsealed changes, seal before starting new work
-- When context shows `session_complete: true`, all specs are done — run `writ summary`
+- When context shows `session_complete: true`, all specs are done — run `writ finish` or `writ summary`
 - Seal results include `hints` array and `file_scope_warning` — check these after each seal
 - If seal returns 0 file changes, another agent may have captured your work — check `writ context`
 
@@ -230,10 +230,10 @@ remain in the log. Use restore as a safety net when your changes cause regressio
 When multiple agents work in parallel, their seals may diverge. Check for this:
 - `writ context` shows `convergence_recommended: true` and `integration_risk` level
 - `writ converge-all --dry-run` previews what will be merged
-- `writ converge-all --apply --strategy most-complete` merges all diverged branches
+- `writ converge-all --apply` merges all diverged branches (Layers 2-3 auto-resolve most conflicts)
 - After convergence, seal the result: `writ seal -s "converged N branches" --agent convergence-bot`
 
-Available strategies: `three-way-merge` (default, leaves conflicts unresolved), `most-recent` (prefers newest), `most-complete` (prefers version with more content).
+Fallback strategies for irreconcilable conflicts: `manual` (default, leaves unresolved), `most-recent` (prefers newest seal), `orchestrator` (returns structured data for AI resolution).
 
 For two-branch convergence: `writ converge <left-spec> <right-spec> --apply`
 
@@ -248,8 +248,11 @@ and files touched by many agents — converge before further work.
 When you're done, the human developer commits your work to git:
 
 ```bash
-git commit -m "$(writ summary --format commit)"          # one-line commit message
-gh pr create --body "$(writ summary --format pr)"         # full PR description
+writ finish                                               # one-command: summary + git add + git commit
+writ finish --full                                        # same, with PR-style commit body
+writ finish --dry-run                                     # preview without committing
+git commit -m "$(writ summary --format commit)"           # manual: one-line commit message
+gh pr create --body "$(writ summary --format pr)"         # manual: full PR description
 ```
 "#.to_string()
 }
@@ -290,11 +293,11 @@ repo.seal(summary="changes", agent_id="your-id", agent_type="agent", spec_id="yo
 
 - Always run `writ context` first to understand project state
 - Seal after every meaningful unit of work (defaults to status: in-progress)
-- Use `--status complete` only on your final seal for a spec
+- Use `--status complete` only on your final seal for a spec — this automatically marks the spec as complete
 - Link seals to specs with --spec when working on a defined spec
 - Include verification data (--tests-passed, --tests-failed, --linted)
 - Use `writ log --all` to see unified history across all branches
-- When context shows `session_complete: true`, all specs are done — run `writ summary`
+- When context shows `session_complete: true`, all specs are done — run `writ finish` or `writ summary`
 - Check seal results for `hints` and `file_scope_warning` fields after each seal
 - If seal returns 0 file changes, another agent may have captured your work first
 
@@ -314,14 +317,16 @@ Every seal is immutable — restoring doesn't delete history.
 
 - Check `integration_risk` field in context for divergence risk assessment
 - `writ converge-all --dry-run` to preview, `--apply` to execute
-- Strategies: `most-complete` (prefers more content), `most-recent` (prefers newest), `three-way-merge` (default, leaves conflicts unresolved)
+- Layers 2-3 auto-resolve additive changes; fallback: `manual` (default), `most-recent`, `orchestrator`
 - After convergence, seal: `writ seal -s "converged" --agent convergence-bot`
 
 ### Human round-trip
 
 ```bash
-git commit -m "$(writ summary --format commit)"          # one-line commit message
-gh pr create --body "$(writ summary --format pr)"         # full PR description
+writ finish                                               # one-command: summary + git add + git commit
+writ finish --full                                        # same, with PR-style commit body
+git commit -m "$(writ summary --format commit)"           # manual: one-line commit message
+gh pr create --body "$(writ summary --format pr)"         # manual: full PR description
 ```
 "#.to_string()
 }
@@ -465,17 +470,14 @@ mod tests {
     #[test]
     fn test_claude_md_section_has_convergence_strategies() {
         let section = writ_claude_md_section();
-        assert!(
-            section.contains("most-complete"),
-            "missing most-complete strategy"
-        );
+        assert!(section.contains("manual"), "missing manual strategy");
         assert!(
             section.contains("most-recent"),
             "missing most-recent strategy"
         );
         assert!(
-            section.contains("three-way-merge"),
-            "missing three-way-merge strategy"
+            section.contains("orchestrator"),
+            "missing orchestrator strategy"
         );
     }
 
@@ -492,6 +494,50 @@ mod tests {
         assert!(
             section.contains("git commit -m \"$(writ summary --format commit)\""),
             "missing correct git commit command"
+        );
+    }
+
+    #[test]
+    fn test_claude_md_section_has_writ_finish() {
+        let section = writ_claude_md_section();
+        assert!(
+            section.contains("writ finish"),
+            "missing writ finish command"
+        );
+        assert!(
+            section.contains("writ finish --full"),
+            "missing writ finish --full"
+        );
+        assert!(
+            section.contains("writ finish --dry-run"),
+            "missing writ finish --dry-run"
+        );
+    }
+
+    #[test]
+    fn test_claude_md_section_documents_auto_promotion() {
+        let section = writ_claude_md_section();
+        assert!(
+            section.contains("automatically marks the spec as complete"),
+            "missing auto-promotion note"
+        );
+    }
+
+    #[test]
+    fn test_agents_md_section_has_writ_finish() {
+        let section = writ_agents_md_section();
+        assert!(
+            section.contains("writ finish"),
+            "missing writ finish command"
+        );
+    }
+
+    #[test]
+    fn test_agents_md_section_documents_auto_promotion() {
+        let section = writ_agents_md_section();
+        assert!(
+            section.contains("automatically marks the spec as complete"),
+            "missing auto-promotion note"
         );
     }
 }

@@ -233,8 +233,9 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Conflict resolution strategy: "three-way-merge" (default), "most-recent", or "most-complete".
-        #[arg(long, default_value = "three-way-merge")]
+        /// Fallback strategy for irreconcilable conflicts: "manual" (default), "most-recent", or "orchestrator".
+        /// Layers 2-3 (additive composition, import merging) always run regardless of strategy.
+        #[arg(long, default_value = "manual")]
         strategy: String,
     },
 
@@ -1874,11 +1875,11 @@ fn cmd_converge_all(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = match strategy_str {
         "most-recent" => writ_core::convergence::ConvergeStrategy::MostRecent,
-        "most-complete" => writ_core::convergence::ConvergeStrategy::MostComplete,
-        "three-way-merge" => writ_core::convergence::ConvergeStrategy::ThreeWayMerge,
+        "manual" => writ_core::convergence::ConvergeStrategy::Manual,
+        "orchestrator" => writ_core::convergence::ConvergeStrategy::Orchestrator,
         other => {
             return Err(format!(
-                "unknown strategy '{}' (use 'three-way-merge', 'most-recent', or 'most-complete')",
+                "unknown strategy '{}' (use 'manual', 'most-recent', or 'orchestrator')",
                 other
             )
             .into());

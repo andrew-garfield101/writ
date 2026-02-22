@@ -1739,8 +1739,8 @@ class TestDivergedBranchDetection:
         agent_ids = [a["agent_id"] for a in ctx["agent_activity"]]
         assert "agent-b" in agent_ids, "ghost agent should be visible in agent_activity"
 
-    def test_diverged_branches_empty_in_spec_scoped(self, tmp_path):
-        """Spec-scoped context omits diverged_branches."""
+    def test_diverged_branches_visible_in_spec_scoped(self, tmp_path):
+        """Spec-scoped context shows ALL diverged branches for full situational awareness."""
         repo = writ.Repository.init(str(tmp_path))
         repo.add_spec(id="alpha", title="Alpha")
         repo.add_spec(id="beta", title="Beta")
@@ -1753,7 +1753,11 @@ class TestDivergedBranchDetection:
         repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
 
         ctx = repo.context(spec="alpha")
-        assert ctx.get("diverged_branches", []) == []
+        # Spec-scoped context shows all diverged branches so agents can see
+        # the full divergence picture for convergence planning.
+        diverged = ctx.get("diverged_branches", [])
+        diverged_specs = [d["spec_id"] for d in diverged]
+        assert "beta" in diverged_specs, "beta is diverged and should be visible"
 
     def test_diverged_branch_json_serializable(self, tmp_path):
         """Context with diverged branches survives JSON round-trip."""
@@ -1804,8 +1808,8 @@ class TestConvergenceNudge:
         ctx = repo.context()
         assert ctx["convergence_recommended"] is True
 
-    def test_convergence_not_recommended_in_spec_scoped(self, tmp_path):
-        """Spec-scoped context doesn't include convergence nudge."""
+    def test_convergence_recommended_in_spec_scoped_when_diverged(self, tmp_path):
+        """Spec-scoped context recommends convergence when diverged branches exist."""
         repo = writ.Repository.init(str(tmp_path))
         repo.add_spec(id="alpha", title="Alpha")
         repo.add_spec(id="beta", title="Beta")
@@ -1818,7 +1822,9 @@ class TestConvergenceNudge:
         repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
 
         ctx = repo.context(spec="alpha")
-        assert ctx.get("convergence_recommended", False) is False
+        # Spec-scoped context shows diverged branches and recommends convergence
+        # so agents have full situational awareness.
+        assert ctx.get("convergence_recommended", False) is True
 
     def test_convergence_omitted_from_json_when_false(self, tmp_path):
         """Token-efficient: convergence_recommended is omitted from JSON when false."""
@@ -2269,8 +2275,8 @@ class TestFileContention:
         parsed = json.loads(serialized)
         assert len(parsed.get("file_contention", [])) == 1
 
-    def test_contention_not_in_spec_context(self, tmp_path):
-        """Spec-scoped context doesn't include contention."""
+    def test_contention_visible_in_spec_context(self, tmp_path):
+        """Spec-scoped context includes contention for files in the spec's scope."""
         repo = writ.Repository.init(str(tmp_path))
         repo.add_spec(id="feat", title="Feature")
 
@@ -2281,7 +2287,12 @@ class TestFileContention:
         repo.seal(summary="b", agent_id="bob", agent_type="agent", spec_id="feat")
 
         ctx = repo.context(spec="feat")
-        assert ctx.get("file_contention", []) == []
+        # a.txt is in the spec's inferred file scope (both agents sealed it),
+        # so contention is correctly surfaced in spec-scoped context.
+        contention = ctx.get("file_contention", [])
+        assert len(contention) == 1
+        assert contention[0]["path"] == "a.txt"
+        assert set(contention[0]["agents"]) == {"alice", "bob"}
 
 
 class TestIntegrationRisk:
@@ -2439,19 +2450,23 @@ class TestConvergence:
         assert "Blog" in html
         assert "All rights reserved" in html
 
-    def test_converge_then_seal(self, tmp_path):
-        """After convergence, seal captures the merged state."""
+    def test_converge_then_state_clean(self, tmp_path):
+        """After convergence, the working state is clean (index matches disk)."""
         repo = self._setup_diverged(tmp_path)
         report = repo.converge("nav-update", "footer-update")
         repo.apply_convergence(report)
 
-        seal = repo.seal(
-            summary="Merged nav + footer",
-            agent_id="orchestrator",
-            agent_type="agent",
+        # After convergence, the index is updated to match the merged files,
+        # so there should be no pending changes.
+        ctx = repo.context()
+        assert ctx["working_state"]["clean"] is True, (
+            "index should reflect converged state — no false pending changes"
         )
-        paths = [c["path"] for c in seal["changes"]]
-        assert "index.html" in paths
+
+        # The merged content should be on disk.
+        html = (tmp_path / "index.html").read_text()
+        assert "Blog" in html, "nav changes should be present"
+        assert "All rights reserved" in html, "footer changes should be present"
 
     def test_converge_with_conflict(self, tmp_path):
         """Conflicting changes produce conflicts in the report."""

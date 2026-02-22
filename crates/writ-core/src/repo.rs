@@ -2915,6 +2915,10 @@ impl Repository {
             warnings.extend(validation_warnings);
         }
 
+        // Deduplicate warnings (same warning can appear in multiple merge phases).
+        let mut seen = HashSet::new();
+        warnings.retain(|w| seen.insert(w.clone()));
+
         // Build post-convergence quality report.
         let quality_report = build_quality_report(
             file_decisions,
@@ -4902,8 +4906,20 @@ fn post_convergence_validation(
                         if !module.starts_with('.') && !module.contains('.') {
                             let module_file = root.join(format!("{}.py", module));
                             let module_dir = root.join(module).join("__init__.py");
+
+                            let file_dir = Path::new(path).parent();
+                            let local_module_file =
+                                file_dir.map(|d| root.join(d).join(format!("{}.py", module)));
+                            let local_module_dir =
+                                file_dir.map(|d| root.join(d).join(module).join("__init__.py"));
+
+                            let found_locally =
+                                local_module_file.as_ref().map_or(false, |p| p.exists())
+                                    || local_module_dir.as_ref().map_or(false, |p| p.exists());
+
                             if !module_file.exists()
                                 && !module_dir.exists()
+                                && !found_locally
                                 && !is_stdlib_module(module)
                                 && !installed.contains(module)
                             {
@@ -5155,16 +5171,122 @@ fn build_quality_report(
         }
     }
 
+    // Check for duplicate imports in applied files.
+    if apply {
+        let mut dup_import_values: Vec<FileMetricValue> = Vec::new();
+        let mut any_dup = false;
+
+        for d in &file_decisions {
+            if d.path.ends_with(".py") || d.path.ends_with(".js") || d.path.ends_with(".ts") {
+                let full = root.join(&d.path);
+                if let Ok(content) = fs::read_to_string(&full) {
+                    let import_lines: Vec<&str> = content
+                        .lines()
+                        .map(|l| l.trim())
+                        .filter(|l| l.starts_with("import ") || l.starts_with("from "))
+                        .collect();
+                    let unique: HashSet<&str> = import_lines.iter().copied().collect();
+                    let dup_count = import_lines.len() - unique.len();
+                    if dup_count > 0 {
+                        any_dup = true;
+                    }
+                    dup_import_values.push(FileMetricValue {
+                        path: d.path.clone(),
+                        value: dup_count,
+                    });
+                }
+            }
+        }
+
+        if !dup_import_values.is_empty() {
+            consistency_checks.push(ConsistencyCheck {
+                metric: "duplicate_imports".to_string(),
+                values: dup_import_values,
+                consistent: !any_dup,
+                warning: if any_dup {
+                    Some("one or more files contain duplicate import statements".to_string())
+                } else {
+                    None
+                },
+            });
+        }
+    }
+
+    // Check for unused imports in applied Python files.
+    if apply {
+        let mut unused_import_values: Vec<FileMetricValue> = Vec::new();
+        let mut any_unused = false;
+
+        for d in &file_decisions {
+            if d.path.ends_with(".py") {
+                let full = root.join(&d.path);
+                if let Ok(content) = fs::read_to_string(&full) {
+                    let lines: Vec<&str> = content.lines().collect();
+                    let non_import_text: String = lines
+                        .iter()
+                        .filter(|l| {
+                            let t = l.trim();
+                            !t.starts_with("import ") && !t.starts_with("from ")
+                        })
+                        .copied()
+                        .collect::<Vec<&str>>()
+                        .join("\n");
+
+                    let mut unused_count = 0usize;
+                    for line in &lines {
+                        let trimmed = line.trim();
+                        // Match "from X import Y" and check if Y is used.
+                        if trimmed.starts_with("from ") && trimmed.contains(" import ") {
+                            if let Some(after_import) = trimmed.splitn(2, " import ").nth(1) {
+                                for name in after_import.split(',') {
+                                    let name = name.trim();
+                                    // Skip wildcard imports and aliased names.
+                                    if name == "*" || name.contains(" as ") {
+                                        continue;
+                                    }
+                                    if !non_import_text.contains(name) {
+                                        unused_count += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if unused_count > 0 {
+                        any_unused = true;
+                    }
+                    unused_import_values.push(FileMetricValue {
+                        path: d.path.clone(),
+                        value: unused_count,
+                    });
+                }
+            }
+        }
+
+        if !unused_import_values.is_empty() {
+            consistency_checks.push(ConsistencyCheck {
+                metric: "unused_imports".to_string(),
+                values: unused_import_values,
+                consistent: !any_unused,
+                warning: if any_unused {
+                    Some("one or more files contain unused imports".to_string())
+                } else {
+                    None
+                },
+            });
+        }
+    }
+
     // Compute quality score.
     let mut score: i32 = 100;
     let unresolved = total_conflicts.saturating_sub(total_resolutions);
     score -= (unresolved * 15) as i32;
     for check in &consistency_checks {
         if !check.consistent {
-            let penalty = if check.metric == "bracket_balance" {
-                25
-            } else {
-                10
+            let penalty = match check.metric.as_str() {
+                "bracket_balance" => 25,
+                "duplicate_imports" => 5,
+                "unused_imports" => 3,
+                _ => 10,
             };
             score -= penalty;
         }
@@ -5210,10 +5332,17 @@ fn build_quality_report(
         .count();
     let n_inconsistent = consistency_checks.iter().filter(|c| !c.consistent).count();
 
-    let summary = format!(
+    let mut summary = format!(
         "{} file(s) processed: {} auto-merged, {} resolved by strategy, {} unresolved conflict(s), {} consistency issue(s)",
         n_files, n_auto, n_resolved, n_unresolved, n_inconsistent,
     );
+    if min_confidence < 1.0 {
+        summary.push_str(&format!(
+            " — confidence: min={}% avg={}%",
+            (min_confidence * 100.0).round() as u32,
+            (avg_confidence * 100.0).round() as u32,
+        ));
+    }
 
     ConvergenceQualityReport {
         file_decisions,
@@ -11419,6 +11548,111 @@ mod context_stress_tests {
         );
     }
 
+    /// IMPORT_ORPHAN should NOT fire for local same-directory modules
+    /// (e.g., `api/app.py` importing `from auth import ...` when `api/auth.py` exists).
+    #[test]
+    fn test_import_orphan_suppressed_by_local_module() {
+        let dir = tempdir().unwrap();
+
+        fs::create_dir_all(dir.path().join("api")).unwrap();
+        fs::write(dir.path().join("requirements.txt"), "flask\n").unwrap();
+        fs::write(
+            dir.path().join("api/app.py"),
+            "from flask import Flask\nfrom auth import require_auth\nfrom models import Book\nfrom search import search_books\n",
+        ).unwrap();
+        fs::write(
+            dir.path().join("api/auth.py"),
+            "def require_auth(f): return f\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("api/models.py"), "class Book: pass\n").unwrap();
+        fs::write(
+            dir.path().join("api/search.py"),
+            "def search_books(): pass\n",
+        )
+        .unwrap();
+
+        let decisions = vec![FileDecision {
+            path: "api/app.py".to_string(),
+            decision: "auto-merged".to_string(),
+            chosen_lines: 4,
+            chosen_spec: None,
+            alternatives: vec![],
+            confidence: Some(0.9),
+        }];
+
+        let warnings = post_convergence_validation(
+            dir.path(),
+            &decisions,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        let orphan_warnings: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("IMPORT_ORPHAN"))
+            .collect();
+
+        assert!(
+            orphan_warnings.is_empty(),
+            "auth.py, models.py, search.py exist in api/ — no orphans expected, got: {:?}",
+            orphan_warnings
+        );
+    }
+
+    /// IMPORT_ORPHAN should still fire for truly missing modules even when
+    /// other local modules exist in the same directory.
+    #[test]
+    fn test_import_orphan_fires_for_missing_local_module() {
+        let dir = tempdir().unwrap();
+
+        fs::create_dir_all(dir.path().join("api")).unwrap();
+        fs::write(dir.path().join("requirements.txt"), "flask\n").unwrap();
+        fs::write(
+            dir.path().join("api/app.py"),
+            "from flask import Flask\nfrom auth import require_auth\nfrom phantom import ghost\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("api/auth.py"),
+            "def require_auth(f): return f\n",
+        )
+        .unwrap();
+
+        let decisions = vec![FileDecision {
+            path: "api/app.py".to_string(),
+            decision: "auto-merged".to_string(),
+            chosen_lines: 3,
+            chosen_spec: None,
+            alternatives: vec![],
+            confidence: Some(0.9),
+        }];
+
+        let warnings = post_convergence_validation(
+            dir.path(),
+            &decisions,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+
+        let orphan_warnings: Vec<&String> = warnings
+            .iter()
+            .filter(|w| w.contains("IMPORT_ORPHAN"))
+            .collect();
+
+        assert_eq!(
+            orphan_warnings.len(),
+            1,
+            "phantom module doesn't exist — should be flagged, got: {:?}",
+            orphan_warnings
+        );
+        assert!(orphan_warnings[0].contains("phantom"));
+        assert!(
+            !orphan_warnings.iter().any(|w| w.contains("auth")),
+            "auth.py exists locally — should not be flagged"
+        );
+    }
+
     /// `ConvergeAllReport.applied` should be false when apply was requested
     /// but conflicts prevented actual writes (all_clean == false).
     #[test]
@@ -16866,5 +17100,232 @@ mod agent_scoped_context_tests {
                 action.action
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod sprint14_reporting_tests {
+    use super::*;
+    use crate::convergence::{ConvergeStrategy, FileDecision};
+    use crate::seal::{AgentIdentity, AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_converge_all_deduplicates_warnings() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Setup: baseline seal.
+        fs::write(dir.path().join("hot.txt"), "base\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Two specs touching the same file.
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        // Agent A modifies hot.txt and seals under s1.
+        fs::write(dir.path().join("hot.txt"), "base\nalpha\n").unwrap();
+        let a = AgentIdentity {
+            id: "agent-a".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            a.clone(),
+            "a work".into(),
+            Some("s1".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent B modifies hot.txt and seals under s2.
+        fs::write(dir.path().join("hot.txt"), "base\nbeta\n").unwrap();
+        let b = AgentIdentity {
+            id: "agent-b".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            b,
+            "b work".into(),
+            Some("s2".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent A seals again to create divergence.
+        fs::write(dir.path().join("hot.txt"), "base\nalpha v2\n").unwrap();
+        repo.seal(
+            a,
+            "a final".into(),
+            Some("s1".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, false)
+            .unwrap();
+
+        // Verify no duplicate warnings.
+        let mut sorted = report.warnings.clone();
+        sorted.sort();
+        let deduped_len = {
+            let mut d = sorted.clone();
+            d.dedup();
+            d.len()
+        };
+        assert_eq!(
+            report.warnings.len(),
+            deduped_len,
+            "warnings should have no duplicates, got: {:?}",
+            report.warnings,
+        );
+    }
+
+    #[test]
+    fn test_quality_report_summary_includes_confidence() {
+        // Build a quality report directly with low-confidence decisions.
+        let dir = tempdir().unwrap();
+
+        let decisions = vec![
+            FileDecision {
+                path: "a.py".into(),
+                decision: "auto-merged".into(),
+                chosen_spec: Some("s1".into()),
+                chosen_lines: 10,
+                alternatives: vec![],
+                confidence: Some(1.0),
+            },
+            FileDecision {
+                path: "b.py".into(),
+                decision: "most-recent".into(),
+                chosen_spec: Some("s2".into()),
+                chosen_lines: 20,
+                alternatives: vec![],
+                confidence: Some(0.7),
+            },
+        ];
+
+        let report = build_quality_report(decisions, dir.path(), false, 1, 1);
+
+        assert!(
+            report.summary.contains("confidence:"),
+            "summary should include confidence stats when < 100%, got: {}",
+            report.summary,
+        );
+        assert!(
+            report.summary.contains("min=70%"),
+            "summary should show min confidence of 70%, got: {}",
+            report.summary,
+        );
+    }
+
+    #[test]
+    fn test_quality_score_penalizes_duplicate_imports() {
+        let dir = tempdir().unwrap();
+
+        // Write a Python file with duplicate imports.
+        fs::write(
+            dir.path().join("app.py"),
+            "import os\nimport os\nimport sys\n\ndef main():\n    os.getcwd()\n    sys.exit()\n",
+        )
+        .unwrap();
+
+        let decisions = vec![FileDecision {
+            path: "app.py".into(),
+            decision: "auto-merged".into(),
+            chosen_spec: Some("s1".into()),
+            chosen_lines: 7,
+            alternatives: vec![],
+            confidence: Some(1.0),
+        }];
+
+        let report = build_quality_report(decisions, dir.path(), true, 0, 0);
+
+        // Should have a duplicate_imports consistency check.
+        let dup_check = report
+            .consistency_checks
+            .iter()
+            .find(|c| c.metric == "duplicate_imports");
+        assert!(
+            dup_check.is_some(),
+            "should have duplicate_imports check, got: {:?}",
+            report.consistency_checks,
+        );
+        assert!(
+            !dup_check.unwrap().consistent,
+            "duplicate_imports check should be inconsistent",
+        );
+
+        // Score should be penalized.
+        assert!(
+            report.quality_score < 100,
+            "score should be < 100 with duplicate imports, got: {}",
+            report.quality_score,
+        );
+    }
+
+    #[test]
+    fn test_quality_score_penalizes_unused_imports() {
+        let dir = tempdir().unwrap();
+
+        // Write a Python file with an unused import.
+        fs::write(
+            dir.path().join("app.py"),
+            "from os import path\nfrom sys import exit\n\ndef main():\n    exit()\n",
+        )
+        .unwrap();
+
+        let decisions = vec![FileDecision {
+            path: "app.py".into(),
+            decision: "auto-merged".into(),
+            chosen_spec: Some("s1".into()),
+            chosen_lines: 5,
+            alternatives: vec![],
+            confidence: Some(1.0),
+        }];
+
+        let report = build_quality_report(decisions, dir.path(), true, 0, 0);
+
+        // Should have an unused_imports consistency check.
+        let unused_check = report
+            .consistency_checks
+            .iter()
+            .find(|c| c.metric == "unused_imports");
+        assert!(
+            unused_check.is_some(),
+            "should have unused_imports check, got: {:?}",
+            report.consistency_checks,
+        );
+        assert!(
+            !unused_check.unwrap().consistent,
+            "unused_imports check should be inconsistent (path is unused)",
+        );
+
+        // Score should be penalized.
+        assert!(
+            report.quality_score < 100,
+            "score should be < 100 with unused imports, got: {}",
+            report.quality_score,
+        );
     }
 }

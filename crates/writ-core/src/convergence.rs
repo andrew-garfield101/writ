@@ -354,6 +354,7 @@ fn merge_imports(left: &[String], right: &[String]) -> Vec<String> {
     match lang {
         ImportLanguage::JavaScript => merge_js_imports(left, right),
         ImportLanguage::Go => merge_go_imports(left, right),
+        ImportLanguage::Python => merge_python_imports(left, right),
         _ => merge_imports_simple(left, right),
     }
 }
@@ -774,6 +775,392 @@ fn merge_go_imports(left: &[String], right: &[String]) -> Vec<String> {
     result
 }
 
+// ---------------------------------------------------------------------------
+// Python-specific import merging
+// ---------------------------------------------------------------------------
+
+/// Common Python standard library module names (top-level).
+/// Used as a heuristic for PEP 8 import ordering.
+const PYTHON_STDLIB: &[&str] = &[
+    "__future__",
+    "abc",
+    "aifc",
+    "argparse",
+    "array",
+    "ast",
+    "asynchat",
+    "asyncio",
+    "asyncore",
+    "atexit",
+    "audioop",
+    "base64",
+    "bdb",
+    "binascii",
+    "binhex",
+    "bisect",
+    "builtins",
+    "bz2",
+    "calendar",
+    "cgi",
+    "cgitb",
+    "chunk",
+    "cmath",
+    "cmd",
+    "code",
+    "codecs",
+    "codeop",
+    "collections",
+    "colorsys",
+    "compileall",
+    "concurrent",
+    "configparser",
+    "contextlib",
+    "contextvars",
+    "copy",
+    "copyreg",
+    "cProfile",
+    "crypt",
+    "csv",
+    "ctypes",
+    "curses",
+    "dataclasses",
+    "datetime",
+    "dbm",
+    "decimal",
+    "difflib",
+    "dis",
+    "distutils",
+    "doctest",
+    "email",
+    "encodings",
+    "enum",
+    "errno",
+    "faulthandler",
+    "fcntl",
+    "filecmp",
+    "fileinput",
+    "fnmatch",
+    "fractions",
+    "ftplib",
+    "functools",
+    "gc",
+    "getopt",
+    "getpass",
+    "gettext",
+    "glob",
+    "grp",
+    "gzip",
+    "hashlib",
+    "heapq",
+    "hmac",
+    "html",
+    "http",
+    "idlelib",
+    "imaplib",
+    "imghdr",
+    "imp",
+    "importlib",
+    "inspect",
+    "io",
+    "ipaddress",
+    "itertools",
+    "json",
+    "keyword",
+    "lib2to3",
+    "linecache",
+    "locale",
+    "logging",
+    "lzma",
+    "mailbox",
+    "mailcap",
+    "marshal",
+    "math",
+    "mimetypes",
+    "mmap",
+    "modulefinder",
+    "multiprocessing",
+    "netrc",
+    "nis",
+    "nntplib",
+    "numbers",
+    "operator",
+    "optparse",
+    "os",
+    "ossaudiodev",
+    "pathlib",
+    "pdb",
+    "pickle",
+    "pickletools",
+    "pipes",
+    "pkgutil",
+    "platform",
+    "plistlib",
+    "poplib",
+    "posix",
+    "posixpath",
+    "pprint",
+    "profile",
+    "pstats",
+    "pty",
+    "pwd",
+    "py_compile",
+    "pyclbr",
+    "pydoc",
+    "queue",
+    "quopri",
+    "random",
+    "re",
+    "readline",
+    "reprlib",
+    "resource",
+    "rlcompleter",
+    "runpy",
+    "sched",
+    "secrets",
+    "select",
+    "selectors",
+    "shelve",
+    "shlex",
+    "shutil",
+    "signal",
+    "site",
+    "smtpd",
+    "smtplib",
+    "sndhdr",
+    "socket",
+    "socketserver",
+    "sqlite3",
+    "ssl",
+    "stat",
+    "statistics",
+    "string",
+    "stringprep",
+    "struct",
+    "subprocess",
+    "sunau",
+    "symtable",
+    "sys",
+    "sysconfig",
+    "syslog",
+    "tabnanny",
+    "tarfile",
+    "telnetlib",
+    "tempfile",
+    "termios",
+    "test",
+    "textwrap",
+    "threading",
+    "time",
+    "timeit",
+    "tkinter",
+    "token",
+    "tokenize",
+    "tomllib",
+    "trace",
+    "traceback",
+    "tracemalloc",
+    "tty",
+    "turtle",
+    "turtledemo",
+    "types",
+    "typing",
+    "unicodedata",
+    "unittest",
+    "urllib",
+    "uu",
+    "uuid",
+    "venv",
+    "warnings",
+    "wave",
+    "weakref",
+    "webbrowser",
+    "winreg",
+    "winsound",
+    "wsgiref",
+    "xdrlib",
+    "xml",
+    "xmlrpc",
+    "zipapp",
+    "zipfile",
+    "zipimport",
+    "zlib",
+];
+
+/// Classify a Python import's top-level module for PEP 8 ordering.
+/// Returns: 0 = __future__, 1 = stdlib, 2 = third-party, 3 = local/relative.
+fn python_import_group(module: &str) -> u8 {
+    if module == "__future__" {
+        return 0;
+    }
+    // Relative imports: start with .
+    if module.starts_with('.') {
+        return 3;
+    }
+    // Extract top-level module name (before first dot).
+    let top_level = module.split('.').next().unwrap_or(module);
+    if PYTHON_STDLIB.contains(&top_level) {
+        1
+    } else {
+        2
+    }
+}
+
+/// A parsed Python import statement.
+#[derive(Debug, Clone)]
+struct PyImport {
+    /// The module being imported from (e.g., `os.path`, `flask`, `.utils`).
+    module: String,
+    /// Named imports for `from X import Y, Z` style. Empty for bare `import X`.
+    names: Vec<String>,
+    /// True if this is `import X` (bare), false if `from X import Y`.
+    is_bare: bool,
+    /// True if this is `from X import *`.
+    is_star: bool,
+}
+
+/// Parse a single Python import line into structured form.
+fn parse_python_import(line: &str) -> Option<PyImport> {
+    let trimmed = line.trim();
+
+    // `from X import Y, Z` or `from X import *`
+    if trimmed.starts_with("from ") {
+        let rest = trimmed[5..].trim();
+        let import_idx = rest.find(" import ")?;
+        let module = rest[..import_idx].trim().to_string();
+        let names_part = rest[import_idx + 8..].trim();
+
+        if names_part == "*" {
+            return Some(PyImport {
+                module,
+                names: vec![],
+                is_bare: false,
+                is_star: true,
+            });
+        }
+
+        // Handle parenthesized imports: `from X import (A, B, C)`
+        let names_str = names_part
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .trim();
+        let names: Vec<String> = names_str
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        return Some(PyImport {
+            module,
+            names,
+            is_bare: false,
+            is_star: false,
+        });
+    }
+
+    // `import X` or `import X, Y` or `import X as Y`
+    if trimmed.starts_with("import ") {
+        let rest = trimmed[7..].trim();
+        // Could be multiple: `import os, sys` — split by comma.
+        let modules: Vec<String> = rest
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        // For bare imports, module is the first part (before `as` if present).
+        // We store each as a separate import for proper grouping.
+        if modules.len() == 1 {
+            return Some(PyImport {
+                module: modules[0].clone(),
+                names: vec![],
+                is_bare: true,
+                is_star: false,
+            });
+        }
+        // Multiple bare imports on one line — return the first, caller handles.
+        // For simplicity, store the full comma-separated text as module.
+        return Some(PyImport {
+            module: rest.to_string(),
+            names: vec![],
+            is_bare: true,
+            is_star: false,
+        });
+    }
+
+    None
+}
+
+/// Render a `PyImport` back to a single import line.
+fn render_python_import(import: &PyImport) -> String {
+    if import.is_bare {
+        return format!("import {}", import.module);
+    }
+    if import.is_star {
+        return format!("from {} import *", import.module);
+    }
+    let mut sorted = import.names.clone();
+    sorted.sort();
+    format!("from {} import {}", import.module, sorted.join(", "))
+}
+
+/// Merge two sets of Python import lines with same-module consolidation
+/// and PEP 8 ordering.
+///
+/// - `from X import A` + `from X import B` → `from X import A, B`
+/// - Groups: `__future__`, stdlib, third-party, local/relative
+/// - Blank line between groups
+/// - Named imports sorted alphabetically within each statement
+fn merge_python_imports(left: &[String], right: &[String]) -> Vec<String> {
+    // Key: (module, is_bare, is_star) → merged import
+    let mut groups: std::collections::BTreeMap<(String, bool, bool), PyImport> =
+        std::collections::BTreeMap::new();
+
+    for line in left.iter().chain(right.iter()) {
+        if let Some(import) = parse_python_import(line) {
+            let key = (import.module.clone(), import.is_bare, import.is_star);
+
+            if let Some(existing) = groups.get_mut(&key) {
+                // Merge named imports from same module.
+                for name in &import.names {
+                    if !existing.names.contains(name) {
+                        existing.names.push(name.clone());
+                    }
+                }
+            } else {
+                groups.insert(key, import);
+            }
+        }
+    }
+
+    // Classify each import into PEP 8 groups and sort.
+    let mut grouped: Vec<(u8, String)> = groups
+        .values()
+        .map(|imp| {
+            let group = python_import_group(&imp.module);
+            let rendered = render_python_import(imp);
+            (group, rendered)
+        })
+        .collect();
+
+    grouped.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    // Build result with blank lines between groups.
+    let mut result = Vec::new();
+    let mut last_group: Option<u8> = None;
+
+    for (group, line) in &grouped {
+        if let Some(prev) = last_group {
+            if *group != prev {
+                result.push(String::new()); // blank line between groups
+            }
+        }
+        result.push(line.clone());
+        last_group = Some(*group);
+    }
+
+    result
+}
+
 /// Parse lines into groups of (declaration_line, preceding_decorators).
 /// A decorator is any line matching `is_decorator_line`; the next
 /// non-decorator, non-empty line is the declaration it annotates.
@@ -941,21 +1328,30 @@ pub fn resolve_conflict_regions(
                         .collect();
                     let lang = detect_import_language(&combined);
 
-                    if matches!(lang, ImportLanguage::JavaScript) {
-                        merge_js_imports(&region.left_lines, &region.right_lines)
-                    } else {
-                        // Non-JS: keep spec-ID ordering with line-level dedup.
-                        let mut l = Vec::new();
-                        if left_first {
-                            l.extend(region.left_lines.iter().cloned());
-                            l.extend(region.right_lines.iter().cloned());
-                        } else {
-                            l.extend(region.right_lines.iter().cloned());
-                            l.extend(region.left_lines.iter().cloned());
+                    match lang {
+                        ImportLanguage::JavaScript => {
+                            merge_js_imports(&region.left_lines, &region.right_lines)
                         }
-                        let mut seen = std::collections::HashSet::new();
-                        l.retain(|line| seen.insert(line.clone()));
-                        l
+                        ImportLanguage::Python => {
+                            merge_python_imports(&region.left_lines, &region.right_lines)
+                        }
+                        ImportLanguage::Go => {
+                            merge_go_imports(&region.left_lines, &region.right_lines)
+                        }
+                        _ => {
+                            // Other languages: keep spec-ID ordering with line-level dedup.
+                            let mut l = Vec::new();
+                            if left_first {
+                                l.extend(region.left_lines.iter().cloned());
+                                l.extend(region.right_lines.iter().cloned());
+                            } else {
+                                l.extend(region.right_lines.iter().cloned());
+                                l.extend(region.left_lines.iter().cloned());
+                            }
+                            let mut seen = std::collections::HashSet::new();
+                            l.retain(|line| seen.insert(line.clone()));
+                            l
+                        }
                     }
                 } else {
                     let mut l = Vec::new();
@@ -1273,12 +1669,277 @@ pub enum SmartMergeResult {
     },
 }
 
+// ---------------------------------------------------------------------------
+// Post-merge cleanup (Layer 5)
+// ---------------------------------------------------------------------------
+
+/// Deduplicate import statements across an entire file.
+///
+/// After merge/concatenation, the same import can appear multiple times —
+/// e.g., once at the top from the original file, and again mid-file from
+/// appended code. This function:
+/// - Removes exact-duplicate import lines (any language)
+/// - Consolidates same-module Python `from X import Y` statements scattered
+///   across the file into the first occurrence
+fn dedup_imports_whole_file(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut result: Vec<String> = Vec::new();
+
+    // Track seen imports: key → index in result where it first appeared.
+    // For Python `from X import Y,Z`: key = module name, value = index.
+    let mut seen_bare: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // For Python from-imports: module → index in result.
+    let mut seen_from: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for line in &lines {
+        let trimmed = line.trim();
+
+        // Try parsing as a Python import for consolidation.
+        if let Some(py) = parse_python_import(trimmed) {
+            if py.is_star {
+                // Star imports: dedup by module.
+                let key = format!("from {} import *", py.module);
+                if seen_bare.contains(&key) {
+                    continue; // skip duplicate
+                }
+                seen_bare.insert(key);
+                result.push(line.to_string());
+            } else if py.is_bare {
+                // Bare `import X`: dedup by exact text.
+                let key = format!("import {}", py.module);
+                if seen_bare.contains(&key) {
+                    continue;
+                }
+                seen_bare.insert(key);
+                result.push(line.to_string());
+            } else {
+                // `from X import Y, Z`: consolidate into first occurrence.
+                if let Some(&first_idx) = seen_from.get(&py.module) {
+                    // Merge names into the existing line.
+                    if let Some(existing) = parse_python_import(result[first_idx].trim()) {
+                        let mut merged_names = existing.names.clone();
+                        for name in &py.names {
+                            if !merged_names.contains(name) {
+                                merged_names.push(name.clone());
+                            }
+                        }
+                        let updated = PyImport {
+                            module: existing.module,
+                            names: merged_names,
+                            is_bare: false,
+                            is_star: false,
+                        };
+                        result[first_idx] = render_python_import(&updated);
+                    }
+                    // Don't push the duplicate line.
+                } else {
+                    seen_from.insert(py.module.clone(), result.len());
+                    result.push(line.to_string());
+                }
+            }
+        } else if is_import_line(line) {
+            // Non-Python imports: dedup by exact text.
+            if seen_bare.contains(trimmed) {
+                continue;
+            }
+            seen_bare.insert(trimmed.to_string());
+            result.push(line.to_string());
+        } else {
+            result.push(line.to_string());
+        }
+    }
+
+    let mut merged = result.join("\n");
+    if content.ends_with('\n') && !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    merged
+}
+
+/// Prune unused imports from merged Python content.
+///
+/// Scans for imported symbols that never appear in the non-import body
+/// of the file. Conservative: keeps bare `import X` (since `X.method()`
+/// may be used), keeps `import *`, and only removes specific names from
+/// `from X import Y, Z` when `Y` or `Z` isn't referenced anywhere.
+fn prune_unused_python_imports(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+
+    // Collect the non-import body text for symbol scanning.
+    let body: String = lines
+        .iter()
+        .filter(|l| !is_import_line(l) && !l.trim().is_empty())
+        .cloned()
+        .collect::<Vec<&str>>()
+        .join("\n");
+
+    let mut result: Vec<String> = Vec::new();
+
+    for line in &lines {
+        let trimmed = line.trim();
+        if let Some(py) = parse_python_import(trimmed) {
+            // Keep bare imports (import os — could use os.X).
+            if py.is_bare || py.is_star {
+                result.push(line.to_string());
+                continue;
+            }
+
+            // For `from X import Y, Z`: check which names are used.
+            let used_names: Vec<String> = py
+                .names
+                .iter()
+                .filter(|name| {
+                    // Handle `as` aliases: `from X import Y as Z` — check Z.
+                    let check_name = if let Some(alias_idx) = name.find(" as ") {
+                        &name[alias_idx + 4..]
+                    } else {
+                        name.as_str()
+                    };
+                    // Check if the symbol appears in the body as a word boundary.
+                    // Simple heuristic: check if `name` appears surrounded by non-alphanumeric chars.
+                    body.contains(check_name)
+                })
+                .cloned()
+                .collect();
+
+            if used_names.is_empty() {
+                // No names from this import are used — drop the entire line.
+                continue;
+            }
+
+            if used_names.len() == py.names.len() {
+                // All names used — keep as-is.
+                result.push(line.to_string());
+            } else {
+                // Some names unused — rewrite with only used names.
+                let pruned = PyImport {
+                    module: py.module,
+                    names: used_names,
+                    is_bare: false,
+                    is_star: false,
+                };
+                result.push(render_python_import(&pruned));
+            }
+        } else {
+            result.push(line.to_string());
+        }
+    }
+
+    let mut merged = result.join("\n");
+    if content.ends_with('\n') && !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    merged
+}
+
+/// Fix formatting in merged Python content.
+///
+/// Ensures 2 blank lines before top-level `class` and `def` definitions
+/// (PEP 8). Does not add blank lines at the very start of the file or
+/// after import blocks.
+fn fix_python_formatting(content: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut result: Vec<String> = Vec::new();
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let is_top_level_def = (trimmed.starts_with("def ") || trimmed.starts_with("class "))
+            && !line.starts_with(' ')
+            && !line.starts_with('\t');
+
+        if is_top_level_def && i > 0 {
+            // Count trailing blank lines already in result.
+            let mut trailing_blanks = 0;
+            for prev in result.iter().rev() {
+                if prev.trim().is_empty() {
+                    trailing_blanks += 1;
+                } else {
+                    break;
+                }
+            }
+
+            // Check if the preceding non-blank line is an import —
+            // only need 2 blanks between import block and first definition.
+            let prev_is_import = result
+                .iter()
+                .rev()
+                .find(|l| !l.trim().is_empty())
+                .map(|l| is_import_line(l))
+                .unwrap_or(false);
+
+            let needed = if prev_is_import { 2 } else { 2 };
+
+            // Add blank lines to reach the needed count.
+            while trailing_blanks < needed {
+                result.push(String::new());
+                trailing_blanks += 1;
+            }
+
+            // Remove excess blank lines (more than 2).
+            while trailing_blanks > needed {
+                if let Some(last) = result.last() {
+                    if last.trim().is_empty() {
+                        result.pop();
+                        trailing_blanks -= 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        result.push(line.to_string());
+    }
+
+    let mut merged = result.join("\n");
+    if content.ends_with('\n') && !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    merged
+}
+
+/// Apply post-merge cleanup to the final merged content.
+///
+/// Runs language-aware cleanup passes:
+/// 1. Duplicate import removal (all languages)
+/// 2. Unused import pruning (Python only)
+/// 3. Formatting fixes (Python only)
+///
+/// Only activates when the content contains import-like patterns,
+/// keeping it a no-op for non-code files.
+fn post_merge_cleanup(content: &str) -> String {
+    // Quick check: does this content have any imports?
+    let has_imports = content.lines().any(|l| is_import_line(l));
+    if !has_imports {
+        return content.to_string();
+    }
+
+    // Step 1: Deduplicate imports.
+    let cleaned = dedup_imports_whole_file(content);
+
+    // Steps 2-3: Python-specific cleanup.
+    let all_lines: Vec<String> = cleaned.lines().map(|l| l.to_string()).collect();
+    let lang = detect_import_language(&all_lines);
+
+    if lang == ImportLanguage::Python {
+        let pruned = prune_unused_python_imports(&cleaned);
+        fix_python_formatting(&pruned)
+    } else {
+        cleaned
+    }
+}
+
 /// Perform a three-way merge with Layers 2-3 auto-resolution.
 ///
 /// Calls `three_way_merge()` (Layer 1), then attempts to resolve any
 /// conflict regions using region classification and structural pattern
 /// matching (Layers 2-3). Only truly irreconcilable `BothModified`
 /// regions remain as conflicts for Layer 4 strategy fallback.
+///
+/// After conflict resolution, applies Layer 5 post-merge cleanup:
+/// duplicate import removal, unused import pruning, and formatting fixes.
 ///
 /// `left_spec` and `right_spec` are spec IDs used for deterministic
 /// ordering when concatenating `BothInserted` regions.
@@ -1291,23 +1952,31 @@ pub fn smart_merge(
 ) -> SmartMergeResult {
     // Layer 1: standard three-way merge.
     match three_way_merge(base, left, right) {
-        FileMergeResult::Clean(content) => SmartMergeResult::Clean {
-            content,
-            resolutions: vec![],
-        },
+        FileMergeResult::Clean(content) => {
+            // Layer 5: post-merge cleanup.
+            let cleaned = post_merge_cleanup(&content);
+            SmartMergeResult::Clean {
+                content: cleaned,
+                resolutions: vec![],
+            }
+        }
         FileMergeResult::Conflict(regions) => {
             // Layers 2-3: attempt to auto-resolve conflict regions.
             let resolved =
                 resolve_conflict_regions(base, left, right, &regions, left_spec, right_spec);
 
             if resolved.fully_resolved {
+                // Layer 5: post-merge cleanup.
+                let cleaned = post_merge_cleanup(&resolved.content);
                 SmartMergeResult::Clean {
-                    content: resolved.content,
+                    content: cleaned,
                     resolutions: resolved.resolutions,
                 }
             } else {
+                // Layer 5: post-merge cleanup (even partial merges benefit).
+                let cleaned = post_merge_cleanup(&resolved.content);
                 SmartMergeResult::Partial {
-                    content: resolved.content,
+                    content: cleaned,
                     resolutions: resolved.resolutions,
                     unresolved: resolved.unresolved_regions,
                 }
@@ -3066,5 +3735,496 @@ h1 {
         assert!(imports.contains(&"\"fmt\"".to_string()));
         assert!(imports.contains(&"\"os\"".to_string()));
         assert!(imports.contains(&"\"github.com/pkg/errors\"".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Python merge pattern tests (Sprint 14 — Amis)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_python_import_consolidation_same_module() {
+        // `from models import Book` + `from models import User` → `from models import Book, User`
+        let left = vec!["from models import Book".to_string()];
+        let right = vec!["from models import User".to_string()];
+
+        let merged = merge_python_imports(&left, &right);
+        assert_eq!(
+            merged.len(),
+            1,
+            "should consolidate into one line: {merged:?}"
+        );
+        assert!(merged[0].contains("Book"), "Book lost: {merged:?}");
+        assert!(merged[0].contains("User"), "User lost: {merged:?}");
+        assert!(
+            merged[0].starts_with("from models import"),
+            "wrong module: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn test_python_import_consolidation_multiple_names() {
+        // `from models import Book, BookCollection` + `from models import User, Book`
+        // → `from models import Book, BookCollection, User`
+        let left = vec!["from models import Book, BookCollection".to_string()];
+        let right = vec!["from models import User, Book".to_string()];
+
+        let merged = merge_python_imports(&left, &right);
+        assert_eq!(merged.len(), 1, "should consolidate: {merged:?}");
+        assert!(merged[0].contains("Book"), "Book lost");
+        assert!(merged[0].contains("BookCollection"), "BookCollection lost");
+        assert!(merged[0].contains("User"), "User lost");
+        // Check dedup — Book should appear once.
+        let book_count = merged[0].matches("Book").count();
+        // "Book" appears in "Book" and "BookCollection", so 2 occurrences.
+        assert_eq!(
+            book_count, 2,
+            "Book should appear in 'Book' and 'BookCollection': {}",
+            merged[0]
+        );
+    }
+
+    #[test]
+    fn test_python_import_ordering_pep8() {
+        // Imports should be ordered: stdlib → third-party → local.
+        let left = vec![
+            "from flask import Flask".to_string(),
+            "import os".to_string(),
+        ];
+        let right = vec![
+            "from .utils import helper".to_string(),
+            "import sys".to_string(),
+        ];
+
+        let merged = merge_python_imports(&left, &right);
+        let content = merged.join("\n");
+
+        // stdlib (os, sys) should come before flask, which should come before .utils.
+        let os_pos = content.find("import os").unwrap();
+        let sys_pos = content.find("import sys").unwrap();
+        let flask_pos = content.find("from flask").unwrap();
+        let utils_pos = content.find("from .utils").unwrap();
+
+        assert!(
+            os_pos < flask_pos,
+            "stdlib should precede third-party: {content}"
+        );
+        assert!(
+            sys_pos < flask_pos,
+            "stdlib should precede third-party: {content}"
+        );
+        assert!(
+            flask_pos < utils_pos,
+            "third-party should precede local: {content}"
+        );
+    }
+
+    #[test]
+    fn test_python_import_ordering_blank_lines_between_groups() {
+        let left = vec![
+            "import os".to_string(),
+            "from flask import Flask".to_string(),
+        ];
+        let right = vec![
+            "import sys".to_string(),
+            "from .models import User".to_string(),
+        ];
+
+        let merged = merge_python_imports(&left, &right);
+
+        // Should have blank lines between groups.
+        // Group 1 (stdlib): import os, import sys
+        // Group 2 (third-party): from flask import Flask
+        // Group 3 (local): from .models import User
+        let mut found_blank_lines = 0;
+        for line in &merged {
+            if line.is_empty() {
+                found_blank_lines += 1;
+            }
+        }
+        assert!(
+            found_blank_lines >= 2,
+            "need blank lines between 3 groups, found {found_blank_lines}: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn test_python_import_dedup_identical() {
+        // Two identical imports → one.
+        let left = vec!["from os.path import join".to_string()];
+        let right = vec!["from os.path import join".to_string()];
+
+        let merged = merge_python_imports(&left, &right);
+        assert_eq!(merged.len(), 1, "duplicate should be deduped: {merged:?}");
+        assert_eq!(merged[0], "from os.path import join");
+    }
+
+    #[test]
+    fn test_python_bare_import_preserved() {
+        // `import os` + `import sys` should remain separate lines.
+        let left = vec!["import os".to_string()];
+        let right = vec!["import sys".to_string()];
+
+        let merged = merge_python_imports(&left, &right);
+        assert!(
+            merged.contains(&"import os".to_string()),
+            "os lost: {merged:?}"
+        );
+        assert!(
+            merged.contains(&"import sys".to_string()),
+            "sys lost: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn test_python_star_import_preserved() {
+        let left = vec!["from typing import *".to_string()];
+        let right = vec!["from collections import OrderedDict".to_string()];
+
+        let merged = merge_python_imports(&left, &right);
+        let content = merged.join("\n");
+        assert!(
+            content.contains("from typing import *"),
+            "star import lost: {content}"
+        );
+        assert!(
+            content.contains("from collections import OrderedDict"),
+            "collections lost: {content}"
+        );
+    }
+
+    #[test]
+    fn test_python_future_import_first() {
+        // __future__ imports should always be first.
+        let left = vec![
+            "import os".to_string(),
+            "from __future__ import annotations".to_string(),
+        ];
+        let right = vec!["from flask import Flask".to_string()];
+
+        let merged = merge_python_imports(&left, &right);
+        let first_non_empty = merged.iter().find(|l| !l.is_empty()).unwrap();
+        assert!(
+            first_non_empty.contains("__future__"),
+            "__future__ should be first: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn test_parse_python_import_bare() {
+        let parsed = parse_python_import("import os").unwrap();
+        assert!(parsed.is_bare);
+        assert_eq!(parsed.module, "os");
+        assert!(parsed.names.is_empty());
+    }
+
+    #[test]
+    fn test_parse_python_import_from() {
+        let parsed = parse_python_import("from os.path import join, exists").unwrap();
+        assert!(!parsed.is_bare);
+        assert_eq!(parsed.module, "os.path");
+        assert!(parsed.names.contains(&"join".to_string()));
+        assert!(parsed.names.contains(&"exists".to_string()));
+    }
+
+    #[test]
+    fn test_parse_python_import_parenthesized() {
+        let parsed = parse_python_import("from flask import (Flask, jsonify, request)").unwrap();
+        assert!(!parsed.is_bare);
+        assert_eq!(parsed.module, "flask");
+        assert_eq!(parsed.names.len(), 3);
+        assert!(parsed.names.contains(&"Flask".to_string()));
+        assert!(parsed.names.contains(&"jsonify".to_string()));
+        assert!(parsed.names.contains(&"request".to_string()));
+    }
+
+    #[test]
+    fn test_parse_python_import_star() {
+        let parsed = parse_python_import("from typing import *").unwrap();
+        assert!(parsed.is_star);
+        assert_eq!(parsed.module, "typing");
+    }
+
+    #[test]
+    fn test_python_import_group_classification() {
+        assert_eq!(python_import_group("__future__"), 0);
+        assert_eq!(python_import_group("os"), 1);
+        assert_eq!(python_import_group("sys"), 1);
+        assert_eq!(python_import_group("os.path"), 1);
+        assert_eq!(python_import_group("collections"), 1);
+        assert_eq!(python_import_group("flask"), 2);
+        assert_eq!(python_import_group("requests"), 2);
+        assert_eq!(python_import_group("django.db"), 2);
+        assert_eq!(python_import_group(".utils"), 3);
+        assert_eq!(python_import_group("..models"), 3);
+    }
+
+    #[test]
+    fn test_python_import_smart_merge_integration() {
+        // Full integration: smart_merge on a Python file with import conflict.
+        // Symbols are referenced in the body so the pruner keeps them.
+        let base = "import os\n\ndef main():\n    app = Flask(__name__)\n    return jsonify({})\n";
+        let left = "import os\nfrom flask import Flask\n\ndef main():\n    app = Flask(__name__)\n    return jsonify({})\n";
+        let right = "import os\nfrom flask import jsonify\n\ndef main():\n    app = Flask(__name__)\n    return jsonify({})\n";
+
+        let result = smart_merge(base, left, right, "agent-a", "agent-b");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content.clone(),
+            SmartMergeResult::Partial { content, .. } => content.clone(),
+        };
+
+        // Both flask imports should be consolidated.
+        assert!(content.contains("Flask"), "Flask lost: {content}");
+        assert!(content.contains("jsonify"), "jsonify lost: {content}");
+        assert!(
+            content.contains("def main"),
+            "main function lost: {content}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-merge cleanup tests (Sprint 14 — Amis)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_dedup_imports_exact_duplicate() {
+        // Exact duplicate imports should be removed.
+        let content = "import os\nimport sys\nimport os\n\nx = os.path.join('a', 'b')\n";
+        let result = dedup_imports_whole_file(content);
+        assert_eq!(
+            result.matches("import os").count(),
+            1,
+            "duplicate import os should be deduped: {result}"
+        );
+        assert!(result.contains("import sys"), "sys lost: {result}");
+    }
+
+    #[test]
+    fn test_dedup_imports_python_from_consolidation() {
+        // Scattered `from X import Y` lines should be consolidated into the first.
+        let content =
+            "from models import Book\nimport os\nfrom models import User\n\nprint(Book, User)\n";
+        let result = dedup_imports_whole_file(content);
+        // Should consolidate into one line at the first occurrence.
+        assert_eq!(
+            result.matches("from models import").count(),
+            1,
+            "should consolidate scattered from-imports: {result}"
+        );
+        assert!(result.contains("Book"), "Book lost: {result}");
+        assert!(result.contains("User"), "User lost: {result}");
+    }
+
+    #[test]
+    fn test_dedup_imports_star_duplicate() {
+        let content = "from typing import *\nfrom typing import *\n\nx: int = 1\n";
+        let result = dedup_imports_whole_file(content);
+        assert_eq!(
+            result.matches("from typing import *").count(),
+            1,
+            "duplicate star import should be deduped: {result}"
+        );
+    }
+
+    #[test]
+    fn test_dedup_imports_non_python() {
+        // Non-Python imports dedup by exact text.
+        let content =
+            "import React from 'react';\nimport React from 'react';\n\nconst App = () => {};\n";
+        let result = dedup_imports_whole_file(content);
+        assert_eq!(
+            result.matches("import React from 'react';").count(),
+            1,
+            "duplicate JS import should be deduped: {result}"
+        );
+    }
+
+    #[test]
+    fn test_prune_unused_imports() {
+        // `useCallback` is imported but never referenced in body.
+        let content = "from flask import Flask, jsonify\nimport os\n\napp = Flask(__name__)\nresult = jsonify(data)\n";
+        let result = prune_unused_python_imports(content);
+        assert!(result.contains("Flask"), "Flask is used: {result}");
+        assert!(result.contains("jsonify"), "jsonify is used: {result}");
+        assert!(
+            result.contains("import os"),
+            "bare import os should be kept: {result}"
+        );
+    }
+
+    #[test]
+    fn test_prune_unused_imports_removes_unreferenced() {
+        let content =
+            "from flask import Flask, jsonify, abort\nimport os\n\napp = Flask(__name__)\n";
+        let result = prune_unused_python_imports(content);
+        assert!(result.contains("Flask"), "Flask is used: {result}");
+        // jsonify and abort are not referenced in body.
+        assert!(
+            !result.contains("jsonify"),
+            "jsonify should be pruned: {result}"
+        );
+        assert!(
+            !result.contains("abort"),
+            "abort should be pruned: {result}"
+        );
+        // import os is bare — should be kept (could use os.path etc.).
+        assert!(result.contains("import os"), "bare import kept: {result}");
+    }
+
+    #[test]
+    fn test_prune_unused_keeps_bare_imports() {
+        // Bare imports should never be pruned (could use X.method).
+        let content = "import os\nimport sys\n\nprint('hello')\n";
+        let result = prune_unused_python_imports(content);
+        assert!(
+            result.contains("import os"),
+            "bare import os should be kept: {result}"
+        );
+        assert!(
+            result.contains("import sys"),
+            "bare import sys should be kept: {result}"
+        );
+    }
+
+    #[test]
+    fn test_prune_unused_keeps_star_imports() {
+        let content = "from typing import *\n\nx: int = 1\n";
+        let result = prune_unused_python_imports(content);
+        assert!(
+            result.contains("from typing import *"),
+            "star import should be kept: {result}"
+        );
+    }
+
+    #[test]
+    fn test_prune_drops_entire_unused_from_import() {
+        // When ALL names from a from-import are unused, drop the whole line.
+        let content = "from unused_module import foo, bar\n\ndef main():\n    print('hello')\n";
+        let result = prune_unused_python_imports(content);
+        assert!(
+            !result.contains("unused_module"),
+            "entirely unused import should be removed: {result}"
+        );
+    }
+
+    #[test]
+    fn test_fix_python_formatting_two_blank_lines_before_def() {
+        let content = "import os\ndef main():\n    pass\n";
+        let result = fix_python_formatting(content);
+        // Should have 2 blank lines before `def main()`.
+        let def_pos = result.find("def main").unwrap();
+        let before_def = &result[..def_pos];
+        let trailing_newlines = before_def
+            .lines()
+            .rev()
+            .take_while(|l| l.trim().is_empty())
+            .count();
+        assert!(
+            trailing_newlines >= 2,
+            "should have 2 blank lines before def: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_fix_python_formatting_two_blank_lines_before_class() {
+        let content = "import os\nclass MyClass:\n    pass\n";
+        let result = fix_python_formatting(content);
+        let class_pos = result.find("class MyClass").unwrap();
+        let before_class = &result[..class_pos];
+        let trailing_newlines = before_class
+            .lines()
+            .rev()
+            .take_while(|l| l.trim().is_empty())
+            .count();
+        assert!(
+            trailing_newlines >= 2,
+            "should have 2 blank lines before class: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_fix_python_formatting_normalizes_excess_blanks() {
+        let content = "import os\n\n\n\n\ndef main():\n    pass\n";
+        let result = fix_python_formatting(content);
+        // Should normalize to exactly 2 blank lines.
+        let def_pos = result.find("def main").unwrap();
+        let before_def = &result[..def_pos];
+        let trailing_newlines = before_def
+            .lines()
+            .rev()
+            .take_while(|l| l.trim().is_empty())
+            .count();
+        assert_eq!(
+            trailing_newlines, 2,
+            "should normalize to exactly 2 blank lines: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_fix_python_formatting_indented_def_untouched() {
+        // Indented def/class should NOT get extra blank lines.
+        let content = "class Foo:\n    def bar(self):\n        pass\n";
+        let result = fix_python_formatting(content);
+        // The `def bar` is indented — should not add blank lines before it.
+        assert!(
+            !result.contains("\n\n\n    def bar"),
+            "indented def should not get extra blanks: {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_post_merge_cleanup_full_pipeline() {
+        // Full pipeline test: scattered duplicate imports, unused imports,
+        // missing blank lines before definitions.
+        let content = "\
+import os
+from flask import Flask, jsonify
+import sys
+from models import Book
+from flask import abort
+from models import User
+def create_app():
+    app = Flask(__name__)
+    book = Book()
+    user = User()
+    return app
+class Config:
+    DEBUG = True
+";
+        let result = post_merge_cleanup(content);
+
+        // Dedup: `from flask` consolidated, `from models` consolidated.
+        assert_eq!(
+            result.matches("from flask import").count(),
+            1,
+            "flask imports should be consolidated: {result}"
+        );
+        assert_eq!(
+            result.matches("from models import").count(),
+            1,
+            "models imports should be consolidated: {result}"
+        );
+
+        // Pruning: `jsonify` and `abort` are not referenced → should be pruned.
+        // `Flask`, `Book`, `User` are referenced → should be kept.
+        assert!(result.contains("Flask"), "Flask used: {result}");
+        assert!(result.contains("Book"), "Book used: {result}");
+        assert!(result.contains("User"), "User used: {result}");
+        assert!(
+            !result.contains("jsonify"),
+            "jsonify unused → pruned: {result}"
+        );
+        assert!(!result.contains("abort"), "abort unused → pruned: {result}");
+
+        // Formatting: 2 blank lines before def and class.
+        assert!(result.contains("def create_app"), "def lost: {result}");
+        assert!(result.contains("class Config"), "class lost: {result}");
+    }
+
+    #[test]
+    fn test_post_merge_cleanup_no_imports_passthrough() {
+        // Files without imports should pass through unchanged.
+        let content = "def main():\n    print('hello')\n";
+        let result = post_merge_cleanup(content);
+        assert_eq!(result, content, "no-import file should be unchanged");
     }
 }

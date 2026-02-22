@@ -214,8 +214,8 @@ enum Commands {
         /// Right spec ID.
         right_spec: String,
 
-        /// Output format: "human" (default), "json", or "brief".
-        #[arg(long, default_value = "human")]
+        /// Output format: "json" (default), "human", or "brief".
+        #[arg(long, default_value = "json")]
         format: String,
 
         /// Apply the convergence result to the working directory (clean merges only).
@@ -226,8 +226,8 @@ enum Commands {
     /// Converge ALL diverged branches in sequence (newest-first ordering).
     /// This is the recommended way to merge after multi-agent parallel work.
     ConvergeAll {
-        /// Output format: "human" (default) or "json".
-        #[arg(long, default_value = "human")]
+        /// Output format: "json" (default) or "human".
+        #[arg(long, default_value = "json")]
         format: String,
 
         /// Automatically apply clean merges and resolve conflicts per strategy.
@@ -437,6 +437,13 @@ enum RemoteCommands {
 }
 
 fn main() {
+    // Reset SIGPIPE to default so piping to `head`, `grep`, etc. doesn't
+    // cause a Rust BrokenPipe panic (exit 101) which kills `set -euo pipefail` scripts.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
     let cwd = std::env::current_dir().unwrap_or_else(|e| {
         eprintln!("error: cannot determine current directory: {e}");
@@ -1989,6 +1996,13 @@ fn cmd_converge_all(
                 println!();
                 println!("  QUALITY REPORT (score: {}/100)", qr.quality_score);
                 println!("    {}", qr.summary);
+                if qr.min_confidence < 1.0 {
+                    println!(
+                        "    confidence: min={}% avg={}%",
+                        (qr.min_confidence * 100.0).round() as u32,
+                        (qr.avg_confidence * 100.0).round() as u32,
+                    );
+                }
                 if !qr.file_decisions.is_empty() {
                     println!();
                     println!("    File decisions:");

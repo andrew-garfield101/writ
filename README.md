@@ -138,14 +138,16 @@ repo.seal(summary="42 tests passing", agent_id="test-bot", spec_id="test-suite",
 
 ### Convergence
 
-When specs overlap, convergence handles the merge:
+When specs overlap, convergence handles the merge. The algorithm is built on a core principle: **compose, don't choose.** Multi-agent work is fundamentally additive — agents build complementary features, not competing implementations. Convergence treats conflicts as opportunities for composition rather than selection.
+
+The engine uses a layered resolution pipeline. Early layers handle structurally safe cases, additive insertions, import accumulation, decorator preservation, superset detection, with high confidence and zero content loss. Only genuinely irreconcilable conflicts (two agents rewrote the same function body differently) fall through to the strategy layer, where the human or orchestrator decides.
 
 ```bash
 # Merge ALL diverged branches at once
 writ converge-all --apply --strategy most-recent
 
-# Or use the most-complete strategy (prefers the version with more content)
-writ converge-all --apply --strategy most-complete
+# Or leave irreconcilable conflicts for manual review
+writ converge-all --apply --strategy manual
 ```
 
 ```python
@@ -157,6 +159,8 @@ if report.get("quality_report"):
     qr = report["quality_report"]
     print(f"Quality score: {qr['quality_score']}/100 — {qr['summary']}")
 ```
+
+Post convergence validation catches structural damage automatically, content loss, bracket imbalance, orphaned imports, so bad merges surface immediately rather than silently breaking the project.
 
 Conflicts are structured JSON — not `<<<<` markers — so orchestrator agents can resolve them programmatically.
 
@@ -276,7 +280,7 @@ writ/
 
 **Storage:** Content-addressable object store (SHA-256, same architecture as git but with SHA-256 instead of SHA-1). Atomic writes (temp + fsync + rename). Hash verification on retrieve. Advisory file locking for concurrency.
 
-**Test coverage:** 306 Rust + 231 Python = 537 tests across core, CLI, and bindings.
+**Test coverage:** 331 Rust + 231 Python = 562 tests across core, CLI, and bindings.
 
 ## CLI reference
 
@@ -291,7 +295,7 @@ writ finish                           # one-command: summary → git add → git
 writ finish --full                    # same, but with PR-style commit body
 writ finish --dry-run                 # preview without committing
 writ converge LEFT RIGHT [--apply]    # two-spec convergence
-writ converge-all --apply --strategy  # merge all diverged branches (most-recent, most-complete)
+writ converge-all --apply --strategy  # merge all diverged branches (manual, most-recent, orchestrator)
 writ spec add --id ID --title "..."   # register a spec
 writ spec status                      # show all specs and their status
 writ state                            # working directory changes
@@ -323,7 +327,7 @@ pytest tests/
 ### Shipped
 
 - **Round-trip workflow.** `writ install` → agents work → `writ summary --format commit` → git commit.
-- **Convergence engine.** Three-way merge with `converge-all`, `MostRecent` and `MostComplete` strategies, post-convergence quality reports, lost-content warnings, and structured conflict reports.
+- **Convergence engine.** Layered resolution pipeline: three-way merge → region classification → structural pattern matching → strategy fallback. Compose-not-choose philosophy preserves all agents' contributions. Post-convergence validation catches content loss, bracket imbalance, and orphaned imports.
 - **Integration risk.** Automatic risk scoring (low/medium/high) from divergence, file contention, and scope violations.
 - **File contention map.** Files touched by 2+ agents surfaced in context, sorted by agent count.
 - **Agent activity tracking.** Per-agent file ownership, seal counts, latest work — across all branches including diverged ones.

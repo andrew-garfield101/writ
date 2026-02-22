@@ -406,6 +406,11 @@ pub struct ContextOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_summary: Option<SessionSummary>,
 
+    /// Actionable recommendation: the single most important thing to do next.
+    /// `None` when there's nothing urgent — just keep working.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_action: Option<RecommendedAction>,
+
     /// Available writ operations for agent discoverability.
     pub available_operations: Vec<String>,
 }
@@ -492,4 +497,19 @@ pub struct SessionSummary {
     pub specs_completed: usize,
     pub files_changed: usize,
     pub message: String,
+}
+
+/// Actionable recommendation based on current context state.
+///
+/// Tells the agent *what to do next* instead of just *what is*.
+/// Priority logic selects the single most important action:
+/// blocking dependency > convergence needed > high risk > unsealed changes > session complete.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecommendedAction {
+    /// Machine-readable action type (e.g. "converge", "seal", "wait_for_dependency").
+    pub action: String,
+    /// Human/agent-readable explanation of what to do and why.
+    pub message: String,
+    /// Priority level: "high", "medium", or "low".
+    pub priority: String,
 }

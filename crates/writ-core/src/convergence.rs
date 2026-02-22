@@ -455,9 +455,14 @@ pub fn resolve_conflict_regions(
                     lines.extend(region.right_lines.iter().cloned());
                     lines.extend(region.left_lines.iter().cloned());
                 }
-                // Deduplicate identical lines (import dedup or general dedup).
-                let mut seen = std::collections::HashSet::new();
-                lines.retain(|l| seen.insert(l.clone()));
+
+                if all_imports {
+                    // Only deduplicate for import regions where exact
+                    // duplicates (e.g., both sides added the same import)
+                    // should be collapsed.
+                    let mut seen = std::collections::HashSet::new();
+                    lines.retain(|l| seen.insert(l.clone()));
+                }
 
                 let method = if all_imports {
                     "import-accumulation"
@@ -1804,5 +1809,77 @@ if __name__ == '__main__':
             assert!((resolved.resolutions[0].confidence - 0.95).abs() < 0.01);
             assert_eq!(resolved.resolutions[0].method, "superset-detected");
         }
+    }
+
+    #[test]
+    fn test_css_bracket_preservation() {
+        let base = "\
+.app {
+  font-family: sans-serif;
+  padding: 20px;
+}
+
+h1 {
+  color: #333;
+}
+";
+        let left = "\
+.app {
+  font-family: sans-serif;
+  padding: 20px;
+}
+
+h1 {
+  color: #333;
+}
+
+.header {
+  display: flex;
+  background: #1a1a2e;
+}
+
+.user-avatar {
+  width: 40px;
+  border-radius: 50%;
+}
+";
+        let right = "\
+.app {
+  font-family: sans-serif;
+  padding: 20px;
+}
+
+h1 {
+  color: #333;
+}
+
+.sidebar {
+  width: 220px;
+  background: #1a1a2e;
+}
+
+.sidebar a {
+  color: #b0b0c0;
+  text-decoration: none;
+}
+";
+        let result = smart_merge(base, left, right, "header", "sidebar");
+        let content = match &result {
+            SmartMergeResult::Clean { content, .. } => content,
+            SmartMergeResult::Partial { content, .. } => content,
+        };
+
+        let opens = content.matches('{').count();
+        let closes = content.matches('}').count();
+        assert_eq!(
+            opens, closes,
+            "CSS brackets unbalanced: {} opens, {} closes\nmerged:\n{}",
+            opens, closes, content
+        );
+
+        assert!(content.contains(".header"), "header styles lost");
+        assert!(content.contains(".sidebar"), "sidebar styles lost");
+        assert!(content.contains(".user-avatar"), "user-avatar styles lost");
+        assert!(content.contains(".sidebar a"), "sidebar a styles lost");
     }
 }

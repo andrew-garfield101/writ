@@ -233,7 +233,7 @@ When multiple agents work in parallel, their seals may diverge. Check for this:
 - `writ converge-all --apply` merges all diverged branches (Layers 2-3 auto-resolve most conflicts)
 - After convergence, seal the result: `writ seal -s "converged N branches" --agent convergence-bot`
 
-Fallback strategies for irreconcilable conflicts: `manual` (default, leaves unresolved), `most-recent` (prefers newest seal), `orchestrator` (returns structured data for AI resolution).
+Fallback strategies for irreconcilable conflicts: `escalate` (default, records full context for review — never silently loses work), `manual` (leaves unresolved), `most-recent` (deprecated — prefers newest seal), `orchestrator` (returns structured data for AI resolution).
 
 For two-branch convergence: `writ converge <left-spec> <right-spec> --apply`
 
@@ -317,7 +317,7 @@ Every seal is immutable — restoring doesn't delete history.
 
 - Check `integration_risk` field in context for divergence risk assessment
 - `writ converge-all --dry-run` to preview, `--apply` to execute
-- Layers 2-3 auto-resolve additive changes; fallback: `manual` (default), `most-recent`, `orchestrator`
+- Deterministic patterns auto-resolve additive changes; fallback: `escalate` (default), `manual`, `orchestrator`
 - After convergence, seal: `writ seal -s "converged" --agent convergence-bot`
 
 ### Human round-trip
@@ -472,8 +472,8 @@ mod tests {
         let section = writ_claude_md_section();
         assert!(section.contains("manual"), "missing manual strategy");
         assert!(
-            section.contains("most-recent"),
-            "missing most-recent strategy"
+            section.contains("escalate"),
+            "missing escalate strategy"
         );
         assert!(
             section.contains("orchestrator"),

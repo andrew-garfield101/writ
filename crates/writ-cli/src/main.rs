@@ -238,9 +238,9 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Fallback strategy for irreconcilable conflicts: "manual" (default), "most-recent", or "orchestrator".
-        /// Layers 2-3 (additive composition, import merging) always run regardless of strategy.
-        #[arg(long, default_value = "manual")]
+        /// Fallback strategy for irreconcilable conflicts: "escalate" (default), "manual", "most-recent" (deprecated), or "orchestrator".
+        /// Deterministic patterns always run regardless of strategy.
+        #[arg(long, default_value = "escalate")]
         strategy: String,
     },
 
@@ -1891,12 +1891,17 @@ fn cmd_converge_all(
     strategy_str: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = match strategy_str {
-        "most-recent" => writ_core::convergence::ConvergeStrategy::MostRecent,
+        "escalate" => writ_core::convergence::ConvergeStrategy::Escalate,
+        "most-recent" => {
+            eprintln!("warning: 'most-recent' strategy is deprecated and will be removed; use 'escalate' instead");
+            #[allow(deprecated)]
+            writ_core::convergence::ConvergeStrategy::MostRecent
+        }
         "manual" => writ_core::convergence::ConvergeStrategy::Manual,
         "orchestrator" => writ_core::convergence::ConvergeStrategy::Orchestrator,
         other => {
             return Err(format!(
-                "unknown strategy '{}' (use 'manual', 'most-recent', or 'orchestrator')",
+                "unknown strategy '{}' (use 'escalate', 'manual', or 'orchestrator')",
                 other
             )
             .into());
@@ -1993,6 +1998,12 @@ fn cmd_converge_all(
             );
             if report.degraded {
                 println!("  STATUS: DEGRADED — most-recent strategy discarded content; review quality report");
+            }
+            if !report.escalations.is_empty() {
+                println!("  ESCALATIONS: {} conflict(s) require review", report.escalations.len());
+                for esc in &report.escalations {
+                    println!("    - {}: {}", esc.file_path, esc.reason);
+                }
             }
 
             if let Some(ref qr) = report.quality_report {

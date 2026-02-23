@@ -555,17 +555,24 @@ impl PyRepository {
     /// conflict resolutions, and warnings about potential content loss.
     ///
     /// `strategy` controls the fallback for irreconcilable conflicts:
-    /// "manual" (default) leaves them unresolved; "most-recent" picks the
-    /// most recently sealed version; "orchestrator" returns structured data.
-    /// Layers 2-3 (additive composition) always run regardless of strategy.
+    /// "escalate" (default) records full context for review; "manual" leaves
+    /// unresolved; "most-recent" (deprecated) picks the most recently sealed
+    /// version; "orchestrator" returns structured data.
+    /// Deterministic patterns always run regardless of strategy.
     ///
     /// When `apply` is True, merged files are written to the working directory.
-    #[pyo3(signature = (strategy="manual", apply=false))]
+    #[pyo3(signature = (strategy="escalate", apply=false))]
     fn converge_all(&self, py: Python, strategy: &str, apply: bool) -> PyResult<PyObject> {
         let strat = match strategy {
-            "most-recent" => writ_core::convergence::ConvergeStrategy::MostRecent,
+            "escalate" => writ_core::convergence::ConvergeStrategy::Escalate,
+            "most-recent" => {
+                eprintln!("writ warning: 'most-recent' strategy is deprecated; use 'escalate' instead");
+                #[allow(deprecated)]
+                writ_core::convergence::ConvergeStrategy::MostRecent
+            }
             "orchestrator" => writ_core::convergence::ConvergeStrategy::Orchestrator,
-            _ => writ_core::convergence::ConvergeStrategy::Manual,
+            "manual" => writ_core::convergence::ConvergeStrategy::Manual,
+            _ => writ_core::convergence::ConvergeStrategy::Escalate,
         };
         let report = self.inner.converge_all(strat, apply).map_err(writ_err)?;
         to_pydict(py, &report)

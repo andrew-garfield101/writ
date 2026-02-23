@@ -2369,6 +2369,7 @@ impl Repository {
                 degraded: false,
                 applied: false,
                 warnings: Vec::new(),
+                escalations: Vec::new(),
                 quality_report: None,
             });
         }
@@ -2407,6 +2408,7 @@ impl Repository {
         let mut total_conflicts = 0usize;
         let mut total_resolutions = 0usize;
         let mut warnings: Vec<String> = Vec::new();
+        let mut all_escalations: Vec<convergence::PipelineEscalation> = Vec::new();
         let mut all_clean = true;
         let mut any_degraded = false;
         let mut file_decisions: Vec<FileDecision> = Vec::new();
@@ -2576,8 +2578,10 @@ impl Repository {
                             step_conflict_files.push(path.clone());
 
                             let resolved = convergence::resolve_conflict_regions(
-                                base, left, right, &regions, &base_spec, spec_id,
+                                &path, base, left, right, &regions, &base_spec, spec_id,
                             );
+
+                            all_escalations.extend(resolved.escalation_records);
 
                             if resolved.fully_resolved {
                                 accumulated.insert(path.clone(), resolved.content.clone());
@@ -2638,6 +2642,7 @@ impl Repository {
                                 total_resolutions += 1;
                             } else {
                                 match strategy {
+                                    #[allow(deprecated)]
                                     ConvergeStrategy::MostRecent => {
                                         let left_ts = self
                                             .load_spec(&base_spec)
@@ -2714,10 +2719,17 @@ impl Repository {
 
                                         total_resolutions += 1;
                                     }
-                                    ConvergeStrategy::Manual | ConvergeStrategy::Orchestrator => {
+                                    ConvergeStrategy::Manual
+                                    | ConvergeStrategy::Orchestrator
+                                    | ConvergeStrategy::Escalate => {
+                                        let is_escalate = strategy == ConvergeStrategy::Escalate;
                                         file_decisions.push(FileDecision {
                                             path: path.clone(),
-                                            decision: "conflict-unresolved".to_string(),
+                                            decision: if is_escalate {
+                                                "escalated".to_string()
+                                            } else {
+                                                "conflict-unresolved".to_string()
+                                            },
                                             chosen_lines: 0,
                                             chosen_spec: None,
                                             alternatives: vec![
@@ -2734,6 +2746,16 @@ impl Repository {
                                             ],
                                             confidence: Some(0.0),
                                         });
+                                        if is_escalate {
+                                            all_escalations.push(convergence::PipelineEscalation {
+                                                file_path: path.clone(),
+                                                reason: "Pattern matching could not resolve conflict".to_string(),
+                                                conflict_class: "both-modified".to_string(),
+                                                left_spec: base_spec.clone(),
+                                                right_spec: spec_id.to_string(),
+                                                recommended_action: "Manual review required — both sides modified this file".to_string(),
+                                            });
+                                        }
                                         step_clean = false;
                                         all_clean = false;
                                     }
@@ -2960,6 +2982,7 @@ impl Repository {
             degraded: any_degraded,
             applied: did_apply,
             warnings,
+            escalations: all_escalations,
             quality_report: Some(quality_report),
         })
     }
@@ -4819,11 +4842,13 @@ pub struct DivergedBranch {
 }
 
 /// Convert a ConvergeStrategy to a human-readable string.
+#[allow(deprecated)]
 fn strategy_name(strategy: ConvergeStrategy) -> String {
     match strategy {
         ConvergeStrategy::Manual => "manual".to_string(),
         ConvergeStrategy::MostRecent => "most-recent".to_string(),
         ConvergeStrategy::Orchestrator => "orchestrator".to_string(),
+        ConvergeStrategy::Escalate => "escalate".to_string(),
     }
 }
 
@@ -5265,7 +5290,7 @@ fn build_quality_report(
                                     if name == "*" || name.contains(" as ") {
                                         continue;
                                     }
-                                    if !non_import_text.contains(name) {
+                                    if !convergence::contains_word(&non_import_text, name) {
                                         unused_count += 1;
                                     }
                                 }
@@ -10855,6 +10880,7 @@ mod recommended_action_tests {
 /// transition and spec-scoped signal across a realistic 3-agent workflow
 /// with dependencies, shared files, scope violations, and convergence.
 #[cfg(test)]
+#[allow(deprecated)]
 mod context_stress_tests {
     use super::*;
     use crate::context::{ContextFilter, ContextScope};
@@ -12902,6 +12928,7 @@ mod agent_activity_tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod summary_tests {
     use super::*;
     use crate::seal::{AgentType, TaskStatus, Verification};
@@ -14723,6 +14750,7 @@ mod convergence_integration_tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod converge_all_tests {
     use super::*;
     use crate::convergence::ConvergeStrategy;
@@ -15069,6 +15097,120 @@ mod converge_all_tests {
         assert!(!report.is_clean, "Manual should leave conflicts");
         assert!(report.total_conflicts > 0);
         assert_eq!(report.total_resolutions, 0);
+    }
+
+    #[test]
+    fn test_converge_all_escalate_strategy_produces_escalation_records() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "original\n").unwrap();
+        let base_agent = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            base_agent,
+            "baseline".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("left".into(), "Left".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("right".into(), "Right".into(), "".into()))
+            .unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "LEFT_VERSION\n").unwrap();
+        let left_agent = AgentIdentity {
+            id: "left-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            left_agent.clone(),
+            "left change".into(),
+            Some("left".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "RIGHT_VERSION\n").unwrap();
+        let right_agent = AgentIdentity {
+            id: "right-dev".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            right_agent,
+            "right change".into(),
+            Some("right".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "LEFT_VERSION\n").unwrap();
+        fs::write(dir.path().join("left-extra.txt"), "extra\n").unwrap();
+        repo.seal(
+            left_agent,
+            "advance head".into(),
+            Some("left".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.update_spec(
+            "left",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::Escalate, false)
+            .unwrap();
+
+        assert!(
+            !report.is_clean,
+            "Escalate should not silently resolve — conflicts are escalated"
+        );
+        assert!(
+            !report.escalations.is_empty(),
+            "Escalate strategy must produce PipelineEscalation records"
+        );
+
+        let has_escalated_decision = report
+            .quality_report
+            .as_ref()
+            .map(|qr| {
+                qr.file_decisions
+                    .iter()
+                    .any(|d| d.decision == "escalated")
+            })
+            .unwrap_or(false);
+        assert!(
+            has_escalated_decision,
+            "quality_report should contain at least one 'escalated' decision"
+        );
+
+        let esc = &report.escalations[0];
+        assert!(
+            !esc.file_path.is_empty(),
+            "escalation record must have a non-empty file_path"
+        );
+        assert!(
+            !esc.reason.is_empty(),
+            "escalation record must have a reason"
+        );
     }
 
     #[test]
@@ -16367,6 +16509,7 @@ export default App;
 
 /// Tests that mutations leave metadata consistent for context().
 #[cfg(test)]
+#[allow(deprecated)]
 mod convergence_metadata_tests {
     use super::*;
     use crate::context::{ContextFilter, ContextScope};
@@ -16922,6 +17065,7 @@ mod convergence_metadata_tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod agent_scoped_context_tests {
     use super::*;
     use crate::context::{ContextFilter, ContextScope};
@@ -17211,6 +17355,7 @@ mod agent_scoped_context_tests {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod sprint14_reporting_tests {
     use super::*;
     use crate::convergence::{ConvergeStrategy, FileDecision};
@@ -17932,5 +18077,87 @@ mod sprint14_reporting_tests {
             ref_check.unwrap().consistent,
             "should be consistent — Product exists in models.py",
         );
+    }
+
+    // Sprint 16 — word-boundary matching in quality report
+
+    #[test]
+    fn test_quality_report_unused_imports_word_boundary() {
+        let dir = tempdir().unwrap();
+
+        // "User" is imported but only "UserProfile" appears in the body.
+        // Word-boundary matching should flag "User" as unused.
+        fs::write(
+            dir.path().join("app.py"),
+            "from models import User, Product\n\nclass UserProfile:\n    product = Product()\n",
+        )
+        .unwrap();
+
+        let decisions = vec![FileDecision {
+            path: "app.py".into(),
+            decision: "auto-merged".into(),
+            chosen_spec: Some("s1".into()),
+            chosen_lines: 4,
+            alternatives: vec![],
+            confidence: Some(1.0),
+        }];
+
+        let report = build_quality_report(decisions, dir.path(), true, 0, 0);
+
+        let unused_check = report
+            .consistency_checks
+            .iter()
+            .find(|c| c.metric == "unused_imports");
+        assert!(
+            unused_check.is_some(),
+            "should have unused_imports check: {:?}",
+            report.consistency_checks,
+        );
+        assert!(
+            !unused_check.unwrap().consistent,
+            "User should be flagged as unused — only UserProfile exists in body",
+        );
+
+        // Score should be penalized for the unused import.
+        assert!(
+            report.quality_score < 100,
+            "score should be < 100 with unused User import, got: {}",
+            report.quality_score,
+        );
+    }
+
+    #[test]
+    fn test_quality_report_unused_imports_whole_word_not_flagged() {
+        let dir = tempdir().unwrap();
+
+        // "User" IS used as a whole word — should NOT be flagged.
+        fs::write(
+            dir.path().join("app.py"),
+            "from models import User\n\ndef get():\n    return User(name='test')\n",
+        )
+        .unwrap();
+
+        let decisions = vec![FileDecision {
+            path: "app.py".into(),
+            decision: "auto-merged".into(),
+            chosen_spec: Some("s1".into()),
+            chosen_lines: 4,
+            alternatives: vec![],
+            confidence: Some(1.0),
+        }];
+
+        let report = build_quality_report(decisions, dir.path(), true, 0, 0);
+
+        let unused_check = report
+            .consistency_checks
+            .iter()
+            .find(|c| c.metric == "unused_imports");
+        // Either no check (no unused imports found) or check is consistent.
+        if let Some(check) = unused_check {
+            assert!(
+                check.consistent,
+                "User is used as whole word — should not be flagged as unused",
+            );
+        }
     }
 }

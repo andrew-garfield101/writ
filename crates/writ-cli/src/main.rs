@@ -1991,6 +1991,9 @@ fn cmd_converge_all(
                 report.total_conflicts,
                 report.total_resolutions,
             );
+            if report.degraded {
+                println!("  STATUS: DEGRADED — most-recent strategy discarded content; review quality report");
+            }
 
             if let Some(ref qr) = report.quality_report {
                 println!();

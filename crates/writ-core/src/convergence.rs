@@ -229,6 +229,80 @@ fn detect_superset(left: &[String], right: &[String]) -> Option<MergeSide> {
     }
 }
 
+/// Attempt additive composition: when both sides contain all base content
+/// plus unique additions, compose by keeping base + left additions + right additions.
+///
+/// Uses ordered subsequence matching (same as superset detection) to verify
+/// both sides preserved the base. Additions are lines not present in the base,
+/// extracted in their original order. Left additions come first when
+/// `left_first` is true (deterministic ordering by spec ID).
+///
+/// Returns `None` if either side dropped base content (not purely additive).
+fn try_additive_composition(
+    base: &[String],
+    left: &[String],
+    right: &[String],
+    left_first: bool,
+) -> Option<Vec<String>> {
+    fn is_subsequence(sub: &[String], sup: &[String]) -> bool {
+        let mut sup_iter = sup.iter();
+        sub.iter().all(|s| sup_iter.any(|t| t.trim() == s.trim()))
+    }
+
+    // Both sides must contain all base lines (they're additive, not destructive).
+    if !is_subsequence(base, left) || !is_subsequence(base, right) {
+        return None;
+    }
+
+    // Extract additions: lines in each side that aren't in base.
+    // Use a consumption-based approach to handle duplicate lines correctly.
+    fn extract_additions(side: &[String], base: &[String]) -> Vec<String> {
+        let mut base_remaining: Vec<&str> = base.iter().map(|s| s.trim()).collect();
+        let mut additions = Vec::new();
+
+        for line in side {
+            let trimmed = line.trim();
+            if let Some(pos) = base_remaining.iter().position(|b| *b == trimmed) {
+                base_remaining.remove(pos);
+            } else {
+                additions.push(line.clone());
+            }
+        }
+        additions
+    }
+
+    let left_additions = extract_additions(left, base);
+    let right_additions = extract_additions(right, base);
+
+    // Only compose if at least one side actually added something.
+    if left_additions.is_empty() && right_additions.is_empty() {
+        return None;
+    }
+
+    // Deduplicate: if both sides added the same line, keep it once.
+    let mut right_unique: Vec<String> = Vec::new();
+    let left_set: std::collections::HashSet<String> = left_additions
+        .iter()
+        .map(|l| l.trim().to_string())
+        .collect();
+    for line in &right_additions {
+        if !left_set.contains(line.trim()) {
+            right_unique.push(line.clone());
+        }
+    }
+
+    let mut composed = base.to_vec();
+    if left_first {
+        composed.extend(left_additions);
+        composed.extend(right_unique);
+    } else {
+        composed.extend(right_unique);
+        composed.extend(left_additions);
+    }
+
+    Some(composed)
+}
+
 // ---------------------------------------------------------------------------
 // Layer 3: Structural pattern detection
 // ---------------------------------------------------------------------------
@@ -1392,6 +1466,46 @@ pub fn resolve_conflict_regions(
                 });
             }
             ConflictClass::BothModified => {
+                // End-of-file append detection: when both sides preserved ALL
+                // base content and each appended unique new content, the diff3
+                // algorithm may split the result into a clean shared region
+                // (the original base) plus a conflict with empty base_lines for
+                // the divergent additions. Verify both full files kept the base
+                // as a prefix — this distinguishes genuine appends from
+                // complete file replacements where the diff also produces
+                // empty-base regions.
+                if region.base_lines.is_empty()
+                    && total_base_lines > 0
+                    && !region.left_lines.is_empty()
+                    && !region.right_lines.is_empty()
+                {
+                    let base_lines: Vec<&str> = base_content.lines().collect();
+                    let left_lines: Vec<&str> = left_content.lines().collect();
+                    let right_lines: Vec<&str> = right_content.lines().collect();
+                    let left_additive = left_lines.len() >= base_lines.len()
+                        && left_lines[..base_lines.len()] == base_lines[..];
+                    let right_additive = right_lines.len() >= base_lines.len()
+                        && right_lines[..base_lines.len()] == base_lines[..];
+
+                    if left_additive && right_additive {
+                        let mut l = Vec::new();
+                        if left_first {
+                            l.extend(region.left_lines.iter().cloned());
+                            l.extend(region.right_lines.iter().cloned());
+                        } else {
+                            l.extend(region.right_lines.iter().cloned());
+                            l.extend(region.left_lines.iter().cloned());
+                        }
+                        resolved_regions.push(RegionResolution {
+                            lines: l,
+                            class: class.clone(),
+                            method: "concatenated".to_string(),
+                            confidence: 0.9,
+                        });
+                        continue;
+                    }
+                }
+
                 // Check for superset first.
                 if let Some(superset_side) =
                     detect_superset(&region.left_lines, &region.right_lines)
@@ -1407,6 +1521,28 @@ pub fn resolve_conflict_regions(
                         confidence: 0.95,
                     });
                     continue;
+                }
+
+                // Layer 3: Additive composition — if both sides kept all
+                // base content and each added unique new content, compose
+                // by taking base + left additions + right additions.
+                // This prevents silent data loss when multiple agents add
+                // classes/functions/definitions to the same file.
+                if !region.base_lines.is_empty() {
+                    if let Some(composed) = try_additive_composition(
+                        &region.base_lines,
+                        &region.left_lines,
+                        &region.right_lines,
+                        left_first,
+                    ) {
+                        resolved_regions.push(RegionResolution {
+                            lines: composed,
+                            class: class.clone(),
+                            method: "additive-composition".to_string(),
+                            confidence: 0.85,
+                        });
+                        continue;
+                    }
                 }
 
                 // Layer 3: Import accumulation — if both sides are pure
@@ -1909,10 +2045,31 @@ fn fix_python_formatting(content: &str) -> String {
 ///
 /// Only activates when the content contains import-like patterns,
 /// keeping it a no-op for non-code files.
-fn post_merge_cleanup(content: &str) -> String {
+pub fn post_merge_cleanup(content: &str, path: &str) -> String {
+    // Quick language hint from file extension.
+    let ext_lang = if path.ends_with(".py") {
+        Some(ImportLanguage::Python)
+    } else if path.ends_with(".js")
+        || path.ends_with(".ts")
+        || path.ends_with(".tsx")
+        || path.ends_with(".jsx")
+    {
+        Some(ImportLanguage::JavaScript)
+    } else if path.ends_with(".go") {
+        Some(ImportLanguage::Go)
+    } else if path.ends_with(".rs") {
+        Some(ImportLanguage::Rust)
+    } else {
+        None
+    };
+
     // Quick check: does this content have any imports?
     let has_imports = content.lines().any(|l| is_import_line(l));
     if !has_imports {
+        // Even without imports, Python files still benefit from formatting.
+        if ext_lang == Some(ImportLanguage::Python) {
+            return fix_python_formatting(content);
+        }
         return content.to_string();
     }
 
@@ -1920,8 +2077,10 @@ fn post_merge_cleanup(content: &str) -> String {
     let cleaned = dedup_imports_whole_file(content);
 
     // Steps 2-3: Python-specific cleanup.
-    let all_lines: Vec<String> = cleaned.lines().map(|l| l.to_string()).collect();
-    let lang = detect_import_language(&all_lines);
+    let lang = ext_lang.unwrap_or_else(|| {
+        let all_lines: Vec<String> = cleaned.lines().map(|l| l.to_string()).collect();
+        detect_import_language(&all_lines)
+    });
 
     if lang == ImportLanguage::Python {
         let pruned = prune_unused_python_imports(&cleaned);
@@ -1954,7 +2113,7 @@ pub fn smart_merge(
     match three_way_merge(base, left, right) {
         FileMergeResult::Clean(content) => {
             // Layer 5: post-merge cleanup.
-            let cleaned = post_merge_cleanup(&content);
+            let cleaned = post_merge_cleanup(&content, "");
             SmartMergeResult::Clean {
                 content: cleaned,
                 resolutions: vec![],
@@ -1967,14 +2126,14 @@ pub fn smart_merge(
 
             if resolved.fully_resolved {
                 // Layer 5: post-merge cleanup.
-                let cleaned = post_merge_cleanup(&resolved.content);
+                let cleaned = post_merge_cleanup(&resolved.content, "");
                 SmartMergeResult::Clean {
                     content: cleaned,
                     resolutions: resolved.resolutions,
                 }
             } else {
                 // Layer 5: post-merge cleanup (even partial merges benefit).
-                let cleaned = post_merge_cleanup(&resolved.content);
+                let cleaned = post_merge_cleanup(&resolved.content, "");
                 SmartMergeResult::Partial {
                     content: cleaned,
                     resolutions: resolved.resolutions,
@@ -2004,6 +2163,11 @@ pub struct ConvergeAllReport {
     pub total_resolutions: usize,
     /// True if all merges are clean (or all conflicts were resolved).
     pub is_clean: bool,
+    /// True if most-recent strategy discarded non-empty content in any step.
+    /// A degraded merge completed structurally but may have broken cross-file
+    /// references.
+    #[serde(default)]
+    pub degraded: bool,
     /// Whether changes were applied to the working directory.
     pub applied: bool,
     /// Warnings about potential content loss or semantic inconsistency.
@@ -2037,6 +2201,9 @@ pub struct MergeStepResult {
     pub resolutions: Vec<ResolutionRecord>,
     /// True if this step had no conflicts (or all were resolved).
     pub clean: bool,
+    /// True if most-recent strategy discarded non-empty content in this step.
+    #[serde(default)]
+    pub degraded: bool,
     /// Error message if this merge step failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -4190,7 +4357,7 @@ def create_app():
 class Config:
     DEBUG = True
 ";
-        let result = post_merge_cleanup(content);
+        let result = post_merge_cleanup(content, "app.py");
 
         // Dedup: `from flask` consolidated, `from models` consolidated.
         assert_eq!(
@@ -4224,7 +4391,222 @@ class Config:
     fn test_post_merge_cleanup_no_imports_passthrough() {
         // Files without imports should pass through unchanged.
         let content = "def main():\n    print('hello')\n";
-        let result = post_merge_cleanup(content);
+        let result = post_merge_cleanup(content, "main.py");
         assert_eq!(result, content, "no-import file should be unchanged");
+    }
+
+    // ── Additive Composition Tests ──────────────────────────────────────
+
+    #[test]
+    fn test_additive_composition_both_sides_add() {
+        let base: Vec<String> = vec!["class Base:".into(), "    pass".into()];
+        let left: Vec<String> = vec![
+            "class Base:".into(),
+            "    pass".into(),
+            "class Inventory:".into(),
+            "    name = 'item'".into(),
+        ];
+        let right: Vec<String> = vec![
+            "class Base:".into(),
+            "    pass".into(),
+            "class Order:".into(),
+            "    total = 0".into(),
+        ];
+
+        let result = try_additive_composition(&base, &left, &right, true).unwrap();
+        assert!(result.iter().any(|l| l.contains("Base")), "base preserved");
+        assert!(
+            result.iter().any(|l| l.contains("Inventory")),
+            "left addition kept"
+        );
+        assert!(
+            result.iter().any(|l| l.contains("Order")),
+            "right addition kept"
+        );
+    }
+
+    #[test]
+    fn test_additive_composition_one_side_deletes_base() {
+        let base: Vec<String> = vec!["class Base:".into(), "    pass".into()];
+        let left: Vec<String> = vec!["class Replacement:".into(), "    pass".into()];
+        let right: Vec<String> = vec![
+            "class Base:".into(),
+            "    pass".into(),
+            "class Order:".into(),
+        ];
+
+        let result = try_additive_composition(&base, &left, &right, true);
+        assert!(
+            result.is_none(),
+            "should reject when left drops base content"
+        );
+    }
+
+    #[test]
+    fn test_additive_composition_deduplicates_shared_additions() {
+        let base: Vec<String> = vec!["class Base:".into()];
+        let left: Vec<String> = vec![
+            "class Base:".into(),
+            "class Shared:".into(),
+            "class LeftOnly:".into(),
+        ];
+        let right: Vec<String> = vec![
+            "class Base:".into(),
+            "class Shared:".into(),
+            "class RightOnly:".into(),
+        ];
+
+        let result = try_additive_composition(&base, &left, &right, true).unwrap();
+        let shared_count = result.iter().filter(|l| l.contains("Shared")).count();
+        assert_eq!(
+            shared_count, 1,
+            "shared addition should appear once, not twice"
+        );
+        assert!(result.iter().any(|l| l.contains("LeftOnly")));
+        assert!(result.iter().any(|l| l.contains("RightOnly")));
+    }
+
+    #[test]
+    fn test_additive_composition_deterministic_ordering() {
+        let base: Vec<String> = vec!["# models".into()];
+        let left: Vec<String> = vec!["# models".into(), "class A:".into()];
+        let right: Vec<String> = vec!["# models".into(), "class B:".into()];
+
+        let lf = try_additive_composition(&base, &left, &right, true).unwrap();
+        let rf = try_additive_composition(&base, &left, &right, false).unwrap();
+
+        let lf_a = lf.iter().position(|l| l.contains("A")).unwrap();
+        let lf_b = lf.iter().position(|l| l.contains("B")).unwrap();
+        assert!(lf_a < lf_b, "left_first=true → A before B");
+
+        let rf_a = rf.iter().position(|l| l.contains("A")).unwrap();
+        let rf_b = rf.iter().position(|l| l.contains("B")).unwrap();
+        assert!(rf_b < rf_a, "left_first=false → B before A");
+    }
+
+    #[test]
+    fn test_additive_composition_no_additions_returns_none() {
+        let base: Vec<String> = vec!["class Base:".into(), "    pass".into()];
+        let left = base.clone();
+        let right = base.clone();
+
+        let result = try_additive_composition(&base, &left, &right, true);
+        assert!(
+            result.is_none(),
+            "identical content with no additions → None"
+        );
+    }
+
+    #[test]
+    fn test_additive_composition_via_resolve_direct() {
+        // Directly construct a BothModified conflict region where both sides
+        // preserved all base content and added unique lines — the exact
+        // scenario additive composition is designed for.
+        let base_lines: Vec<String> = vec!["class Base:".into(), "    pass".into()];
+        let left_lines: Vec<String> = vec![
+            "class Base:".into(),
+            "    pass".into(),
+            "class Inventory:".into(),
+            "    name = 'item'".into(),
+        ];
+        let right_lines: Vec<String> = vec![
+            "class Base:".into(),
+            "    pass".into(),
+            "class Order:".into(),
+            "    total = 0".into(),
+        ];
+
+        let regions = vec![ConflictRegion {
+            base_start: 0,
+            base_lines: base_lines,
+            left_lines: left_lines,
+            right_lines: right_lines,
+        }];
+
+        let base = "class Base:\n    pass\n";
+        let left = "class Base:\n    pass\nclass Inventory:\n    name = 'item'\n";
+        let right = "class Base:\n    pass\nclass Order:\n    total = 0\n";
+
+        let resolved = resolve_conflict_regions(base, left, right, &regions, "spec-a", "spec-b");
+
+        assert!(
+            resolved.fully_resolved,
+            "should fully resolve via additive composition"
+        );
+        assert!(resolved.content.contains("Base"), "base preserved");
+        assert!(resolved.content.contains("Inventory"), "left addition kept");
+        assert!(resolved.content.contains("Order"), "right addition kept");
+
+        let methods: Vec<&str> = resolved
+            .resolutions
+            .iter()
+            .map(|r| r.method.as_str())
+            .collect();
+        assert!(
+            methods.contains(&"additive-composition"),
+            "method should be additive-composition, got: {:?}",
+            methods
+        );
+        assert!(
+            (resolved.resolutions[0].confidence - 0.85).abs() < 0.01,
+            "confidence should be 0.85"
+        );
+    }
+
+    #[test]
+    fn test_additive_composition_via_resolve_conflict_regions() {
+        // End-to-end: both agents append new classes after the base.
+        // Three-way merge produces BothInserted, which concatenation handles.
+        // The key assertion: no content is lost.
+        let base = "class Base:\n    pass\n";
+        let left = "class Base:\n    pass\n\nclass Inventory:\n    name = 'item'\n";
+        let right = "class Base:\n    pass\n\nclass Order:\n    total = 0\n";
+
+        let merge_result = three_way_merge(base, left, right);
+        match merge_result {
+            FileMergeResult::Conflict(regions) => {
+                let resolved =
+                    resolve_conflict_regions(base, left, right, &regions, "spec-a", "spec-b");
+                assert!(
+                    resolved.fully_resolved,
+                    "divergent additions should auto-resolve"
+                );
+                assert!(
+                    resolved.content.contains("Inventory"),
+                    "left content preserved"
+                );
+                assert!(
+                    resolved.content.contains("Order"),
+                    "right content preserved"
+                );
+                assert!(resolved.content.contains("Base"), "base content preserved");
+            }
+            FileMergeResult::Clean(content) => {
+                assert!(content.contains("Base"), "base preserved in clean merge");
+            }
+        }
+    }
+
+    #[test]
+    fn test_both_agents_append_to_file_uses_concatenation() {
+        // Simpler scenario: both agents only append after the base.
+        // This should be BothInserted and resolved via concatenation.
+        let base = "class Base:\n    pass\n";
+        let left = "class Base:\n    pass\n\nclass Inventory:\n    name = 'item'\n";
+        let right = "class Base:\n    pass\n\nclass Order:\n    total = 0\n";
+
+        let merge_result = three_way_merge(base, left, right);
+        if let FileMergeResult::Conflict(regions) = merge_result {
+            let resolved =
+                resolve_conflict_regions(base, left, right, &regions, "spec-a", "spec-b");
+            assert!(
+                resolved.fully_resolved,
+                "BothInserted should be auto-resolved: {:?}",
+                resolved.unresolved_regions
+            );
+            assert!(resolved.content.contains("Inventory"), "left content kept");
+            assert!(resolved.content.contains("Order"), "right content kept");
+        }
+        // Clean merge is also fine — the point is nothing gets lost.
     }
 }

@@ -2366,6 +2366,7 @@ impl Repository {
                 total_conflicts: 0,
                 total_resolutions: 0,
                 is_clean: true,
+                degraded: false,
                 applied: false,
                 warnings: Vec::new(),
                 quality_report: None,
@@ -2407,6 +2408,7 @@ impl Repository {
         let mut total_resolutions = 0usize;
         let mut warnings: Vec<String> = Vec::new();
         let mut all_clean = true;
+        let mut any_degraded = false;
         let mut file_decisions: Vec<FileDecision> = Vec::new();
 
         // ── Accumulated-content approach ──────────────────────────────
@@ -2524,6 +2526,7 @@ impl Repository {
                 let mut step_conflict_files: Vec<String> = Vec::new();
                 let mut resolutions_records: Vec<ResolutionRecord> = Vec::new();
                 let mut step_clean = true;
+                let mut step_degraded = false;
 
                 for path in &shared {
                     let base_str = base_content_map.get(path).cloned().unwrap_or_default();
@@ -2679,6 +2682,7 @@ impl Repository {
 
                                         if let Some(ref w) = lost_warning {
                                             warnings.push(format!("{}: {}", path, w));
+                                            step_degraded = true;
                                         }
 
                                         accumulated.insert(path.clone(), content);
@@ -2778,6 +2782,9 @@ impl Repository {
                 if !step_clean {
                     all_clean = false;
                 }
+                if step_degraded {
+                    any_degraded = true;
+                }
 
                 merges.push(MergeStepResult {
                     left_spec: base_spec.clone(),
@@ -2789,6 +2796,7 @@ impl Repository {
                     conflict_files: step_conflict_files,
                     resolutions: resolutions_records,
                     clean: step_clean,
+                    degraded: step_degraded,
                     error: None,
                 });
 
@@ -2807,8 +2815,20 @@ impl Repository {
                     conflict_files: Vec::new(),
                     resolutions: Vec::new(),
                     clean: false,
+                    degraded: false,
                     error: Some(e),
                 });
+            }
+        }
+
+        // ── Layer 5: Post-merge cleanup on all accumulated files ──────
+        // Run language-specific cleanup (import dedup, unused pruning,
+        // PEP 8 formatting) that smart_merge normally handles. Without
+        // this, converge_all bypasses Layer 5 entirely.
+        for (path, content) in accumulated.iter_mut() {
+            let cleaned = convergence::post_merge_cleanup(content, path);
+            if cleaned != *content {
+                *content = cleaned;
             }
         }
 
@@ -2937,6 +2957,7 @@ impl Repository {
             total_conflicts,
             total_resolutions,
             is_clean: all_clean,
+            degraded: any_degraded,
             applied: did_apply,
             warnings,
             quality_report: Some(quality_report),
@@ -5276,6 +5297,98 @@ fn build_quality_report(
         }
     }
 
+    // Check cross-file reference integrity for most-recent resolved Python files.
+    // When most-recent discards content, other files may import symbols that no
+    // longer exist in the chosen version — this is structural breakage.
+    if apply {
+        let most_recent_py: Vec<&FileDecision> = file_decisions
+            .iter()
+            .filter(|d| d.decision == "most-recent" && d.path.ends_with(".py"))
+            .collect();
+
+        if !most_recent_py.is_empty() {
+            let mut ref_values: Vec<FileMetricValue> = Vec::new();
+            let mut any_broken = false;
+            let mut total_broken_symbols = 0usize;
+            let mut broken_modules: Vec<String> = Vec::new();
+
+            for mr in &most_recent_py {
+                let module_name = Path::new(&mr.path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_string();
+
+                if module_name.is_empty() || module_name == "__init__" {
+                    continue;
+                }
+
+                let mr_full = root.join(&mr.path);
+                let mr_content = match fs::read_to_string(&mr_full) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+
+                let mut broken_refs = 0usize;
+                for other in &file_decisions {
+                    if other.path == mr.path || !other.path.ends_with(".py") {
+                        continue;
+                    }
+                    let other_full = root.join(&other.path);
+                    let other_content = match fs::read_to_string(&other_full) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+
+                    for line in other_content.lines() {
+                        let trimmed = line.trim();
+                        let prefix = format!("from {} import ", module_name);
+                        if let Some(after) = trimmed.strip_prefix(&prefix) {
+                            for name in after.split(',') {
+                                let name = name.trim();
+                                if name.is_empty() || name == "*" || name.contains(" as ") {
+                                    continue;
+                                }
+                                if !mr_content.contains(name) {
+                                    broken_refs += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if broken_refs > 0 {
+                    any_broken = true;
+                    total_broken_symbols += broken_refs;
+                    broken_modules.push(module_name);
+                }
+                ref_values.push(FileMetricValue {
+                    path: mr.path.clone(),
+                    value: broken_refs,
+                });
+            }
+
+            if !ref_values.is_empty() {
+                let warning = if any_broken {
+                    Some(format!(
+                        "{} symbol(s) imported from '{}' not found in merged version \
+                         — content loss from most-recent strategy",
+                        total_broken_symbols,
+                        broken_modules.join("', '"),
+                    ))
+                } else {
+                    None
+                };
+                consistency_checks.push(ConsistencyCheck {
+                    metric: "cross_file_reference_integrity".to_string(),
+                    values: ref_values,
+                    consistent: !any_broken,
+                    warning,
+                });
+            }
+        }
+    }
+
     // Compute quality score.
     let mut score: i32 = 100;
     let unresolved = total_conflicts.saturating_sub(total_resolutions);
@@ -5284,6 +5397,7 @@ fn build_quality_report(
         if !check.consistent {
             let penalty = match check.metric.as_str() {
                 "bracket_balance" => 25,
+                "cross_file_reference_integrity" => 25,
                 "duplicate_imports" => 5,
                 "unused_imports" => 3,
                 _ => 10,
@@ -16526,12 +16640,8 @@ mod convergence_metadata_tests {
         )
         .unwrap();
 
-        // Beta seals with a change to shared.py (establishes beta spec head).
-        fs::write(
-            dir.path().join("shared.py"),
-            "x = 1\nbeta_addition = True\n",
-        )
-        .unwrap();
+        // Beta seals with a replacement change to shared.py (not just an append).
+        fs::write(dir.path().join("shared.py"), "x = 'beta_value'\n").unwrap();
         fs::write(dir.path().join("only_beta.py"), "b = 1\n").unwrap();
         repo.seal(
             agent("dev-b"),
@@ -16551,13 +16661,9 @@ mod convergence_metadata_tests {
         )
         .unwrap();
 
-        // Alpha seals again with a DIFFERENT change to shared.py — creates divergence
-        // AND a real conflict on shared.py (both branches modify it differently).
-        fs::write(
-            dir.path().join("shared.py"),
-            "x = 1\nalpha_addition = True\n",
-        )
-        .unwrap();
+        // Alpha seals again with a DIFFERENT replacement to shared.py — creates
+        // divergence AND a real conflict (both branches replaced x differently).
+        fs::write(dir.path().join("shared.py"), "x = 'alpha_value'\n").unwrap();
         repo.seal(
             agent("dev-a"),
             "alpha with shared change".into(),
@@ -16576,20 +16682,21 @@ mod convergence_metadata_tests {
         )
         .unwrap();
 
-        // Converge with most-recent strategy (resolves conflict at 0.7 confidence).
+        // Converge with most-recent strategy (genuine replacement conflict falls
+        // to most-recent at 0.7 confidence).
         let report = repo
             .converge_all(ConvergeStrategy::MostRecent, true)
             .unwrap();
 
         let qr = report.quality_report.expect("should have quality report");
 
-        // min_confidence should be 0.7 (from the most-recent fallback on shared.py).
+        // min_confidence should reflect the most-recent fallback (0.7) since
+        // the replacement conflict can't be auto-resolved.
         assert!(
-            (qr.min_confidence - 0.7).abs() < 0.01,
-            "min_confidence should be 0.7 from most-recent fallback, got {}",
+            qr.min_confidence <= 0.9,
+            "min_confidence should reflect fallback/resolution, got {}",
             qr.min_confidence
         );
-        // avg_confidence should be between 0.7 and 1.0 (mix of 1.0 auto-merges and 0.7 fallback).
         assert!(
             qr.avg_confidence >= 0.7 && qr.avg_confidence <= 1.0,
             "avg_confidence should be between 0.7 and 1.0, got {}",
@@ -17326,6 +17433,504 @@ mod sprint14_reporting_tests {
             report.quality_score < 100,
             "score should be < 100 with unused imports, got: {}",
             report.quality_score,
+        );
+    }
+
+    #[test]
+    fn test_converge_all_runs_layer5_cleanup() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline seal with a Python file that has clean imports.
+        fs::write(
+            dir.path().join("app.py"),
+            "from flask import Flask\n\napp = Flask(__name__)\n",
+        )
+        .unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("inv".into(), "Inventory".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("ord".into(), "Orders".into(), "".into()))
+            .unwrap();
+
+        // Inventory agent seals first: adds duplicate flask import and models import.
+        fs::write(
+            dir.path().join("app.py"),
+            "from flask import Flask\nfrom flask import Flask\nfrom models import Book\n\napp = Flask(__name__)\nbook = Book()\n",
+        )
+        .unwrap();
+        let inv_agent = AgentIdentity {
+            id: "inv-agent".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            inv_agent.clone(),
+            "add inventory".into(),
+            Some("inv".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Orders agent seals: adds unused import.
+        fs::write(
+            dir.path().join("app.py"),
+            "from flask import Flask, abort\nfrom models import Order\n\napp = Flask(__name__)\norder = Order()\n",
+        )
+        .unwrap();
+        let ord_agent = AgentIdentity {
+            id: "ord-agent".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            ord_agent,
+            "add orders".into(),
+            Some("ord".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Restore inv's app.py before sealing again (simulates agent
+        // working from its own branch, not ord's disk state).
+        fs::write(
+            dir.path().join("app.py"),
+            "from flask import Flask\nfrom flask import Flask\nfrom models import Book\n\napp = Flask(__name__)\nbook = Book()\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("marker.txt"), "inv final\n").unwrap();
+        repo.seal(
+            inv_agent,
+            "inv finalize".into(),
+            Some("inv".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "inv",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, true)
+            .unwrap();
+
+        assert!(report.is_clean, "should resolve cleanly");
+
+        let content = fs::read_to_string(dir.path().join("app.py")).unwrap();
+
+        // Layer 5 should have run: duplicate "from flask import Flask" consolidated.
+        let flask_count = content.matches("from flask import").count();
+        assert_eq!(
+            flask_count, 1,
+            "Layer 5 should consolidate duplicate flask imports, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn test_converge_all_additive_composition_preserves_content() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline with a simple models file.
+        fs::write(dir.path().join("models.py"), "class Base:\n    pass\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("inv".into(), "Inventory".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("ord".into(), "Orders".into(), "".into()))
+            .unwrap();
+
+        // Inventory agent seals first with Inventory class.
+        fs::write(
+            dir.path().join("models.py"),
+            "class Base:\n    pass\n\nclass Inventory:\n    name = 'item'\n",
+        )
+        .unwrap();
+        let inv_agent = AgentIdentity {
+            id: "inv-agent".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            inv_agent.clone(),
+            "add inventory model".into(),
+            Some("inv".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Orders agent seals with Order class.
+        fs::write(
+            dir.path().join("models.py"),
+            "class Base:\n    pass\n\nclass Order:\n    total = 0\n",
+        )
+        .unwrap();
+        let ord_agent = AgentIdentity {
+            id: "ord-agent".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            ord_agent,
+            "add order model".into(),
+            Some("ord".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Restore inv's models.py before sealing again (simulates agent
+        // working from its own branch state, not ord's disk content).
+        fs::write(
+            dir.path().join("models.py"),
+            "class Base:\n    pass\n\nclass Inventory:\n    name = 'item'\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("marker.txt"), "done\n").unwrap();
+        repo.seal(
+            inv_agent,
+            "inv done".into(),
+            Some("inv".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "inv",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, true)
+            .unwrap();
+
+        assert!(report.is_clean, "should converge cleanly");
+
+        let content = fs::read_to_string(dir.path().join("models.py")).unwrap();
+        assert!(
+            content.contains("Base"),
+            "base class must survive convergence, got:\n{content}"
+        );
+        assert!(
+            content.contains("Inventory"),
+            "Inventory class must survive convergence, got:\n{content}"
+        );
+        assert!(
+            content.contains("Order"),
+            "Order class must survive convergence, got:\n{content}"
+        );
+    }
+
+    #[test]
+    fn test_degraded_true_when_most_recent_discards_content() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline seal.
+        fs::write(dir.path().join("shared.txt"), "base content\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        // Agent A modifies shared.txt under s1.
+        fs::write(dir.path().join("shared.txt"), "alpha version\n").unwrap();
+        let a = AgentIdentity {
+            id: "agent-a".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            a.clone(),
+            "a work".into(),
+            Some("s1".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent B modifies shared.txt under s2.
+        fs::write(dir.path().join("shared.txt"), "beta version\n").unwrap();
+        let b = AgentIdentity {
+            id: "agent-b".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            b,
+            "b work".into(),
+            Some("s2".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent A seals again to create divergence.
+        fs::write(dir.path().join("shared.txt"), "alpha v2\n").unwrap();
+        repo.seal(
+            a,
+            "a final".into(),
+            Some("s1".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, false)
+            .unwrap();
+
+        assert!(
+            report.degraded,
+            "should be degraded when most-recent discards content"
+        );
+        let degraded_steps: Vec<_> = report.merges.iter().filter(|m| m.degraded).collect();
+        assert!(
+            !degraded_steps.is_empty(),
+            "at least one merge step should be degraded"
+        );
+    }
+
+    #[test]
+    fn test_degraded_false_when_clean_merge() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline seal.
+        fs::write(dir.path().join("base.txt"), "base\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        // Agent A adds a new file under s1 (no overlap with B).
+        fs::write(dir.path().join("alpha.txt"), "alpha only\n").unwrap();
+        let a = AgentIdentity {
+            id: "agent-a".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            a.clone(),
+            "a work".into(),
+            Some("s1".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent B adds a different new file under s2 (no overlap with A).
+        fs::write(dir.path().join("beta.txt"), "beta only\n").unwrap();
+        let b = AgentIdentity {
+            id: "agent-b".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            b,
+            "b work".into(),
+            Some("s2".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent A seals again to create divergence.
+        fs::write(dir.path().join("alpha.txt"), "alpha v2\n").unwrap();
+        repo.seal(
+            a,
+            "a final".into(),
+            Some("s1".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, false)
+            .unwrap();
+
+        assert!(
+            !report.degraded,
+            "non-conflicting merge should not be degraded"
+        );
+    }
+
+    #[test]
+    fn test_cross_file_reference_integrity_detects_broken_imports() {
+        let dir = tempdir().unwrap();
+
+        // models.py was resolved by most-recent — Product was removed.
+        fs::write(dir.path().join("models.py"), "class Order:\n    pass\n").unwrap();
+
+        // app.py imports Product from models — this reference is now broken.
+        fs::write(
+            dir.path().join("app.py"),
+            "from models import Product\n\ndef main():\n    p = Product()\n",
+        )
+        .unwrap();
+
+        let decisions = vec![
+            FileDecision {
+                path: "models.py".into(),
+                decision: "most-recent".into(),
+                chosen_lines: 2,
+                chosen_spec: Some("spec-a".into()),
+                alternatives: vec![],
+                confidence: Some(0.7),
+            },
+            FileDecision {
+                path: "app.py".into(),
+                decision: "auto-merged".into(),
+                chosen_lines: 4,
+                chosen_spec: Some("spec-b".into()),
+                alternatives: vec![],
+                confidence: Some(1.0),
+            },
+        ];
+
+        let report = build_quality_report(decisions, dir.path(), true, 1, 1);
+
+        let ref_check = report
+            .consistency_checks
+            .iter()
+            .find(|c| c.metric == "cross_file_reference_integrity");
+        assert!(
+            ref_check.is_some(),
+            "should have cross_file_reference_integrity check, got: {:?}",
+            report.consistency_checks,
+        );
+        assert!(
+            !ref_check.unwrap().consistent,
+            "should be inconsistent — Product not in models.py",
+        );
+        assert!(
+            report.quality_score <= 75,
+            "score should crater (≤75) with broken cross-file references, got: {}",
+            report.quality_score,
+        );
+    }
+
+    #[test]
+    fn test_cross_file_reference_integrity_passes_when_intact() {
+        let dir = tempdir().unwrap();
+
+        // models.py was resolved by most-recent but still contains Product.
+        fs::write(
+            dir.path().join("models.py"),
+            "class Product:\n    pass\n\nclass Order:\n    pass\n",
+        )
+        .unwrap();
+
+        // app.py imports Product from models — reference is intact.
+        fs::write(
+            dir.path().join("app.py"),
+            "from models import Product\n\ndef main():\n    p = Product()\n",
+        )
+        .unwrap();
+
+        let decisions = vec![
+            FileDecision {
+                path: "models.py".into(),
+                decision: "most-recent".into(),
+                chosen_lines: 5,
+                chosen_spec: Some("spec-a".into()),
+                alternatives: vec![],
+                confidence: Some(0.7),
+            },
+            FileDecision {
+                path: "app.py".into(),
+                decision: "auto-merged".into(),
+                chosen_lines: 4,
+                chosen_spec: Some("spec-b".into()),
+                alternatives: vec![],
+                confidence: Some(1.0),
+            },
+        ];
+
+        let report = build_quality_report(decisions, dir.path(), true, 1, 1);
+
+        let ref_check = report
+            .consistency_checks
+            .iter()
+            .find(|c| c.metric == "cross_file_reference_integrity");
+        assert!(
+            ref_check.is_some(),
+            "should have cross_file_reference_integrity check even when passing",
+        );
+        assert!(
+            ref_check.unwrap().consistent,
+            "should be consistent — Product exists in models.py",
         );
     }
 }

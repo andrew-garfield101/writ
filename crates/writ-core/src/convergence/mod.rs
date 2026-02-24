@@ -24,13 +24,16 @@
 pub mod analyzers;
 pub mod diff3;
 pub mod patterns;
+pub mod phase1;
+pub mod phase2;
+pub mod phase4;
+pub mod pipeline;
 pub mod types;
 
-pub use diff3::three_way_merge;
 use diff3::rebuild_with_resolutions;
+pub use diff3::three_way_merge;
 
 use serde::{Deserialize, Serialize};
-
 
 // ---------------------------------------------------------------------------
 // Types
@@ -129,7 +132,10 @@ pub enum ConvergeStrategy {
     /// **DEPRECATED** — preserved for backward compatibility during migration.
     /// Prefers the most recently sealed version. This silently drops work and
     /// is being replaced by `Escalate`. Will be removed in a future version.
-    #[deprecated(since = "0.2.0", note = "use Escalate instead — MostRecent silently drops work")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "use Escalate instead — MostRecent silently drops work"
+    )]
     MostRecent,
     /// Return structured conflict data for orchestrator agent resolution.
     Orchestrator,
@@ -1532,7 +1538,8 @@ pub fn resolve_conflict_regions(
                     conflict_class: "delete-vs-modify".to_string(),
                     left_spec: left_spec_id.to_string(),
                     right_spec: right_spec_id.to_string(),
-                    recommended_action: "Review whether deletion or modification is correct".to_string(),
+                    recommended_action: "Review whether deletion or modification is correct"
+                        .to_string(),
                 });
                 resolved_regions.push(RegionResolution {
                     lines: vec![],
@@ -2047,8 +2054,9 @@ pub fn smart_merge(
         }
         FileMergeResult::Conflict(regions) => {
             // Layers 2-3: attempt to auto-resolve conflict regions.
-            let resolved =
-                resolve_conflict_regions(file_path, base, left, right, &regions, left_spec, right_spec);
+            let resolved = resolve_conflict_regions(
+                file_path, base, left, right, &regions, left_spec, right_spec,
+            );
 
             if resolved.fully_resolved {
                 // Layer 5: post-merge cleanup.
@@ -2490,7 +2498,9 @@ mod tests {
             _ => panic!("expected conflict"),
         };
 
-        let resolved = resolve_conflict_regions("test.py", base, left, right, &regions, "api-dev", "auth-dev");
+        let resolved = resolve_conflict_regions(
+            "test.py", base, left, right, &regions, "api-dev", "auth-dev",
+        );
         assert!(resolved.fully_resolved);
         assert!(resolved.content.contains("import flask"));
         assert!(resolved.content.contains("import auth"));
@@ -2518,8 +2528,10 @@ mod tests {
 
         // Both orderings should produce the same content because
         // ordering is by spec ID, not left/right position.
-        let result_lr = resolve_conflict_regions("test.py", base, left, right, &regions_lr, "alpha", "beta");
-        let result_rl = resolve_conflict_regions("test.py", base, right, left, &regions_rl, "beta", "alpha");
+        let result_lr =
+            resolve_conflict_regions("test.py", base, left, right, &regions_lr, "alpha", "beta");
+        let result_rl =
+            resolve_conflict_regions("test.py", base, right, left, &regions_rl, "beta", "alpha");
 
         assert_eq!(result_lr.content, result_rl.content);
     }
@@ -2546,7 +2558,9 @@ mod tests {
             "Should have an escalation record"
         );
         assert!(
-            resolved.escalation_records[0].reason.contains("DeleteVsModify"),
+            resolved.escalation_records[0]
+                .reason
+                .contains("DeleteVsModify"),
             "Escalation should reference DeleteVsModify"
         );
     }
@@ -4231,7 +4245,8 @@ class Config:
         let left = "class Base:\n    pass\nclass Inventory:\n    name = 'item'\n";
         let right = "class Base:\n    pass\nclass Order:\n    total = 0\n";
 
-        let resolved = resolve_conflict_regions("test.py", base, left, right, &regions, "spec-a", "spec-b");
+        let resolved =
+            resolve_conflict_regions("test.py", base, left, right, &regions, "spec-a", "spec-b");
 
         assert!(
             resolved.fully_resolved,
@@ -4269,8 +4284,9 @@ class Config:
         let merge_result = three_way_merge(base, left, right);
         match merge_result {
             FileMergeResult::Conflict(regions) => {
-                let resolved =
-                    resolve_conflict_regions("test.py", base, left, right, &regions, "spec-a", "spec-b");
+                let resolved = resolve_conflict_regions(
+                    "test.py", base, left, right, &regions, "spec-a", "spec-b",
+                );
                 assert!(
                     resolved.fully_resolved,
                     "divergent additions should auto-resolve"
@@ -4301,8 +4317,9 @@ class Config:
 
         let merge_result = three_way_merge(base, left, right);
         if let FileMergeResult::Conflict(regions) = merge_result {
-            let resolved =
-                resolve_conflict_regions("test.py", base, left, right, &regions, "spec-a", "spec-b");
+            let resolved = resolve_conflict_regions(
+                "test.py", base, left, right, &regions, "spec-a", "spec-b",
+            );
             assert!(
                 resolved.fully_resolved,
                 "BothInserted should be auto-resolved: {:?}",

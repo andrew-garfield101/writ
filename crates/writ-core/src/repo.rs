@@ -20,6 +20,7 @@ use crate::convergence::{
     self, ConsistencyCheck, ConvergeAllReport, ConvergeStrategy, ConvergenceQualityReport,
     ConvergenceReport, FileAlternative, FileConflict, FileDecision, FileMergeResult,
     FileMetricValue, FileResolution, MergeStepResult, MergedFile, ResolutionRecord,
+    pipeline::{ConvergencePipeline, PipelineInput},
 };
 use crate::diff::{self, DiffOutput, FileDiff};
 use crate::error::{WritError, WritResult};
@@ -2413,6 +2414,8 @@ impl Repository {
         let mut any_degraded = false;
         let mut file_decisions: Vec<FileDecision> = Vec::new();
 
+        let v2_pipeline = ConvergencePipeline::new();
+
         // ── Accumulated-content approach ──────────────────────────────
         // Load the common base (ancestor before any spec sealed) and the
         // base spec's current tree into an accumulated content map.  Each
@@ -2559,8 +2562,25 @@ impl Repository {
                         continue;
                     }
 
-                    match convergence::three_way_merge(base, left, right) {
-                        convergence::FileMergeResult::Clean(content) => {
+                    // ── v2 pipeline: structural diff → classify → pattern resolve ──
+                    let pipeline_input = PipelineInput {
+                        file_path: path.clone(),
+                        base: base.to_string(),
+                        left: left.to_string(),
+                        right: right.to_string(),
+                        left_spec: base_spec.clone(),
+                        right_spec: spec_id.to_string(),
+                        spec_context: None,
+                    };
+                    let pipeline_output = v2_pipeline.run(&pipeline_input);
+
+                    if pipeline_output.fully_resolved {
+                        let content = pipeline_output
+                            .merged_content
+                            .unwrap_or_default();
+                        let num_regions = pipeline_output.resolutions.len();
+
+                        if num_regions == 0 {
                             step_auto += 1;
                             file_decisions.push(FileDecision {
                                 path: path.clone(),
@@ -2570,195 +2590,337 @@ impl Repository {
                                 alternatives: vec![],
                                 confidence: Some(1.0),
                             });
-                            accumulated.insert(path.clone(), content);
-                            accumulated_modified.insert(path.clone());
-                        }
-                        convergence::FileMergeResult::Conflict(regions) => {
-                            step_conflicts_count += 1;
-                            step_conflict_files.push(path.clone());
+                        } else {
+                            let method_summary: Vec<String> = pipeline_output
+                                .resolutions
+                                .iter()
+                                .filter_map(|ro| match &ro.resolution {
+                                    convergence::types::RegionResolutionStatus::Resolved {
+                                        method,
+                                        ..
+                                    } => Some(method.clone()),
+                                    _ => None,
+                                })
+                                .collect::<HashSet<_>>()
+                                .into_iter()
+                                .collect();
 
-                            let resolved = convergence::resolve_conflict_regions(
-                                &path, base, left, right, &regions, &base_spec, spec_id,
-                            );
-
-                            all_escalations.extend(resolved.escalation_records);
-
-                            if resolved.fully_resolved {
-                                accumulated.insert(path.clone(), resolved.content.clone());
-                                accumulated_modified.insert(path.clone());
-
-                                let method_summary: Vec<String> = resolved
+                            let avg_confidence = {
+                                let cs: Vec<f64> = pipeline_output
                                     .resolutions
                                     .iter()
-                                    .map(|r| r.method.clone())
-                                    .collect::<HashSet<_>>()
-                                    .into_iter()
+                                    .filter_map(|ro| match &ro.resolution {
+                                        convergence::types::RegionResolutionStatus::Resolved {
+                                            confidence,
+                                            ..
+                                        } => Some(*confidence),
+                                        _ => None,
+                                    })
                                     .collect();
-
-                                let avg_confidence = if resolved.resolutions.is_empty() {
+                                if cs.is_empty() {
                                     1.0
                                 } else {
-                                    resolved
+                                    cs.iter().sum::<f64>() / cs.len() as f64
+                                }
+                            };
+
+                            resolutions_records.push(ResolutionRecord {
+                                path: path.clone(),
+                                strategy: format!(
+                                    "v2-pipeline: {}",
+                                    method_summary.join(", ")
+                                ),
+                                chosen_spec: None,
+                                lost_content_warning: None,
+                            });
+
+                            file_decisions.push(FileDecision {
+                                path: path.clone(),
+                                decision: "auto-resolved".to_string(),
+                                chosen_lines: content.lines().count(),
+                                chosen_spec: None,
+                                alternatives: vec![
+                                    FileAlternative {
+                                        spec: "accumulated".to_string(),
+                                        lines: left.lines().count(),
+                                        reason: format!(
+                                            "composed (confidence: {:.0}%)",
+                                            avg_confidence * 100.0
+                                        ),
+                                    },
+                                    FileAlternative {
+                                        spec: spec_id.to_string(),
+                                        lines: right.lines().count(),
+                                        reason: format!(
+                                            "composed (confidence: {:.0}%)",
+                                            avg_confidence * 100.0
+                                        ),
+                                    },
+                                ],
+                                confidence: Some(avg_confidence),
+                            });
+
+                            step_conflicts_count += 1;
+                            step_conflict_files.push(path.clone());
+                            total_resolutions += 1;
+                        }
+
+                        accumulated.insert(path.clone(), content);
+                        accumulated_modified.insert(path.clone());
+                    } else {
+                        // v2 pipeline could not fully resolve. Fall back to the
+                        // v1 text-level resolver which has robust import detection
+                        // for languages without a dedicated structural analyzer.
+                        let v1_result =
+                            match convergence::three_way_merge(base, left, right) {
+                                convergence::FileMergeResult::Clean(content) => {
+                                    convergence::ResolvedFile {
+                                        content,
+                                        resolutions: vec![],
+                                        fully_resolved: true,
+                                        unresolved_regions: vec![],
+                                        escalation_records: vec![],
+                                    }
+                                }
+                                convergence::FileMergeResult::Conflict(regions) => {
+                                    convergence::resolve_conflict_regions(
+                                        path, base, left, right, &regions,
+                                        &base_spec, spec_id,
+                                    )
+                                }
+                            };
+
+                        if v1_result.fully_resolved {
+                            accumulated
+                                .insert(path.clone(), v1_result.content.clone());
+                            accumulated_modified.insert(path.clone());
+
+                            all_escalations.extend(v1_result.escalation_records);
+
+                            let method_summary: Vec<String> = v1_result
+                                .resolutions
+                                .iter()
+                                .map(|r| r.method.clone())
+                                .collect::<HashSet<_>>()
+                                .into_iter()
+                                .collect();
+
+                            let avg_confidence =
+                                if v1_result.resolutions.is_empty() {
+                                    1.0
+                                } else {
+                                    v1_result
                                         .resolutions
                                         .iter()
                                         .map(|r| r.confidence)
                                         .sum::<f64>()
-                                        / resolved.resolutions.len() as f64
+                                        / v1_result.resolutions.len() as f64
                                 };
 
-                                resolutions_records.push(ResolutionRecord {
-                                    path: path.clone(),
-                                    strategy: format!("auto: {}", method_summary.join(", ")),
-                                    chosen_spec: None,
-                                    lost_content_warning: None,
-                                });
+                            resolutions_records.push(ResolutionRecord {
+                                path: path.clone(),
+                                strategy: format!(
+                                    "v1-fallback: {}",
+                                    method_summary.join(", ")
+                                ),
+                                chosen_spec: None,
+                                lost_content_warning: None,
+                            });
 
-                                file_decisions.push(FileDecision {
-                                    path: path.clone(),
-                                    decision: "auto-resolved".to_string(),
-                                    chosen_lines: resolved.content.lines().count(),
-                                    chosen_spec: None,
-                                    alternatives: vec![
-                                        FileAlternative {
-                                            spec: "accumulated".to_string(),
-                                            lines: left.lines().count(),
-                                            reason: format!(
-                                                "composed (confidence: {:.0}%)",
-                                                avg_confidence * 100.0
-                                            ),
-                                        },
-                                        FileAlternative {
-                                            spec: spec_id.to_string(),
-                                            lines: right.lines().count(),
-                                            reason: format!(
-                                                "composed (confidence: {:.0}%)",
-                                                avg_confidence * 100.0
-                                            ),
-                                        },
-                                    ],
-                                    confidence: Some(avg_confidence),
-                                });
+                            file_decisions.push(FileDecision {
+                                path: path.clone(),
+                                decision: "auto-resolved".to_string(),
+                                chosen_lines: v1_result.content.lines().count(),
+                                chosen_spec: None,
+                                alternatives: vec![
+                                    FileAlternative {
+                                        spec: "accumulated".to_string(),
+                                        lines: left.lines().count(),
+                                        reason: format!(
+                                            "composed (confidence: {:.0}%)",
+                                            avg_confidence * 100.0
+                                        ),
+                                    },
+                                    FileAlternative {
+                                        spec: spec_id.to_string(),
+                                        lines: right.lines().count(),
+                                        reason: format!(
+                                            "composed (confidence: {:.0}%)",
+                                            avg_confidence * 100.0
+                                        ),
+                                    },
+                                ],
+                                confidence: Some(avg_confidence),
+                            });
 
-                                total_resolutions += 1;
-                            } else {
-                                match strategy {
-                                    #[allow(deprecated)]
-                                    ConvergeStrategy::MostRecent => {
-                                        let left_ts = self
-                                            .load_spec(&base_spec)
-                                            .ok()
-                                            .and_then(|s| s.sealed_by.last().cloned())
-                                            .and_then(|id| self.load_seal(&id).ok())
-                                            .map(|s| s.timestamp);
-                                        let right_ts = self
-                                            .load_spec(spec_id)
-                                            .ok()
-                                            .and_then(|s| s.sealed_by.last().cloned())
-                                            .and_then(|id| self.load_seal(&id).ok())
-                                            .map(|s| s.timestamp);
+                            step_conflicts_count += 1;
+                            step_conflict_files.push(path.clone());
+                            total_resolutions += 1;
+                        } else {
+                            // Neither v2 nor v1 resolved. Apply strategy.
+                            step_conflicts_count += 1;
+                            step_conflict_files.push(path.clone());
 
-                                        let prefer_right = match (left_ts, right_ts) {
-                                            (Some(l), Some(r)) => r >= l,
-                                            (None, Some(_)) => true,
-                                            _ => false,
-                                        };
+                            all_escalations.extend(v1_result.escalation_records);
+                            for esc in &pipeline_output.escalations {
+                                all_escalations.push(
+                                    convergence::PipelineEscalation {
+                                        file_path: esc.file_path.clone(),
+                                        reason: format!("{:?}", esc.reason),
+                                        conflict_class: format!(
+                                            "{:?}",
+                                            esc.conflict_type
+                                        ),
+                                        left_spec: esc.left_agent.clone(),
+                                        right_spec: esc.right_agent.clone(),
+                                        recommended_action: esc
+                                            .recommended_action
+                                            .clone(),
+                                    },
+                                );
+                            }
 
-                                        let content = if prefer_right {
-                                            right.to_string()
-                                        } else {
-                                            left.to_string()
-                                        };
-                                        let (chosen, other) = if prefer_right {
-                                            (spec_id.to_string(), base_spec.clone())
-                                        } else {
-                                            (base_spec.clone(), spec_id.to_string())
-                                        };
+                            match strategy {
+                                #[allow(deprecated)]
+                                ConvergeStrategy::MostRecent => {
+                                    let left_ts = self
+                                        .load_spec(&base_spec)
+                                        .ok()
+                                        .and_then(|s| {
+                                            s.sealed_by.last().cloned()
+                                        })
+                                        .and_then(|id| {
+                                            self.load_seal(&id).ok()
+                                        })
+                                        .map(|s| s.timestamp);
+                                    let right_ts = self
+                                        .load_spec(spec_id)
+                                        .ok()
+                                        .and_then(|s| {
+                                            s.sealed_by.last().cloned()
+                                        })
+                                        .and_then(|id| {
+                                            self.load_seal(&id).ok()
+                                        })
+                                        .map(|s| s.timestamp);
 
-                                        let lost = if prefer_right { left } else { right };
-                                        let lost_warning =
-                                            if !lost.is_empty() {
-                                                Some(format!(
-                                                "Discarded {} line(s) from '{}' in favor of '{}'",
-                                                lost.lines().count(), other, chosen,
-                                            ))
-                                            } else {
-                                                None
-                                            };
+                                    let prefer_right = match (left_ts, right_ts)
+                                    {
+                                        (Some(l), Some(r)) => r >= l,
+                                        (None, Some(_)) => true,
+                                        _ => false,
+                                    };
 
-                                        if let Some(ref w) = lost_warning {
-                                            warnings.push(format!("{}: {}", path, w));
-                                            step_degraded = true;
-                                        }
+                                    let content = if prefer_right {
+                                        right.to_string()
+                                    } else {
+                                        left.to_string()
+                                    };
+                                    let (chosen, other) = if prefer_right {
+                                        (spec_id.to_string(), base_spec.clone())
+                                    } else {
+                                        (base_spec.clone(), spec_id.to_string())
+                                    };
 
-                                        accumulated.insert(path.clone(), content);
-                                        accumulated_modified.insert(path.clone());
+                                    let lost =
+                                        if prefer_right { left } else { right };
+                                    let lost_warning = if !lost.is_empty() {
+                                        Some(format!(
+                                            "Discarded {} line(s) from '{}' in favor of '{}'",
+                                            lost.lines().count(),
+                                            other,
+                                            chosen,
+                                        ))
+                                    } else {
+                                        None
+                                    };
 
-                                        resolutions_records.push(ResolutionRecord {
+                                    if let Some(ref w) = lost_warning {
+                                        warnings.push(format!(
+                                            "{}: {}",
+                                            path, w
+                                        ));
+                                        step_degraded = true;
+                                    }
+
+                                    accumulated
+                                        .insert(path.clone(), content);
+                                    accumulated_modified
+                                        .insert(path.clone());
+
+                                    resolutions_records.push(
+                                        ResolutionRecord {
                                             path: path.clone(),
-                                            strategy: "most-recent".to_string(),
-                                            chosen_spec: Some(chosen.clone()),
-                                            lost_content_warning: lost_warning,
-                                        });
+                                            strategy: "most-recent"
+                                                .to_string(),
+                                            chosen_spec: Some(
+                                                chosen.clone(),
+                                            ),
+                                            lost_content_warning:
+                                                lost_warning,
+                                        },
+                                    );
 
-                                        file_decisions.push(FileDecision {
-                                            path: path.clone(),
-                                            decision: "most-recent".to_string(),
-                                            chosen_lines: if prefer_right {
-                                                right.lines().count()
-                                            } else {
-                                                left.lines().count()
-                                            },
-                                            chosen_spec: Some(chosen),
-                                            alternatives: vec![FileAlternative {
+                                    file_decisions.push(FileDecision {
+                                        path: path.clone(),
+                                        decision: "most-recent".to_string(),
+                                        chosen_lines: if prefer_right {
+                                            right.lines().count()
+                                        } else {
+                                            left.lines().count()
+                                        },
+                                        chosen_spec: Some(chosen),
+                                        alternatives: vec![
+                                            FileAlternative {
                                                 spec: other,
                                                 lines: lost.lines().count(),
-                                                reason: "discarded: not most recent".to_string(),
-                                            }],
-                                            confidence: Some(0.7),
-                                        });
-
-                                        total_resolutions += 1;
-                                    }
-                                    ConvergeStrategy::Manual
-                                    | ConvergeStrategy::Orchestrator
-                                    | ConvergeStrategy::Escalate => {
-                                        let is_escalate = strategy == ConvergeStrategy::Escalate;
-                                        file_decisions.push(FileDecision {
-                                            path: path.clone(),
-                                            decision: if is_escalate {
-                                                "escalated".to_string()
-                                            } else {
-                                                "conflict-unresolved".to_string()
+                                                reason:
+                                                    "discarded: not most recent"
+                                                        .to_string(),
                                             },
-                                            chosen_lines: 0,
-                                            chosen_spec: None,
-                                            alternatives: vec![
-                                                FileAlternative {
-                                                    spec: "accumulated".to_string(),
-                                                    lines: left.lines().count(),
-                                                    reason: "left side (accumulated)".to_string(),
-                                                },
-                                                FileAlternative {
-                                                    spec: spec_id.to_string(),
-                                                    lines: right.lines().count(),
-                                                    reason: "right side (diverged)".to_string(),
-                                                },
-                                            ],
-                                            confidence: Some(0.0),
-                                        });
-                                        if is_escalate {
-                                            all_escalations.push(convergence::PipelineEscalation {
-                                                file_path: path.clone(),
-                                                reason: "Pattern matching could not resolve conflict".to_string(),
-                                                conflict_class: "both-modified".to_string(),
-                                                left_spec: base_spec.clone(),
-                                                right_spec: spec_id.to_string(),
-                                                recommended_action: "Manual review required — both sides modified this file".to_string(),
-                                            });
+                                        ],
+                                        confidence: Some(0.7),
+                                    });
+
+                                    total_resolutions += 1;
+                                }
+                                ConvergeStrategy::Manual
+                                | ConvergeStrategy::Orchestrator
+                                | ConvergeStrategy::Escalate => {
+                                    let decision_str = match strategy {
+                                        ConvergeStrategy::Escalate => {
+                                            "escalated"
                                         }
-                                        step_clean = false;
-                                        all_clean = false;
-                                    }
+                                        _ => "conflict-unresolved",
+                                    };
+                                    file_decisions.push(FileDecision {
+                                        path: path.clone(),
+                                        decision: decision_str.to_string(),
+                                        chosen_lines: 0,
+                                        chosen_spec: None,
+                                        alternatives: vec![
+                                            FileAlternative {
+                                                spec: "accumulated"
+                                                    .to_string(),
+                                                lines: left.lines().count(),
+                                                reason:
+                                                    "left side (accumulated)"
+                                                        .to_string(),
+                                            },
+                                            FileAlternative {
+                                                spec: spec_id.to_string(),
+                                                lines: right
+                                                    .lines()
+                                                    .count(),
+                                                reason:
+                                                    "right side (diverged)"
+                                                        .to_string(),
+                                            },
+                                        ],
+                                        confidence: Some(0.0),
+                                    });
+                                    step_clean = false;
+                                    all_clean = false;
                                 }
                             }
                         }
@@ -15191,11 +15353,7 @@ mod converge_all_tests {
         let has_escalated_decision = report
             .quality_report
             .as_ref()
-            .map(|qr| {
-                qr.file_decisions
-                    .iter()
-                    .any(|d| d.decision == "escalated")
-            })
+            .map(|qr| qr.file_decisions.iter().any(|d| d.decision == "escalated"))
             .unwrap_or(false);
         assert!(
             has_escalated_decision,
@@ -15210,6 +15368,118 @@ mod converge_all_tests {
         assert!(
             !esc.reason.is_empty(),
             "escalation record must have a reason"
+        );
+    }
+
+    #[test]
+    fn test_converge_all_v2_pipeline_resolves_python_imports() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let base_py = "import os\n\ndef main():\n    pass\n";
+        fs::write(dir.path().join("app.py"), base_py).unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "baseline".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("agent-a".into(), "Agent A".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("agent-b".into(), "Agent B".into(), "".into()))
+            .unwrap();
+
+        let a_py = "import os\nimport json\n\ndef main():\n    pass\n";
+        fs::write(dir.path().join("app.py"), a_py).unwrap();
+        let agent_a = AgentIdentity {
+            id: "a".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            agent_a.clone(),
+            "add json".into(),
+            Some("agent-a".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("app.py"), base_py).unwrap();
+
+        let b_py = "import os\nimport sys\n\ndef main():\n    pass\n";
+        fs::write(dir.path().join("app.py"), b_py).unwrap();
+        let agent_b = AgentIdentity {
+            id: "b".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            agent_b,
+            "add sys".into(),
+            Some("agent-b".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("app.py"), a_py).unwrap();
+        repo.seal(
+            agent_a,
+            "finalize".into(),
+            Some("agent-a".into()),
+            crate::seal::TaskStatus::Complete,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "agent-a",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::Escalate, true)
+            .unwrap();
+
+        assert!(report.applied, "should apply");
+        assert!(report.is_clean, "should be clean — both imports composable");
+
+        let merged = fs::read_to_string(dir.path().join("app.py")).unwrap();
+        assert!(
+            merged.contains("import json"),
+            "json import lost! merged:\n{merged}"
+        );
+        assert!(
+            merged.contains("import sys"),
+            "sys import lost! merged:\n{merged}"
+        );
+        assert!(
+            merged.contains("import os"),
+            "os import lost! merged:\n{merged}"
+        );
+
+        let has_pipeline_tag = report.merges.iter().any(|m| {
+            m.resolutions.iter().any(|r| {
+                r.strategy.starts_with("v2-pipeline")
+                    || r.strategy.starts_with("v1-fallback")
+            })
+        });
+        assert!(
+            has_pipeline_tag,
+            "resolution strategy should reference v2-pipeline or v1-fallback"
         );
     }
 

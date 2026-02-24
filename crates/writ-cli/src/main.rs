@@ -2000,7 +2000,10 @@ fn cmd_converge_all(
                 println!("  STATUS: DEGRADED — most-recent strategy discarded content; review quality report");
             }
             if !report.escalations.is_empty() {
-                println!("  ESCALATIONS: {} conflict(s) require review", report.escalations.len());
+                println!(
+                    "  ESCALATIONS: {} conflict(s) require review",
+                    report.escalations.len()
+                );
                 for esc in &report.escalations {
                     println!("    - {}: {}", esc.file_path, esc.reason);
                 }

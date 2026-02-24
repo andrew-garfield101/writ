@@ -566,7 +566,9 @@ impl PyRepository {
         let strat = match strategy {
             "escalate" => writ_core::convergence::ConvergeStrategy::Escalate,
             "most-recent" => {
-                eprintln!("writ warning: 'most-recent' strategy is deprecated; use 'escalate' instead");
+                eprintln!(
+                    "writ warning: 'most-recent' strategy is deprecated; use 'escalate' instead"
+                );
                 #[allow(deprecated)]
                 writ_core::convergence::ConvergeStrategy::MostRecent
             }

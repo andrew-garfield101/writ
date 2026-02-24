@@ -471,10 +471,7 @@ mod tests {
     fn test_claude_md_section_has_convergence_strategies() {
         let section = writ_claude_md_section();
         assert!(section.contains("manual"), "missing manual strategy");
-        assert!(
-            section.contains("escalate"),
-            "missing escalate strategy"
-        );
+        assert!(section.contains("escalate"), "missing escalate strategy");
         assert!(
             section.contains("orchestrator"),
             "missing orchestrator strategy"

@@ -358,6 +358,84 @@ impl StructuralConflictRegion {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline contract types (Phase-to-Phase communication)
+// ---------------------------------------------------------------------------
+
+/// Phase 1 result for a single file.
+///
+/// Wraps the diff3 output: either a clean merge (no conflicts) or a
+/// structural diff with conflict regions annotated by the language analyzer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Phase1Result {
+    /// diff3 found no conflicts — file merges cleanly.
+    Clean(String),
+    /// Conflicts found — structural analysis applied to each region.
+    Conflicts(StructuralDiff),
+}
+
+/// Phase 2 result: all conflicts in a file classified and ready for Phase 3.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Phase2Result {
+    /// File path being processed.
+    pub file_path: String,
+    /// Which analyzer was used.
+    pub analyzer_used: String,
+    /// Each conflict region, classified with type and structural info.
+    pub classified_conflicts: Vec<ClassifiedConflict>,
+}
+
+/// What happened to a single conflict region after pipeline processing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RegionResolutionStatus {
+    /// Resolved by a pattern or phase.
+    Resolved {
+        /// The merged content for this region.
+        content: String,
+        /// Which method resolved it (pattern name or phase description).
+        method: String,
+        /// Confidence score of the resolution.
+        confidence: f64,
+        /// Which phase resolved it (3 = deterministic, 4 = spec-aware, 5 = LLM).
+        resolved_in_phase: u8,
+    },
+    /// Escalated — could not be auto-resolved.
+    Escalated {
+        /// Why this region was escalated.
+        reason: EscalationReason,
+        /// Best-guess recommendation for the reviewer.
+        recommendation: String,
+    },
+}
+
+/// Per-region audit trail — tracks a conflict through the entire pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegionOutcome {
+    /// The classified conflict from Phase 2.
+    pub classified: ClassifiedConflict,
+    /// Phase 3 proposal, if a pattern matched (even if not auto-resolved).
+    pub phase3_result: Option<ResolutionProposal>,
+    /// Final resolution status after all phases.
+    pub resolution: RegionResolutionStatus,
+}
+
+/// Complete pipeline result for a single file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PipelineFileResult {
+    /// File path that was processed.
+    pub file_path: String,
+    /// Which analyzer was used for structural analysis.
+    pub analyzer_used: String,
+    /// Fully merged content, if all regions were resolved.
+    pub merged_content: Option<String>,
+    /// Per-region audit trail.
+    pub region_outcomes: Vec<RegionOutcome>,
+    /// Escalation records for regions that could not be auto-resolved.
+    pub escalations: Vec<EscalationRecord>,
+    /// True if every conflict region was resolved.
+    pub fully_resolved: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -511,5 +589,67 @@ mod tests {
             recommended_action: "Manual review required".into(),
         };
         assert_eq!(record.reason, EscalationReason::NoPatternMatch);
+    }
+
+    #[test]
+    fn test_phase1_result_serialization() {
+        let clean = Phase1Result::Clean("merged content".into());
+        let json = serde_json::to_string(&clean).unwrap();
+        let decoded: Phase1Result = serde_json::from_str(&json).unwrap();
+        match decoded {
+            Phase1Result::Clean(s) => assert_eq!(s, "merged content"),
+            _ => panic!("expected Clean"),
+        }
+    }
+
+    #[test]
+    fn test_region_resolution_status_variants() {
+        let resolved = RegionResolutionStatus::Resolved {
+            content: "merged".into(),
+            method: "import_accumulation".into(),
+            confidence: 0.95,
+            resolved_in_phase: 3,
+        };
+        let json = serde_json::to_string(&resolved).unwrap();
+        let decoded: RegionResolutionStatus = serde_json::from_str(&json).unwrap();
+        match decoded {
+            RegionResolutionStatus::Resolved {
+                confidence,
+                resolved_in_phase,
+                ..
+            } => {
+                assert!((confidence - 0.95).abs() < f64::EPSILON);
+                assert_eq!(resolved_in_phase, 3);
+            }
+            _ => panic!("expected Resolved"),
+        }
+
+        let escalated = RegionResolutionStatus::Escalated {
+            reason: EscalationReason::DeleteVsModify,
+            recommendation: "Review deletion".into(),
+        };
+        let json = serde_json::to_string(&escalated).unwrap();
+        let decoded: RegionResolutionStatus = serde_json::from_str(&json).unwrap();
+        match decoded {
+            RegionResolutionStatus::Escalated { reason, .. } => {
+                assert_eq!(reason, EscalationReason::DeleteVsModify);
+            }
+            _ => panic!("expected Escalated"),
+        }
+    }
+
+    #[test]
+    fn test_pipeline_file_result_construction() {
+        let result = PipelineFileResult {
+            file_path: "models.py".into(),
+            analyzer_used: "python".into(),
+            merged_content: Some("class User: pass".into()),
+            region_outcomes: vec![],
+            escalations: vec![],
+            fully_resolved: true,
+        };
+        assert!(result.fully_resolved);
+        assert!(result.merged_content.is_some());
+        assert!(result.escalations.is_empty());
     }
 }

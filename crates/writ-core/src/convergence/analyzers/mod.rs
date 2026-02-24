@@ -10,7 +10,11 @@
 //! diff3 functionality.
 
 pub mod generic;
+pub mod go;
+pub mod javascript;
 pub mod python;
+pub mod rust_lang;
+pub mod typescript;
 
 use super::types::{StructuralUnit, UnitKind};
 
@@ -136,9 +140,10 @@ pub fn analyzer_for_path(path: &str) -> Box<dyn LanguageAnalyzer> {
     let ext = path.rsplit('.').next().unwrap_or("");
     match ext {
         "py" | "pyi" => Box::new(python::PythonAnalyzer),
-        // Future: "rs" => Box::new(rust_lang::RustAnalyzer),
-        // Future: "ts" | "tsx" => Box::new(typescript::TypeScriptAnalyzer),
-        // Future: "go" => Box::new(go::GoAnalyzer),
+        "rs" => Box::new(rust_lang::RustAnalyzer),
+        "ts" | "tsx" => Box::new(typescript::TypeScriptAnalyzer),
+        "js" | "jsx" | "mjs" | "cjs" => Box::new(javascript::JavaScriptAnalyzer),
+        "go" => Box::new(go::GoAnalyzer),
         _ => Box::new(generic::GenericAnalyzer),
     }
 }
@@ -166,10 +171,51 @@ mod tests {
     }
 
     #[test]
-    fn test_analyzer_dispatch_rust_falls_back_for_now() {
+    fn test_analyzer_dispatch_rust() {
         let analyzer = analyzer_for_path("main.rs");
-        // Rust analyzer is a stub for Sprint 1 — falls back to generic.
-        assert_eq!(analyzer.name(), "generic");
+        assert_eq!(analyzer.name(), "rust");
+    }
+
+    #[test]
+    fn test_analyzer_dispatch_go() {
+        let analyzer = analyzer_for_path("main.go");
+        assert_eq!(analyzer.name(), "go");
+    }
+
+    #[test]
+    fn test_analyzer_dispatch_typescript() {
+        let analyzer = analyzer_for_path("app.ts");
+        assert_eq!(analyzer.name(), "typescript");
+    }
+
+    #[test]
+    fn test_analyzer_dispatch_tsx() {
+        let analyzer = analyzer_for_path("App.tsx");
+        assert_eq!(analyzer.name(), "typescript");
+    }
+
+    #[test]
+    fn test_analyzer_dispatch_javascript() {
+        let analyzer = analyzer_for_path("index.js");
+        assert_eq!(analyzer.name(), "javascript");
+    }
+
+    #[test]
+    fn test_analyzer_dispatch_jsx() {
+        let analyzer = analyzer_for_path("App.jsx");
+        assert_eq!(analyzer.name(), "javascript");
+    }
+
+    #[test]
+    fn test_analyzer_dispatch_mjs() {
+        let analyzer = analyzer_for_path("module.mjs");
+        assert_eq!(analyzer.name(), "javascript");
+    }
+
+    #[test]
+    fn test_analyzer_dispatch_cjs() {
+        let analyzer = analyzer_for_path("config.cjs");
+        assert_eq!(analyzer.name(), "javascript");
     }
 
     #[test]

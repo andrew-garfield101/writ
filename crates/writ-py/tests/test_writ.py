@@ -535,10 +535,10 @@ class TestConvergeAll:
             assert "clean" in step
 
     def test_converge_all_default_strategy(self, tmp_path):
-        """Default strategy is manual."""
+        """Default strategy is escalate."""
         repo = self._setup_diverged(tmp_path)
         report = repo.converge_all()
-        assert report["strategy"] == "manual"
+        assert report["strategy"] == "escalate"
 
     def _setup_content_conflict(self, tmp_path):
         """Create a repo where two specs conflict on the same file with

@@ -17,10 +17,11 @@ use crate::context::{
     SealNudge, SealSummary, SessionSummary, SpecProgress, WorkingStateSummary,
 };
 use crate::convergence::{
-    self, ConsistencyCheck, ConvergeAllReport, ConvergeStrategy, ConvergenceQualityReport,
+    self,
+    pipeline::{ConvergencePipeline, PipelineInput},
+    ConsistencyCheck, ConvergeAllReport, ConvergeStrategy, ConvergenceQualityReport,
     ConvergenceReport, FileAlternative, FileConflict, FileDecision, FileMergeResult,
     FileMetricValue, FileResolution, MergeStepResult, MergedFile, ResolutionRecord,
-    pipeline::{ConvergencePipeline, PipelineInput},
 };
 use crate::diff::{self, DiffOutput, FileDiff};
 use crate::error::{WritError, WritResult};
@@ -2375,10 +2376,8 @@ impl Repository {
             });
         }
 
-        // Sort diverged branches: most seals first (highest impact merged last
-        // means their content is more likely to survive in the final state).
+        // Collect diverged branches and find base spec.
         let mut ordered: Vec<_> = diverged.into_iter().collect();
-        ordered.sort_by(|a, b| b.seal_count.cmp(&a.seal_count));
 
         // Find a base spec that IS on the HEAD chain.
         let specs = self.list_specs()?;
@@ -2393,15 +2392,55 @@ impl Repository {
 
         let base_spec = if let Some(s) = on_head.first() {
             s.id.clone()
-        } else if let Some(first) = ordered.first() {
-            let id = first.spec_id.clone();
-            ordered.remove(0);
-            id
         } else {
-            return Err(WritError::Other(
-                "No specs available for convergence base".to_string(),
-            ));
+            // No on-head spec — pick the one with most seals as base.
+            ordered.sort_by(|a, b| {
+                b.seal_count
+                    .cmp(&a.seal_count)
+                    .then_with(|| a.spec_id.cmp(&b.spec_id))
+            });
+            if let Some(first) = ordered.first() {
+                let id = first.spec_id.clone();
+                ordered.remove(0);
+                id
+            } else {
+                return Err(WritError::Other(
+                    "No specs available for convergence base".to_string(),
+                ));
+            }
         };
+
+        // ── N-agent merge ordering (T9) ──────────────────────────────────
+        // Build MergeCandidates with file overlap data, then compute an
+        // optimal merge order that minimizes conflict complexity.
+        let base_spec_data_for_order = self.load_spec(&base_spec)?;
+        let base_modified_for_order = self
+            .spec_modified_files(&base_spec_data_for_order)
+            .unwrap_or_default();
+
+        let mut candidates: Vec<convergence::MergeCandidate> = Vec::new();
+        for branch in &ordered {
+            let modified = if let Ok(spec_data) = self.load_spec(&branch.spec_id) {
+                self.spec_modified_files(&spec_data).unwrap_or_default()
+            } else {
+                HashSet::new()
+            };
+            candidates.push(convergence::MergeCandidate {
+                spec_id: branch.spec_id.clone(),
+                modified_files: modified,
+                seal_count: branch.seal_count,
+            });
+        }
+
+        let optimal_order = convergence::compute_merge_order(&candidates, &base_modified_for_order);
+
+        // Reorder `ordered` to match the computed optimal order.
+        let order_map: HashMap<String, usize> = optimal_order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id.clone(), i))
+            .collect();
+        ordered.sort_by_key(|b| order_map.get(&b.spec_id).copied().unwrap_or(usize::MAX));
 
         let merge_order: Vec<String> = ordered.iter().map(|b| b.spec_id.clone()).collect();
         let mut merges = Vec::new();
@@ -2575,9 +2614,7 @@ impl Repository {
                     let pipeline_output = v2_pipeline.run(&pipeline_input);
 
                     if pipeline_output.fully_resolved {
-                        let content = pipeline_output
-                            .merged_content
-                            .unwrap_or_default();
+                        let content = pipeline_output.merged_content.unwrap_or_default();
                         let num_regions = pipeline_output.resolutions.len();
 
                         if num_regions == 0 {
@@ -2626,10 +2663,7 @@ impl Repository {
 
                             resolutions_records.push(ResolutionRecord {
                                 path: path.clone(),
-                                strategy: format!(
-                                    "v2-pipeline: {}",
-                                    method_summary.join(", ")
-                                ),
+                                strategy: format!("v2-pipeline: {}", method_summary.join(", ")),
                                 chosen_spec: None,
                                 lost_content_warning: None,
                             });
@@ -2671,28 +2705,25 @@ impl Repository {
                         // v2 pipeline could not fully resolve. Fall back to the
                         // v1 text-level resolver which has robust import detection
                         // for languages without a dedicated structural analyzer.
-                        let v1_result =
-                            match convergence::three_way_merge(base, left, right) {
-                                convergence::FileMergeResult::Clean(content) => {
-                                    convergence::ResolvedFile {
-                                        content,
-                                        resolutions: vec![],
-                                        fully_resolved: true,
-                                        unresolved_regions: vec![],
-                                        escalation_records: vec![],
-                                    }
+                        let v1_result = match convergence::three_way_merge(base, left, right) {
+                            convergence::FileMergeResult::Clean(content) => {
+                                convergence::ResolvedFile {
+                                    content,
+                                    resolutions: vec![],
+                                    fully_resolved: true,
+                                    unresolved_regions: vec![],
+                                    escalation_records: vec![],
                                 }
-                                convergence::FileMergeResult::Conflict(regions) => {
-                                    convergence::resolve_conflict_regions(
-                                        path, base, left, right, &regions,
-                                        &base_spec, spec_id,
-                                    )
-                                }
-                            };
+                            }
+                            convergence::FileMergeResult::Conflict(regions) => {
+                                convergence::resolve_conflict_regions(
+                                    path, base, left, right, &regions, &base_spec, spec_id,
+                                )
+                            }
+                        };
 
                         if v1_result.fully_resolved {
-                            accumulated
-                                .insert(path.clone(), v1_result.content.clone());
+                            accumulated.insert(path.clone(), v1_result.content.clone());
                             accumulated_modified.insert(path.clone());
 
                             all_escalations.extend(v1_result.escalation_records);
@@ -2705,24 +2736,20 @@ impl Repository {
                                 .into_iter()
                                 .collect();
 
-                            let avg_confidence =
-                                if v1_result.resolutions.is_empty() {
-                                    1.0
-                                } else {
-                                    v1_result
-                                        .resolutions
-                                        .iter()
-                                        .map(|r| r.confidence)
-                                        .sum::<f64>()
-                                        / v1_result.resolutions.len() as f64
-                                };
+                            let avg_confidence = if v1_result.resolutions.is_empty() {
+                                1.0
+                            } else {
+                                v1_result
+                                    .resolutions
+                                    .iter()
+                                    .map(|r| r.confidence)
+                                    .sum::<f64>()
+                                    / v1_result.resolutions.len() as f64
+                            };
 
                             resolutions_records.push(ResolutionRecord {
                                 path: path.clone(),
-                                strategy: format!(
-                                    "v1-fallback: {}",
-                                    method_summary.join(", ")
-                                ),
+                                strategy: format!("v1-fallback: {}", method_summary.join(", ")),
                                 chosen_spec: None,
                                 lost_content_warning: None,
                             });
@@ -2763,21 +2790,14 @@ impl Repository {
 
                             all_escalations.extend(v1_result.escalation_records);
                             for esc in &pipeline_output.escalations {
-                                all_escalations.push(
-                                    convergence::PipelineEscalation {
-                                        file_path: esc.file_path.clone(),
-                                        reason: format!("{:?}", esc.reason),
-                                        conflict_class: format!(
-                                            "{:?}",
-                                            esc.conflict_type
-                                        ),
-                                        left_spec: esc.left_agent.clone(),
-                                        right_spec: esc.right_agent.clone(),
-                                        recommended_action: esc
-                                            .recommended_action
-                                            .clone(),
-                                    },
-                                );
+                                all_escalations.push(convergence::PipelineEscalation {
+                                    file_path: esc.file_path.clone(),
+                                    reason: format!("{:?}", esc.reason),
+                                    conflict_class: format!("{:?}", esc.conflict_type),
+                                    left_spec: esc.left_agent.clone(),
+                                    right_spec: esc.right_agent.clone(),
+                                    recommended_action: esc.recommended_action.clone(),
+                                });
                             }
 
                             match strategy {
@@ -2786,26 +2806,17 @@ impl Repository {
                                     let left_ts = self
                                         .load_spec(&base_spec)
                                         .ok()
-                                        .and_then(|s| {
-                                            s.sealed_by.last().cloned()
-                                        })
-                                        .and_then(|id| {
-                                            self.load_seal(&id).ok()
-                                        })
+                                        .and_then(|s| s.sealed_by.last().cloned())
+                                        .and_then(|id| self.load_seal(&id).ok())
                                         .map(|s| s.timestamp);
                                     let right_ts = self
                                         .load_spec(spec_id)
                                         .ok()
-                                        .and_then(|s| {
-                                            s.sealed_by.last().cloned()
-                                        })
-                                        .and_then(|id| {
-                                            self.load_seal(&id).ok()
-                                        })
+                                        .and_then(|s| s.sealed_by.last().cloned())
+                                        .and_then(|id| self.load_seal(&id).ok())
                                         .map(|s| s.timestamp);
 
-                                    let prefer_right = match (left_ts, right_ts)
-                                    {
+                                    let prefer_right = match (left_ts, right_ts) {
                                         (Some(l), Some(r)) => r >= l,
                                         (None, Some(_)) => true,
                                         _ => false,
@@ -2822,8 +2833,7 @@ impl Repository {
                                         (base_spec.clone(), spec_id.to_string())
                                     };
 
-                                    let lost =
-                                        if prefer_right { left } else { right };
+                                    let lost = if prefer_right { left } else { right };
                                     let lost_warning = if !lost.is_empty() {
                                         Some(format!(
                                             "Discarded {} line(s) from '{}' in favor of '{}'",
@@ -2836,30 +2846,19 @@ impl Repository {
                                     };
 
                                     if let Some(ref w) = lost_warning {
-                                        warnings.push(format!(
-                                            "{}: {}",
-                                            path, w
-                                        ));
+                                        warnings.push(format!("{}: {}", path, w));
                                         step_degraded = true;
                                     }
 
-                                    accumulated
-                                        .insert(path.clone(), content);
-                                    accumulated_modified
-                                        .insert(path.clone());
+                                    accumulated.insert(path.clone(), content);
+                                    accumulated_modified.insert(path.clone());
 
-                                    resolutions_records.push(
-                                        ResolutionRecord {
-                                            path: path.clone(),
-                                            strategy: "most-recent"
-                                                .to_string(),
-                                            chosen_spec: Some(
-                                                chosen.clone(),
-                                            ),
-                                            lost_content_warning:
-                                                lost_warning,
-                                        },
-                                    );
+                                    resolutions_records.push(ResolutionRecord {
+                                        path: path.clone(),
+                                        strategy: "most-recent".to_string(),
+                                        chosen_spec: Some(chosen.clone()),
+                                        lost_content_warning: lost_warning,
+                                    });
 
                                     file_decisions.push(FileDecision {
                                         path: path.clone(),
@@ -2870,15 +2869,11 @@ impl Repository {
                                             left.lines().count()
                                         },
                                         chosen_spec: Some(chosen),
-                                        alternatives: vec![
-                                            FileAlternative {
-                                                spec: other,
-                                                lines: lost.lines().count(),
-                                                reason:
-                                                    "discarded: not most recent"
-                                                        .to_string(),
-                                            },
-                                        ],
+                                        alternatives: vec![FileAlternative {
+                                            spec: other,
+                                            lines: lost.lines().count(),
+                                            reason: "discarded: not most recent".to_string(),
+                                        }],
                                         confidence: Some(0.7),
                                     });
 
@@ -2888,9 +2883,7 @@ impl Repository {
                                 | ConvergeStrategy::Orchestrator
                                 | ConvergeStrategy::Escalate => {
                                     let decision_str = match strategy {
-                                        ConvergeStrategy::Escalate => {
-                                            "escalated"
-                                        }
+                                        ConvergeStrategy::Escalate => "escalated",
                                         _ => "conflict-unresolved",
                                     };
                                     file_decisions.push(FileDecision {
@@ -2900,21 +2893,14 @@ impl Repository {
                                         chosen_spec: None,
                                         alternatives: vec![
                                             FileAlternative {
-                                                spec: "accumulated"
-                                                    .to_string(),
+                                                spec: "accumulated".to_string(),
                                                 lines: left.lines().count(),
-                                                reason:
-                                                    "left side (accumulated)"
-                                                        .to_string(),
+                                                reason: "left side (accumulated)".to_string(),
                                             },
                                             FileAlternative {
                                                 spec: spec_id.to_string(),
-                                                lines: right
-                                                    .lines()
-                                                    .count(),
-                                                reason:
-                                                    "right side (diverged)"
-                                                        .to_string(),
+                                                lines: right.lines().count(),
+                                                reason: "right side (diverged)".to_string(),
                                             },
                                         ],
                                         confidence: Some(0.0),
@@ -15450,9 +15436,7 @@ mod converge_all_tests {
         )
         .unwrap();
 
-        let report = repo
-            .converge_all(ConvergeStrategy::Escalate, true)
-            .unwrap();
+        let report = repo.converge_all(ConvergeStrategy::Escalate, true).unwrap();
 
         assert!(report.applied, "should apply");
         assert!(report.is_clean, "should be clean — both imports composable");
@@ -15473,8 +15457,7 @@ mod converge_all_tests {
 
         let has_pipeline_tag = report.merges.iter().any(|m| {
             m.resolutions.iter().any(|r| {
-                r.strategy.starts_with("v2-pipeline")
-                    || r.strategy.starts_with("v1-fallback")
+                r.strategy.starts_with("v2-pipeline") || r.strategy.starts_with("v1-fallback")
             })
         });
         assert!(

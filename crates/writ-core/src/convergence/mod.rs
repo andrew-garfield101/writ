@@ -27,6 +27,8 @@ pub mod patterns;
 pub mod phase1;
 pub mod phase2;
 pub mod phase4;
+pub mod phase5;
+pub mod phase6;
 pub mod pipeline;
 pub mod types;
 
@@ -2076,6 +2078,81 @@ pub fn smart_merge(
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// N-agent merge ordering (T9)
+// ---------------------------------------------------------------------------
+
+/// Information about a diverged spec needed for merge ordering.
+#[derive(Debug, Clone)]
+pub struct MergeCandidate {
+    /// The spec ID.
+    pub spec_id: String,
+    /// Files modified by this spec (union of all its seal changes).
+    pub modified_files: std::collections::HashSet<String>,
+    /// Number of seals on this branch (used as tie-breaker).
+    pub seal_count: usize,
+}
+
+/// Compute an optimal merge order that minimizes conflict complexity.
+///
+/// The algorithm is greedy: at each step it picks the candidate whose
+/// modified files have the **least overlap** with the accumulated file set.
+/// Specs that touch disjoint files merge cleanly, so they go first.
+/// High-overlap specs are deferred until the accumulated state has maximum
+/// context for conflict resolution.
+///
+/// Tie-breaking:
+/// 1. Higher `seal_count` first (more established work)
+/// 2. Lexicographic `spec_id` (determinism)
+///
+/// Returns the spec IDs in the recommended merge order.
+pub fn compute_merge_order(
+    candidates: &[MergeCandidate],
+    base_modified: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut remaining: Vec<usize> = (0..candidates.len()).collect();
+    let mut accumulated = base_modified.clone();
+    let mut order = Vec::with_capacity(candidates.len());
+
+    while !remaining.is_empty() {
+        // Score each remaining candidate: count of files overlapping with accumulated.
+        let best_idx = remaining
+            .iter()
+            .copied()
+            .min_by(|&a, &b| {
+                let overlap_a = candidates[a]
+                    .modified_files
+                    .iter()
+                    .filter(|f| accumulated.contains(*f))
+                    .count();
+                let overlap_b = candidates[b]
+                    .modified_files
+                    .iter()
+                    .filter(|f| accumulated.contains(*f))
+                    .count();
+
+                overlap_a
+                    .cmp(&overlap_b)
+                    // Tie-break: more seals first (more established)
+                    .then_with(|| candidates[b].seal_count.cmp(&candidates[a].seal_count))
+                    // Final tie-break: lexicographic spec_id for determinism
+                    .then_with(|| candidates[a].spec_id.cmp(&candidates[b].spec_id))
+            })
+            .unwrap(); // safe: remaining is non-empty
+
+        // Add this candidate's files to the accumulated set.
+        accumulated.extend(candidates[best_idx].modified_files.iter().cloned());
+        order.push(candidates[best_idx].spec_id.clone());
+        remaining.retain(|&i| i != best_idx);
+    }
+
+    order
 }
 
 /// Result of `converge_all` — multi-branch convergence.
@@ -4398,5 +4475,230 @@ class Config:
             result.contains("Product"),
             "Product IS used as a whole word: {result}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // T9 — N-agent merge ordering
+    // -----------------------------------------------------------------------
+
+    fn hs(items: &[&str]) -> std::collections::HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_merge_order_empty_candidates() {
+        let order = compute_merge_order(&[], &hs(&[]));
+        assert!(order.is_empty());
+    }
+
+    #[test]
+    fn test_merge_order_single_candidate() {
+        let candidates = vec![MergeCandidate {
+            spec_id: "alpha".into(),
+            modified_files: hs(&["a.rs"]),
+            seal_count: 1,
+        }];
+        let order = compute_merge_order(&candidates, &hs(&[]));
+        assert_eq!(order, vec!["alpha"]);
+    }
+
+    #[test]
+    fn test_merge_order_disjoint_specs_tiebreak_by_seal_count() {
+        // All disjoint (0 overlap each), so tie-break by seal_count desc.
+        let candidates = vec![
+            MergeCandidate {
+                spec_id: "few-seals".into(),
+                modified_files: hs(&["a.rs"]),
+                seal_count: 1,
+            },
+            MergeCandidate {
+                spec_id: "many-seals".into(),
+                modified_files: hs(&["b.rs"]),
+                seal_count: 5,
+            },
+        ];
+        let order = compute_merge_order(&candidates, &hs(&[]));
+        assert_eq!(
+            order[0], "many-seals",
+            "more seals should go first when overlap is tied"
+        );
+    }
+
+    #[test]
+    fn test_merge_order_disjoint_before_overlapping() {
+        // base touches "shared.rs". spec-a touches "shared.rs" (overlap=1),
+        // spec-b touches "unique.rs" (overlap=0). spec-b should go first.
+        let candidates = vec![
+            MergeCandidate {
+                spec_id: "overlapper".into(),
+                modified_files: hs(&["shared.rs"]),
+                seal_count: 3,
+            },
+            MergeCandidate {
+                spec_id: "disjoint".into(),
+                modified_files: hs(&["unique.rs"]),
+                seal_count: 1,
+            },
+        ];
+        let order = compute_merge_order(&candidates, &hs(&["shared.rs"]));
+        assert_eq!(order[0], "disjoint", "disjoint spec should merge first");
+        assert_eq!(order[1], "overlapper");
+    }
+
+    #[test]
+    fn test_merge_order_least_overlap_first() {
+        // base touches a.rs, b.rs. spec-x touches a.rs+b.rs (overlap=2),
+        // spec-y touches a.rs (overlap=1), spec-z touches c.rs (overlap=0).
+        let candidates = vec![
+            MergeCandidate {
+                spec_id: "high-overlap".into(),
+                modified_files: hs(&["a.rs", "b.rs"]),
+                seal_count: 1,
+            },
+            MergeCandidate {
+                spec_id: "mid-overlap".into(),
+                modified_files: hs(&["a.rs"]),
+                seal_count: 1,
+            },
+            MergeCandidate {
+                spec_id: "no-overlap".into(),
+                modified_files: hs(&["c.rs"]),
+                seal_count: 1,
+            },
+        ];
+        let order = compute_merge_order(&candidates, &hs(&["a.rs", "b.rs"]));
+        assert_eq!(order[0], "no-overlap", "zero overlap goes first");
+        assert_eq!(order[1], "mid-overlap", "lower overlap goes second");
+        assert_eq!(order[2], "high-overlap", "highest overlap goes last");
+    }
+
+    #[test]
+    fn test_merge_order_cascading_accumulation() {
+        // base has no files. spec-a touches x.rs, spec-b touches x.rs+y.rs.
+        // Initially both have 0 overlap. spec-a wins tie-break (alphabetical).
+        // After merging spec-a, accumulated = {x.rs}.
+        // Now spec-b has overlap=1 (x.rs). But it's the only one left.
+        let candidates = vec![
+            MergeCandidate {
+                spec_id: "a-spec".into(),
+                modified_files: hs(&["x.rs"]),
+                seal_count: 1,
+            },
+            MergeCandidate {
+                spec_id: "b-spec".into(),
+                modified_files: hs(&["x.rs", "y.rs"]),
+                seal_count: 1,
+            },
+        ];
+        let order = compute_merge_order(&candidates, &hs(&[]));
+        // Both start at 0 overlap, same seal_count. "a-spec" < "b-spec" lexicographically.
+        assert_eq!(order[0], "a-spec");
+        assert_eq!(order[1], "b-spec");
+    }
+
+    #[test]
+    fn test_merge_order_cascading_changes_pick() {
+        // Three specs. Base has file-a.
+        // spec-1: touches file-b (disjoint, overlap=0)
+        // spec-2: touches file-a, file-b (overlap=1 with base)
+        // spec-3: touches file-b (overlap=0 with base)
+        // First pick: spec-1 or spec-3 (both overlap=0). Tie: same seal_count,
+        //   so lexicographic → spec-1 first.
+        // After spec-1: accumulated = {file-a, file-b}
+        // Remaining: spec-2 (overlap=2: file-a+file-b), spec-3 (overlap=1: file-b)
+        // spec-3 goes next (overlap=1 < 2).
+        // spec-2 goes last.
+        let candidates = vec![
+            MergeCandidate {
+                spec_id: "spec-1".into(),
+                modified_files: hs(&["file-b"]),
+                seal_count: 1,
+            },
+            MergeCandidate {
+                spec_id: "spec-2".into(),
+                modified_files: hs(&["file-a", "file-b"]),
+                seal_count: 1,
+            },
+            MergeCandidate {
+                spec_id: "spec-3".into(),
+                modified_files: hs(&["file-b"]),
+                seal_count: 1,
+            },
+        ];
+        let order = compute_merge_order(&candidates, &hs(&["file-a"]));
+        assert_eq!(
+            order[0], "spec-1",
+            "disjoint goes first (alphabetic tie-break)"
+        );
+        assert_eq!(
+            order[1], "spec-3",
+            "after accumulation, spec-3 has less overlap"
+        );
+        assert_eq!(order[2], "spec-2", "highest overlap goes last");
+    }
+
+    #[test]
+    fn test_merge_order_tiebreak_deterministic_by_spec_id() {
+        // Same overlap, same seal_count — lexicographic spec_id breaks tie.
+        let candidates = vec![
+            MergeCandidate {
+                spec_id: "zeta".into(),
+                modified_files: hs(&["a.rs"]),
+                seal_count: 1,
+            },
+            MergeCandidate {
+                spec_id: "alpha".into(),
+                modified_files: hs(&["b.rs"]),
+                seal_count: 1,
+            },
+            MergeCandidate {
+                spec_id: "mu".into(),
+                modified_files: hs(&["c.rs"]),
+                seal_count: 1,
+            },
+        ];
+        let order = compute_merge_order(&candidates, &hs(&[]));
+        assert_eq!(order, vec!["alpha", "mu", "zeta"]);
+    }
+
+    #[test]
+    fn test_merge_order_seal_count_tiebreak_over_spec_id() {
+        // Same overlap, different seal_count — seal_count wins over spec_id.
+        let candidates = vec![
+            MergeCandidate {
+                spec_id: "alpha".into(),
+                modified_files: hs(&["a.rs"]),
+                seal_count: 1,
+            },
+            MergeCandidate {
+                spec_id: "zeta".into(),
+                modified_files: hs(&["b.rs"]),
+                seal_count: 5,
+            },
+        ];
+        let order = compute_merge_order(&candidates, &hs(&[]));
+        assert_eq!(
+            order[0], "zeta",
+            "higher seal_count should win over alphabetic spec_id"
+        );
+    }
+
+    #[test]
+    fn test_merge_order_empty_modified_files() {
+        // A spec with no modified files always has 0 overlap.
+        let candidates = vec![
+            MergeCandidate {
+                spec_id: "empty".into(),
+                modified_files: hs(&[]),
+                seal_count: 1,
+            },
+            MergeCandidate {
+                spec_id: "heavy".into(),
+                modified_files: hs(&["a.rs", "b.rs", "c.rs"]),
+                seal_count: 1,
+            },
+        ];
+        let order = compute_merge_order(&candidates, &hs(&["a.rs", "b.rs"]));
+        assert_eq!(order[0], "empty", "empty spec has 0 overlap, goes first");
     }
 }

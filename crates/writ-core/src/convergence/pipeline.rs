@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use super::analyzers;
 use super::patterns::{PatternRegistry, PatternResult};
+use super::phase6::HardenedVerifier;
 use super::types::*;
 
 // ---------------------------------------------------------------------------
@@ -186,6 +187,8 @@ impl LlmResolver for StubLlmResolver {
 }
 
 /// Basic Phase 6 verifier that checks the analyzer can re-parse the output.
+/// Kept as a reference implementation; production uses `HardenedVerifier`.
+#[allow(dead_code)]
 struct BasicVerifier;
 
 impl Verifier for BasicVerifier {
@@ -264,7 +267,7 @@ impl ConvergencePipeline {
             pattern_registry,
             spec_resolver: Box::new(super::phase4::SpecAwareResolver),
             llm_resolver: Box::new(StubLlmResolver),
-            verifier: Box::new(BasicVerifier),
+            verifier: Box::new(HardenedVerifier::new()),
         }
     }
 

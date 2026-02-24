@@ -138,20 +138,26 @@ repo.seal(summary="42 tests passing", agent_id="test-bot", spec_id="test-suite",
 
 ### Convergence
 
-When specs overlap, convergence handles the merge. The algorithm is built on a core principle: **compose, don't choose.** Multi-agent work is fundamentally additive — agents build complementary features, not competing implementations. Convergence treats conflicts as opportunities for composition rather than selection.
+When specs overlap, convergence handles the merge. Git merges lines. Writ merges *meaning*.
 
-The engine uses a layered resolution pipeline. Early layers handle structurally safe cases, additive insertions, import accumulation, decorator preservation, superset detection, with high confidence and zero content loss. Only genuinely irreconcilable conflicts (two agents rewrote the same function body differently) fall through to the strategy layer, where the human or orchestrator decides.
+The convergence engine understands code structurally — it knows the difference between an import, a function definition, and a statement. When two agents both add imports to the same file, writ doesn't see a "conflict" — it sees two additive changes and composes them. When two agents modify the same function body differently, writ knows that's a real conflict and escalates it with full context.
+
+The core principle: **compose, don't choose.** Multi-agent work is fundamentally additive. Agents build complementary features, not competing implementations. The engine has language-aware analyzers for Python, Rust, Go, TypeScript, and JavaScript, with graceful fallback for everything else.
+
+The resolution pipeline is layered and auditable. Deterministic structural patterns handle the common cases with high confidence. Spec-aware resolution uses writ's first-class spec and seal metadata — file scope, acceptance criteria, design notes — to make informed decisions that no other VCS can make. Every resolution is tagged with its method and confidence score, so you always know *how* and *why* a merge decision was made.
+
+Post-merge verification catches structural damage automatically — duplicate definitions, unbalanced delimiters, content loss, leftover conflict markers — before bad merges reach the working tree. The engine rejects broken output rather than silently applying it.
 
 ```bash
-# Merge ALL diverged branches at once
-writ converge-all --apply --strategy most-recent
+# Merge ALL diverged branches at once — escalate what can't be auto-resolved
+writ converge-all --apply --strategy escalate
 
 # Or leave irreconcilable conflicts for manual review
 writ converge-all --apply --strategy manual
 ```
 
 ```python
-report = repo.converge_all(strategy="most-recent", apply=True)
+report = repo.converge_all(strategy="escalate", apply=True)
 print(f"Merged {len(report['merge_order'])} branches")
 print(f"Auto-merged: {report['total_auto_merged']}, Resolved: {report['total_resolutions']}")
 
@@ -160,9 +166,7 @@ if report.get("quality_report"):
     print(f"Quality score: {qr['quality_score']}/100 — {qr['summary']}")
 ```
 
-Post convergence validation catches structural damage automatically, content loss, bracket imbalance, orphaned imports, so bad merges surface immediately rather than silently breaking the project.
-
-Conflicts are structured JSON — not `<<<<` markers — so orchestrator agents can resolve them programmatically.
+Conflicts are structured JSON — not `<<<<` markers — so orchestrator agents can resolve them programmatically. Merge ordering is optimized automatically: specs that touch disjoint files merge first, minimizing conflict complexity for the overlapping cases that follow.
 
 ### Integration risk
 
@@ -280,7 +284,7 @@ writ/
 
 **Storage:** Content-addressable object store (SHA-256, same architecture as git but with SHA-256 instead of SHA-1). Atomic writes (temp + fsync + rename). Hash verification on retrieve. Advisory file locking for concurrency.
 
-**Test coverage:** 331 Rust + 231 Python = 562 tests across core, CLI, and bindings.
+**Test coverage:** 655+ Rust + 231 Python = 886+ tests across core, CLI, and bindings.
 
 ## CLI reference
 
@@ -295,7 +299,7 @@ writ finish                           # one-command: summary → git add → git
 writ finish --full                    # same, but with PR-style commit body
 writ finish --dry-run                 # preview without committing
 writ converge LEFT RIGHT [--apply]    # two-spec convergence
-writ converge-all --apply --strategy  # merge all diverged branches (manual, most-recent, orchestrator)
+writ converge-all --apply --strategy  # merge all diverged branches (escalate, manual, orchestrator)
 writ spec add --id ID --title "..."   # register a spec
 writ spec status                      # show all specs and their status
 writ state                            # working directory changes
@@ -327,7 +331,7 @@ pytest tests/
 ### Shipped
 
 - **Round-trip workflow.** `writ install` → agents work → `writ summary --format commit` → git commit.
-- **Convergence engine.** Layered resolution pipeline: three-way merge → region classification → structural pattern matching → strategy fallback. Compose-not-choose philosophy preserves all agents' contributions. Post-convergence validation catches content loss, bracket imbalance, and orphaned imports.
+- **Convergence engine v2.** Six-phase pipeline: structural diff → classification → deterministic resolution → spec-aware resolution → LLM-assisted resolution → post-merge verification. Language-aware analyzers for Python, Rust, Go, TypeScript, and JavaScript. Compose-not-choose philosophy preserves all agents' contributions. Hardened verification catches broken merges before they reach the working tree. Optimized N-agent merge ordering minimizes conflict complexity. Full audit trail with per-resolution method and confidence scoring.
 - **Integration risk.** Automatic risk scoring (low/medium/high) from divergence, file contention, and scope violations.
 - **File contention map.** Files touched by 2+ agents surfaced in context, sorted by agent count.
 - **Agent activity tracking.** Per-agent file ownership, seal counts, latest work — across all branches including diverged ones.

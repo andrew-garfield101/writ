@@ -253,6 +253,28 @@ fn sanity_check(merged: &str, conflict: &ClassifiedConflict, file_path: &str) ->
 }
 
 // ---------------------------------------------------------------------------
+// No-op backend (default when no real LLM is configured)
+// ---------------------------------------------------------------------------
+
+/// A no-op backend that always returns `None`.
+///
+/// Used as the default when no real LLM provider is configured.
+/// The pipeline gate (`enable_phase5_llm`) prevents Phase 5 from running,
+/// but this ensures the resolver is structurally real and ready to swap in
+/// a real backend via `set_llm_resolver()`.
+pub struct NoOpBackend;
+
+impl LlmBackend for NoOpBackend {
+    fn complete(&self, _prompt: &str) -> Option<String> {
+        None
+    }
+
+    fn model_name(&self) -> &str {
+        "none"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // StructuredLlmResolver — Real implementation
 // ---------------------------------------------------------------------------
 

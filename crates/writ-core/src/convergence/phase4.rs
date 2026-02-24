@@ -13,7 +13,7 @@
 //!    doesn't, prefer the in-scope agent's changes.
 //! 2. **Delete Confirmation** (0.85) — for DeleteVsModify, check which
 //!    spec explicitly references the file to determine intent.
-//! 3. **Intent Compatibility** (0.80) — if both seals describe non-conflicting
+//! 3. **Intent Compatibility** (0.85) — if both seals describe non-conflicting
 //!    intents and Phase 3 suggested a composition, confirm it.
 //! 4. **Spec Priority** (stubbed) — reserved for future priority ordering.
 
@@ -23,7 +23,7 @@ use super::types::*;
 /// Confidence scores for each resolution rule.
 const SCOPE_AUTHORITY_CONFIDENCE: f64 = 0.90;
 const DELETE_CONFIRMATION_CONFIDENCE: f64 = 0.85;
-const INTENT_COMPATIBILITY_CONFIDENCE: f64 = 0.80;
+const INTENT_COMPATIBILITY_CONFIDENCE: f64 = 0.85;
 
 /// The spec-aware resolver implementing Phase 4 of the convergence pipeline.
 ///
@@ -368,7 +368,13 @@ fn truncate(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
         s
     } else {
-        &s[..max_len]
+        // Find the largest valid char boundary at or before max_len
+        // to avoid panicking on multi-byte UTF-8 characters.
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
     }
 }
 
@@ -672,7 +678,7 @@ mod tests {
         assert!(result.is_some());
         let proposal = result.unwrap();
         assert_eq!(proposal.pattern_name, "spec_intent_compatibility");
-        assert!((proposal.confidence - 0.80).abs() < f64::EPSILON);
+        assert!((proposal.confidence - 0.85).abs() < f64::EPSILON);
         assert_eq!(proposal.merged_content, suggestion.merged_content);
     }
 
@@ -845,5 +851,24 @@ mod tests {
             "Added token validation to auth module",
             "Added rate limiting wrapper to auth module",
         ));
+    }
+
+    #[test]
+    fn test_truncate_ascii() {
+        assert_eq!(truncate("hello world", 5), "hello");
+        assert_eq!(truncate("short", 100), "short");
+    }
+
+    #[test]
+    fn test_truncate_multibyte_utf8() {
+        // Each emoji is 4 bytes. "Hi 👋🌍" = 3 ASCII + 4 + 4 = 11 bytes.
+        let s = "Hi 👋🌍";
+        // Truncating at 5 lands inside the first emoji (bytes 3..7).
+        // Should back up to byte 3 (the space boundary).
+        let result = truncate(s, 5);
+        assert_eq!(result, "Hi ");
+        // Truncating at 7 should capture "Hi 👋" (exactly on boundary).
+        let result = truncate(s, 7);
+        assert_eq!(result, "Hi 👋");
     }
 }

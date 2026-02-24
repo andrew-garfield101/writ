@@ -17,6 +17,7 @@ use std::time::Instant;
 
 use super::analyzers;
 use super::patterns::{PatternRegistry, PatternResult};
+use super::phase5::{NoOpBackend, StructuredLlmResolver};
 use super::phase6::HardenedVerifier;
 use super::types::*;
 
@@ -173,8 +174,10 @@ pub trait Verifier: Send + Sync {
 // Default Stub Implementations
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 struct StubLlmResolver;
 
+#[allow(dead_code)]
 impl LlmResolver for StubLlmResolver {
     fn resolve(
         &self,
@@ -266,7 +269,7 @@ impl ConvergencePipeline {
             config,
             pattern_registry,
             spec_resolver: Box::new(super::phase4::SpecAwareResolver),
-            llm_resolver: Box::new(StubLlmResolver),
+            llm_resolver: Box::new(StructuredLlmResolver::new(Box::new(NoOpBackend))),
             verifier: Box::new(HardenedVerifier::new()),
         }
     }

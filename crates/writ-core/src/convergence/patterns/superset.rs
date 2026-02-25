@@ -2,8 +2,9 @@
 //!
 //! When one side's content is a strict superset of the other's
 //! (contains everything the other has, plus more), propose the
-//! superset. Confidence is deliberately low (0.70) because the
-//! smaller side may have intentionally removed content.
+//! superset. In multi-agent workflows this is the common case:
+//! a later agent built on an earlier agent's work. Confidence
+//! is 0.88 (above auto-resolve) with a review warning.
 
 use super::Pattern;
 use crate::convergence::types::{ClassifiedConflict, ConflictType, ResolutionProposal};
@@ -18,7 +19,7 @@ impl Pattern for SupersetContainment {
     }
 
     fn applies_to(&self) -> &[ConflictType] {
-        &[ConflictType::BothModified]
+        &[ConflictType::BothModified, ConflictType::BothInserted]
     }
 
     fn matches(&self, conflict: &ClassifiedConflict) -> bool {
@@ -57,7 +58,7 @@ impl Pattern for SupersetContainment {
                 .join("\n");
             Some(ResolutionProposal {
                 pattern_name: self.name().into(),
-                confidence: 0.70,
+                confidence: 0.88,
                 merged_content: content,
                 explanation: "Left side is a strict superset of right side".into(),
                 warnings: vec![
@@ -74,7 +75,7 @@ impl Pattern for SupersetContainment {
                 .join("\n");
             Some(ResolutionProposal {
                 pattern_name: self.name().into(),
-                confidence: 0.70,
+                confidence: 0.88,
                 merged_content: content,
                 explanation: "Right side is a strict superset of left side".into(),
                 warnings: vec![
@@ -126,7 +127,7 @@ mod tests {
         );
         let proposal = pattern.resolve(&conflict).unwrap();
         assert!(proposal.merged_content.contains("line3"));
-        assert!((proposal.confidence - 0.70).abs() < f64::EPSILON);
+        assert!((proposal.confidence - 0.88).abs() < f64::EPSILON);
         assert!(proposal.explanation.contains("Left"));
     }
 

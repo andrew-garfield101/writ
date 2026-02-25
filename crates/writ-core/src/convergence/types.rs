@@ -169,6 +169,34 @@ pub enum ConflictScope {
     Mixed,
 }
 
+impl ConflictScope {
+    /// Determine the conflict scope from the unit kinds on both sides.
+    /// Whitespace should be filtered out before calling this.
+    pub fn from_unit_kinds(left_kinds: &[UnitKind], right_kinds: &[UnitKind]) -> Self {
+        let mut all_kinds: Vec<&UnitKind> = left_kinds.iter().chain(right_kinds.iter()).collect();
+        all_kinds.dedup_by(|a, b| a == b);
+
+        if all_kinds.is_empty() {
+            return ConflictScope::Mixed;
+        }
+
+        if all_kinds.iter().all(|k| matches!(k, UnitKind::Import)) {
+            return ConflictScope::Import;
+        }
+        if all_kinds.iter().all(|k| matches!(k, UnitKind::Definition)) {
+            return ConflictScope::Definition;
+        }
+        if all_kinds
+            .iter()
+            .all(|k| matches!(k, UnitKind::Statement | UnitKind::Block))
+        {
+            return ConflictScope::IntraFunction;
+        }
+
+        ConflictScope::Mixed
+    }
+}
+
 /// A fully classified conflict, ready for Phase 3+ resolution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClassifiedConflict {

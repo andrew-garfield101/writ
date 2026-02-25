@@ -22,6 +22,7 @@
 //! - [`patterns`] — Pattern trait + PatternRegistry for deterministic resolution
 
 pub mod analyzers;
+pub mod decompose;
 pub mod diff3;
 pub mod patterns;
 pub mod phase1;
@@ -1469,7 +1470,8 @@ pub fn resolve_conflict_regions(
                 let all_imports =
                     is_import_region(&region.left_lines) && is_import_region(&region.right_lines);
 
-                let lines = if all_imports {
+                // Determine resolution strategy and method together.
+                let (lines, method) = if all_imports {
                     // Check if JS/TS for source-module grouping.
                     let combined: Vec<String> = region
                         .left_lines
@@ -1479,7 +1481,7 @@ pub fn resolve_conflict_regions(
                         .collect();
                     let lang = detect_import_language(&combined);
 
-                    match lang {
+                    let merged = match lang {
                         ImportLanguage::JavaScript => {
                             merge_js_imports(&region.left_lines, &region.right_lines)
                         }
@@ -1503,7 +1505,19 @@ pub fn resolve_conflict_regions(
                             l.retain(|line| seen.insert(line.clone()));
                             l
                         }
-                    }
+                    };
+                    (merged, "import-accumulation")
+                } else if let Some(superset_side) =
+                    detect_superset(&region.left_lines, &region.right_lines)
+                {
+                    // One side contains everything the other has plus more.
+                    // Use the superset instead of concatenating (which would
+                    // produce duplicate definitions/routes/etc).
+                    let lines = match superset_side {
+                        MergeSide::Left => region.left_lines.clone(),
+                        MergeSide::Right => region.right_lines.clone(),
+                    };
+                    (lines, "superset-detected")
                 } else {
                     let mut l = Vec::new();
                     if left_first {
@@ -1513,13 +1527,7 @@ pub fn resolve_conflict_regions(
                         l.extend(region.right_lines.iter().cloned());
                         l.extend(region.left_lines.iter().cloned());
                     }
-                    l
-                };
-
-                let method = if all_imports {
-                    "import-accumulation"
-                } else {
-                    "concatenated"
+                    (l, "concatenated")
                 };
 
                 resolved_regions.push(RegionResolution {
@@ -1573,6 +1581,25 @@ pub fn resolve_conflict_regions(
                         && right_lines[..base_lines.len()] == base_lines[..];
 
                     if left_additive && right_additive {
+                        // Check superset first: if one side's additions contain
+                        // everything the other added plus more, use the superset
+                        // instead of blindly concatenating (which duplicates).
+                        if let Some(superset_side) =
+                            detect_superset(&region.left_lines, &region.right_lines)
+                        {
+                            let lines = match superset_side {
+                                MergeSide::Left => region.left_lines.clone(),
+                                MergeSide::Right => region.right_lines.clone(),
+                            };
+                            resolved_regions.push(RegionResolution {
+                                lines,
+                                class: class.clone(),
+                                method: "superset-detected".to_string(),
+                                confidence: 0.95,
+                            });
+                            continue;
+                        }
+
                         let mut l = Vec::new();
                         if left_first {
                             l.extend(region.left_lines.iter().cloned());
@@ -2190,6 +2217,10 @@ pub struct ConvergeAllReport {
     /// Post-convergence quality assessment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quality_report: Option<ConvergenceQualityReport>,
+    /// Files changed by convergence (paths relative to repo root).
+    /// Callers creating convergence seals should include these.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub files_changed: Vec<String>,
 }
 
 /// Result of a single merge step in `converge_all`.
@@ -4700,5 +4731,67 @@ class Config:
         ];
         let order = compute_merge_order(&candidates, &hs(&["a.rs", "b.rs"]));
         assert_eq!(order[0], "empty", "empty spec has 0 overlap, goes first");
+    }
+
+    // ── BothInserted superset regression tests ──────────────────────
+
+    /// When both sides insert content and one is a superset, the v1
+    /// resolver should use the superset instead of concatenating.
+    #[test]
+    fn test_both_inserted_superset_avoids_duplication() {
+        let base = "from flask import Flask\napp = Flask(__name__)\n";
+        let left =
+            "from flask import Flask\napp = Flask(__name__)\n\n@app.route('/inv')\ndef inv():\n    return 'inv'\n";
+        let right =
+            "from flask import Flask\napp = Flask(__name__)\n\n@app.route('/inv')\ndef inv():\n    return 'inv'\n\n@app.route('/auth')\ndef auth():\n    return 'auth'\n";
+
+        let result = match three_way_merge(base, left, right) {
+            FileMergeResult::Clean(c) => c,
+            FileMergeResult::Conflict(regions) => {
+                let resolved =
+                    resolve_conflict_regions("app.py", base, left, right, &regions, "inv", "auth");
+                assert!(
+                    resolved.fully_resolved,
+                    "should resolve, got content:\n{}",
+                    resolved.content
+                );
+                resolved.content
+            }
+        };
+
+        // Right is a superset of left — should contain both routes.
+        assert!(result.contains("/inv"), "inv route must survive");
+        assert!(result.contains("/auth"), "auth route must survive");
+
+        // Must NOT have duplicates.
+        let flask_count = result.matches("Flask(__name__)").count();
+        assert_eq!(
+            flask_count, 1,
+            "only 1 Flask app, got {flask_count} in:\n{result}"
+        );
+        let inv_count = result.matches("def inv():").count();
+        assert_eq!(
+            inv_count, 1,
+            "only 1 inv() definition, got {inv_count} in:\n{result}"
+        );
+    }
+
+    /// Pure concatenation should still work when neither side is a superset.
+    #[test]
+    fn test_both_inserted_non_superset_still_concatenates() {
+        let base = "header\n";
+        let left = "header\nleft-only-content\n";
+        let right = "header\nright-only-content\n";
+
+        match three_way_merge(base, left, right) {
+            FileMergeResult::Clean(_) => {} // may cleanly merge
+            FileMergeResult::Conflict(regions) => {
+                let resolved =
+                    resolve_conflict_regions("file.txt", base, left, right, &regions, "a", "b");
+                // Both sides' unique content should be present.
+                assert!(resolved.content.contains("left-only-content"));
+                assert!(resolved.content.contains("right-only-content"));
+            }
+        }
     }
 }

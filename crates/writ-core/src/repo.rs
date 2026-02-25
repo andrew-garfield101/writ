@@ -2356,9 +2356,21 @@ impl Repository {
         strategy: ConvergeStrategy,
         apply: bool,
     ) -> WritResult<ConvergeAllReport> {
-        let diverged = self.diverged_branches()?;
+        // ── All-spec convergence ─────────────────────────────────────────
+        // Collect ALL specs with sealed work, not just diverged ones.
+        // Sequential sealing puts all seals on the HEAD chain, so
+        // diverged_branches() misses specs that still need N-way merging.
+        let specs = self.list_specs()?;
+        let specs_with_work: Vec<&Spec> =
+            specs.iter().filter(|s| !s.sealed_by.is_empty()).collect();
 
-        if diverged.is_empty() {
+        let diverged = self.diverged_branches()?;
+        let diverged_ids: HashSet<String> = diverged.iter().map(|b| b.spec_id.clone()).collect();
+
+        // Nothing to converge if fewer than 2 specs have work AND nothing
+        // is diverged. (A single spec with diverged branches still needs
+        // merging.)
+        if specs_with_work.len() < 2 && diverged.is_empty() {
             return Ok(ConvergeAllReport {
                 base_spec: String::new(),
                 merge_order: Vec::new(),
@@ -2373,16 +2385,14 @@ impl Repository {
                 warnings: Vec::new(),
                 escalations: Vec::new(),
                 quality_report: None,
+                files_changed: Vec::new(),
             });
         }
 
-        // Collect diverged branches and find base spec.
-        let mut ordered: Vec<_> = diverged.into_iter().collect();
-
-        // Find a base spec that IS on the HEAD chain.
-        let specs = self.list_specs()?;
-        let diverged_ids: HashSet<String> = ordered.iter().map(|b| b.spec_id.clone()).collect();
-        let on_head: Vec<_> = specs
+        // ── Choose a base spec ──────────────────────────────────────────
+        // Prefer an on-HEAD, complete spec with sealed work as the base.
+        // Its tree becomes the initial accumulated state.
+        let on_head: Vec<_> = specs_with_work
             .iter()
             .filter(|s| {
                 !diverged_ids.contains(&s.id)
@@ -2392,23 +2402,81 @@ impl Repository {
 
         let base_spec = if let Some(s) = on_head.first() {
             s.id.clone()
-        } else {
-            // No on-head spec — pick the one with most seals as base.
-            ordered.sort_by(|a, b| {
-                b.seal_count
-                    .cmp(&a.seal_count)
-                    .then_with(|| a.spec_id.cmp(&b.spec_id))
+        } else if !specs_with_work.is_empty() {
+            // No on-head complete spec. Pick the spec with the most seals
+            // as the base (it has the most context).
+            let mut sorted: Vec<_> = specs_with_work.iter().collect();
+            sorted.sort_by(|a, b| {
+                b.sealed_by
+                    .len()
+                    .cmp(&a.sealed_by.len())
+                    .then_with(|| a.id.cmp(&b.id))
             });
-            if let Some(first) = ordered.first() {
-                let id = first.spec_id.clone();
-                ordered.remove(0);
-                id
-            } else {
-                return Err(WritError::Other(
-                    "No specs available for convergence base".to_string(),
-                ));
-            }
+            sorted[0].id.clone()
+        } else {
+            return Err(WritError::Other(
+                "No specs available for convergence base".to_string(),
+            ));
         };
+
+        // ── Build ordered merge list from ALL non-base specs ────────────
+        // Include diverged specs AND non-diverged specs with sealed work.
+        // This ensures every spec's contributions participate in the merge.
+        let mut ordered: Vec<DivergedBranch> = Vec::new();
+
+        // Add diverged specs.
+        for branch in &diverged {
+            if branch.spec_id != base_spec {
+                ordered.push(branch.clone());
+            }
+        }
+
+        // Add non-diverged specs with work (excluding base and already-
+        // included diverged specs).
+        for spec in &specs_with_work {
+            if spec.id == base_spec || diverged_ids.contains(&spec.id) {
+                continue;
+            }
+            let agents: Vec<String> = spec
+                .sealed_by
+                .iter()
+                .filter_map(|sid| self.load_seal(sid).ok())
+                .map(|s| s.agent.id.clone())
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            let tip = spec
+                .sealed_by
+                .last()
+                .map(|s| s[..12.min(s.len())].to_string())
+                .unwrap_or_default();
+            ordered.push(DivergedBranch {
+                spec_id: spec.id.clone(),
+                tip_seal: tip,
+                seal_count: spec.sealed_by.len(),
+                agents,
+            });
+        }
+
+        // After including all specs, if nothing to merge, return early.
+        if ordered.is_empty() {
+            return Ok(ConvergeAllReport {
+                base_spec,
+                merge_order: Vec::new(),
+                merges: Vec::new(),
+                strategy: strategy_name(strategy),
+                total_auto_merged: 0,
+                total_conflicts: 0,
+                total_resolutions: 0,
+                is_clean: true,
+                degraded: false,
+                applied: false,
+                warnings: Vec::new(),
+                escalations: Vec::new(),
+                quality_report: None,
+                files_changed: Vec::new(),
+            });
+        }
 
         // ── N-agent merge ordering (T9) ──────────────────────────────────
         // Build MergeCandidates with file overlap data, then compute an
@@ -3118,6 +3186,11 @@ impl Repository {
             total_resolutions,
         );
 
+        // Collect the list of files changed by convergence so callers can
+        // create accurate convergence seals.
+        let mut files_changed: Vec<String> = accumulated.keys().cloned().collect();
+        files_changed.sort();
+
         Ok(ConvergeAllReport {
             base_spec,
             merge_order,
@@ -3132,6 +3205,7 @@ impl Repository {
             warnings,
             escalations: all_escalations,
             quality_report: Some(quality_report),
+            files_changed,
         })
     }
 
@@ -5365,6 +5439,97 @@ fn build_quality_report(
         }
     }
 
+    // Check for duplicate definitions in applied code files.
+    // Catches duplicate `def`, `class`, `fn`, `struct`, `function`, `const` etc.
+    if apply {
+        let mut dup_def_values: Vec<FileMetricValue> = Vec::new();
+        let mut any_dup_defs = false;
+
+        for d in &file_decisions {
+            let ext = Path::new(&d.path)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("");
+            if !matches!(ext, "py" | "rs" | "go" | "js" | "ts" | "tsx" | "jsx" | "rb") {
+                continue;
+            }
+            let full = root.join(&d.path);
+            if let Ok(content) = fs::read_to_string(&full) {
+                let mut def_names: Vec<String> = Vec::new();
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    // Python: def foo(...) / class Foo
+                    // Rust: fn foo / struct Foo / enum Foo
+                    // Go: func foo
+                    // JS/TS: function foo / class Foo / const foo =
+                    let name = if let Some(rest) = trimmed.strip_prefix("def ") {
+                        rest.split('(').next().map(|s| format!("def:{}", s.trim()))
+                    } else if let Some(rest) = trimmed.strip_prefix("class ") {
+                        rest.split(['(', ':', '{', ' '])
+                            .next()
+                            .map(|s| format!("class:{}", s.trim()))
+                    } else if let Some(rest) = trimmed.strip_prefix("fn ") {
+                        rest.split(['(', '<'])
+                            .next()
+                            .map(|s| format!("fn:{}", s.trim()))
+                    } else if let Some(rest) = trimmed.strip_prefix("pub fn ") {
+                        rest.split(['(', '<'])
+                            .next()
+                            .map(|s| format!("fn:{}", s.trim()))
+                    } else if let Some(rest) = trimmed.strip_prefix("struct ") {
+                        rest.split(['{', '(', '<', ' '])
+                            .next()
+                            .map(|s| format!("struct:{}", s.trim()))
+                    } else if let Some(rest) = trimmed.strip_prefix("pub struct ") {
+                        rest.split(['{', '(', '<', ' '])
+                            .next()
+                            .map(|s| format!("struct:{}", s.trim()))
+                    } else if let Some(rest) = trimmed.strip_prefix("function ") {
+                        rest.split('(')
+                            .next()
+                            .map(|s| format!("function:{}", s.trim()))
+                    } else {
+                        None
+                    };
+                    if let Some(n) = name {
+                        if !n.ends_with(':') {
+                            def_names.push(n);
+                        }
+                    }
+                }
+
+                let mut seen = HashSet::new();
+                let dup_count = def_names
+                    .iter()
+                    .filter(|n| !seen.insert(n.as_str()))
+                    .count();
+                if dup_count > 0 {
+                    any_dup_defs = true;
+                }
+                dup_def_values.push(FileMetricValue {
+                    path: d.path.clone(),
+                    value: dup_count,
+                });
+            }
+        }
+
+        if !dup_def_values.is_empty() {
+            consistency_checks.push(ConsistencyCheck {
+                metric: "duplicate_definitions".to_string(),
+                values: dup_def_values,
+                consistent: !any_dup_defs,
+                warning: if any_dup_defs {
+                    Some(
+                        "one or more files contain duplicate definitions (functions, classes, structs) — likely merge corruption"
+                            .to_string(),
+                    )
+                } else {
+                    None
+                },
+            });
+        }
+    }
+
     // Check for duplicate imports in applied files.
     if apply {
         let mut dup_import_values: Vec<FileMetricValue> = Vec::new();
@@ -5571,6 +5736,7 @@ fn build_quality_report(
             let penalty = match check.metric.as_str() {
                 "bracket_balance" => 25,
                 "cross_file_reference_integrity" => 25,
+                "duplicate_definitions" => 30,
                 "duplicate_imports" => 5,
                 "unused_imports" => 3,
                 _ => 10,
@@ -18059,6 +18225,400 @@ mod sprint14_reporting_tests {
         );
     }
 
+    // ── Regression tests for all-spec convergence (TR20 bug fix) ─────
+
+    /// Regression: sequential single-seal agents must all participate in
+    /// convergence, not just diverged ones. Before the fix, converge_all
+    /// only processed specs whose head was off the HEAD chain. Sequential
+    /// sealing puts ALL seals on the chain, so non-base specs were
+    /// silently excluded — their files were never merged.
+    #[test]
+    fn test_converge_all_includes_non_diverged_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline seal (no spec).
+        fs::write(dir.path().join("base.txt"), "baseline\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // 3 specs, each agent seals exactly ONCE (sequential, no divergence).
+        repo.add_spec(&Spec::new(
+            "inventory".into(),
+            "Inventory".into(),
+            "".into(),
+        ))
+        .unwrap();
+        repo.add_spec(&Spec::new("auth".into(), "Auth".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("orders".into(), "Orders".into(), "".into()))
+            .unwrap();
+
+        // Agent A: inventory (seals first)
+        fs::write(dir.path().join("inventory.py"), "class Inventory: pass\n").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "inv-dev".into(),
+                agent_type: AgentType::Agent,
+            },
+            "add inventory".into(),
+            Some("inventory".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "inventory",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Agent B: auth (seals second — no divergence, HEAD chain grows)
+        fs::write(dir.path().join("auth.py"), "class Auth: pass\n").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "auth-dev".into(),
+                agent_type: AgentType::Agent,
+            },
+            "add auth".into(),
+            Some("auth".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "auth",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Agent C: orders (seals last — still no divergence)
+        fs::write(dir.path().join("orders.py"), "class Orders: pass\n").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "orders-dev".into(),
+                agent_type: AgentType::Agent,
+            },
+            "add orders".into(),
+            Some("orders".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "orders",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Verify no divergence (the old bug: empty diverged = no merge).
+        let diverged = repo.diverged_branches().unwrap();
+        assert!(diverged.is_empty(), "sequential seals should not diverge");
+
+        // converge_all must still include ALL 3 specs.
+        let report = repo.converge_all(ConvergeStrategy::Escalate, true).unwrap();
+
+        // The merge_order should include 2 non-base specs.
+        assert_eq!(
+            report.merge_order.len(),
+            2,
+            "all non-base specs must participate, got: {:?}",
+            report.merge_order
+        );
+        assert!(report.is_clean);
+        assert!(report.applied);
+
+        // All 3 agent files should be on disk after convergence.
+        assert!(
+            dir.path().join("inventory.py").exists(),
+            "inventory.py must exist"
+        );
+        assert!(dir.path().join("auth.py").exists(), "auth.py must exist");
+        assert!(
+            dir.path().join("orders.py").exists(),
+            "orders.py must exist"
+        );
+    }
+
+    /// Regression: 3 sequential agents all modify the same shared file.
+    /// Before the fix, only the base spec's version survived. Now all
+    /// contributions should be composed via three-way merge.
+    #[test]
+    fn test_converge_all_sequential_shared_file_all_preserved() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline with a shared file.
+        fs::write(
+            dir.path().join("app.py"),
+            "from flask import Flask\napp = Flask(__name__)\n",
+        )
+        .unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("inv".into(), "Inventory".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("auth".into(), "Auth".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("orders".into(), "Orders".into(), "".into()))
+            .unwrap();
+
+        // Agent A: adds inventory route. Seals first.
+        fs::write(
+            dir.path().join("app.py"),
+            "from flask import Flask\napp = Flask(__name__)\n\n@app.route('/inventory')\ndef inventory():\n    return 'inv'\n",
+        )
+        .unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "inv-dev".into(),
+                agent_type: AgentType::Agent,
+            },
+            "add inventory route".into(),
+            Some("inv".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "inv",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Agent B: adds auth route (includes inv's route because disk
+        // was written before this agent sealed).
+        fs::write(
+            dir.path().join("app.py"),
+            "from flask import Flask\napp = Flask(__name__)\n\n@app.route('/inventory')\ndef inventory():\n    return 'inv'\n\n@app.route('/auth')\ndef auth():\n    return 'auth'\n",
+        )
+        .unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "auth-dev".into(),
+                agent_type: AgentType::Agent,
+            },
+            "add auth route".into(),
+            Some("auth".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "auth",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Agent C: adds orders route (includes inv + auth routes).
+        fs::write(
+            dir.path().join("app.py"),
+            "from flask import Flask\napp = Flask(__name__)\n\n@app.route('/inventory')\ndef inventory():\n    return 'inv'\n\n@app.route('/auth')\ndef auth():\n    return 'auth'\n\n@app.route('/orders')\ndef orders():\n    return 'orders'\n",
+        )
+        .unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "orders-dev".into(),
+                agent_type: AgentType::Agent,
+            },
+            "add orders route".into(),
+            Some("orders".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.update_spec(
+            "orders",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let report = repo.converge_all(ConvergeStrategy::Escalate, true).unwrap();
+
+        assert!(report.is_clean, "should converge cleanly");
+        assert!(report.applied);
+        assert_eq!(
+            report.merge_order.len(),
+            2,
+            "2 non-base specs in merge_order"
+        );
+
+        // The final app.py must contain ALL three routes.
+        let content = fs::read_to_string(dir.path().join("app.py")).unwrap();
+        assert!(
+            content.contains("/inventory"),
+            "inventory route must survive convergence, got:\n{content}"
+        );
+        assert!(
+            content.contains("/auth"),
+            "auth route must survive convergence, got:\n{content}"
+        );
+        assert!(
+            content.contains("/orders"),
+            "orders route must survive convergence, got:\n{content}"
+        );
+
+        // Must NOT have duplicate Flask app instances.
+        let flask_count = content.matches("Flask(__name__)").count();
+        assert_eq!(
+            flask_count, 1,
+            "only 1 Flask app instance, got {flask_count} in:\n{content}"
+        );
+    }
+
+    /// Verify that converge_all populates files_changed in the report
+    /// so callers can create accurate convergence seals.
+    #[test]
+    fn test_converge_all_files_changed_populated() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline with shared file.
+        fs::write(dir.path().join("app.py"), "base\n").unwrap();
+        let setup = AgentIdentity {
+            id: "setup".into(),
+            agent_type: AgentType::Agent,
+        };
+        repo.seal(
+            setup,
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("a".into(), "A".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("b".into(), "B".into(), "".into()))
+            .unwrap();
+
+        // Agent A: modifies shared file + adds new file.
+        fs::write(dir.path().join("app.py"), "base\nfrom_a\n").unwrap();
+        fs::write(dir.path().join("a_only.py"), "a stuff\n").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "a-dev".into(),
+                agent_type: AgentType::Agent,
+            },
+            "a work".into(),
+            Some("a".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent B: modifies shared file + adds new file.
+        fs::write(dir.path().join("app.py"), "base\nfrom_a\nfrom_b\n").unwrap();
+        fs::write(dir.path().join("b_only.py"), "b stuff\n").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "b-dev".into(),
+                agent_type: AgentType::Agent,
+            },
+            "b work".into(),
+            Some("b".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo.converge_all(ConvergeStrategy::Escalate, true).unwrap();
+        assert!(report.applied);
+        // files_changed should contain the files that convergence modified.
+        assert!(
+            !report.files_changed.is_empty(),
+            "files_changed should be populated, got empty"
+        );
+        // app.py should be in the changed list (it was a conflict file).
+        assert!(
+            report.files_changed.contains(&"app.py".to_string()),
+            "app.py should be in files_changed, got: {:?}",
+            report.files_changed
+        );
+    }
+
+    /// Regression: converge_all with only 1 spec and no diverged branches
+    /// should still return early (nothing to merge).
+    #[test]
+    fn test_converge_all_single_spec_returns_early() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "content\n").unwrap();
+        repo.add_spec(&Spec::new("solo".into(), "Solo".into(), "".into()))
+            .unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "dev".into(),
+                agent_type: AgentType::Agent,
+            },
+            "work".into(),
+            Some("solo".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo.converge_all(ConvergeStrategy::Manual, false).unwrap();
+        assert!(report.is_clean);
+        assert!(
+            report.merges.is_empty(),
+            "single spec should have no merges"
+        );
+    }
+
     #[test]
     fn test_degraded_true_when_most_recent_discards_content() {
         let dir = tempdir().unwrap();
@@ -18411,6 +18971,86 @@ mod sprint14_reporting_tests {
                 check.consistent,
                 "User is used as whole word — should not be flagged as unused",
             );
+        }
+    }
+
+    /// Quality report should detect duplicate definitions (functions, classes)
+    /// in merged files and penalize the score.
+    #[test]
+    fn test_quality_report_duplicate_definitions_detected() {
+        let dir = tempdir().unwrap();
+
+        // File with duplicate function definition — typical merge corruption.
+        fs::write(
+            dir.path().join("app.py"),
+            "def main():\n    print('a')\n\ndef main():\n    print('b')\n",
+        )
+        .unwrap();
+
+        let decisions = vec![FileDecision {
+            path: "app.py".into(),
+            decision: "auto-resolved".into(),
+            chosen_spec: Some("s1".into()),
+            chosen_lines: 5,
+            alternatives: vec![],
+            confidence: Some(0.88),
+        }];
+
+        let report = build_quality_report(decisions, dir.path(), true, 1, 1);
+
+        let dup_check = report
+            .consistency_checks
+            .iter()
+            .find(|c| c.metric == "duplicate_definitions");
+        assert!(
+            dup_check.is_some(),
+            "duplicate_definitions check should be present"
+        );
+        let check = dup_check.unwrap();
+        assert!(
+            !check.consistent,
+            "should flag duplicate def main() as inconsistent"
+        );
+        assert!(
+            check.warning.is_some(),
+            "should have a warning about duplicates"
+        );
+        // Score should be penalized (30 points for dup defs).
+        assert!(
+            report.quality_score <= 70,
+            "score should be <= 70 with duplicate defs, got {}",
+            report.quality_score
+        );
+    }
+
+    /// Quality report should pass when no duplicate definitions exist.
+    #[test]
+    fn test_quality_report_no_duplicate_definitions_passes() {
+        let dir = tempdir().unwrap();
+
+        fs::write(
+            dir.path().join("app.py"),
+            "def foo():\n    pass\n\ndef bar():\n    pass\n",
+        )
+        .unwrap();
+
+        let decisions = vec![FileDecision {
+            path: "app.py".into(),
+            decision: "auto-merged".into(),
+            chosen_spec: None,
+            chosen_lines: 5,
+            alternatives: vec![],
+            confidence: Some(1.0),
+        }];
+
+        let report = build_quality_report(decisions, dir.path(), true, 0, 0);
+
+        let dup_check = report
+            .consistency_checks
+            .iter()
+            .find(|c| c.metric == "duplicate_definitions");
+        if let Some(check) = dup_check {
+            assert!(check.consistent, "no duplicate defs — should be consistent");
         }
     }
 }

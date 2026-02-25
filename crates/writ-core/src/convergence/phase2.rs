@@ -126,7 +126,7 @@ fn derive_structural_info(region: &StructuralConflictRegion) -> StructuralInfo {
         .any(|name| right_def_names.contains(name));
 
     // Determine scope from unit kinds.
-    let scope = determine_scope(&left_unit_kinds, &right_unit_kinds);
+    let scope = ConflictScope::from_unit_kinds(&left_unit_kinds, &right_unit_kinds);
 
     StructuralInfo {
         left_unit_kinds,
@@ -134,35 +134,6 @@ fn derive_structural_info(region: &StructuralConflictRegion) -> StructuralInfo {
         has_name_overlap,
         scope,
     }
-}
-
-/// Determine the conflict scope from the unit kinds on both sides.
-fn determine_scope(left_kinds: &[UnitKind], right_kinds: &[UnitKind]) -> ConflictScope {
-    let mut all_kinds: Vec<&UnitKind> = left_kinds.iter().chain(right_kinds.iter()).collect();
-    all_kinds.dedup_by(|a, b| a == b);
-
-    if all_kinds.is_empty() {
-        return ConflictScope::Mixed;
-    }
-
-    let all_import = all_kinds.iter().all(|k| matches!(k, UnitKind::Import));
-    if all_import {
-        return ConflictScope::Import;
-    }
-
-    let all_definition = all_kinds.iter().all(|k| matches!(k, UnitKind::Definition));
-    if all_definition {
-        return ConflictScope::Definition;
-    }
-
-    let all_intra = all_kinds
-        .iter()
-        .all(|k| matches!(k, UnitKind::Statement | UnitKind::Block));
-    if all_intra {
-        return ConflictScope::IntraFunction;
-    }
-
-    ConflictScope::Mixed
 }
 
 /// Join structural unit contents into a single string for comparison.

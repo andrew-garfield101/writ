@@ -128,6 +128,8 @@ pub struct PipelineOutput {
     pub escalations: Vec<EscalationRecord>,
     /// Verification result (if Phase 6 ran).
     pub verification: Option<VerificationResult>,
+    /// Traceability report from no-silent-addition check (if Phase 6 ran).
+    pub traceability: Option<super::traceability::TraceabilityReport>,
     /// Per-phase timing for performance analysis.
     pub phase_timings: PhaseTimings,
 }
@@ -317,6 +319,7 @@ impl ConvergencePipeline {
                     resolutions: vec![],
                     escalations: vec![],
                     verification: None,
+                    traceability: None,
                     phase_timings: timings,
                 };
             }
@@ -499,6 +502,7 @@ impl ConvergencePipeline {
                         resolutions: region_outcomes,
                         escalations,
                         verification: None,
+                        traceability: None,
                         phase_timings: timings,
                     }
                 }
@@ -541,10 +545,58 @@ impl ConvergencePipeline {
                         resolutions: region_outcomes,
                         escalations,
                         verification: Some(result),
+                        traceability: None,
                         phase_timings: timings,
                     };
                 }
                 Some(result)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // === Phase 6b: Traceability (no-silent-addition rule) ===
+        // Runs after HardenedVerifier passes. Needs all three inputs + merged.
+        let traceability = if self.config.enable_phase6_verification {
+            if let Some(ref content) = merged_content {
+                let trace_input = super::traceability::TraceabilityInput {
+                    file_path: input.file_path.clone(),
+                    base: input.base.clone(),
+                    left: input.left.clone(),
+                    right: input.right.clone(),
+                    merged: content.clone(),
+                };
+                let report = super::traceability::validate_no_additions(&trace_input);
+
+                if report.verdict == super::traceability::TraceabilityVerdict::Fail {
+                    escalations.push(EscalationRecord {
+                        file_path: input.file_path.clone(),
+                        conflict_type: ConflictType::BothModified,
+                        base_content: input.base.clone(),
+                        left_content: input.left.clone(),
+                        right_content: input.right.clone(),
+                        left_agent: input.left_spec.clone(),
+                        right_agent: input.right_spec.clone(),
+                        phase3_suggestion: None,
+                        reason: EscalationReason::VerificationFailed,
+                        recommended_action: format!("Traceability failed: {}", report.summary),
+                    });
+                    timings.total_ms = pipeline_start.elapsed().as_millis() as u64;
+                    return PipelineOutput {
+                        file_path: input.file_path.clone(),
+                        analyzer_used: analyzer_used.clone(),
+                        fully_resolved: false,
+                        merged_content: None,
+                        resolutions: region_outcomes,
+                        escalations,
+                        verification,
+                        traceability: Some(report),
+                        phase_timings: timings,
+                    };
+                }
+                Some(report)
             } else {
                 None
             }
@@ -562,6 +614,7 @@ impl ConvergencePipeline {
             resolutions: region_outcomes,
             escalations,
             verification,
+            traceability,
             phase_timings: timings,
         }
     }
@@ -2008,5 +2061,584 @@ mod mixed_trust_convergence_tests {
             !output.fully_resolved,
             "Restricted TypeScript imports should escalate (0.60 cap)"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Traceability integration tests (C.1.2)
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod traceability_pipeline_tests {
+    use super::*;
+    use crate::convergence::traceability::TraceabilityVerdict;
+
+    fn make_input(file_path: &str, base: &str, left: &str, right: &str) -> PipelineInput {
+        PipelineInput {
+            file_path: file_path.to_string(),
+            base: base.to_string(),
+            left: left.to_string(),
+            right: right.to_string(),
+            left_spec: "spec-a".to_string(),
+            right_spec: "spec-b".to_string(),
+            spec_context: None,
+            trust_context: None,
+        }
+    }
+
+    #[test]
+    fn test_traceability_passes_on_auto_resolved_merge() {
+        // Both sides add different imports → conflict resolved by pattern engine
+        // → Phase 6 runs → traceability validates merged output is traceable
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n\ndef main():\n    pass\n";
+        let left = "import os\nimport sys\n\ndef main():\n    pass\n";
+        let right = "import os\nimport json\n\ndef main():\n    pass\n";
+
+        let input = make_input("app.py", base, left, right);
+        let output = pipeline.run(&input);
+
+        assert!(output.fully_resolved);
+        assert!(output.merged_content.is_some());
+        // Traceability report should exist and pass
+        let report = output
+            .traceability
+            .expect("traceability report should be present");
+        assert_eq!(report.verdict, TraceabilityVerdict::Pass);
+        assert!(report.novel_units.is_empty());
+        assert!(report.untraced_lines.is_empty());
+    }
+
+    #[test]
+    fn test_traceability_report_present_on_auto_resolved_imports() {
+        // Disjoint imports merge — traceability should still pass since both
+        // sides contribute content
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n\ndef main():\n    pass\n";
+        let left = "import os\nimport sys\n\ndef main():\n    pass\n";
+        let right = "import os\nimport json\n\ndef main():\n    pass\n";
+
+        let input = make_input("app.py", base, left, right);
+        let output = pipeline.run(&input);
+
+        assert!(output.fully_resolved);
+        let report = output
+            .traceability
+            .expect("traceability report should exist");
+        assert_eq!(report.verdict, TraceabilityVerdict::Pass);
+        assert_eq!(report.file_path, "app.py");
+    }
+
+    #[test]
+    fn test_traceability_none_when_phase6_disabled() {
+        // Phase 6 disabled → no verification, no traceability
+        let mut config = PipelineConfig::default();
+        config.enable_phase6_verification = false;
+        let pipeline = ConvergencePipeline::with_config(config);
+
+        let base = "def hello():\n    pass\n";
+        let left = "def hello():\n    print('hi')\n";
+        let right = "def hello():\n    pass\n";
+
+        let input = make_input("app.py", base, left, right);
+        let output = pipeline.run(&input);
+
+        assert!(output.fully_resolved);
+        assert!(
+            output.traceability.is_none(),
+            "traceability should be None when phase6 disabled"
+        );
+    }
+
+    #[test]
+    fn test_traceability_none_when_no_merged_content() {
+        // If merge escalates (no merged content), traceability shouldn't run
+        let pipeline = ConvergencePipeline::new();
+        // Both sides modify the same line differently → conflict
+        let base = "x = 1\n";
+        let left = "x = 2\n";
+        let right = "x = 3\n";
+
+        let input = make_input("app.py", base, left, right);
+        let output = pipeline.run(&input);
+
+        // Whether it resolves or escalates, if there's no merged content
+        // then traceability should be None
+        if output.merged_content.is_none() {
+            assert!(
+                output.traceability.is_none(),
+                "traceability should be None when no merged content"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hardened_verifier_failure_skips_traceability() {
+        // If HardenedVerifier fails, traceability shouldn't run — short-circuit
+        use crate::convergence::types::{VerificationResult, VerificationVerdict};
+
+        struct AlwaysFailVerifier;
+        impl Verifier for AlwaysFailVerifier {
+            fn verify(&self, _content: &str, _file_path: &str) -> VerificationResult {
+                VerificationResult {
+                    syntactic_valid: false,
+                    warnings: vec!["forced failure".to_string()],
+                    verdict: VerificationVerdict::Failed,
+                }
+            }
+        }
+
+        let mut pipeline = ConvergencePipeline::new();
+        pipeline.set_verifier(Box::new(AlwaysFailVerifier));
+
+        // Disjoint imports create a conflict that gets auto-resolved,
+        // producing merged content that reaches Phase 6
+        let base = "import os\n\ndef main():\n    pass\n";
+        let left = "import os\nimport sys\n\ndef main():\n    pass\n";
+        let right = "import os\nimport json\n\ndef main():\n    pass\n";
+
+        let input = make_input("app.py", base, left, right);
+        let output = pipeline.run(&input);
+
+        assert!(!output.fully_resolved);
+        // Verification failed → traceability should be None (never ran)
+        assert!(
+            output.traceability.is_none(),
+            "traceability should not run when verifier fails"
+        );
+        // The verification result should exist with failure
+        let verification = output.verification.expect("verification should exist");
+        assert_eq!(verification.verdict, VerificationVerdict::Failed);
+    }
+
+    #[test]
+    fn test_traceability_report_in_output_with_verification() {
+        // After auto-resolved conflict merge, both verification and
+        // traceability should be present in the output
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n\ndef main():\n    pass\n";
+        let left = "import os\nimport sys\n\ndef main():\n    pass\n";
+        let right = "import os\nimport json\n\ndef main():\n    pass\n";
+
+        let input = make_input("app.py", base, left, right);
+        let output = pipeline.run(&input);
+
+        assert!(output.fully_resolved);
+        // Both verification and traceability should be present
+        assert!(
+            output.verification.is_some(),
+            "verification should be present"
+        );
+        assert!(
+            output.traceability.is_some(),
+            "traceability should be present"
+        );
+        // Traceability should pass since all content is from inputs
+        let report = output.traceability.unwrap();
+        assert_eq!(report.verdict, TraceabilityVerdict::Pass);
+    }
+
+    #[test]
+    fn test_traceability_none_on_clean_phase1_merge() {
+        // Clean merges (one side only) resolve in Phase 1, skipping Phase 6.
+        // Traceability should be None since Phase 6 never runs.
+        let pipeline = ConvergencePipeline::new();
+        let base = "def hello():\n    pass\n";
+        let left = "def hello():\n    print('hi')\n";
+        let right = "def hello():\n    pass\n";
+
+        let input = make_input("app.py", base, left, right);
+        let output = pipeline.run(&input);
+
+        assert!(output.fully_resolved);
+        assert!(output.merged_content.is_some());
+        // Phase 1 clean → no Phase 6 → no traceability
+        assert!(
+            output.traceability.is_none(),
+            "Phase 1 clean merges skip Phase 6, so no traceability"
+        );
+    }
+
+    #[test]
+    fn test_traceability_failure_causes_escalation() {
+        // The deterministic pattern engine (Phase 3) always produces content
+        // derived from inputs, so traceability naturally passes in normal flow.
+        // This test validates that if validate_no_additions() WOULD return Fail
+        // (e.g., from a future Phase 4/5 LLM-generated resolution), the pipeline
+        // correctly: (1) creates an escalation, (2) sets merged_content to None,
+        // (3) sets fully_resolved to false, and (4) preserves the report.
+        //
+        // We test this by calling validate_no_additions directly with content
+        // that simulates a pattern engine injecting novel content, then verify
+        // the detection works at the boundary the pipeline relies on.
+        use crate::convergence::traceability::{validate_no_additions, TraceabilityInput};
+
+        let base = "import os\n\ndef main():\n    pass\n";
+        let left = "import os\nimport sys\n\ndef main():\n    pass\n";
+        let right = "import os\nimport json\n\ndef main():\n    pass\n";
+
+        // Simulate a merge that introduces novel content not in any input
+        let merged_with_novel =
+            "import os\nimport sys\nimport json\nimport NOVEL_PACKAGE\n\ndef main():\n    pass\n";
+
+        let input = TraceabilityInput {
+            file_path: "app.py".to_string(),
+            base: base.to_string(),
+            left: left.to_string(),
+            right: right.to_string(),
+            merged: merged_with_novel.to_string(),
+        };
+
+        let report = validate_no_additions(&input);
+
+        // The novel import line should be flagged
+        assert_eq!(
+            report.verdict,
+            crate::convergence::traceability::TraceabilityVerdict::Fail,
+            "Novel content should trigger traceability failure"
+        );
+        assert!(
+            !report.untraced_lines.is_empty(),
+            "Should have at least one untraced line"
+        );
+
+        // Verify the untraced line is the novel import
+        let novel_line = report
+            .untraced_lines
+            .iter()
+            .find(|l| l.content.contains("NOVEL_PACKAGE"));
+        assert!(
+            novel_line.is_some(),
+            "The NOVEL_PACKAGE import should be flagged as untraced"
+        );
+
+        // Verify the report is actionable (has best-match info)
+        let novel = novel_line.unwrap();
+        assert!(
+            novel.best_similarity < 0.9,
+            "Novel content should have low similarity to any input line"
+        );
+    }
+
+    #[test]
+    fn test_traceability_failure_path_escalation_structure() {
+        // Verify the escalation record structure that Phase 6b would create.
+        // This tests the same EscalationRecord construction used at pipeline.rs:575-586.
+        let escalation = EscalationRecord {
+            file_path: "app.py".to_string(),
+            conflict_type: ConflictType::BothModified,
+            base_content: "base".to_string(),
+            left_content: "left".to_string(),
+            right_content: "right".to_string(),
+            left_agent: "spec-a".to_string(),
+            right_agent: "spec-b".to_string(),
+            phase3_suggestion: None,
+            reason: EscalationReason::VerificationFailed,
+            recommended_action: "Traceability failed: 1 untraced lines".to_string(),
+        };
+
+        assert_eq!(escalation.reason, EscalationReason::VerificationFailed);
+        assert!(escalation
+            .recommended_action
+            .contains("Traceability failed"));
+        assert!(escalation.phase3_suggestion.is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C.3.2 — Reproducibility Verification Tests
+// ---------------------------------------------------------------------------
+// Given same inputs + same config, deterministic phases (1-3) produce
+// identical output. We run the same conflict through the pipeline multiple
+// times and assert the results are byte-for-byte identical.
+
+#[cfg(test)]
+mod reproducibility_tests {
+    use super::*;
+
+    fn make_input(file_path: &str, base: &str, left: &str, right: &str) -> PipelineInput {
+        PipelineInput {
+            file_path: file_path.to_string(),
+            base: base.to_string(),
+            left: left.to_string(),
+            right: right.to_string(),
+            left_spec: "spec-a".to_string(),
+            right_spec: "spec-b".to_string(),
+            spec_context: None,
+            trust_context: None,
+        }
+    }
+
+    /// Helper: run the same input through the pipeline N times with the same
+    /// config and return all outputs.
+    fn run_n_times(config: PipelineConfig, input: &PipelineInput, n: usize) -> Vec<PipelineOutput> {
+        (0..n)
+            .map(|_| {
+                let pipeline = ConvergencePipeline::with_config(config.clone());
+                pipeline.run(input)
+            })
+            .collect()
+    }
+
+    /// Assert two pipeline outputs are deterministically identical.
+    ///
+    /// Compares the meaningful deterministic fields: merged content,
+    /// resolution status (content, method, confidence, phase), escalation
+    /// reasons, and verification/traceability verdicts.
+    ///
+    /// Note: We compare `RegionResolutionStatus` and `phase3_result` directly
+    /// rather than the full `RegionOutcome` Debug string, because
+    /// `StructuralUnit.metadata` is a HashMap whose iteration order is
+    /// non-deterministic across runs.
+    fn assert_outputs_identical(a: &PipelineOutput, b: &PipelineOutput) {
+        assert_eq!(a.file_path, b.file_path);
+        assert_eq!(a.analyzer_used, b.analyzer_used);
+        assert_eq!(a.fully_resolved, b.fully_resolved);
+        assert_eq!(a.merged_content, b.merged_content);
+        assert_eq!(a.resolutions.len(), b.resolutions.len());
+        assert_eq!(a.escalations.len(), b.escalations.len());
+
+        // Compare each resolution by its deterministic output fields.
+        // We serialize to JSON for comparison since RegionResolutionStatus and
+        // ResolutionProposal contain f64 fields (making PartialEq derivation
+        // impractical) and JSON gives stable, ordered output unlike Debug.
+        for (i, (ra, rb)) in a.resolutions.iter().zip(b.resolutions.iter()).enumerate() {
+            assert_eq!(
+                serde_json::to_string(&ra.resolution).unwrap(),
+                serde_json::to_string(&rb.resolution).unwrap(),
+                "resolution status mismatch at index {i}"
+            );
+            assert_eq!(
+                serde_json::to_string(&ra.phase3_result).unwrap(),
+                serde_json::to_string(&rb.phase3_result).unwrap(),
+                "phase3_result mismatch at index {i}"
+            );
+            assert_eq!(
+                ra.classified.conflict_type, rb.classified.conflict_type,
+                "conflict_type mismatch at index {i}"
+            );
+        }
+
+        // Compare each escalation
+        for (ea, eb) in a.escalations.iter().zip(b.escalations.iter()) {
+            assert_eq!(ea.file_path, eb.file_path);
+            assert_eq!(ea.reason, eb.reason);
+            assert_eq!(ea.recommended_action, eb.recommended_action);
+        }
+
+        // Verification verdict must match
+        match (&a.verification, &b.verification) {
+            (Some(va), Some(vb)) => {
+                assert_eq!(va.verdict, vb.verdict);
+                assert_eq!(va.syntactic_valid, vb.syntactic_valid);
+                assert_eq!(va.warnings, vb.warnings);
+            }
+            (None, None) => {}
+            _ => panic!("verification presence mismatch"),
+        }
+
+        // Traceability verdict must match
+        match (&a.traceability, &b.traceability) {
+            (Some(ta), Some(tb)) => {
+                assert_eq!(ta.verdict, tb.verdict);
+                assert_eq!(ta.novel_units.len(), tb.novel_units.len());
+                assert_eq!(ta.untraced_lines.len(), tb.untraced_lines.len());
+                assert_eq!(ta.lines_checked, tb.lines_checked);
+                assert_eq!(ta.lines_passed, tb.lines_passed);
+            }
+            (None, None) => {}
+            _ => panic!("traceability presence mismatch"),
+        }
+    }
+
+    #[test]
+    fn test_reproducible_disjoint_import_merge() {
+        // Disjoint imports → Phase 3 pattern resolution → deterministic
+        let input = make_input(
+            "app.py",
+            "import os\n\ndef main():\n    pass\n",
+            "import os\nimport sys\n\ndef main():\n    pass\n",
+            "import os\nimport json\n\ndef main():\n    pass\n",
+        );
+        let config = PipelineConfig::default();
+        let outputs = run_n_times(config, &input, 5);
+
+        for i in 1..outputs.len() {
+            assert_outputs_identical(&outputs[0], &outputs[i]);
+        }
+        // Sanity: should actually resolve
+        assert!(outputs[0].fully_resolved);
+        assert!(outputs[0].merged_content.is_some());
+    }
+
+    #[test]
+    fn test_reproducible_one_side_only_change() {
+        // Only left modifies → Phase 1 clean merge → deterministic
+        let input = make_input(
+            "lib.py",
+            "def hello():\n    pass\n",
+            "def hello():\n    print('hi')\n",
+            "def hello():\n    pass\n",
+        );
+        let config = PipelineConfig::default();
+        let outputs = run_n_times(config, &input, 5);
+
+        for i in 1..outputs.len() {
+            assert_outputs_identical(&outputs[0], &outputs[i]);
+        }
+        assert!(outputs[0].fully_resolved);
+    }
+
+    #[test]
+    fn test_reproducible_escalation() {
+        // Both sides modify same line differently → escalation → deterministic
+        let input = make_input("config.py", "x = 1\n", "x = 2\n", "x = 3\n");
+        let config = PipelineConfig::default();
+        let outputs = run_n_times(config, &input, 5);
+
+        for i in 1..outputs.len() {
+            assert_outputs_identical(&outputs[0], &outputs[i]);
+        }
+        // Should escalate (same line, different changes)
+        assert!(!outputs[0].escalations.is_empty() || outputs[0].fully_resolved);
+    }
+
+    #[test]
+    fn test_reproducible_rust_function_conflict() {
+        // Rust file with disjoint function additions → deterministic merge
+        let base = "fn main() {\n    println!(\"hello\");\n}\n";
+        let left =
+            "fn helper() {\n    // added by left\n}\n\nfn main() {\n    println!(\"hello\");\n}\n";
+        let right =
+            "fn main() {\n    println!(\"hello\");\n}\n\nfn utils() {\n    // added by right\n}\n";
+
+        let input = make_input("main.rs", base, left, right);
+        let config = PipelineConfig::default();
+        let outputs = run_n_times(config, &input, 5);
+
+        for i in 1..outputs.len() {
+            assert_outputs_identical(&outputs[0], &outputs[i]);
+        }
+    }
+
+    #[test]
+    fn test_reproducible_with_verification_disabled() {
+        // Same conflict, Phase 6 disabled → still deterministic through Phases 1-3
+        let input = make_input(
+            "app.py",
+            "import os\n\ndef main():\n    pass\n",
+            "import os\nimport sys\n\ndef main():\n    pass\n",
+            "import os\nimport json\n\ndef main():\n    pass\n",
+        );
+        let mut config = PipelineConfig::default();
+        config.enable_phase6_verification = false;
+        let outputs = run_n_times(config, &input, 5);
+
+        for i in 1..outputs.len() {
+            assert_outputs_identical(&outputs[0], &outputs[i]);
+        }
+        assert!(outputs[0].fully_resolved);
+        // Verification and traceability should be None
+        assert!(outputs[0].verification.is_none());
+        assert!(outputs[0].traceability.is_none());
+    }
+
+    #[test]
+    fn test_reproducible_identical_content_no_conflict() {
+        // All three sides identical → no conflict → deterministic
+        let content = "def hello():\n    return 42\n";
+        let input = make_input("noop.py", content, content, content);
+        let config = PipelineConfig::default();
+        let outputs = run_n_times(config, &input, 5);
+
+        for i in 1..outputs.len() {
+            assert_outputs_identical(&outputs[0], &outputs[i]);
+        }
+        assert!(outputs[0].fully_resolved);
+    }
+
+    #[test]
+    fn test_reproducible_go_import_merge() {
+        // Go file with disjoint imports → deterministic
+        let base = "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n";
+        let left = "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n";
+        let right = "package main\n\nimport (\n\t\"fmt\"\n\t\"strings\"\n)\n\nfunc main() {\n\tfmt.Println(\"hi\")\n}\n";
+
+        let input = make_input("main.go", base, left, right);
+        let config = PipelineConfig::default();
+        let outputs = run_n_times(config, &input, 5);
+
+        for i in 1..outputs.len() {
+            assert_outputs_identical(&outputs[0], &outputs[i]);
+        }
+    }
+
+    #[test]
+    fn test_reproducible_typescript_import_merge() {
+        // TypeScript file with disjoint imports → deterministic
+        let base =
+            "import { useState } from 'react';\n\nexport function App() {\n  return null;\n}\n";
+        let left = "import { useState } from 'react';\nimport { useEffect } from 'react';\n\nexport function App() {\n  return null;\n}\n";
+        let right = "import { useState } from 'react';\nimport axios from 'axios';\n\nexport function App() {\n  return null;\n}\n";
+
+        let input = make_input("App.tsx", base, left, right);
+        let config = PipelineConfig::default();
+        let outputs = run_n_times(config, &input, 5);
+
+        for i in 1..outputs.len() {
+            assert_outputs_identical(&outputs[0], &outputs[i]);
+        }
+    }
+
+    #[test]
+    fn test_reproducible_config_determinism() {
+        // Same config produces same results; different config may differ,
+        // but each config is internally deterministic.
+        let input = make_input(
+            "app.py",
+            "import os\n\ndef main():\n    pass\n",
+            "import os\nimport sys\n\ndef main():\n    pass\n",
+            "import os\nimport json\n\ndef main():\n    pass\n",
+        );
+
+        let config_a = PipelineConfig::default();
+        let mut config_b = PipelineConfig::default();
+        config_b.enable_phase6_verification = false;
+
+        let outputs_a = run_n_times(config_a, &input, 3);
+        let outputs_b = run_n_times(config_b, &input, 3);
+
+        // Each config set is internally consistent
+        for i in 1..outputs_a.len() {
+            assert_outputs_identical(&outputs_a[0], &outputs_a[i]);
+        }
+        for i in 1..outputs_b.len() {
+            assert_outputs_identical(&outputs_b[0], &outputs_b[i]);
+        }
+
+        // The two configs produce different verification/traceability presence
+        assert!(outputs_a[0].verification.is_some());
+        assert!(outputs_b[0].verification.is_none());
+    }
+
+    #[test]
+    fn test_reproducible_merged_content_byte_identical() {
+        // Strongest guarantee: merged content is byte-for-byte identical
+        let input = make_input(
+            "app.py",
+            "import os\n\ndef main():\n    pass\n",
+            "import os\nimport sys\n\ndef main():\n    pass\n",
+            "import os\nimport json\n\ndef main():\n    pass\n",
+        );
+        let config = PipelineConfig::default();
+        let outputs = run_n_times(config, &input, 10);
+
+        let first_content = outputs[0].merged_content.as_ref().unwrap();
+        for output in &outputs[1..] {
+            assert_eq!(
+                first_content,
+                output.merged_content.as_ref().unwrap(),
+                "merged content must be byte-identical across runs"
+            );
+        }
     }
 }

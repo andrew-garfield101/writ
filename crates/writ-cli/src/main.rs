@@ -328,6 +328,12 @@ enum Commands {
         #[command(subcommand)]
         action: AgentCommands,
     },
+
+    /// View security events and monitoring data.
+    Security {
+        #[command(subcommand)]
+        action: SecurityCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -572,6 +578,28 @@ enum RemoteCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum SecurityCommands {
+    /// List recent security events.
+    Events {
+        /// Filter by severity: info, warning, or critical.
+        #[arg(long)]
+        severity: Option<String>,
+
+        /// Filter by event type (e.g., convergence_started, scope_violation).
+        #[arg(long)]
+        event_type: Option<String>,
+
+        /// Maximum number of events to show.
+        #[arg(long, short)]
+        limit: Option<usize>,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+}
+
 fn main() {
     // Reset SIGPIPE to default so piping to `head`, `grep`, etc. doesn't
     // cause a Rust BrokenPipe panic (exit 101) which kills `set -euo pipefail` scripts.
@@ -757,6 +785,20 @@ fn main() {
                 list,
                 set,
             } => cmd_agent_scope(&cwd, &name, add, remove, list, set),
+        },
+        Commands::Security { action } => match action {
+            SecurityCommands::Events {
+                severity,
+                event_type,
+                limit,
+                format,
+            } => cmd_security_events(
+                &cwd,
+                severity.as_deref(),
+                event_type.as_deref(),
+                limit,
+                &format,
+            ),
         },
     };
 
@@ -3166,6 +3208,95 @@ fn cmd_agent_scope(
         println!("scope for '{}':", name);
         for s in &agent.scope_constraints {
             println!("  {s}");
+        }
+    }
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// Security commands
+// -------------------------------------------------------------------
+
+fn cmd_security_events(
+    cwd: &PathBuf,
+    severity: Option<&str>,
+    event_type: Option<&str>,
+    limit: Option<usize>,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let writ_dir = cwd.join(".writ");
+    if !writ_dir.exists() {
+        return Err("not a writ repository (no .writ directory)".into());
+    }
+
+    let severity_filter = match severity {
+        Some("info") => Some(writ_core::security::Severity::Info),
+        Some("warning") => Some(writ_core::security::Severity::Warning),
+        Some("critical") => Some(writ_core::security::Severity::Critical),
+        Some(other) => {
+            eprintln!(
+                "unknown severity '{}' — expected info, warning, or critical",
+                other
+            );
+            std::process::exit(1);
+        }
+        None => None,
+    };
+
+    let logger = writ_core::security::SecurityEventLogger::new(&writ_dir);
+    let mut events = logger.read_events(severity_filter.as_ref())?;
+
+    // Apply event_type filter if specified.
+    if let Some(et) = event_type {
+        events.retain(|e| e.event_type == et);
+    }
+
+    let events: Vec<_> = if let Some(n) = limit {
+        events.into_iter().rev().take(n).collect()
+    } else {
+        events.into_iter().rev().collect()
+    };
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&events)?);
+        }
+        _ => {
+            if events.is_empty() {
+                println!("no security events recorded");
+                if let Some(sev) = severity {
+                    println!("  (filtered by severity: {})", sev);
+                }
+                return Ok(());
+            }
+
+            println!(
+                "{} security event(s){}:",
+                events.len(),
+                severity
+                    .map(|s| format!(" (severity: {})", s))
+                    .unwrap_or_default()
+            );
+            println!();
+
+            for event in &events {
+                let sev_label = match event.severity {
+                    writ_core::security::Severity::Info => "INFO",
+                    writ_core::security::Severity::Warning => "WARN",
+                    writ_core::security::Severity::Critical => "CRIT",
+                };
+                let agent = event
+                    .agent_id
+                    .as_deref()
+                    .map(|a| format!(" agent={}", a))
+                    .unwrap_or_default();
+                let ts = event.timestamp.format("%Y-%m-%d %H:%M:%S UTC");
+
+                println!("[{}] {} {}{}", sev_label, ts, event.event_type, agent);
+                println!("  {}", event.details);
+                println!();
+            }
         }
     }
 

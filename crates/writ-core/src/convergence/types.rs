@@ -6,7 +6,12 @@
 //! trait produces them, and the [`Pattern`](super::patterns::Pattern) trait
 //! consumes them.
 
+use std::collections::HashMap;
+
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use super::traceability::{TraceabilityReport, TraceabilityVerdict};
 
 // ---------------------------------------------------------------------------
 // Structural Units — the atoms of language-aware diffing (Phase 1)
@@ -464,6 +469,97 @@ pub struct PipelineFileResult {
     pub fully_resolved: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Convergence Seal Record — reproducibility and auditability metadata
+// ---------------------------------------------------------------------------
+
+/// A record capturing the full context of a convergence operation.
+///
+/// Created alongside a convergence seal. Enables reproducibility auditing:
+/// given the same inputs and config, deterministic phases should produce
+/// identical output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConvergenceSealRecord {
+    /// The seal ID this record is attached to.
+    pub seal_id: String,
+    /// When the convergence was performed.
+    pub timestamp: DateTime<Utc>,
+    /// The spec used as the merge base.
+    pub base_spec: String,
+    /// Spec IDs that participated in the convergence (including base).
+    pub participating_specs: Vec<String>,
+    /// BLAKE3 hashes of input seals for reproducibility.
+    pub input_seal_hashes: Vec<String>,
+    /// Convergence engine version string.
+    pub pipeline_version: String,
+    /// Pattern name → version mapping for deterministic replay.
+    pub pattern_versions: HashMap<String, String>,
+    /// BLAKE3 hash of serialized pipeline configuration.
+    pub configuration_hash: String,
+    /// Per-file traceability reports (only for merged files).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub traceability_reports: Vec<TraceabilityReport>,
+    /// True if ALL files passed traceability validation.
+    pub traceability_passed: bool,
+    /// Number of files auto-merged (no conflicts).
+    pub files_auto_merged: usize,
+    /// Number of files auto-resolved (conflicts resolved by patterns/pipeline).
+    pub files_auto_resolved: usize,
+    /// Number of files with unresolved conflicts.
+    pub files_escalated: usize,
+    /// Whether the convergence was degraded (content loss possible).
+    pub degraded: bool,
+    /// Files changed by convergence.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub files_changed: Vec<String>,
+    /// Quality score from the convergence quality report (0-100).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_score: Option<u32>,
+}
+
+impl ConvergenceSealRecord {
+    /// Create a new record from a converge_all report and traceability results.
+    pub fn from_report(
+        seal_id: &str,
+        report: &super::ConvergeAllReport,
+        traceability_reports: Vec<TraceabilityReport>,
+        input_seal_hashes: Vec<String>,
+        pipeline_version: &str,
+        pattern_versions: HashMap<String, String>,
+        configuration_hash: &str,
+    ) -> Self {
+        let traceability_passed = traceability_reports
+            .iter()
+            .all(|r| r.verdict == TraceabilityVerdict::Pass);
+
+        let quality_score = report.quality_report.as_ref().map(|qr| qr.quality_score);
+
+        let mut participating_specs = vec![report.base_spec.clone()];
+        participating_specs.extend(report.merge_order.iter().cloned());
+
+        ConvergenceSealRecord {
+            seal_id: seal_id.to_string(),
+            timestamp: Utc::now(),
+            base_spec: report.base_spec.clone(),
+            participating_specs,
+            input_seal_hashes,
+            pipeline_version: pipeline_version.to_string(),
+            pattern_versions,
+            configuration_hash: configuration_hash.to_string(),
+            traceability_reports,
+            traceability_passed,
+            files_auto_merged: report.total_auto_merged,
+            files_auto_resolved: report.total_resolutions,
+            files_escalated: report
+                .total_conflicts
+                .saturating_sub(report.total_resolutions),
+            degraded: report.degraded,
+            files_changed: report.files_changed.clone(),
+            quality_score,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -679,5 +775,163 @@ mod tests {
         assert!(result.fully_resolved);
         assert!(result.merged_content.is_some());
         assert!(result.escalations.is_empty());
+    }
+
+    // -- ConvergenceSealRecord tests --
+
+    fn make_minimal_report() -> crate::convergence::ConvergeAllReport {
+        crate::convergence::ConvergeAllReport {
+            base_spec: "spec-base".to_string(),
+            merge_order: vec!["spec-a".to_string(), "spec-b".to_string()],
+            merges: vec![],
+            strategy: "escalate".to_string(),
+            total_auto_merged: 5,
+            total_conflicts: 3,
+            total_resolutions: 2,
+            is_clean: false,
+            degraded: false,
+            applied: true,
+            warnings: vec![],
+            escalations: vec![],
+            quality_report: None,
+            files_changed: vec!["src/main.rs".to_string()],
+            convergence_record: None,
+        }
+    }
+
+    #[test]
+    fn test_convergence_seal_record_construction() {
+        let report = make_minimal_report();
+        let record = ConvergenceSealRecord::from_report(
+            "seal-123",
+            &report,
+            vec![],
+            vec!["hash-a".to_string(), "hash-b".to_string()],
+            "0.1.0",
+            HashMap::new(),
+            "config-hash-abc",
+        );
+
+        assert_eq!(record.seal_id, "seal-123");
+        assert_eq!(record.base_spec, "spec-base");
+        assert_eq!(
+            record.participating_specs,
+            vec!["spec-base", "spec-a", "spec-b"]
+        );
+        assert_eq!(record.input_seal_hashes.len(), 2);
+        assert_eq!(record.pipeline_version, "0.1.0");
+        assert_eq!(record.configuration_hash, "config-hash-abc");
+        assert_eq!(record.files_auto_merged, 5);
+        assert_eq!(record.files_auto_resolved, 2);
+        assert_eq!(record.files_escalated, 1);
+        assert!(!record.degraded);
+        assert!(record.traceability_passed); // no reports = all pass
+    }
+
+    #[test]
+    fn test_convergence_seal_record_serialization_roundtrip() {
+        let report = make_minimal_report();
+        let mut patterns = HashMap::new();
+        patterns.insert("additive".to_string(), "1.0".to_string());
+        let record = ConvergenceSealRecord::from_report(
+            "seal-456",
+            &report,
+            vec![],
+            vec!["h1".to_string()],
+            "0.2.0",
+            patterns,
+            "cfg-hash",
+        );
+
+        let json = serde_json::to_string_pretty(&record).unwrap();
+        let parsed: ConvergenceSealRecord = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.seal_id, "seal-456");
+        assert_eq!(parsed.pipeline_version, "0.2.0");
+        assert_eq!(
+            parsed.pattern_versions.get("additive"),
+            Some(&"1.0".to_string())
+        );
+    }
+
+    #[test]
+    fn test_convergence_seal_record_traceability_passed_false() {
+        use crate::convergence::traceability::{TraceabilityReport, TraceabilityVerdict};
+
+        let report = make_minimal_report();
+        let failing_trace = TraceabilityReport {
+            file_path: "src/main.rs".to_string(),
+            verdict: TraceabilityVerdict::Fail,
+            novel_units: vec![],
+            untraced_lines: vec![],
+            lines_checked: 10,
+            lines_passed: 8,
+            threshold: 0,
+            summary: "TIER 2 FAIL".to_string(),
+        };
+
+        let record = ConvergenceSealRecord::from_report(
+            "seal-789",
+            &report,
+            vec![failing_trace],
+            vec![],
+            "0.1.0",
+            HashMap::new(),
+            "cfg",
+        );
+
+        assert!(
+            !record.traceability_passed,
+            "Should be false when any report fails"
+        );
+    }
+
+    #[test]
+    fn test_convergence_seal_record_config_hash_deterministic() {
+        let report = make_minimal_report();
+        let r1 = ConvergenceSealRecord::from_report(
+            "s",
+            &report,
+            vec![],
+            vec![],
+            "v",
+            HashMap::new(),
+            "hash-A",
+        );
+        let r2 = ConvergenceSealRecord::from_report(
+            "s",
+            &report,
+            vec![],
+            vec![],
+            "v",
+            HashMap::new(),
+            "hash-A",
+        );
+        assert_eq!(r1.configuration_hash, r2.configuration_hash);
+        assert_eq!(r1.configuration_hash, "hash-A");
+    }
+
+    #[test]
+    fn test_convergence_seal_record_has_all_sprint_doc_fields() {
+        let report = make_minimal_report();
+        let mut patterns = HashMap::new();
+        patterns.insert("imports".to_string(), "2.0".to_string());
+
+        let record = ConvergenceSealRecord::from_report(
+            "seal-x",
+            &report,
+            vec![],
+            vec!["hash-1".to_string()],
+            "0.3.0",
+            patterns,
+            "config-hash-xyz",
+        );
+
+        // Sprint doc required fields: input_seal_hashes, pipeline_version,
+        // pattern_versions, configuration_hash
+        assert!(!record.input_seal_hashes.is_empty());
+        assert!(!record.pipeline_version.is_empty());
+        assert!(!record.pattern_versions.is_empty());
+        assert!(!record.configuration_hash.is_empty());
     }
 }

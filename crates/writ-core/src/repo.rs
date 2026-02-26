@@ -505,6 +505,10 @@ impl Repository {
                     ));
                 }
             }
+        } else {
+            // Agent not in identity store — emit unrecognized agent event
+            let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+            let _ = logger.emit_unrecognized_agent(&agent.id);
         }
 
         // Look up parent seal's chain_hash for the cryptographic chain link
@@ -714,6 +718,9 @@ impl Repository {
         } else if !chain_valid {
             Some(format!("chain_hash mismatch: expected {expected_chain}"))
         } else if sig_valid == Some(false) {
+            // Emit authentication failure event (best-effort)
+            let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+            let _ = logger.emit_authentication_failure(&seal.id, "signature verification failed");
             Some("signature verification failed".into())
         } else {
             None
@@ -739,55 +746,7 @@ impl Repository {
         verifying_key: Option<&ed25519_dalek::VerifyingKey>,
     ) -> WritResult<ChainVerification> {
         let seals = self.log()?;
-        let mut verified = 0;
-        let mut unsecured = 0;
-        let mut failures = Vec::new();
-
-        for (i, seal) in seals.iter().enumerate() {
-            if !seal.is_secured() {
-                unsecured += 1;
-                continue;
-            }
-
-            let result = self.verify_seal(seal, verifying_key);
-
-            if result.content_hash_valid && result.chain_hash_valid {
-                // For non-genesis seals, verify parent_seal_hash matches
-                // the previous seal's chain_hash (seals are newest-first)
-                if i + 1 < seals.len() {
-                    let parent = &seals[i + 1];
-                    if let Some(ref parent_chain) = parent.chain_hash {
-                        if seal.parent_seal_hash.as_ref() != Some(parent_chain) {
-                            failures.push(SealVerification {
-                                seal_id: seal.id.clone(),
-                                content_hash_valid: true,
-                                chain_hash_valid: true,
-                                signature_present: result.signature_present,
-                                signature_valid: result.signature_valid,
-                                error: Some(format!(
-                                    "parent_seal_hash doesn't match parent's chain_hash (expected {})",
-                                    parent_chain
-                                )),
-                            });
-                            continue;
-                        }
-                    }
-                }
-                verified += 1;
-            } else {
-                failures.push(result);
-            }
-        }
-
-        let valid = failures.is_empty();
-
-        Ok(ChainVerification {
-            total_seals: seals.len(),
-            verified,
-            unsecured,
-            failures,
-            valid,
-        })
+        self.verify_seal_chain(&seals, verifying_key)
     }
 
     /// Verify the HEAD chain plus every spec's branch chain.
@@ -826,16 +785,22 @@ impl Repository {
     }
 
     /// Verify cryptographic integrity of a spec's branch chain.
-    ///
-    /// Walks from the spec's HEAD backward, verifying each seal's content hash,
-    /// chain hash, and parent linkage — identical logic to `verify_chain()` but
-    /// scoped to the spec's branch.
     fn verify_spec_chain(
         &self,
         spec_id: &str,
         verifying_key: Option<&ed25519_dalek::VerifyingKey>,
     ) -> WritResult<ChainVerification> {
         let seals = self.spec_log(spec_id)?;
+        self.verify_seal_chain(&seals, verifying_key)
+    }
+
+    /// Shared implementation for chain verification — used by both
+    /// `verify_chain()` (HEAD) and `verify_spec_chain()` (per-spec).
+    fn verify_seal_chain(
+        &self,
+        seals: &[crate::seal::Seal],
+        verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> WritResult<ChainVerification> {
         let mut verified = 0;
         let mut unsecured = 0;
         let mut failures = Vec::new();
@@ -849,20 +814,25 @@ impl Repository {
             let result = self.verify_seal(seal, verifying_key);
 
             if result.content_hash_valid && result.chain_hash_valid {
+                // For non-genesis seals, verify parent_seal_hash matches
+                // the previous seal's chain_hash (seals are newest-first)
                 if i + 1 < seals.len() {
                     let parent = &seals[i + 1];
                     if let Some(ref parent_chain) = parent.chain_hash {
                         if seal.parent_seal_hash.as_ref() != Some(parent_chain) {
+                            let err_msg = format!(
+                                "parent_seal_hash doesn't match parent's chain_hash (expected {})",
+                                parent_chain
+                            );
+                            let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+                            let _ = logger.emit_chain_hash_failure(&seal.id, &err_msg);
                             failures.push(SealVerification {
                                 seal_id: seal.id.clone(),
                                 content_hash_valid: true,
                                 chain_hash_valid: true,
                                 signature_present: result.signature_present,
                                 signature_valid: result.signature_valid,
-                                error: Some(format!(
-                                    "parent_seal_hash doesn't match parent's chain_hash (expected {})",
-                                    parent_chain
-                                )),
+                                error: Some(err_msg),
                             });
                             continue;
                         }
@@ -870,6 +840,11 @@ impl Repository {
                 }
                 verified += 1;
             } else {
+                // Content or chain hash mismatch — emit security event
+                if let Some(ref err) = result.error {
+                    let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+                    let _ = logger.emit_chain_hash_failure(&result.seal_id, err);
+                }
                 failures.push(result);
             }
         }
@@ -2780,6 +2755,7 @@ impl Repository {
                 escalations: Vec::new(),
                 quality_report: None,
                 files_changed: Vec::new(),
+                convergence_record: None,
             });
         }
 
@@ -2869,6 +2845,7 @@ impl Repository {
                 escalations: Vec::new(),
                 quality_report: None,
                 files_changed: Vec::new(),
+                convergence_record: None,
             });
         }
 
@@ -2914,8 +2891,23 @@ impl Repository {
         let mut all_clean = true;
         let mut any_degraded = false;
         let mut file_decisions: Vec<FileDecision> = Vec::new();
+        let mut traceability_reports: Vec<convergence::traceability::TraceabilityReport> =
+            Vec::new();
 
         let v2_pipeline = ConvergencePipeline::new();
+
+        // Emit convergence_started event (best-effort).
+        let conv_logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+        let _ = conv_logger.emit_convergence_event(
+            "convergence_started",
+            crate::security::Severity::Info,
+            &format!(
+                "Convergence started: {} specs, base='{}', strategy={}",
+                ordered.len() + 1,
+                base_spec,
+                strategy_name(strategy)
+            ),
+        );
 
         // ── Accumulated-content approach ──────────────────────────────
         // Load the common base (ancestor before any spec sealed) and the
@@ -3075,6 +3067,11 @@ impl Repository {
                         trust_context: self.build_trust_context(&base_spec, spec_id),
                     };
                     let pipeline_output = v2_pipeline.run(&pipeline_input);
+
+                    // Collect traceability report for reproducibility record.
+                    if let Some(trace) = &pipeline_output.traceability {
+                        traceability_reports.push(trace.clone());
+                    }
 
                     if pipeline_output.fully_resolved {
                         let content = pipeline_output.merged_content.unwrap_or_default();
@@ -3261,6 +3258,16 @@ impl Repository {
                                     right_spec: esc.right_agent.clone(),
                                     recommended_action: esc.recommended_action.clone(),
                                 });
+                                // Emit per-escalation security event with agent context.
+                                let _ = conv_logger.emit_convergence_event_with_agent(
+                                    "convergence_escalation",
+                                    crate::security::Severity::Warning,
+                                    &format!(
+                                        "Escalation in '{}': {:?} between '{}' and '{}'",
+                                        esc.file_path, esc.reason, esc.left_agent, esc.right_agent
+                                    ),
+                                    Some(&format!("{},{}", esc.left_agent, esc.right_agent)),
+                                );
                             }
 
                             match strategy {
@@ -3581,15 +3588,79 @@ impl Repository {
             total_resolutions,
         );
 
+        // Emit low-confidence warning if any decision fell below threshold.
+        if quality_report.min_confidence < 0.85 {
+            let _ = conv_logger.emit_convergence_event(
+                "convergence_low_confidence",
+                crate::security::Severity::Warning,
+                &format!(
+                    "Low confidence detected: min={}%, avg={}%",
+                    (quality_report.min_confidence * 100.0).round() as u32,
+                    (quality_report.avg_confidence * 100.0).round() as u32,
+                ),
+            );
+        }
+
         // Collect the list of files changed by convergence so callers can
         // create accurate convergence seals.
         let mut files_changed: Vec<String> = accumulated.keys().cloned().collect();
         files_changed.sort();
 
-        Ok(ConvergeAllReport {
-            base_spec,
-            merge_order,
-            merges,
+        // Emit convergence completion event (best-effort).
+        let completion_event_type = if any_degraded {
+            "convergence_degraded"
+        } else {
+            "convergence_completed"
+        };
+        let completion_severity = if any_degraded {
+            crate::security::Severity::Warning
+        } else {
+            crate::security::Severity::Info
+        };
+        let _ = conv_logger.emit_convergence_event(
+            completion_event_type,
+            completion_severity,
+            &format!(
+                "Convergence {}: {} merges, {} auto-merged, {} conflicts, {} resolutions, {} escalations, clean={}",
+                if any_degraded { "degraded" } else { "completed" },
+                merges.len(),
+                total_auto_merged,
+                total_conflicts,
+                total_resolutions,
+                all_escalations.len(),
+                all_clean
+            ),
+        );
+
+        // Build reproducibility record with real data.
+        let input_seal_hashes: Vec<String> = ordered.iter().map(|b| b.tip_seal.clone()).collect();
+        let pipeline_version = env!("CARGO_PKG_VERSION").to_string();
+        let pattern_versions: HashMap<String, String> = [
+            ("import_accumulation", "1.0"),
+            ("additive_composition", "1.0"),
+            ("superset", "1.0"),
+            ("non_overlapping_definitions", "1.0"),
+            ("eof_append", "1.0"),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+        // Compute configuration hash from strategy + thresholds.
+        let config_data = format!(
+            "strategy={};auto_resolve={};suggest={}",
+            strategy_name(strategy),
+            convergence::types::ConfidenceThresholds::default().auto_resolve,
+            convergence::types::ConfidenceThresholds::default().suggest,
+        );
+        let configuration_hash = crate::crypto::blake3_hex(config_data.as_bytes());
+
+        // Build the partial report to pass to from_report (need it constructed
+        // first to use the factory method).
+        let partial_report = ConvergeAllReport {
+            base_spec: base_spec.clone(),
+            merge_order: merge_order.clone(),
+            merges: merges.clone(),
             strategy: strategy_name(strategy),
             total_auto_merged,
             total_conflicts,
@@ -3597,10 +3668,26 @@ impl Repository {
             is_clean: all_clean,
             degraded: any_degraded,
             applied: did_apply,
-            warnings,
-            escalations: all_escalations,
+            warnings: warnings.clone(),
+            escalations: all_escalations.clone(),
             quality_report: Some(quality_report),
-            files_changed,
+            files_changed: files_changed.clone(),
+            convergence_record: None,
+        };
+
+        let convergence_record = convergence::types::ConvergenceSealRecord::from_report(
+            "pending", // seal ID is assigned when the caller creates the seal
+            &partial_report,
+            traceability_reports,
+            input_seal_hashes,
+            &pipeline_version,
+            pattern_versions,
+            &configuration_hash,
+        );
+
+        Ok(ConvergeAllReport {
+            convergence_record: Some(convergence_record),
+            ..partial_report
         })
     }
 
@@ -3780,6 +3867,10 @@ impl Repository {
                     ));
                 }
             }
+        } else {
+            // Agent not in identity store — emit unrecognized agent event
+            let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+            let _ = logger.emit_unrecognized_agent(&agent.id);
         }
 
         let parent_seal_hash = match parent {
@@ -12090,6 +12181,155 @@ mod agent_edge_case_tests {
             )
             .unwrap_err();
         assert!(matches!(err, WritError::ScopeViolation(_)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C.2.3 — Monitoring event emission integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod monitoring_event_tests {
+    use super::*;
+    use crate::agent::TrustLevel;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn test_agent(id: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: id.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_chain_hash_failure_emits_event() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a seal with crypto fields
+        fs::write(dir.path().join("file.txt"), "hello").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "initial".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Tamper with the seal's content_hash on disk
+        let seal_path = dir
+            .path()
+            .join(".writ/seals")
+            .join(format!("{}.json", seal.id));
+        let json = fs::read_to_string(&seal_path).unwrap();
+        let tampered = json.replace(
+            seal.content_hash.as_deref().unwrap_or(""),
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+        );
+        fs::write(&seal_path, tampered).unwrap();
+
+        // Run verify_chain — should detect the tampered seal
+        let result = repo.verify_chain(None).unwrap();
+        assert!(!result.valid, "chain should be invalid after tampering");
+
+        // Check that a chain_hash_failure security event was emitted
+        let logger = crate::security::SecurityEventLogger::new(&dir.path().join(".writ"));
+        let events = logger.read_events(None).unwrap();
+        let chain_event = events.iter().find(|e| e.event_type == "chain_hash_failure");
+        assert!(
+            chain_event.is_some(),
+            "expected chain_hash_failure event after tampered seal verification"
+        );
+        assert_eq!(
+            chain_event.unwrap().severity,
+            crate::security::Severity::Warning
+        );
+    }
+
+    #[test]
+    fn test_unrecognized_agent_seal_emits_event() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Register one agent so the identity store exists
+        repo.register_agent("known-agent", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        // Seal with an unregistered agent
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        repo.seal(
+            test_agent("unknown-bot"),
+            "unregistered work".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Check that an unrecognized_agent event was emitted
+        let logger = crate::security::SecurityEventLogger::new(&dir.path().join(".writ"));
+        let events = logger.read_events(None).unwrap();
+        let unrecognized = events.iter().find(|e| e.event_type == "unrecognized_agent");
+        assert!(
+            unrecognized.is_some(),
+            "expected unrecognized_agent event for unregistered agent"
+        );
+        assert_eq!(
+            unrecognized.unwrap().agent_id.as_deref(),
+            Some("unknown-bot")
+        );
+        assert_eq!(
+            unrecognized.unwrap().severity,
+            crate::security::Severity::Warning
+        );
+    }
+
+    #[test]
+    fn test_signature_failure_emits_event() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a seal (will be signed if agent has keys, or unsigned)
+        fs::write(dir.path().join("file.txt"), "data").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "signed work".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Generate a different keypair (wrong key)
+        let wrong_keypair = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let wrong_verifying = wrong_keypair.verifying_key();
+
+        // If the seal has a signature, verify with wrong key should fail
+        if seal.signature.is_some() {
+            let result = repo.verify_seal(&seal, Some(&wrong_verifying));
+            assert_eq!(result.signature_valid, Some(false));
+
+            let logger = crate::security::SecurityEventLogger::new(&dir.path().join(".writ"));
+            let events = logger.read_events(None).unwrap();
+            let auth_event = events
+                .iter()
+                .find(|e| e.event_type == "authentication_failure");
+            assert!(
+                auth_event.is_some(),
+                "expected authentication_failure event for wrong key verification"
+            );
+            assert_eq!(
+                auth_event.unwrap().severity,
+                crate::security::Severity::Critical
+            );
+        }
     }
 }
 
@@ -21040,6 +21280,208 @@ mod convergence_metadata_tests {
             "no conflicts → min_confidence should be 1.0, got {}",
             qr.min_confidence
         );
+    }
+}
+
+#[cfg(test)]
+#[allow(deprecated)]
+mod convergence_events_integration_tests {
+    use super::*;
+    use crate::convergence::ConvergeStrategy;
+    use crate::seal::AgentIdentity;
+    use crate::spec::Spec;
+    use tempfile::tempdir;
+
+    /// Integration test: converge_all should emit convergence_started and
+    /// convergence_completed (or degraded) events to the security log.
+    #[test]
+    fn test_converge_all_emits_started_and_completed_events() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create baseline content and seal
+        fs::write(dir.path().join("shared.txt"), "line1\nline2\n").unwrap();
+        let agent = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            agent.clone(),
+            "baseline".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Create two specs
+        repo.add_spec(&Spec::new("alpha".into(), "Alpha".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("beta".into(), "Beta".into(), "".into()))
+            .unwrap();
+
+        // Alpha seals on HEAD (stays on main chain)
+        fs::write(dir.path().join("alpha.txt"), "alpha content\n").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "alpha-agent".into(),
+                agent_type: crate::seal::AgentType::Agent,
+            },
+            "alpha work".into(),
+            Some("alpha".into()),
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Beta creates divergence: seal, add file, seal again
+        fs::write(dir.path().join("beta.txt"), "beta content\n").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "beta-agent".into(),
+                agent_type: crate::seal::AgentType::Agent,
+            },
+            "beta work".into(),
+            Some("beta".into()),
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Fork: seal alpha again (forces beta to diverge)
+        fs::write(dir.path().join("alpha2.txt"), "more alpha\n").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "alpha-agent".into(),
+                agent_type: crate::seal::AgentType::Agent,
+            },
+            "alpha cont".into(),
+            Some("alpha".into()),
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Clear any pre-existing events
+        let events_path = dir
+            .path()
+            .join(".writ")
+            .join("security")
+            .join("events.jsonl");
+        if events_path.exists() {
+            fs::remove_file(&events_path).unwrap();
+        }
+
+        // Run convergence
+        let _report = repo
+            .converge_all(ConvergeStrategy::MostRecent, false)
+            .unwrap();
+
+        // Read events from log
+        let logger = crate::security::SecurityEventLogger::new(&dir.path().join(".writ"));
+        let events = logger.read_events(None).unwrap();
+
+        let event_types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+
+        assert!(
+            event_types.contains(&"convergence_started"),
+            "Should have convergence_started event, got: {:?}",
+            event_types
+        );
+        assert!(
+            event_types.contains(&"convergence_completed")
+                || event_types.contains(&"convergence_degraded"),
+            "Should have convergence_completed or convergence_degraded event, got: {:?}",
+            event_types
+        );
+    }
+
+    /// Integration test: convergence_record should be populated in the report.
+    #[test]
+    fn test_converge_all_populates_convergence_record() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "base\n").unwrap();
+        let agent = AgentIdentity {
+            id: "setup".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        repo.seal(
+            agent,
+            "baseline".into(),
+            None,
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        // Create divergence
+        fs::write(dir.path().join("s1.txt"), "s1\n").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "a1".into(),
+                agent_type: crate::seal::AgentType::Agent,
+            },
+            "s1 work".into(),
+            Some("s1".into()),
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("s2.txt"), "s2\n").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "a2".into(),
+                agent_type: crate::seal::AgentType::Agent,
+            },
+            "s2 work".into(),
+            Some("s2".into()),
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Fork
+        fs::write(dir.path().join("s1b.txt"), "s1b\n").unwrap();
+        repo.seal(
+            AgentIdentity {
+                id: "a1".into(),
+                agent_type: crate::seal::AgentType::Agent,
+            },
+            "s1 cont".into(),
+            Some("s1".into()),
+            crate::seal::TaskStatus::InProgress,
+            crate::seal::Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_all(ConvergeStrategy::MostRecent, false)
+            .unwrap();
+
+        let record = report
+            .convergence_record
+            .expect("convergence_record should be populated");
+
+        assert!(!record.pipeline_version.is_empty());
+        assert!(!record.configuration_hash.is_empty());
+        assert!(!record.pattern_versions.is_empty());
+        assert!(!record.participating_specs.is_empty());
     }
 }
 

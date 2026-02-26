@@ -31,6 +31,7 @@ pub mod phase4;
 pub mod phase5;
 pub mod phase6;
 pub mod pipeline;
+pub mod traceability;
 pub mod types;
 
 use diff3::rebuild_with_resolutions;
@@ -2221,6 +2222,11 @@ pub struct ConvergeAllReport {
     /// Callers creating convergence seals should include these.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub files_changed: Vec<String>,
+    /// Reproducibility record — captures all inputs and config needed to
+    /// replay this convergence deterministically. Present when convergence
+    /// completes (even if degraded).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub convergence_record: Option<types::ConvergenceSealRecord>,
 }
 
 /// Result of a single merge step in `converge_all`.

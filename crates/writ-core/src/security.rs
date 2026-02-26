@@ -75,6 +75,7 @@ impl SecurityEventLogger {
     }
 
     /// Read all events, optionally filtered by severity.
+    /// Uses a shared (read) lock to prevent torn reads from concurrent writers.
     pub fn read_events(
         &self,
         severity_filter: Option<&Severity>,
@@ -83,6 +84,7 @@ impl SecurityEventLogger {
             return Ok(Vec::new());
         }
         let file = File::open(&self.events_path)?;
+        file.lock_shared().map_err(|e| WritError::Io(e))?;
         let reader = BufReader::new(file);
         let mut events = Vec::new();
         for line in reader.lines() {
@@ -159,6 +161,69 @@ impl SecurityEventLogger {
             event_type: "agent_revoked".to_string(),
             agent_id: Some(agent_id.to_string()),
             details: format!("Agent '{}' revoked: {}", agent_id, reason),
+        })
+    }
+
+    /// Convenience: emit a convergence-related event.
+    pub fn emit_convergence_event(
+        &self,
+        event_type: &str,
+        severity: Severity,
+        details: &str,
+    ) -> WritResult<()> {
+        self.emit_convergence_event_with_agent(event_type, severity, details, None)
+    }
+
+    /// Convenience: emit a convergence-related event with optional agent context.
+    pub fn emit_convergence_event_with_agent(
+        &self,
+        event_type: &str,
+        severity: Severity,
+        details: &str,
+        agent_id: Option<&str>,
+    ) -> WritResult<()> {
+        self.emit_event(&SecurityEvent {
+            timestamp: Utc::now(),
+            severity,
+            event_type: event_type.to_string(),
+            agent_id: agent_id.map(|s| s.to_string()),
+            details: details.to_string(),
+        })
+    }
+
+    /// Convenience: emit a Warning for chain hash verification failure.
+    pub fn emit_chain_hash_failure(&self, seal_id: &str, details: &str) -> WritResult<()> {
+        self.emit_event(&SecurityEvent {
+            timestamp: Utc::now(),
+            severity: Severity::Warning,
+            event_type: "chain_hash_failure".to_string(),
+            agent_id: None,
+            details: format!("Seal '{}': {}", seal_id, details),
+        })
+    }
+
+    /// Convenience: emit a Warning for unrecognized agent at seal time.
+    pub fn emit_unrecognized_agent(&self, agent_id: &str) -> WritResult<()> {
+        self.emit_event(&SecurityEvent {
+            timestamp: Utc::now(),
+            severity: Severity::Warning,
+            event_type: "unrecognized_agent".to_string(),
+            agent_id: Some(agent_id.to_string()),
+            details: format!(
+                "Agent '{}' is not registered in agent identity store",
+                agent_id
+            ),
+        })
+    }
+
+    /// Convenience: emit a Critical event for signature verification failure.
+    pub fn emit_authentication_failure(&self, seal_id: &str, details: &str) -> WritResult<()> {
+        self.emit_event(&SecurityEvent {
+            timestamp: Utc::now(),
+            severity: Severity::Critical,
+            event_type: "authentication_failure".to_string(),
+            agent_id: None,
+            details: format!("Seal '{}': {}", seal_id, details),
         })
     }
 }
@@ -578,5 +643,138 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].reason, FlagReason::AgentCompromised);
         assert_eq!(entries[1].reason, FlagReason::DownstreamOfCompromised);
+    }
+
+    // --- Convergence event tests ---
+
+    #[test]
+    fn test_emit_convergence_started_event() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+
+        logger
+            .emit_convergence_event(
+                "convergence_started",
+                Severity::Info,
+                "Convergence started: 3 specs, base='auth', strategy=escalate",
+            )
+            .unwrap();
+
+        let events = logger.read_events(None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "convergence_started");
+        assert_eq!(events[0].severity, Severity::Info);
+        assert!(events[0].agent_id.is_none());
+        assert!(events[0].details.contains("3 specs"));
+    }
+
+    #[test]
+    fn test_emit_convergence_completed_event() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+
+        logger
+            .emit_convergence_event(
+                "convergence_completed",
+                Severity::Info,
+                "Convergence completed: 2 merges, 5 auto-merged, clean=true",
+            )
+            .unwrap();
+
+        let events = logger.read_events(None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "convergence_completed");
+        assert_eq!(events[0].severity, Severity::Info);
+    }
+
+    #[test]
+    fn test_emit_convergence_degraded_event() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+
+        logger
+            .emit_convergence_event(
+                "convergence_degraded",
+                Severity::Warning,
+                "Convergence degraded: content loss possible",
+            )
+            .unwrap();
+
+        let events = logger.read_events(None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "convergence_degraded");
+        assert_eq!(events[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn test_emit_convergence_escalation_event() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+
+        logger
+            .emit_convergence_event(
+                "convergence_escalation",
+                Severity::Warning,
+                "Escalation in 'main.rs': BothModified between 'agent-a' and 'agent-b'",
+            )
+            .unwrap();
+
+        let events = logger.read_events(None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "convergence_escalation");
+        assert_eq!(events[0].severity, Severity::Warning);
+        assert!(events[0].details.contains("main.rs"));
+    }
+
+    // --- C.2.3 convenience method tests ---
+
+    #[test]
+    fn test_emit_chain_hash_failure() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+
+        logger
+            .emit_chain_hash_failure("seal-abc123", "content_hash mismatch: expected deadbeef")
+            .unwrap();
+
+        let events = logger.read_events(None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "chain_hash_failure");
+        assert_eq!(events[0].severity, Severity::Warning);
+        assert!(events[0].agent_id.is_none());
+        assert!(events[0].details.contains("seal-abc123"));
+        assert!(events[0].details.contains("content_hash mismatch"));
+    }
+
+    #[test]
+    fn test_emit_unrecognized_agent() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+
+        logger.emit_unrecognized_agent("mystery-bot").unwrap();
+
+        let events = logger.read_events(None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "unrecognized_agent");
+        assert_eq!(events[0].severity, Severity::Warning);
+        assert_eq!(events[0].agent_id.as_deref(), Some("mystery-bot"));
+        assert!(events[0].details.contains("not registered"));
+    }
+
+    #[test]
+    fn test_emit_authentication_failure() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+
+        logger
+            .emit_authentication_failure("seal-xyz", "signature verification failed")
+            .unwrap();
+
+        let events = logger.read_events(None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "authentication_failure");
+        assert_eq!(events[0].severity, Severity::Critical);
+        assert!(events[0].details.contains("seal-xyz"));
+        assert!(events[0].details.contains("signature verification failed"));
     }
 }

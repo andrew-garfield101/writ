@@ -76,6 +76,8 @@ pub struct PipelineInput {
     pub right_spec: String,
     /// Optional spec metadata for Phase 4.
     pub spec_context: Option<SpecContext>,
+    /// Trust context for confidence capping based on agent trust levels.
+    pub trust_context: Option<crate::agent::TrustContext>,
 }
 
 /// Spec metadata available for Phase 4 resolution.
@@ -367,6 +369,10 @@ impl ConvergencePipeline {
 
             let phase3_result = self.pattern_registry.evaluate(conflict);
 
+            // Apply trust-based confidence cap (Sprint B)
+            let phase3_result =
+                Self::apply_trust_adjustment(phase3_result, input.trust_context.as_ref());
+
             match phase3_result {
                 PatternResult::AutoResolved(proposal) => {
                     resolved_contents.push(Some(proposal.merged_content.clone()));
@@ -613,6 +619,43 @@ impl ConvergencePipeline {
     // Phases 4 & 5: Higher-level resolution (stub wiring)
     // -----------------------------------------------------------------------
 
+    /// Apply trust-based confidence cap to a pattern result.
+    ///
+    /// If a trust context is provided, the pattern's confidence is capped by
+    /// the trust adjustment factor. This may demote an AutoResolved result to
+    /// Suggested or NoMatch, depending on thresholds.
+    fn apply_trust_adjustment(
+        result: PatternResult,
+        trust_context: Option<&crate::agent::TrustContext>,
+    ) -> PatternResult {
+        let ctx = match trust_context {
+            Some(c) => c,
+            None => return result,
+        };
+        let adjustment = ctx.trust_adjustment();
+        match result {
+            PatternResult::AutoResolved(mut proposal) => {
+                proposal.confidence = proposal.confidence.min(adjustment);
+                if proposal.confidence >= 0.85 {
+                    PatternResult::AutoResolved(proposal)
+                } else if proposal.confidence >= 0.60 {
+                    PatternResult::Suggested(proposal)
+                } else {
+                    PatternResult::NoMatch
+                }
+            }
+            PatternResult::Suggested(mut proposal) => {
+                proposal.confidence = proposal.confidence.min(adjustment);
+                if proposal.confidence >= 0.60 {
+                    PatternResult::Suggested(proposal)
+                } else {
+                    PatternResult::NoMatch
+                }
+            }
+            PatternResult::NoMatch => PatternResult::NoMatch,
+        }
+    }
+
     fn try_phase4_and_5(
         &self,
         conflict: &ClassifiedConflict,
@@ -791,6 +834,7 @@ mod tests {
             left_spec: "spec-a".to_string(),
             right_spec: "spec-b".to_string(),
             spec_context: None,
+            trust_context: None,
         }
     }
 
@@ -1344,6 +1388,625 @@ mod tests {
         assert!(
             output.verification.is_some(),
             "verification should be present when Phase 6 is enabled"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Sprint B — Trust-adjusted convergence tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a TrustContext with the given trust levels.
+    fn make_trust_context(
+        left: crate::agent::TrustLevel,
+        right: crate::agent::TrustLevel,
+    ) -> crate::agent::TrustContext {
+        crate::agent::TrustContext {
+            left_trust: left,
+            right_trust: right,
+        }
+    }
+
+    #[test]
+    fn test_trust_full_full_no_cap() {
+        // Full+Full → 1.0 adjustment — should not cap any confidence
+        use crate::agent::TrustLevel;
+        let proposal = ResolutionProposal {
+            pattern_name: "test_pattern".into(),
+            confidence: 0.95,
+            merged_content: "merged".into(),
+            explanation: "test".into(),
+            warnings: vec![],
+        };
+        let ctx = make_trust_context(TrustLevel::Full, TrustLevel::Full);
+
+        let result = ConvergencePipeline::apply_trust_adjustment(
+            PatternResult::AutoResolved(proposal),
+            Some(&ctx),
+        );
+        match result {
+            PatternResult::AutoResolved(p) => {
+                assert!(
+                    (p.confidence - 0.95).abs() < f64::EPSILON,
+                    "Full+Full should not cap confidence: got {}",
+                    p.confidence
+                );
+            }
+            other => panic!("Full+Full should stay AutoResolved, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_trust_standard_standard_caps_at_090() {
+        // Standard+Standard → 0.90 adjustment — caps confidence but 0.90 >= 0.85
+        // threshold so it stays AutoResolved
+        use crate::agent::TrustLevel;
+        let proposal = ResolutionProposal {
+            pattern_name: "test_pattern".into(),
+            confidence: 0.95,
+            merged_content: "merged".into(),
+            explanation: "test".into(),
+            warnings: vec![],
+        };
+        let ctx = make_trust_context(TrustLevel::Standard, TrustLevel::Standard);
+
+        let result = ConvergencePipeline::apply_trust_adjustment(
+            PatternResult::AutoResolved(proposal),
+            Some(&ctx),
+        );
+        match result {
+            PatternResult::AutoResolved(p) => {
+                assert!(
+                    (p.confidence - 0.90).abs() < f64::EPSILON,
+                    "Standard+Standard should cap at 0.90: got {}",
+                    p.confidence
+                );
+            }
+            other => panic!(
+                "Standard+Standard with 0.95 should stay AutoResolved (0.90 >= 0.85), got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_trust_mixed_caps_at_075() {
+        // Full+Standard → 0.75 adjustment — demotes to Suggested
+        use crate::agent::TrustLevel;
+        let proposal = ResolutionProposal {
+            pattern_name: "test_pattern".into(),
+            confidence: 0.95,
+            merged_content: "merged".into(),
+            explanation: "test".into(),
+            warnings: vec![],
+        };
+        let ctx = make_trust_context(TrustLevel::Full, TrustLevel::Standard);
+
+        let result = ConvergencePipeline::apply_trust_adjustment(
+            PatternResult::AutoResolved(proposal),
+            Some(&ctx),
+        );
+        match result {
+            PatternResult::Suggested(p) => {
+                assert!(
+                    (p.confidence - 0.75).abs() < f64::EPSILON,
+                    "Mixed trust should cap at 0.75: got {}",
+                    p.confidence
+                );
+            }
+            other => panic!(
+                "Full+Standard with 0.95 should demote to Suggested, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_trust_restricted_caps_at_060() {
+        // Restricted+anything (non-Untrusted) → 0.60 adjustment
+        use crate::agent::TrustLevel;
+        let proposal = ResolutionProposal {
+            pattern_name: "test_pattern".into(),
+            confidence: 0.95,
+            merged_content: "merged".into(),
+            explanation: "test".into(),
+            warnings: vec![],
+        };
+        let ctx = make_trust_context(TrustLevel::Restricted, TrustLevel::Full);
+
+        let result = ConvergencePipeline::apply_trust_adjustment(
+            PatternResult::AutoResolved(proposal),
+            Some(&ctx),
+        );
+        match result {
+            PatternResult::Suggested(p) => {
+                assert!(
+                    (p.confidence - 0.60).abs() < f64::EPSILON,
+                    "Restricted should cap at 0.60: got {}",
+                    p.confidence
+                );
+            }
+            other => panic!(
+                "Restricted+Full with 0.95 should demote to Suggested, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_trust_untrusted_always_drops_to_nomatch() {
+        // Untrusted → 0.0 adjustment — everything becomes NoMatch
+        use crate::agent::TrustLevel;
+        let proposal = ResolutionProposal {
+            pattern_name: "test_pattern".into(),
+            confidence: 0.99,
+            merged_content: "merged".into(),
+            explanation: "test".into(),
+            warnings: vec![],
+        };
+        let ctx = make_trust_context(TrustLevel::Untrusted, TrustLevel::Full);
+
+        let result = ConvergencePipeline::apply_trust_adjustment(
+            PatternResult::AutoResolved(proposal),
+            Some(&ctx),
+        );
+        assert!(
+            matches!(result, PatternResult::NoMatch),
+            "Untrusted agent should always produce NoMatch, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_trust_none_context_is_passthrough() {
+        // No TrustContext → result passes through unchanged
+        let proposal = ResolutionProposal {
+            pattern_name: "test_pattern".into(),
+            confidence: 0.95,
+            merged_content: "merged".into(),
+            explanation: "test".into(),
+            warnings: vec![],
+        };
+
+        let result = ConvergencePipeline::apply_trust_adjustment(
+            PatternResult::AutoResolved(proposal),
+            None,
+        );
+        match result {
+            PatternResult::AutoResolved(p) => {
+                assert!(
+                    (p.confidence - 0.95).abs() < f64::EPSILON,
+                    "No trust context should pass through: got {}",
+                    p.confidence
+                );
+            }
+            other => panic!(
+                "No trust context should leave AutoResolved unchanged, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn test_trust_cap_applied_after_pattern_evaluation() {
+        // Integration test: run the full pipeline with Standard+Standard trust
+        // on a conflict that Phase 3 would normally auto-resolve (disjoint imports).
+        // The trust cap (0.90) should demote AutoResolved → Suggested → escalation.
+        use crate::agent::TrustLevel;
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n";
+        let left = "import os\nimport json\n";
+        let right = "import os\nimport sys\n";
+
+        let mut input = make_input("test.py", base, left, right);
+        input.trust_context = Some(make_trust_context(
+            TrustLevel::Standard,
+            TrustLevel::Standard,
+        ));
+
+        let output = pipeline.run(&input);
+
+        // With Standard+Standard (0.90 cap), a normally auto-resolved import merge
+        // should now be Suggested (0.90 < 0.85 threshold? No, 0.90 >= 0.85).
+        // Actually 0.90 >= 0.85 so it stays AutoResolved. The cap only demotes if
+        // the capped value drops below the threshold. Let's verify it still resolves.
+        assert!(
+            output.fully_resolved,
+            "Standard+Standard (0.90) should still auto-resolve high-confidence imports"
+        );
+    }
+
+    #[test]
+    fn test_trust_untrusted_escalates_normally_resolvable() {
+        // Integration test: a normally auto-resolvable import merge should escalate
+        // when one agent is Untrusted (0.0 cap → NoMatch → escalation).
+        use crate::agent::TrustLevel;
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n";
+        let left = "import os\nimport json\n";
+        let right = "import os\nimport sys\n";
+
+        let mut input = make_input("test.py", base, left, right);
+        input.trust_context = Some(make_trust_context(TrustLevel::Untrusted, TrustLevel::Full));
+
+        let output = pipeline.run(&input);
+
+        assert!(
+            !output.fully_resolved,
+            "Untrusted agent should cause escalation even for normally-resolvable conflicts"
+        );
+        assert!(
+            !output.escalations.is_empty(),
+            "Untrusted agent should produce escalation records"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// B.3.2 — Mixed-trust convergence integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod mixed_trust_convergence_tests {
+    use super::*;
+    use crate::agent::{TrustContext, TrustLevel};
+
+    fn make_input(file_path: &str, base: &str, left: &str, right: &str) -> PipelineInput {
+        PipelineInput {
+            file_path: file_path.to_string(),
+            base: base.to_string(),
+            left: left.to_string(),
+            right: right.to_string(),
+            left_spec: "spec-a".to_string(),
+            right_spec: "spec-b".to_string(),
+            spec_context: None,
+            trust_context: None,
+        }
+    }
+
+    fn make_trust(left: TrustLevel, right: TrustLevel) -> TrustContext {
+        TrustContext {
+            left_trust: left,
+            right_trust: right,
+        }
+    }
+
+    // --- Full+Full: confidence unaffected, auto-resolves normally ---
+
+    #[test]
+    fn test_full_full_python_imports_auto_resolve() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n";
+        let left = "import os\nimport json\n";
+        let right = "import os\nimport sys\n";
+
+        let mut input = make_input("app.py", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Full, TrustLevel::Full));
+
+        let output = pipeline.run(&input);
+        assert!(
+            output.fully_resolved,
+            "Full+Full should auto-resolve disjoint imports"
+        );
+        let merged = output.merged_content.unwrap();
+        assert!(
+            merged.contains("import json"),
+            "merged should contain left import"
+        );
+        assert!(
+            merged.contains("import sys"),
+            "merged should contain right import"
+        );
+    }
+
+    #[test]
+    fn test_full_full_rust_use_statements_auto_resolve() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "use std::io;\n\nfn main() {}\n";
+        let left = "use std::io;\nuse std::fs;\n\nfn main() {}\n";
+        let right = "use std::io;\nuse std::path::Path;\n\nfn main() {}\n";
+
+        let mut input = make_input("main.rs", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Full, TrustLevel::Full));
+
+        let output = pipeline.run(&input);
+        assert!(
+            output.fully_resolved,
+            "Full+Full should auto-resolve disjoint use statements"
+        );
+        let merged = output.merged_content.unwrap();
+        assert!(
+            merged.contains("use std::fs;"),
+            "merged should contain left use"
+        );
+        assert!(
+            merged.contains("use std::path::Path;"),
+            "merged should contain right use"
+        );
+    }
+
+    // --- Standard+Standard: cap 0.90, still auto-resolves (0.90 >= 0.85) ---
+
+    #[test]
+    fn test_standard_standard_still_auto_resolves_high_confidence() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n";
+        let left = "import os\nimport json\n";
+        let right = "import os\nimport sys\n";
+
+        let mut input = make_input("util.py", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Standard, TrustLevel::Standard));
+
+        let output = pipeline.run(&input);
+        assert!(
+            output.fully_resolved,
+            "Standard+Standard (cap 0.90) should still auto-resolve (0.90 >= 0.85 threshold)"
+        );
+    }
+
+    #[test]
+    fn test_standard_standard_confidence_capped_in_resolutions() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n";
+        let left = "import os\nimport json\n";
+        let right = "import os\nimport sys\n";
+
+        let mut input = make_input("check.py", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Standard, TrustLevel::Standard));
+
+        let output = pipeline.run(&input);
+        // Check that resolution proposals have capped confidence
+        for resolution in &output.resolutions {
+            if let Some(ref proposal) = resolution.phase3_result {
+                assert!(
+                    proposal.confidence <= 0.90 + f64::EPSILON,
+                    "Standard+Standard should cap confidence to 0.90, got {}",
+                    proposal.confidence
+                );
+            }
+        }
+    }
+
+    // --- Full+Standard (mixed): cap 0.75, demotes to Suggested → escalation ---
+
+    #[test]
+    fn test_mixed_full_standard_demotes_to_escalation() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n";
+        let left = "import os\nimport json\n";
+        let right = "import os\nimport sys\n";
+
+        let mut input = make_input("mixed.py", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Full, TrustLevel::Standard));
+
+        let output = pipeline.run(&input);
+        // 0.75 cap < 0.85 auto-resolve threshold → demoted to Suggested → escalated
+        assert!(
+            !output.fully_resolved,
+            "Mixed trust (0.75 cap) should escalate — confidence below auto-resolve threshold"
+        );
+        assert!(
+            !output.escalations.is_empty(),
+            "Mixed trust should produce escalation records"
+        );
+    }
+
+    #[test]
+    fn test_mixed_standard_full_same_as_full_standard() {
+        // Symmetry: Standard+Full should produce same result as Full+Standard
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n";
+        let left = "import os\nimport json\n";
+        let right = "import os\nimport sys\n";
+
+        let mut input_a = make_input("sym_a.py", base, left, right);
+        input_a.trust_context = Some(make_trust(TrustLevel::Full, TrustLevel::Standard));
+
+        let mut input_b = make_input("sym_b.py", base, left, right);
+        input_b.trust_context = Some(make_trust(TrustLevel::Standard, TrustLevel::Full));
+
+        let output_a = pipeline.run(&input_a);
+        let output_b = pipeline.run(&input_b);
+
+        assert_eq!(
+            output_a.fully_resolved, output_b.fully_resolved,
+            "Trust adjustment should be symmetric: Full+Standard == Standard+Full"
+        );
+        assert_eq!(
+            output_a.escalations.len(),
+            output_b.escalations.len(),
+            "Same number of escalations regardless of left/right trust order"
+        );
+    }
+
+    // --- Restricted+any: cap 0.60, barely above suggest threshold ---
+
+    #[test]
+    fn test_restricted_full_escalates() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n";
+        let left = "import os\nimport json\n";
+        let right = "import os\nimport sys\n";
+
+        let mut input = make_input("restricted.py", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Restricted, TrustLevel::Full));
+
+        let output = pipeline.run(&input);
+        assert!(
+            !output.fully_resolved,
+            "Restricted (0.60 cap) should escalate — far below 0.85 auto-resolve"
+        );
+    }
+
+    #[test]
+    fn test_restricted_restricted_escalates() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "use std::io;\n\nfn main() {}\n";
+        let left = "use std::io;\nuse std::fs;\n\nfn main() {}\n";
+        let right = "use std::io;\nuse std::path::Path;\n\nfn main() {}\n";
+
+        let mut input = make_input("restricted.rs", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Restricted, TrustLevel::Restricted));
+
+        let output = pipeline.run(&input);
+        assert!(
+            !output.fully_resolved,
+            "Restricted+Restricted (0.60 cap) should escalate"
+        );
+    }
+
+    // --- Untrusted+any: cap 0.0, everything becomes NoMatch ---
+
+    #[test]
+    fn test_untrusted_full_always_escalates() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n";
+        let left = "import os\nimport json\n";
+        let right = "import os\nimport sys\n";
+
+        let mut input = make_input("untrusted.py", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Untrusted, TrustLevel::Full));
+
+        let output = pipeline.run(&input);
+        assert!(
+            !output.fully_resolved,
+            "Untrusted (0.0 cap) should always escalate"
+        );
+        assert!(
+            !output.escalations.is_empty(),
+            "Untrusted should produce escalation records"
+        );
+    }
+
+    #[test]
+    fn test_untrusted_standard_always_escalates() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "use std::io;\n\nfn main() {}\n";
+        let left = "use std::io;\nuse std::fs;\n\nfn main() {}\n";
+        let right = "use std::io;\nuse std::path::Path;\n\nfn main() {}\n";
+
+        let mut input = make_input("untrusted.rs", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Untrusted, TrustLevel::Standard));
+
+        let output = pipeline.run(&input);
+        assert!(
+            !output.fully_resolved,
+            "Untrusted+Standard should always escalate"
+        );
+    }
+
+    #[test]
+    fn test_untrusted_both_sides_always_escalates() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n";
+        let left = "import os\nimport json\n";
+        let right = "import os\nimport sys\n";
+
+        let mut input = make_input("both_untrusted.py", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Untrusted, TrustLevel::Untrusted));
+
+        let output = pipeline.run(&input);
+        assert!(
+            !output.fully_resolved,
+            "Untrusted+Untrusted should always escalate"
+        );
+    }
+
+    // --- Symmetry verification ---
+
+    #[test]
+    fn test_trust_adjustment_is_symmetric() {
+        // For all meaningful trust level pairs, verify Left=A Right=B
+        // produces the same trust_adjustment as Left=B Right=A
+        let levels = [
+            TrustLevel::Full,
+            TrustLevel::Standard,
+            TrustLevel::Restricted,
+            TrustLevel::Untrusted,
+        ];
+
+        for &l in &levels {
+            for &r in &levels {
+                let ctx_lr = make_trust(l, r);
+                let ctx_rl = make_trust(r, l);
+                assert!(
+                    (ctx_lr.trust_adjustment() - ctx_rl.trust_adjustment()).abs() < f64::EPSILON,
+                    "Trust adjustment should be symmetric: {:?}+{:?} ({}) != {:?}+{:?} ({})",
+                    l,
+                    r,
+                    ctx_lr.trust_adjustment(),
+                    r,
+                    l,
+                    ctx_rl.trust_adjustment(),
+                );
+            }
+        }
+    }
+
+    // --- No trust context passthrough ---
+
+    #[test]
+    fn test_no_trust_context_resolves_normally() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "import os\n";
+        let left = "import os\nimport json\n";
+        let right = "import os\nimport sys\n";
+
+        let mut input = make_input("no_trust.py", base, left, right);
+        input.trust_context = None; // No trust context
+
+        let output = pipeline.run(&input);
+        assert!(
+            output.fully_resolved,
+            "No trust context should allow normal resolution"
+        );
+    }
+
+    // --- TypeScript trust tests ---
+
+    #[test]
+    fn test_full_full_typescript_imports_resolve() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "import React from 'react';\n\nexport default function App() {}\n";
+        let left =
+            "import React from 'react';\nimport axios from 'axios';\n\nexport default function App() {}\n";
+        let right =
+            "import React from 'react';\nimport lodash from 'lodash';\n\nexport default function App() {}\n";
+
+        let mut input = make_input("App.tsx", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Full, TrustLevel::Full));
+
+        let output = pipeline.run(&input);
+        assert!(
+            output.fully_resolved,
+            "Full+Full TypeScript imports should auto-resolve"
+        );
+        let merged = output.merged_content.unwrap();
+        assert!(
+            merged.contains("axios"),
+            "merged should contain left import"
+        );
+        assert!(
+            merged.contains("lodash"),
+            "merged should contain right import"
+        );
+    }
+
+    #[test]
+    fn test_restricted_typescript_imports_escalate() {
+        let pipeline = ConvergencePipeline::new();
+        let base = "import React from 'react';\n\nexport default function App() {}\n";
+        let left =
+            "import React from 'react';\nimport axios from 'axios';\n\nexport default function App() {}\n";
+        let right =
+            "import React from 'react';\nimport lodash from 'lodash';\n\nexport default function App() {}\n";
+
+        let mut input = make_input("App.tsx", base, left, right);
+        input.trust_context = Some(make_trust(TrustLevel::Restricted, TrustLevel::Standard));
+
+        let output = pipeline.run(&input);
+        assert!(
+            !output.fully_resolved,
+            "Restricted TypeScript imports should escalate (0.60 cap)"
         );
     }
 }

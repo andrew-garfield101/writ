@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
+use writ_core::agent::{AgentUpdate, TrustLevel};
 use writ_core::context::{ContextFilter, ContextScope};
 use writ_core::diff::LineOp;
 use writ_core::seal::{AgentIdentity, AgentType, ChangeType, TaskStatus, Verification};
@@ -106,6 +107,10 @@ enum Commands {
         /// Expected HEAD seal ID (for optimistic conflict detection).
         #[arg(long)]
         expected_head: Option<String>,
+
+        /// Reject seals that modify files outside the agent's scope constraints.
+        #[arg(long)]
+        enforce_scope: bool,
     },
 
     /// Inspect a specific seal.
@@ -305,6 +310,10 @@ enum Commands {
         #[arg(long)]
         chain: bool,
 
+        /// Verify HEAD chain plus all spec branch chains.
+        #[arg(long)]
+        all_chains: bool,
+
         /// Verify a specific seal by ID (or prefix).
         #[arg(long)]
         seal: Option<String>,
@@ -312,6 +321,103 @@ enum Commands {
         /// Output format: "human" (default) or "json".
         #[arg(long, default_value = "human")]
         format: String,
+    },
+
+    /// Manage agent identities.
+    Agent {
+        #[command(subcommand)]
+        action: AgentCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentCommands {
+    /// Register a new agent identity.
+    Register {
+        /// Agent identifier (alphanumeric, hyphens, underscores, dots).
+        name: String,
+
+        /// Trust level: full, standard, restricted, or untrusted.
+        #[arg(long, default_value = "standard")]
+        trust_level: String,
+
+        /// Scope constraint glob pattern (repeatable).
+        #[arg(long)]
+        scope: Option<Vec<String>>,
+
+        /// Who is registering this agent.
+        #[arg(long, default_value = "human")]
+        registered_by: String,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// List all registered agents.
+    List {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Show details for a specific agent.
+    Show {
+        /// Agent identifier.
+        name: String,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Revoke an agent (permanent, removes keys).
+    Revoke {
+        /// Agent identifier.
+        name: String,
+
+        /// Reason for revocation.
+        #[arg(long)]
+        reason: String,
+
+        /// When the compromise started (RFC 3339). If omitted, assumes now.
+        /// All seals by this agent after this time are flagged as compromised.
+        #[arg(long)]
+        compromise_timestamp: Option<String>,
+    },
+
+    /// Suspend an agent (temporary).
+    Suspend {
+        /// Agent identifier.
+        name: String,
+    },
+
+    /// Reactivate a suspended agent.
+    Reactivate {
+        /// Agent identifier.
+        name: String,
+    },
+
+    /// Manage an agent's scope constraints.
+    Scope {
+        /// Agent identifier.
+        name: String,
+
+        /// Add a scope constraint glob pattern.
+        #[arg(long)]
+        add: Option<String>,
+
+        /// Remove a scope constraint pattern.
+        #[arg(long)]
+        remove: Option<String>,
+
+        /// List current scope constraints.
+        #[arg(long)]
+        list: bool,
+
+        /// Replace all scope constraints (comma-separated).
+        #[arg(long, value_delimiter = ',')]
+        set: Option<Vec<String>>,
     },
 }
 
@@ -505,6 +611,7 @@ fn main() {
             linted,
             allow_empty,
             expected_head,
+            enforce_scope,
         } => cmd_seal(
             &cwd,
             &summary,
@@ -517,6 +624,7 @@ fn main() {
             linted,
             allow_empty,
             expected_head,
+            enforce_scope,
         ),
         Commands::Show {
             seal_id,
@@ -621,9 +729,35 @@ fn main() {
         },
         Commands::Verify {
             chain,
+            all_chains,
             seal,
             format,
-        } => cmd_verify(&cwd, chain, seal.as_deref(), &format),
+        } => cmd_verify(&cwd, chain, all_chains, seal.as_deref(), &format),
+        Commands::Agent { action } => match action {
+            AgentCommands::Register {
+                name,
+                trust_level,
+                scope,
+                registered_by,
+                format,
+            } => cmd_agent_register(&cwd, &name, &trust_level, scope, &registered_by, &format),
+            AgentCommands::List { format } => cmd_agent_list(&cwd, &format),
+            AgentCommands::Show { name, format } => cmd_agent_show(&cwd, &name, &format),
+            AgentCommands::Revoke {
+                name,
+                reason,
+                compromise_timestamp,
+            } => cmd_agent_revoke(&cwd, &name, &reason, compromise_timestamp.as_deref()),
+            AgentCommands::Suspend { name } => cmd_agent_suspend(&cwd, &name),
+            AgentCommands::Reactivate { name } => cmd_agent_reactivate(&cwd, &name),
+            AgentCommands::Scope {
+                name,
+                add,
+                remove,
+                list,
+                set,
+            } => cmd_agent_scope(&cwd, &name, add, remove, list, set),
+        },
     };
 
     if let Err(e) = result {
@@ -893,8 +1027,10 @@ fn cmd_seal(
     linted: bool,
     allow_empty: bool,
     expected_head: Option<String>,
+    enforce_scope: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let mut repo = Repository::open(cwd)?;
+    repo.set_enforce_scope(enforce_scope);
 
     let agent = AgentIdentity {
         id: agent_id.to_string(),
@@ -2519,6 +2655,7 @@ fn cmd_remote_status(
 fn cmd_verify(
     cwd: &std::path::Path,
     chain: bool,
+    all_chains: bool,
     seal_id: Option<&str>,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -2526,6 +2663,10 @@ fn cmd_verify(
 
     if let Some(id) = seal_id {
         return cmd_verify_seal(&repo, id, format);
+    }
+
+    if all_chains {
+        return cmd_verify_all_chains(&repo, format);
     }
 
     if chain {
@@ -2668,6 +2809,363 @@ fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<(), Box<dyn std::
             } else {
                 println!("  result: VALID");
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_verify_all_chains(
+    repo: &Repository,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = repo.verify_all_chains(None)?;
+
+    match format {
+        "json" => {
+            let json = serde_json::json!({
+                "all_valid": result.all_valid,
+                "head_chain": {
+                    "valid": result.head_chain.valid,
+                    "seals_checked": result.head_chain.total_seals,
+                    "seals_verified": result.head_chain.verified,
+                    "seals_unsecured": result.head_chain.unsecured,
+                    "failures": result.head_chain.failures.iter().map(|f| {
+                        serde_json::json!({
+                            "seal": &f.seal_id[..12.min(f.seal_id.len())],
+                            "error": f.error,
+                        })
+                    }).collect::<Vec<_>>(),
+                },
+                "spec_chains": result.spec_chains.iter().map(|sc| {
+                    serde_json::json!({
+                        "spec_id": sc.spec_id,
+                        "valid": sc.chain.valid,
+                        "seals_checked": sc.chain.total_seals,
+                        "seals_verified": sc.chain.verified,
+                        "seals_unsecured": sc.chain.unsecured,
+                        "failures": sc.chain.failures.iter().map(|f| {
+                            serde_json::json!({
+                                "seal": &f.seal_id[..12.min(f.seal_id.len())],
+                                "error": f.error,
+                            })
+                        }).collect::<Vec<_>>(),
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        }
+        _ => {
+            println!("=== HEAD chain ===");
+            println!(
+                "  {} seals checked, {} verified, {} pre-security",
+                result.head_chain.total_seals,
+                result.head_chain.verified,
+                result.head_chain.unsecured
+            );
+            for f in &result.head_chain.failures {
+                let short_id = &f.seal_id[..12.min(f.seal_id.len())];
+                println!(
+                    "  FAIL {short_id}: {}",
+                    f.error.as_deref().unwrap_or("unknown")
+                );
+            }
+            println!(
+                "  result: {}",
+                if result.head_chain.valid {
+                    "VALID"
+                } else {
+                    "INVALID"
+                }
+            );
+
+            if result.spec_chains.is_empty() {
+                println!("\nno spec branches to verify");
+            } else {
+                for sc in &result.spec_chains {
+                    println!("\n=== spec: {} ===", sc.spec_id);
+                    println!(
+                        "  {} seals checked, {} verified, {} pre-security",
+                        sc.chain.total_seals, sc.chain.verified, sc.chain.unsecured
+                    );
+                    for f in &sc.chain.failures {
+                        let short_id = &f.seal_id[..12.min(f.seal_id.len())];
+                        println!(
+                            "  FAIL {short_id}: {}",
+                            f.error.as_deref().unwrap_or("unknown")
+                        );
+                    }
+                    println!(
+                        "  result: {}",
+                        if sc.chain.valid { "VALID" } else { "INVALID" }
+                    );
+                }
+            }
+
+            println!(
+                "\noverall: {}",
+                if result.all_valid {
+                    "ALL CHAINS VALID"
+                } else {
+                    "SOME CHAINS INVALID"
+                }
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Agent commands (Sprint B)
+// ---------------------------------------------------------------------------
+
+fn cmd_agent_register(
+    cwd: &PathBuf,
+    name: &str,
+    trust_level: &str,
+    scope: Option<Vec<String>>,
+    registered_by: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+
+    let trust = TrustLevel::from_str_loose(trust_level).ok_or_else(|| {
+        format!(
+            "invalid trust level '{trust_level}' — use full, standard, restricted, or untrusted"
+        )
+    })?;
+
+    let scope_constraints = scope.unwrap_or_default();
+    let agent = repo.register_agent(name, registered_by, trust, scope_constraints)?;
+
+    match format {
+        "json" => {
+            let json = serde_json::to_string_pretty(&agent)?;
+            println!("{json}");
+        }
+        _ => {
+            println!("registered agent '{}'", agent.agent_id);
+            println!("  trust_level: {:?}", agent.trust_level);
+            println!("  public_key:  {}...", &agent.public_key[..16]);
+            if agent.scope_constraints.is_empty() {
+                println!("  scope:       unrestricted");
+            } else {
+                println!("  scope:       {}", agent.scope_constraints.join(", "));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_agent_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    let agents = repo.list_agents()?;
+
+    if agents.is_empty() {
+        match format {
+            "json" => println!("[]"),
+            _ => println!("no registered agents"),
+        }
+        return Ok(());
+    }
+
+    match format {
+        "json" => {
+            let json = serde_json::to_string_pretty(&agents)?;
+            println!("{json}");
+        }
+        _ => {
+            println!(
+                "{:<20} {:<12} {:<10} {}",
+                "AGENT", "TRUST", "STATUS", "SCOPE"
+            );
+            for agent in &agents {
+                let scope = if agent.scope_constraints.is_empty() {
+                    "unrestricted".to_string()
+                } else {
+                    agent.scope_constraints.join(", ")
+                };
+                println!(
+                    "{:<20} {:<12} {:<10} {}",
+                    agent.agent_id,
+                    format!("{:?}", agent.trust_level).to_lowercase(),
+                    format!("{:?}", agent.status).to_lowercase(),
+                    scope
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_agent_show(
+    cwd: &PathBuf,
+    name: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    let agent = repo.load_agent(name)?;
+
+    match format {
+        "json" => {
+            let json = serde_json::to_string_pretty(&agent)?;
+            println!("{json}");
+        }
+        _ => {
+            println!("agent: {}", agent.agent_id);
+            println!("  status:        {:?}", agent.status);
+            println!("  trust_level:   {:?}", agent.trust_level);
+            println!("  public_key:    {}", agent.public_key);
+            println!("  registered_at: {}", agent.registered_at.to_rfc3339());
+            println!("  registered_by: {}", agent.registered_by);
+            if agent.scope_constraints.is_empty() {
+                println!("  scope:         unrestricted");
+            } else {
+                for s in &agent.scope_constraints {
+                    println!("  scope:         {s}");
+                }
+            }
+            if let Some(ref reason) = agent.revocation_reason {
+                println!(
+                    "  revoked_at:    {}",
+                    agent.revoked_at.unwrap().to_rfc3339()
+                );
+                println!("  reason:        {reason}");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_agent_revoke(
+    cwd: &PathBuf,
+    name: &str,
+    reason: &str,
+    compromise_timestamp: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+
+    let ts = match compromise_timestamp {
+        Some(s) => {
+            let parsed = chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| format!("invalid timestamp '{}': {}", s, e))?;
+            Some(parsed.with_timezone(&chrono::Utc))
+        }
+        None => None,
+    };
+
+    let agent = repo.revoke_agent_with_compromise(name, reason, ts)?;
+
+    println!("agent '{name}' revoked: {reason}");
+
+    // Report flagged seals
+    let flagged = repo.flagged_seal_ids()?;
+    if !flagged.is_empty() {
+        println!(
+            "  {} seal(s) flagged as potentially compromised",
+            flagged.len()
+        );
+        if let Some(t) = ts {
+            println!("  compromise window: {} to now", t.to_rfc3339());
+        } else if let Some(t) = agent.revoked_at {
+            println!("  compromise window: {} (revocation time)", t.to_rfc3339());
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_agent_suspend(cwd: &PathBuf, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    repo.suspend_agent(name)?;
+    println!("agent '{name}' suspended");
+    Ok(())
+}
+
+fn cmd_agent_reactivate(cwd: &PathBuf, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    repo.reactivate_agent(name)?;
+    println!("agent '{name}' reactivated");
+    Ok(())
+}
+
+fn cmd_agent_scope(
+    cwd: &PathBuf,
+    name: &str,
+    add: Option<String>,
+    remove: Option<String>,
+    list: bool,
+    set: Option<Vec<String>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+
+    if let Some(patterns) = set {
+        let updated = repo.update_agent(
+            name,
+            AgentUpdate {
+                scope_constraints: Some(patterns),
+                ..Default::default()
+            },
+        )?;
+        println!("scope for '{}' set to:", name);
+        if updated.scope_constraints.is_empty() {
+            println!("  unrestricted");
+        } else {
+            for s in &updated.scope_constraints {
+                println!("  {s}");
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(pattern) = add {
+        let agent = repo.load_agent(name)?;
+        let mut constraints = agent.scope_constraints.clone();
+        if !constraints.contains(&pattern) {
+            constraints.push(pattern.clone());
+        }
+        repo.update_agent(
+            name,
+            AgentUpdate {
+                scope_constraints: Some(constraints),
+                ..Default::default()
+            },
+        )?;
+        println!("added '{pattern}' to scope for '{name}'");
+        return Ok(());
+    }
+
+    if let Some(pattern) = remove {
+        let agent = repo.load_agent(name)?;
+        let constraints: Vec<String> = agent
+            .scope_constraints
+            .into_iter()
+            .filter(|s| s != &pattern)
+            .collect();
+        repo.update_agent(
+            name,
+            AgentUpdate {
+                scope_constraints: Some(constraints),
+                ..Default::default()
+            },
+        )?;
+        println!("removed '{pattern}' from scope for '{name}'");
+        return Ok(());
+    }
+
+    // Default: list scope (also triggered by --list flag)
+    let _ = list; // flag is consumed but default behavior is the same
+    let agent = repo.load_agent(name)?;
+    if agent.scope_constraints.is_empty() {
+        println!("scope for '{}': unrestricted", name);
+    } else {
+        println!("scope for '{}':", name);
+        for s in &agent.scope_constraints {
+            println!("  {s}");
         }
     }
 

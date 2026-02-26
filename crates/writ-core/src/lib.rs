@@ -4,6 +4,7 @@
 //! Its core primitives are **specs** (not branches), **seals** (not commits),
 //! and **convergence** (not merging).
 
+pub mod agent;
 #[cfg(feature = "bridge")]
 pub mod bridge;
 pub mod context;
@@ -22,6 +23,7 @@ pub mod object;
 pub mod remote;
 pub mod repo;
 pub mod seal;
+pub mod security;
 pub mod spec;
 pub mod state;
 

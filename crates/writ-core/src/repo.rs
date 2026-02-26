@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::{AgentStatus, AgentUpdate, RegisteredAgent, TrustLevel};
 use crate::context::{
     AgentActivity, ChainIntegritySummary, ContextFilter, ContextOutput, ContextScope, DepStatus,
     DiffSummary, DivergedBranchWarning, FileContention, FileScopeViolation, IntegrationRisk,
@@ -48,6 +49,9 @@ pub struct Repository {
     objects: ObjectStore,
     /// In-memory HEAD recorded at last context() call, for automatic conflict detection.
     last_context_head: Mutex<Option<String>>,
+    /// When true, seal() rejects files outside an agent's scope constraints.
+    /// When false (default), out-of-scope files produce warnings but the seal succeeds.
+    enforce_scope: bool,
 }
 
 /// Snapshot of git working tree state, used by install().
@@ -121,6 +125,7 @@ impl Repository {
         fs::create_dir_all(writ_dir.join("specs"))?;
         fs::create_dir_all(writ_dir.join("heads"))?;
         fs::create_dir_all(writ_dir.join("keys"))?;
+        fs::create_dir_all(writ_dir.join("agents"))?;
         fs::write(writ_dir.join("HEAD"), "")?;
 
         // Generate the convergence engine keypair (encrypted at rest via KeyStore)
@@ -152,7 +157,17 @@ impl Repository {
             writ_dir,
             objects,
             last_context_head: Mutex::new(None),
+            enforce_scope: false,
         })
+    }
+
+    /// Enable or disable hard scope enforcement on seal().
+    ///
+    /// When enabled, sealing files outside an agent's scope constraints
+    /// returns `WritError::ScopeViolation`. When disabled (default),
+    /// out-of-scope files produce `AGENT_SCOPE` warnings but the seal succeeds.
+    pub fn set_enforce_scope(&mut self, enforce: bool) {
+        self.enforce_scope = enforce;
     }
 
     /// One-command setup: init writ, detect git, import baseline, install hooks.
@@ -364,6 +379,21 @@ impl Repository {
         allow_empty: bool,
     ) -> WritResult<Seal> {
         Self::validate_agent_id(&agent.id)?;
+        // Reject seals from revoked or suspended agents
+        if let Ok(registered) = self.load_agent(&agent.id) {
+            if registered.status == AgentStatus::Revoked {
+                return Err(WritError::AgentInactive(format!(
+                    "agent '{}' is revoked and cannot create seals",
+                    agent.id
+                )));
+            }
+            if registered.status == AgentStatus::Suspended {
+                return Err(WritError::AgentInactive(format!(
+                    "agent '{}' is suspended and cannot create seals",
+                    agent.id
+                )));
+            }
+        }
         let _lock = self.lock()?;
         let mut index = self.load_index()?;
         let rules = self.ignore_rules();
@@ -426,6 +456,13 @@ impl Repository {
                     sid,
                     scope_warn.out_of_scope_files.join(", "),
                 ));
+                // Emit security event for scope violation (best-effort, don't block seal)
+                let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+                if let Err(e) =
+                    logger.emit_scope_violation(&agent.id, sid, &scope_warn.out_of_scope_files)
+                {
+                    seal_warnings.push(format!("SECURITY_LOG_FAILURE: {e}"));
+                }
             }
         }
 
@@ -433,6 +470,41 @@ impl Repository {
             seal_warnings.push(
                 "GHOST_WORK: seal has a summary but 0 file changes — work may have been captured by another agent's seal".to_string(),
             );
+        }
+
+        // Agent identity checks (Sprint B)
+        if let Ok(registered) = self.load_agent(&agent.id) {
+            if registered.status != AgentStatus::Active {
+                seal_warnings.push(format!(
+                    "AGENT_INACTIVE: agent '{}' status is {:?}",
+                    agent.id, registered.status
+                ));
+            }
+            let out_of_scope: Vec<&str> = changes
+                .iter()
+                .filter(|c| !crate::agent::is_in_scope(&registered.scope_constraints, &c.path))
+                .map(|c| c.path.as_str())
+                .collect();
+            if !out_of_scope.is_empty() {
+                // Always emit security event (best-effort)
+                let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+                let _ = logger.emit_agent_scope_violation(&agent.id, &out_of_scope);
+                if self.enforce_scope {
+                    return Err(WritError::ScopeViolation(format!(
+                        "agent '{}' modified {} file(s) outside scope: {}",
+                        agent.id,
+                        out_of_scope.len(),
+                        out_of_scope.join(", ")
+                    )));
+                } else {
+                    seal_warnings.push(format!(
+                        "AGENT_SCOPE: {} file(s) outside agent '{}' scope: {}",
+                        out_of_scope.len(),
+                        agent.id,
+                        out_of_scope.join(", ")
+                    ));
+                }
+            }
         }
 
         // Look up parent seal's chain_hash for the cryptographic chain link
@@ -462,7 +534,11 @@ impl Repository {
             seal_warnings,
             parent_seal_hash,
         );
-        seal.secure(None);
+
+        // Sign with agent's key if available, otherwise unsigned
+        let ks = KeyStore::open(&self.writ_dir);
+        let signing_key = ks.load_agent_signing_key(&seal.agent.id).ok();
+        seal.secure(signing_key.as_ref());
 
         self.save_seal(&seal)?;
         atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
@@ -705,6 +781,100 @@ impl Repository {
 
         let valid = failures.is_empty();
 
+        Ok(ChainVerification {
+            total_seals: seals.len(),
+            verified,
+            unsecured,
+            failures,
+            valid,
+        })
+    }
+
+    /// Verify the HEAD chain plus every spec's branch chain.
+    ///
+    /// Returns an `AllChainsVerification` with the HEAD result and per-spec
+    /// results. `all_valid` is true only if every chain passes.
+    pub fn verify_all_chains(
+        &self,
+        verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> WritResult<AllChainsVerification> {
+        let head_chain = self.verify_chain(verifying_key)?;
+
+        let mut spec_chains = Vec::new();
+        let heads_dir = self.writ_dir.join("heads");
+        if heads_dir.exists() {
+            let mut spec_ids: Vec<String> = Vec::new();
+            for entry in fs::read_dir(&heads_dir)? {
+                let entry = entry?;
+                spec_ids.push(entry.file_name().to_string_lossy().to_string());
+            }
+            spec_ids.sort();
+
+            for spec_id in spec_ids {
+                let chain = self.verify_spec_chain(&spec_id, verifying_key)?;
+                spec_chains.push(SpecChainResult { spec_id, chain });
+            }
+        }
+
+        let all_valid = head_chain.valid && spec_chains.iter().all(|sc| sc.chain.valid);
+
+        Ok(AllChainsVerification {
+            head_chain,
+            spec_chains,
+            all_valid,
+        })
+    }
+
+    /// Verify cryptographic integrity of a spec's branch chain.
+    ///
+    /// Walks from the spec's HEAD backward, verifying each seal's content hash,
+    /// chain hash, and parent linkage — identical logic to `verify_chain()` but
+    /// scoped to the spec's branch.
+    fn verify_spec_chain(
+        &self,
+        spec_id: &str,
+        verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> WritResult<ChainVerification> {
+        let seals = self.spec_log(spec_id)?;
+        let mut verified = 0;
+        let mut unsecured = 0;
+        let mut failures = Vec::new();
+
+        for (i, seal) in seals.iter().enumerate() {
+            if !seal.is_secured() {
+                unsecured += 1;
+                continue;
+            }
+
+            let result = self.verify_seal(seal, verifying_key);
+
+            if result.content_hash_valid && result.chain_hash_valid {
+                if i + 1 < seals.len() {
+                    let parent = &seals[i + 1];
+                    if let Some(ref parent_chain) = parent.chain_hash {
+                        if seal.parent_seal_hash.as_ref() != Some(parent_chain) {
+                            failures.push(SealVerification {
+                                seal_id: seal.id.clone(),
+                                content_hash_valid: true,
+                                chain_hash_valid: true,
+                                signature_present: result.signature_present,
+                                signature_valid: result.signature_valid,
+                                error: Some(format!(
+                                    "parent_seal_hash doesn't match parent's chain_hash (expected {})",
+                                    parent_chain
+                                )),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                verified += 1;
+            } else {
+                failures.push(result);
+            }
+        }
+
+        let valid = failures.is_empty();
         Ok(ChainVerification {
             total_seals: seals.len(),
             verified,
@@ -2902,6 +3072,7 @@ impl Repository {
                         left_spec: base_spec.clone(),
                         right_spec: spec_id.to_string(),
                         spec_context: None,
+                        trust_context: self.build_trust_context(&base_spec, spec_id),
                     };
                     let pipeline_output = v2_pipeline.run(&pipeline_input);
 
@@ -3474,6 +3645,21 @@ impl Repository {
         allow_empty: bool,
     ) -> WritResult<Seal> {
         Self::validate_agent_id(&agent.id)?;
+        // Reject seals from revoked or suspended agents
+        if let Ok(registered) = self.load_agent(&agent.id) {
+            if registered.status == AgentStatus::Revoked {
+                return Err(WritError::AgentInactive(format!(
+                    "agent '{}' is revoked and cannot create seals",
+                    agent.id
+                )));
+            }
+            if registered.status == AgentStatus::Suspended {
+                return Err(WritError::AgentInactive(format!(
+                    "agent '{}' is suspended and cannot create seals",
+                    agent.id
+                )));
+            }
+        }
         let _lock = self.lock()?;
         let mut index = self.load_index()?;
         let rules = self.ignore_rules();
@@ -3546,6 +3732,13 @@ impl Repository {
                     sid,
                     scope_warn.out_of_scope_files.join(", "),
                 ));
+                // Emit security event for scope violation (best-effort, don't block seal)
+                let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+                if let Err(e) =
+                    logger.emit_scope_violation(&agent.id, sid, &scope_warn.out_of_scope_files)
+                {
+                    seal_warnings.push(format!("SECURITY_LOG_FAILURE: {e}"));
+                }
             }
         }
 
@@ -3553,6 +3746,40 @@ impl Repository {
             seal_warnings.push(
                 "GHOST_WORK: seal has a summary but 0 file changes — work may have been captured by another agent's seal".to_string(),
             );
+        }
+
+        // Agent identity checks (Sprint B)
+        if let Ok(registered) = self.load_agent(&agent.id) {
+            if registered.status != AgentStatus::Active {
+                seal_warnings.push(format!(
+                    "AGENT_INACTIVE: agent '{}' status is {:?}",
+                    agent.id, registered.status
+                ));
+            }
+            let out_of_scope: Vec<&str> = changes
+                .iter()
+                .filter(|c| !crate::agent::is_in_scope(&registered.scope_constraints, &c.path))
+                .map(|c| c.path.as_str())
+                .collect();
+            if !out_of_scope.is_empty() {
+                let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+                let _ = logger.emit_agent_scope_violation(&agent.id, &out_of_scope);
+                if self.enforce_scope {
+                    return Err(WritError::ScopeViolation(format!(
+                        "agent '{}' modified {} file(s) outside scope: {}",
+                        agent.id,
+                        out_of_scope.len(),
+                        out_of_scope.join(", ")
+                    )));
+                } else {
+                    seal_warnings.push(format!(
+                        "AGENT_SCOPE: {} file(s) outside agent '{}' scope: {}",
+                        out_of_scope.len(),
+                        agent.id,
+                        out_of_scope.join(", ")
+                    ));
+                }
+            }
         }
 
         let parent_seal_hash = match parent {
@@ -3581,7 +3808,11 @@ impl Repository {
             seal_warnings,
             parent_seal_hash,
         );
-        seal.secure(None);
+
+        // Sign with agent's key if available, otherwise unsigned
+        let ks = KeyStore::open(&self.writ_dir);
+        let signing_key = ks.load_agent_signing_key(&seal.agent.id).ok();
+        seal.secure(signing_key.as_ref());
 
         self.save_seal(&seal)?;
         atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
@@ -3619,6 +3850,287 @@ impl Repository {
     pub fn convergence_verifying_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
         let ks = KeyStore::open(&self.writ_dir);
         ks.load_agent_verifying_key("convergence").ok()
+    }
+
+    // -----------------------------------------------------------------------
+    // Agent management
+    // -----------------------------------------------------------------------
+
+    /// Register a new agent. Generates an Ed25519 keypair and stores it in
+    /// the keystore. Returns the `RegisteredAgent` record.
+    pub fn register_agent(
+        &self,
+        agent_id: &str,
+        registered_by: &str,
+        trust_level: TrustLevel,
+        scope_constraints: Vec<String>,
+    ) -> WritResult<RegisteredAgent> {
+        let agent_path = self.writ_dir.join(format!("agents/{agent_id}.json"));
+        if agent_path.exists() {
+            return Err(WritError::AgentAlreadyExists(agent_id.to_string()));
+        }
+
+        // Generate keypair and store in keystore
+        let (signing_key, verifying_key) = crate::crypto::generate_keypair();
+        let ks = KeyStore::open(&self.writ_dir);
+        ks.store_agent_key(agent_id, &signing_key, &verifying_key)?;
+
+        let agent = RegisteredAgent {
+            agent_id: agent_id.to_string(),
+            public_key: crate::crypto::verifying_key_to_hex(&verifying_key),
+            registered_at: chrono::Utc::now(),
+            registered_by: registered_by.to_string(),
+            trust_level,
+            scope_constraints,
+            status: AgentStatus::Active,
+            revoked_at: None,
+            revocation_reason: None,
+        };
+
+        let json = serde_json::to_string_pretty(&agent)?;
+        atomic_write(&agent_path, json.as_bytes())?;
+        Ok(agent)
+    }
+
+    /// Load a registered agent by ID.
+    pub fn load_agent(&self, agent_id: &str) -> WritResult<RegisteredAgent> {
+        let agent_path = self.writ_dir.join(format!("agents/{agent_id}.json"));
+        let data = fs::read_to_string(&agent_path)
+            .map_err(|_| WritError::AgentNotFound(agent_id.to_string()))?;
+        let agent: RegisteredAgent = serde_json::from_str(&data)
+            .map_err(|e| WritError::Other(format!("agent JSON: {e}")))?;
+        Ok(agent)
+    }
+
+    /// List all registered agents.
+    pub fn list_agents(&self) -> WritResult<Vec<RegisteredAgent>> {
+        let agents_dir = self.writ_dir.join("agents");
+        if !agents_dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut agents = Vec::new();
+        for entry in fs::read_dir(&agents_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "json") {
+                if let Ok(data) = fs::read_to_string(&path) {
+                    if let Ok(agent) = serde_json::from_str::<RegisteredAgent>(&data) {
+                        agents.push(agent);
+                    }
+                }
+            }
+        }
+        agents.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+        Ok(agents)
+    }
+
+    /// Update a registered agent (trust level, scope constraints).
+    pub fn update_agent(&self, agent_id: &str, update: AgentUpdate) -> WritResult<RegisteredAgent> {
+        let mut agent = self.load_agent(agent_id)?;
+
+        if let Some(trust) = update.trust_level {
+            agent.trust_level = trust;
+        }
+        if let Some(scope) = update.scope_constraints {
+            agent.scope_constraints = scope;
+        }
+
+        let agent_path = self.writ_dir.join(format!("agents/{agent_id}.json"));
+        let json = serde_json::to_string_pretty(&agent)?;
+        atomic_write(&agent_path, json.as_bytes())?;
+        Ok(agent)
+    }
+
+    /// Revoke an agent. Sets status to Revoked, records reason and timestamp.
+    /// Removes keys from keystore (agent can no longer sign).
+    ///
+    /// If `compromise_timestamp` is provided, all seals created by this agent
+    /// between that time and now are flagged in the flagged-seals manifest.
+    /// If not provided, defaults to `revoked_at` (assumes compromise started
+    /// at revocation time). Downstream seals that incorporate flagged seals
+    /// are also transitively flagged.
+    pub fn revoke_agent(&self, agent_id: &str, reason: &str) -> WritResult<RegisteredAgent> {
+        self.revoke_agent_with_compromise(agent_id, reason, None)
+    }
+
+    /// Revoke an agent with an explicit compromise timestamp.
+    ///
+    /// Seals created by the agent between `compromise_timestamp` and now are
+    /// flagged. Downstream seals that incorporate any flagged seal as a parent
+    /// are transitively flagged as well.
+    pub fn revoke_agent_with_compromise(
+        &self,
+        agent_id: &str,
+        reason: &str,
+        compromise_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> WritResult<RegisteredAgent> {
+        let mut agent = self.load_agent(agent_id)?;
+        agent.status = AgentStatus::Revoked;
+        let now = chrono::Utc::now();
+        agent.revoked_at = Some(now);
+        agent.revocation_reason = Some(reason.to_string());
+
+        let agent_path = self.writ_dir.join(format!("agents/{agent_id}.json"));
+        let json = serde_json::to_string_pretty(&agent)?;
+        atomic_write(&agent_path, json.as_bytes())?;
+
+        // Remove keys from keystore (best-effort)
+        let ks = KeyStore::open(&self.writ_dir);
+        let _ = ks.remove_agent_keys(agent_id);
+
+        // Emit security event (best-effort)
+        let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+        let _ = logger.emit_agent_revoked(agent_id, reason);
+
+        // Flag seals in the compromise window (best-effort)
+        let compromise_start = compromise_timestamp.unwrap_or(now);
+        let _ = self.flag_compromised_seals(agent_id, compromise_start, now);
+
+        Ok(agent)
+    }
+
+    /// Flag all seals by `agent_id` created between `from` and `to`,
+    /// plus any downstream seals that transitively depend on them.
+    fn flag_compromised_seals(
+        &self,
+        agent_id: &str,
+        from: chrono::DateTime<chrono::Utc>,
+        to: chrono::DateTime<chrono::Utc>,
+    ) -> WritResult<()> {
+        use crate::security::{FlagReason, FlaggedSeal, FlaggedSealStore};
+
+        let store = FlaggedSealStore::new(&self.writ_dir);
+        let all_seals = self.log_all()?;
+
+        // Phase 1: flag seals created by this agent in the compromise window
+        let mut flagged_ids: HashSet<String> = HashSet::new();
+        for seal in &all_seals {
+            if seal.agent.id == agent_id && seal.timestamp >= from && seal.timestamp <= to {
+                flagged_ids.insert(seal.id.clone());
+                store.flag_seal(&FlaggedSeal {
+                    seal_id: seal.id.clone(),
+                    agent_id: agent_id.to_string(),
+                    reason: FlagReason::AgentCompromised,
+                    compromise_window: (from, to),
+                    flagged_by: "system".to_string(),
+                    flagged_at: to,
+                })?;
+            }
+        }
+
+        if flagged_ids.is_empty() {
+            return Ok(());
+        }
+
+        // Phase 2: transitively flag downstream seals whose parent is flagged
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for seal in &all_seals {
+                if flagged_ids.contains(&seal.id) {
+                    continue;
+                }
+                if let Some(ref parent) = seal.parent {
+                    if flagged_ids.contains(parent) {
+                        flagged_ids.insert(seal.id.clone());
+                        store.flag_seal(&FlaggedSeal {
+                            seal_id: seal.id.clone(),
+                            agent_id: agent_id.to_string(),
+                            reason: FlagReason::DownstreamOfCompromised,
+                            compromise_window: (from, to),
+                            flagged_by: "system".to_string(),
+                            flagged_at: to,
+                        })?;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Load the set of flagged seal IDs for cheap membership checks.
+    ///
+    /// Returns an empty set if no seals have been flagged.
+    pub fn flagged_seal_ids(&self) -> WritResult<HashSet<String>> {
+        crate::security::FlaggedSealStore::new(&self.writ_dir).flagged_ids()
+    }
+
+    /// Load all flagged seal entries with full metadata.
+    pub fn flagged_seals(&self) -> WritResult<Vec<crate::security::FlaggedSeal>> {
+        crate::security::FlaggedSealStore::new(&self.writ_dir).load_all()
+    }
+
+    /// Suspend an agent. Sets status to Suspended.
+    pub fn suspend_agent(&self, agent_id: &str) -> WritResult<RegisteredAgent> {
+        let mut agent = self.load_agent(agent_id)?;
+        agent.status = AgentStatus::Suspended;
+
+        let agent_path = self.writ_dir.join(format!("agents/{agent_id}.json"));
+        let json = serde_json::to_string_pretty(&agent)?;
+        atomic_write(&agent_path, json.as_bytes())?;
+        Ok(agent)
+    }
+
+    /// Reactivate a suspended agent.
+    pub fn reactivate_agent(&self, agent_id: &str) -> WritResult<RegisteredAgent> {
+        let mut agent = self.load_agent(agent_id)?;
+        if agent.status == AgentStatus::Revoked {
+            return Err(WritError::AgentInactive(format!(
+                "agent '{agent_id}' is revoked and cannot be reactivated"
+            )));
+        }
+        agent.status = AgentStatus::Active;
+
+        let agent_path = self.writ_dir.join(format!("agents/{agent_id}.json"));
+        let json = serde_json::to_string_pretty(&agent)?;
+        atomic_write(&agent_path, json.as_bytes())?;
+        Ok(agent)
+    }
+
+    /// Look up the trust level for an agent.
+    /// Returns `TrustLevel::Untrusted` for unregistered agents.
+    pub fn agent_trust_level(&self, agent_id: &str) -> TrustLevel {
+        self.load_agent(agent_id)
+            .map(|a| a.trust_level)
+            .unwrap_or(TrustLevel::Untrusted)
+    }
+
+    /// Build a trust context for convergence by looking up the agents
+    /// involved in each spec's latest seal.
+    fn build_trust_context(
+        &self,
+        left_spec: &str,
+        right_spec: &str,
+    ) -> Option<crate::agent::TrustContext> {
+        let left_agent = self.spec_latest_agent(left_spec)?;
+        let right_agent = self.spec_latest_agent(right_spec)?;
+
+        let left_trust = self.agent_trust_level(&left_agent);
+        let right_trust = self.agent_trust_level(&right_agent);
+
+        Some(crate::agent::TrustContext {
+            left_trust,
+            right_trust,
+        })
+    }
+
+    /// Find the agent_id of the most recent seal for a given spec.
+    fn spec_latest_agent(&self, spec_id: &str) -> Option<String> {
+        let spec = self.load_spec(spec_id).ok()?;
+        let latest_seal_id = spec.sealed_by.last()?;
+        let seal = self.load_seal(latest_seal_id).ok()?;
+        Some(seal.agent.id.clone())
+    }
+
+    /// Check whether an agent is in scope for a given file path.
+    /// Returns `true` for unregistered agents (no constraints to enforce).
+    pub fn agent_in_scope(&self, agent_id: &str, file_path: &str) -> bool {
+        match self.load_agent(agent_id) {
+            Ok(agent) => crate::agent::is_in_scope(&agent.scope_constraints, file_path),
+            Err(_) => true, // Unregistered = no constraints
+        }
     }
 
     /// Validate a relative path and return its absolute form within the repo root.
@@ -4055,7 +4567,11 @@ impl Repository {
             seal_warnings,
             parent_seal_hash,
         );
-        seal.secure(None);
+
+        // Sign with agent's key if available, otherwise unsigned
+        let ks = KeyStore::open(&self.writ_dir);
+        let signing_key = ks.load_agent_signing_key(&seal.agent.id).ok();
+        seal.secure(signing_key.as_ref());
 
         self.save_seal(&seal)?;
         atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
@@ -6203,6 +6719,21 @@ pub struct ChainVerification {
     pub unsecured: usize,
     pub failures: Vec<SealVerification>,
     pub valid: bool,
+}
+
+/// Result of verifying a single spec's branch chain.
+#[derive(Debug, Clone, Serialize)]
+pub struct SpecChainResult {
+    pub spec_id: String,
+    pub chain: ChainVerification,
+}
+
+/// Result of verifying HEAD chain + all spec branch chains.
+#[derive(Debug, Clone, Serialize)]
+pub struct AllChainsVerification {
+    pub head_chain: ChainVerification,
+    pub spec_chains: Vec<SpecChainResult>,
+    pub all_valid: bool,
 }
 
 #[cfg(test)]
@@ -9382,6 +9913,171 @@ mod chain_tests {
     }
 }
 
+// --- B.7: verify_all_chains tests ---
+
+#[cfg(test)]
+mod verify_all_chains_tests {
+    use super::*;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use crate::spec::{Spec, SpecStatus};
+    use tempfile::tempdir;
+
+    fn vac_agent() -> AgentIdentity {
+        AgentIdentity {
+            id: "vac-agent".to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_verify_all_chains_empty_repo() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.verify_all_chains(None).unwrap();
+        assert!(result.all_valid, "empty repo should be valid");
+        assert_eq!(result.head_chain.total_seals, 0);
+        assert!(result.spec_chains.is_empty());
+    }
+
+    #[test]
+    fn test_verify_all_chains_head_only() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        repo.seal(
+            vac_agent(),
+            "first".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let result = repo.verify_all_chains(None).unwrap();
+        assert!(result.all_valid);
+        assert!(result.head_chain.valid);
+        assert_eq!(result.head_chain.total_seals, 1);
+        assert!(result.spec_chains.is_empty());
+    }
+
+    #[test]
+    fn test_verify_all_chains_with_spec_branch() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a spec
+        let spec = Spec {
+            id: "test-spec".to_string(),
+            title: "Test spec".to_string(),
+            description: "testing".to_string(),
+            status: SpecStatus::InProgress,
+            file_scope: vec!["src/".to_string()],
+            acceptance_criteria: vec![],
+            design_notes: vec![],
+            depends_on: vec![],
+            sealed_by: vec![],
+            tech_stack: vec![],
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        repo.add_spec(&spec).unwrap();
+
+        // Seal on HEAD
+        fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        repo.seal(
+            vac_agent(),
+            "head seal".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Seal on spec branch
+        fs::write(dir.path().join("file.txt"), "v2").unwrap();
+        repo.seal(
+            vac_agent(),
+            "spec seal".to_string(),
+            Some("test-spec".to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let result = repo.verify_all_chains(None).unwrap();
+        assert!(result.all_valid, "all chains should be valid");
+        assert!(result.head_chain.valid);
+        assert_eq!(result.spec_chains.len(), 1);
+        assert_eq!(result.spec_chains[0].spec_id, "test-spec");
+        assert!(result.spec_chains[0].chain.valid);
+        assert!(result.spec_chains[0].chain.total_seals >= 1);
+    }
+
+    #[test]
+    fn test_verify_all_chains_multiple_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        for name in &["alpha", "beta"] {
+            let spec = Spec {
+                id: name.to_string(),
+                title: name.to_string(),
+                description: "testing".to_string(),
+                status: SpecStatus::InProgress,
+                file_scope: vec![],
+                acceptance_criteria: vec![],
+                design_notes: vec![],
+                depends_on: vec![],
+                sealed_by: vec![],
+                tech_stack: vec![],
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+            };
+            repo.add_spec(&spec).unwrap();
+        }
+
+        // Seal on HEAD first
+        fs::write(dir.path().join("file.txt"), "base").unwrap();
+        repo.seal(
+            vac_agent(),
+            "base seal".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Seal on each spec branch
+        for name in &["alpha", "beta"] {
+            fs::write(dir.path().join("file.txt"), format!("{name}-v1")).unwrap();
+            repo.seal(
+                vac_agent(),
+                format!("{name} seal"),
+                Some(name.to_string()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        }
+
+        let result = repo.verify_all_chains(None).unwrap();
+        assert!(result.all_valid);
+        assert_eq!(result.spec_chains.len(), 2);
+        // Should be sorted by spec_id
+        assert_eq!(result.spec_chains[0].spec_id, "alpha");
+        assert_eq!(result.spec_chains[1].spec_id, "beta");
+        assert!(result.spec_chains[0].chain.valid);
+        assert!(result.spec_chains[1].chain.valid);
+    }
+}
+
 // --- A.2.7: Signature integration tests (Djo + Amis) ---
 
 #[cfg(test)]
@@ -9850,6 +10546,1550 @@ mod convergence_keypair_tests {
             !crate::crypto::verify_signature(seal.content_hash.as_ref().unwrap(), truncated, &vk,),
             "truncated signature should be rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod agent_store_tests {
+    use super::*;
+    use crate::agent::{AgentStatus, TrustLevel};
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_init_creates_agents_dir() {
+        let dir = tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+        assert!(dir.path().join(".writ/agents").exists());
+    }
+
+    #[test]
+    fn test_register_agent_creates_file() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let agent = repo
+            .register_agent("worker-1", "human-andrew", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        assert_eq!(agent.agent_id, "worker-1");
+        assert_eq!(agent.trust_level, TrustLevel::Standard);
+        assert_eq!(agent.status, AgentStatus::Active);
+        assert!(!agent.public_key.is_empty());
+        assert!(dir.path().join(".writ/agents/worker-1.json").exists());
+    }
+
+    #[test]
+    fn test_register_agent_duplicate_rejected() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker-1", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+        let err = repo
+            .register_agent("worker-1", "human", TrustLevel::Full, vec![])
+            .unwrap_err();
+        assert!(
+            matches!(err, WritError::AgentAlreadyExists(_)),
+            "expected AgentAlreadyExists, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_load_agent_roundtrip() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let scope = vec!["src/".to_string(), "tests/".to_string()];
+        repo.register_agent("worker-2", "human", TrustLevel::Restricted, scope.clone())
+            .unwrap();
+
+        let loaded = repo.load_agent("worker-2").unwrap();
+        assert_eq!(loaded.agent_id, "worker-2");
+        assert_eq!(loaded.trust_level, TrustLevel::Restricted);
+        assert_eq!(loaded.scope_constraints, scope);
+    }
+
+    #[test]
+    fn test_load_agent_not_found() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let err = repo.load_agent("nonexistent").unwrap_err();
+        assert!(matches!(err, WritError::AgentNotFound(_)));
+    }
+
+    #[test]
+    fn test_list_agents() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("agent-b", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+        repo.register_agent("agent-a", "human", TrustLevel::Full, vec![])
+            .unwrap();
+
+        let agents = repo.list_agents().unwrap();
+        assert_eq!(agents.len(), 2);
+        // Sorted alphabetically
+        assert_eq!(agents[0].agent_id, "agent-a");
+        assert_eq!(agents[1].agent_id, "agent-b");
+    }
+
+    #[test]
+    fn test_update_agent_trust_level() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        let updated = repo
+            .update_agent(
+                "worker",
+                AgentUpdate {
+                    trust_level: Some(TrustLevel::Full),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.trust_level, TrustLevel::Full);
+
+        // Persisted
+        let loaded = repo.load_agent("worker").unwrap();
+        assert_eq!(loaded.trust_level, TrustLevel::Full);
+    }
+
+    #[test]
+    fn test_update_agent_scope() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        let updated = repo
+            .update_agent(
+                "worker",
+                AgentUpdate {
+                    scope_constraints: Some(vec!["src/**".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(updated.scope_constraints, vec!["src/**".to_string()]);
+    }
+
+    #[test]
+    fn test_revoke_agent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("bad-agent", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        let revoked = repo.revoke_agent("bad-agent", "compromised").unwrap();
+        assert_eq!(revoked.status, AgentStatus::Revoked);
+        assert!(revoked.revoked_at.is_some());
+        assert_eq!(revoked.revocation_reason.as_deref(), Some("compromised"));
+
+        // Keys removed — loading signing key should fail
+        let ks = KeyStore::open(&dir.path().join(".writ"));
+        assert!(ks.load_agent_signing_key("bad-agent").is_err());
+    }
+
+    #[test]
+    fn test_suspend_and_reactivate() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        let suspended = repo.suspend_agent("worker").unwrap();
+        assert_eq!(suspended.status, AgentStatus::Suspended);
+
+        let reactivated = repo.reactivate_agent("worker").unwrap();
+        assert_eq!(reactivated.status, AgentStatus::Active);
+    }
+
+    #[test]
+    fn test_reactivate_revoked_fails() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+        repo.revoke_agent("worker", "done").unwrap();
+
+        let err = repo.reactivate_agent("worker").unwrap_err();
+        assert!(matches!(err, WritError::AgentInactive(_)));
+    }
+
+    #[test]
+    fn test_agent_trust_level_registered() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker", "human", TrustLevel::Restricted, vec![])
+            .unwrap();
+        assert_eq!(repo.agent_trust_level("worker"), TrustLevel::Restricted);
+    }
+
+    #[test]
+    fn test_agent_trust_level_unregistered() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        assert_eq!(repo.agent_trust_level("unknown"), TrustLevel::Untrusted);
+    }
+
+    #[test]
+    fn test_agent_in_scope_registered_with_constraints() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent(
+            "worker",
+            "human",
+            TrustLevel::Standard,
+            vec!["src/".to_string()],
+        )
+        .unwrap();
+
+        assert!(repo.agent_in_scope("worker", "src/main.rs"));
+        assert!(!repo.agent_in_scope("worker", "tests/test.rs"));
+    }
+
+    #[test]
+    fn test_agent_in_scope_unregistered() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        // Unregistered agents have no constraints — always in scope
+        assert!(repo.agent_in_scope("unknown", "anything/goes.rs"));
+    }
+}
+
+#[cfg(test)]
+mod agent_identity_tests {
+    use super::*;
+    use crate::agent::TrustLevel;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn test_agent(id: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: id.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_revoked_agent_seal_rejected() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("bad-agent", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+        repo.revoke_agent("bad-agent", "compromised key").unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let err = repo
+            .seal(
+                test_agent("bad-agent"),
+                "should fail".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, WritError::AgentInactive(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("revoked"), "expected 'revoked' in: {msg}");
+    }
+
+    #[test]
+    fn test_suspended_agent_seal_rejected() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("paused-agent", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+        repo.suspend_agent("paused-agent").unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let err = repo
+            .seal(
+                test_agent("paused-agent"),
+                "should fail".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, WritError::AgentInactive(_)));
+        let msg = err.to_string();
+        assert!(msg.contains("suspended"), "expected 'suspended' in: {msg}");
+    }
+
+    #[test]
+    fn test_revoked_agent_seal_paths_rejected() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("bad-agent", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+        repo.revoke_agent("bad-agent", "compromised").unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let err = repo
+            .seal_paths(
+                test_agent("bad-agent"),
+                "should fail".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                &["file.txt".to_string()],
+                false,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, WritError::AgentInactive(_)));
+    }
+
+    #[test]
+    fn test_revocation_emits_security_event() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+        repo.revoke_agent("worker", "lost trust").unwrap();
+
+        let logger = crate::security::SecurityEventLogger::new(&dir.path().join(".writ"));
+        let events = logger.read_events(None).unwrap();
+        assert!(!events.is_empty(), "expected security event on revocation");
+
+        let revocation_event = events
+            .iter()
+            .find(|e| e.event_type == "agent_revoked")
+            .expect("expected agent_revoked event");
+        assert_eq!(
+            revocation_event.severity,
+            crate::security::Severity::Critical
+        );
+        assert_eq!(revocation_event.agent_id.as_deref(), Some("worker"));
+        assert!(revocation_event.details.contains("lost trust"));
+    }
+
+    #[test]
+    fn test_seals_before_revocation_remain_valid() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        // Create a seal while agent is active
+        fs::write(dir.path().join("work.txt"), "good work").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "pre-revocation work".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Now revoke the agent
+        repo.revoke_agent("worker", "no longer trusted").unwrap();
+
+        // The previous seal should still be loadable and valid
+        let loaded = repo.load_seal(&seal.id).unwrap();
+        assert_eq!(loaded.summary, "pre-revocation work");
+        assert_eq!(loaded.agent.id, "worker");
+
+        // verify_chain should still pass for the pre-revocation seal
+        let chain_result = repo.verify_chain(None);
+        assert!(chain_result.is_ok());
+    }
+
+    #[test]
+    fn test_unregistered_agent_seal_allowed() {
+        // Backward compatibility: agents that aren't registered can still seal
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("unknown-agent"),
+                "should succeed".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(seal.agent.id, "unknown-agent");
+    }
+
+    #[test]
+    fn test_reactivated_agent_can_seal_again() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        // Suspend, then verify seal fails
+        repo.suspend_agent("worker").unwrap();
+        fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        assert!(repo
+            .seal(
+                test_agent("worker"),
+                "blocked".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .is_err());
+
+        // Reactivate, then verify seal succeeds
+        repo.reactivate_agent("worker").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "back in action".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(seal.agent.id, "worker");
+    }
+}
+
+// --- B.1.5: Flagged seals integration tests ---
+
+#[cfg(test)]
+mod flagged_seals_tests {
+    use super::*;
+    use crate::agent::TrustLevel;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use crate::security::{FlagReason, FlaggedSealStore};
+    use tempfile::tempdir;
+
+    fn test_agent(id: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: id.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_revoke_with_compromise_flags_seals_in_window() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        // Create two seals
+        fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        let seal1 = repo
+            .seal(
+                test_agent("worker"),
+                "first".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        let seal1_ts = seal1.timestamp;
+
+        fs::write(dir.path().join("file.txt"), "v2").unwrap();
+        repo.seal(
+            test_agent("worker"),
+            "second".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Revoke with compromise timestamp = before first seal
+        // Both seals should be flagged
+        let compromise_time = seal1_ts - chrono::Duration::seconds(1);
+        repo.revoke_agent_with_compromise("worker", "compromised", Some(compromise_time))
+            .unwrap();
+
+        let flagged = repo.flagged_seal_ids().unwrap();
+        // At minimum the 2 direct seals should be flagged
+        assert!(
+            flagged.len() >= 2,
+            "expected at least 2 flagged seals, got {}",
+            flagged.len()
+        );
+    }
+
+    #[test]
+    fn test_revoke_without_compromise_timestamp_uses_now() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        // Create a seal well before "now"
+        fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        repo.seal(
+            test_agent("worker"),
+            "old seal".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Revoke without compromise_timestamp — defaults to now
+        // Since the seal was created before now, the window is [now, now]
+        // so no seals should be in the window
+        repo.revoke_agent("worker", "policy violation").unwrap();
+
+        let flagged = repo.flagged_seal_ids().unwrap();
+        assert!(
+            flagged.is_empty(),
+            "no seals should be flagged when compromise_timestamp defaults to now"
+        );
+    }
+
+    #[test]
+    fn test_downstream_seals_transitively_flagged() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("bad-agent", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+        repo.register_agent("good-agent", "human", TrustLevel::Full, vec![])
+            .unwrap();
+
+        // bad-agent creates a seal
+        fs::write(dir.path().join("file.txt"), "compromised content").unwrap();
+        let bad_seal = repo
+            .seal(
+                test_agent("bad-agent"),
+                "malicious work".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // good-agent creates a seal on top (downstream of bad seal)
+        fs::write(dir.path().join("file.txt"), "good content").unwrap();
+        let good_seal = repo
+            .seal(
+                test_agent("good-agent"),
+                "innocent work".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Revoke bad-agent with compromise window covering bad_seal
+        let compromise_time = bad_seal.timestamp - chrono::Duration::seconds(1);
+        repo.revoke_agent_with_compromise("bad-agent", "compromised", Some(compromise_time))
+            .unwrap();
+
+        let flagged = repo.flagged_seal_ids().unwrap();
+        assert!(
+            flagged.contains(&bad_seal.id),
+            "directly compromised seal should be flagged"
+        );
+        assert!(
+            flagged.contains(&good_seal.id),
+            "downstream seal should be transitively flagged"
+        );
+
+        // Verify the reasons are correct
+        let entries = repo.flagged_seals().unwrap();
+        let bad_entry = entries.iter().find(|e| e.seal_id == bad_seal.id).unwrap();
+        assert_eq!(bad_entry.reason, FlagReason::AgentCompromised);
+
+        let good_entry = entries.iter().find(|e| e.seal_id == good_seal.id).unwrap();
+        assert_eq!(good_entry.reason, FlagReason::DownstreamOfCompromised);
+    }
+
+    #[test]
+    fn test_no_seals_in_window_produces_no_flags() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent("worker", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        // Create a seal
+        fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "before compromise".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Revoke with compromise window AFTER the seal was created
+        let future_time = seal.timestamp + chrono::Duration::hours(1);
+        repo.revoke_agent_with_compromise("worker", "compromised", Some(future_time))
+            .unwrap();
+
+        let flagged = repo.flagged_seal_ids().unwrap();
+        assert!(
+            flagged.is_empty(),
+            "seal created before compromise window should not be flagged"
+        );
+    }
+
+    #[test]
+    fn test_flagged_seal_store_accessible_from_repo() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Initially empty
+        assert!(repo.flagged_seal_ids().unwrap().is_empty());
+        assert!(repo.flagged_seals().unwrap().is_empty());
+
+        // Manually flag a seal via the store
+        let store = FlaggedSealStore::new(&dir.path().join(".writ"));
+        store
+            .flag_seal(&crate::security::FlaggedSeal {
+                seal_id: "test-seal".to_string(),
+                agent_id: "agent".to_string(),
+                reason: FlagReason::AgentCompromised,
+                compromise_window: (chrono::Utc::now(), chrono::Utc::now()),
+                flagged_by: "admin".to_string(),
+                flagged_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        // Now repo should see it
+        let ids = repo.flagged_seal_ids().unwrap();
+        assert!(ids.contains("test-seal"));
+    }
+}
+
+#[cfg(test)]
+mod scope_constraint_tests {
+    use super::*;
+    use crate::agent::TrustLevel;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use crate::spec::Spec;
+    use tempfile::tempdir;
+
+    fn test_agent(id: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: id.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    fn spec_with_scope(id: &str, scope: Vec<String>) -> Spec {
+        let mut spec = Spec::new(id.to_string(), id.to_string(), "test".to_string());
+        spec.file_scope = scope;
+        spec
+    }
+
+    #[test]
+    fn test_exact_path_in_scope_no_warning() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&spec_with_scope("feat", vec!["src/main.rs".to_string()]))
+            .unwrap();
+
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "in scope".to_string(),
+                Some("feat".to_string()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let has_scope_warning = seal.warnings.iter().any(|h| h.contains("FILE_SCOPE"));
+        assert!(!has_scope_warning, "expected no FILE_SCOPE warning");
+    }
+
+    #[test]
+    fn test_directory_prefix_in_scope() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&spec_with_scope("feat", vec!["src/".to_string()]))
+            .unwrap();
+
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "pub mod stuff;").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "in scope".to_string(),
+                Some("feat".to_string()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let has_scope_warning = seal.warnings.iter().any(|h| h.contains("FILE_SCOPE"));
+        assert!(!has_scope_warning, "src/lib.rs should be in scope of src/");
+    }
+
+    #[test]
+    fn test_file_outside_scope_detected() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&spec_with_scope("feat", vec!["src/".to_string()]))
+            .unwrap();
+
+        fs::write(dir.path().join("README.md"), "docs").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "out of scope".to_string(),
+                Some("feat".to_string()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let has_scope_warning = seal.warnings.iter().any(|h| h.contains("FILE_SCOPE"));
+        assert!(
+            has_scope_warning,
+            "README.md should trigger FILE_SCOPE warning"
+        );
+    }
+
+    #[test]
+    fn test_multiple_files_mixed_scope() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&spec_with_scope("feat", vec!["src/".to_string()]))
+            .unwrap();
+
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/lib.rs"), "in scope").unwrap();
+        fs::write(dir.path().join("config.toml"), "out of scope").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "mixed".to_string(),
+                Some("feat".to_string()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let scope_warning = seal.warnings.iter().find(|h| h.contains("FILE_SCOPE"));
+        assert!(scope_warning.is_some(), "should have FILE_SCOPE warning");
+        let msg = scope_warning.unwrap();
+        assert!(
+            msg.contains("config.toml"),
+            "warning should mention config.toml"
+        );
+        assert!(
+            !msg.contains("src/lib.rs"),
+            "warning should NOT mention in-scope file"
+        );
+    }
+
+    #[test]
+    fn test_wildcard_scope_matches() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&spec_with_scope("feat", vec!["*.rs".to_string()]))
+            .unwrap();
+
+        fs::write(dir.path().join("main.rs"), "fn main(){}").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "wildcard".to_string(),
+                Some("feat".to_string()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let has_scope_warning = seal.warnings.iter().any(|h| h.contains("FILE_SCOPE"));
+        assert!(!has_scope_warning, "*.rs should match main.rs");
+    }
+
+    #[test]
+    fn test_empty_scope_allows_all() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&spec_with_scope("feat", vec![])).unwrap();
+
+        fs::write(dir.path().join("anything.xyz"), "content").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "no scope".to_string(),
+                Some("feat".to_string()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let has_scope_warning = seal.warnings.iter().any(|h| h.contains("FILE_SCOPE"));
+        assert!(!has_scope_warning, "empty scope should allow all files");
+    }
+
+    #[test]
+    fn test_scope_violation_emits_security_event() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&spec_with_scope("feat", vec!["src/".to_string()]))
+            .unwrap();
+
+        fs::write(dir.path().join("secret.key"), "private").unwrap();
+        repo.seal(
+            test_agent("worker"),
+            "out of scope".to_string(),
+            Some("feat".to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let logger = crate::security::SecurityEventLogger::new(&dir.path().join(".writ"));
+        let events = logger.read_events(None).unwrap();
+        let violation = events
+            .iter()
+            .find(|e| e.event_type == "scope_violation")
+            .expect("expected scope_violation security event");
+        assert_eq!(violation.severity, crate::security::Severity::Critical);
+        assert!(violation.details.contains("secret.key"));
+    }
+
+    #[test]
+    fn test_agent_scope_warning_on_seal() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.register_agent(
+            "scoped-worker",
+            "human",
+            TrustLevel::Restricted,
+            vec!["src/".to_string()],
+        )
+        .unwrap();
+
+        fs::create_dir_all(dir.path().join("tests")).unwrap();
+        fs::write(dir.path().join("tests/test.rs"), "test").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("scoped-worker"),
+                "agent out of scope".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let agent_scope_warning = seal.warnings.iter().find(|h| h.contains("AGENT_SCOPE"));
+        assert!(
+            agent_scope_warning.is_some(),
+            "agent modifying tests/ outside its src/ scope should get AGENT_SCOPE warning"
+        );
+    }
+
+    #[test]
+    fn test_deeply_nested_path_in_scope() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&spec_with_scope("feat", vec!["src/".to_string()]))
+            .unwrap();
+
+        fs::create_dir_all(dir.path().join("src/core/deep/nested")).unwrap();
+        fs::write(dir.path().join("src/core/deep/nested/mod.rs"), "//").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("worker"),
+                "deeply nested".to_string(),
+                Some("feat".to_string()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let has_scope_warning = seal.warnings.iter().any(|h| h.contains("FILE_SCOPE"));
+        assert!(
+            !has_scope_warning,
+            "deeply nested file under src/ should be in scope"
+        );
+    }
+
+    // --- Attack vector stubs (depend on B.2.1 path canonicalization in seal path) ---
+
+    #[test]
+    fn test_path_traversal_dot_dot_stub() {
+        // TODO(B.2.1): Verify that path traversal attempts like
+        // "src/auth/../../secrets/keys.json" are rejected or normalized
+        // before scope checking in seal(). Requires CC's B.2.1 canonicalization
+        // to be integrated into the seal file-change pipeline.
+    }
+
+    #[test]
+    fn test_symlink_outside_scope_stub() {
+        // TODO(B.2.1): Verify that symlinks pointing outside the repo root
+        // are detected and rejected during seal. Requires filesystem-level
+        // canonicalization checks from B.2.1.
+    }
+
+    #[test]
+    fn test_absolute_path_rejected_stub() {
+        // TODO(B.2.1): Verify that absolute paths (e.g. "/etc/passwd")
+        // cannot bypass scope constraints during seal. The validate_path
+        // function already rejects these, but needs integration testing
+        // in the full seal pipeline.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// B.1.6 — Agent identity edge-case & scope enforcement integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod agent_edge_case_tests {
+    use super::*;
+    use crate::agent::{AgentUpdate, TrustLevel};
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn test_agent(id: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: id.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    // --- Registration edge cases ---
+
+    #[test]
+    fn test_register_empty_scope_means_unrestricted() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let agent = repo
+            .register_agent("open-agent", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+
+        assert!(agent.scope_constraints.is_empty());
+
+        // Should be able to seal any file without AGENT_SCOPE warning
+        fs::write(dir.path().join("anywhere.txt"), "content").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("open-agent"),
+                "unrestricted".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let has_agent_scope = seal.warnings.iter().any(|w| w.contains("AGENT_SCOPE"));
+        assert!(
+            !has_agent_scope,
+            "empty scope constraints should not trigger AGENT_SCOPE warning"
+        );
+    }
+
+    #[test]
+    fn test_register_overlapping_scope_patterns() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let agent = repo
+            .register_agent(
+                "overlap-agent",
+                "human",
+                TrustLevel::Standard,
+                vec![
+                    "src/".to_string(),
+                    "src/auth/".to_string(),
+                    "*.rs".to_string(),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(agent.scope_constraints.len(), 3);
+
+        // File matching multiple patterns should still be in scope
+        fs::create_dir_all(dir.path().join("src/auth")).unwrap();
+        fs::write(dir.path().join("src/auth/login.rs"), "fn login() {}").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("overlap-agent"),
+                "overlapping scopes".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let has_agent_scope = seal.warnings.iter().any(|w| w.contains("AGENT_SCOPE"));
+        assert!(
+            !has_agent_scope,
+            "file matching overlapping scopes should be in scope"
+        );
+    }
+
+    #[test]
+    fn test_unicode_agent_id_rejected_at_seal() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Seal with unicode agent ID — validate_agent_id rejects non-ASCII
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let err = repo
+            .seal(
+                test_agent("agënt-ünïcödé"),
+                "should fail".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, WritError::InvalidInput(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid characters"),
+            "expected invalid chars error: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_register_auto_creates_agents_directory() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let agents_dir = dir.path().join(".writ/agents");
+        // init() should have created this
+        assert!(agents_dir.exists());
+
+        let agent = repo
+            .register_agent("new-agent", "human", TrustLevel::Full, vec![])
+            .unwrap();
+        assert_eq!(agent.agent_id, "new-agent");
+
+        // Verify the agent file was created
+        let agent_file = agents_dir.join("new-agent.json");
+        assert!(agent_file.exists());
+    }
+
+    #[test]
+    fn test_register_agent_id_boundary_lengths() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Single character — minimum valid
+        let agent = repo
+            .register_agent("a", "human", TrustLevel::Standard, vec![])
+            .unwrap();
+        assert_eq!(agent.agent_id, "a");
+
+        // 128 characters — maximum valid
+        let long_id: String = std::iter::repeat('x').take(128).collect();
+        let agent = repo
+            .register_agent(&long_id, "human", TrustLevel::Standard, vec![])
+            .unwrap();
+        assert_eq!(agent.agent_id.len(), 128);
+    }
+
+    // --- Scope enforcement integration tests ---
+
+    #[test]
+    fn test_enforce_scope_false_allows_out_of_scope_with_warning() {
+        let dir = tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        repo.set_enforce_scope(false);
+        repo.register_agent(
+            "scoped-agent",
+            "human",
+            TrustLevel::Standard,
+            vec!["src/".to_string()],
+        )
+        .unwrap();
+
+        // Write file outside scope
+        fs::create_dir_all(dir.path().join("tests")).unwrap();
+        fs::write(dir.path().join("tests/test.rs"), "test code").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("scoped-agent"),
+                "out of scope warning".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Should succeed but with warning
+        let agent_scope_warning = seal.warnings.iter().find(|w| w.contains("AGENT_SCOPE"));
+        assert!(
+            agent_scope_warning.is_some(),
+            "enforce_scope=false should produce AGENT_SCOPE warning, not error"
+        );
+        assert!(
+            agent_scope_warning.unwrap().contains("tests/test.rs"),
+            "warning should mention the out-of-scope file"
+        );
+    }
+
+    #[test]
+    fn test_enforce_scope_true_rejects_out_of_scope() {
+        let dir = tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        repo.set_enforce_scope(true);
+        repo.register_agent(
+            "locked-agent",
+            "human",
+            TrustLevel::Standard,
+            vec!["src/".to_string()],
+        )
+        .unwrap();
+
+        // Write file outside scope
+        fs::write(dir.path().join("secrets.env"), "API_KEY=xxx").unwrap();
+        let err = repo
+            .seal(
+                test_agent("locked-agent"),
+                "should be rejected".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, WritError::ScopeViolation(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("secrets.env"),
+            "error should mention the file: {msg}"
+        );
+        assert!(
+            msg.contains("locked-agent"),
+            "error should mention the agent: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_enforce_scope_true_allows_in_scope_files() {
+        let dir = tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        repo.set_enforce_scope(true);
+        repo.register_agent(
+            "good-agent",
+            "human",
+            TrustLevel::Standard,
+            vec!["src/".to_string()],
+        )
+        .unwrap();
+
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/main.rs"), "fn main() {}").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("good-agent"),
+                "all in scope".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // No AGENT_SCOPE warning, no error
+        let has_agent_scope = seal.warnings.iter().any(|w| w.contains("AGENT_SCOPE"));
+        assert!(
+            !has_agent_scope,
+            "all files in scope should produce no warning"
+        );
+    }
+
+    #[test]
+    fn test_enforce_scope_seal_paths_rejects_out_of_scope() {
+        let dir = tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        repo.set_enforce_scope(true);
+        repo.register_agent(
+            "paths-agent",
+            "human",
+            TrustLevel::Standard,
+            vec!["src/".to_string()],
+        )
+        .unwrap();
+
+        // Create files — one in scope, one out
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/good.rs"), "good").unwrap();
+        fs::write(dir.path().join("bad.txt"), "bad").unwrap();
+
+        let err = repo
+            .seal_paths(
+                test_agent("paths-agent"),
+                "should fail".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                &["src/good.rs".to_string(), "bad.txt".to_string()],
+                false,
+            )
+            .unwrap_err();
+
+        assert!(matches!(err, WritError::ScopeViolation(_)));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bad.txt"),
+            "error should mention out-of-scope file: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_unregistered_agent_bypasses_scope_enforcement() {
+        let dir = tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        repo.set_enforce_scope(true);
+
+        // Don't register the agent — scope enforcement only applies to registered agents
+        fs::write(dir.path().join("anywhere.txt"), "content").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("unknown-agent"),
+                "no constraints".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let has_agent_scope = seal.warnings.iter().any(|w| w.contains("AGENT_SCOPE"));
+        assert!(
+            !has_agent_scope,
+            "unregistered agent should have no scope constraints"
+        );
+    }
+
+    #[test]
+    fn test_scope_violation_emits_security_event_regardless_of_enforce() {
+        let dir = tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        repo.set_enforce_scope(false); // Warning mode
+        repo.register_agent(
+            "logged-agent",
+            "human",
+            TrustLevel::Standard,
+            vec!["src/".to_string()],
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("outside.txt"), "content").unwrap();
+        // Should succeed (warning mode) but still log security event
+        repo.seal(
+            test_agent("logged-agent"),
+            "should warn".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let logger = crate::security::SecurityEventLogger::new(&dir.path().join(".writ"));
+        let events = logger.read_events(None).unwrap();
+        let violation = events
+            .iter()
+            .find(|e| e.event_type == "agent_scope_violation")
+            .expect("should emit agent_scope_violation even in warning mode");
+        assert_eq!(violation.severity, crate::security::Severity::Critical);
+        assert_eq!(violation.agent_id.as_deref(), Some("logged-agent"));
+        assert!(violation.details.contains("outside.txt"));
+    }
+
+    #[test]
+    fn test_enforce_scope_true_also_emits_security_event() {
+        let dir = tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        repo.set_enforce_scope(true);
+        repo.register_agent(
+            "strict-agent",
+            "human",
+            TrustLevel::Standard,
+            vec!["src/".to_string()],
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("forbidden.txt"), "nope").unwrap();
+        // This should fail
+        let _err = repo
+            .seal(
+                test_agent("strict-agent"),
+                "rejected".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap_err();
+
+        // But security event should still be logged before the error
+        let logger = crate::security::SecurityEventLogger::new(&dir.path().join(".writ"));
+        let events = logger.read_events(None).unwrap();
+        let violation = events
+            .iter()
+            .find(|e| e.event_type == "agent_scope_violation");
+        assert!(
+            violation.is_some(),
+            "security event should be logged even when seal is rejected"
+        );
+    }
+
+    #[test]
+    fn test_path_traversal_rejected_by_scope_check() {
+        // canonicalize_path rejects "../" so traversal attempts should
+        // be treated as out-of-scope (is_in_scope returns false)
+        use crate::agent::{canonicalize_path, is_in_scope};
+
+        let scope = vec!["src/".to_string()];
+
+        // Direct traversal
+        assert!(!is_in_scope(&scope, "../etc/passwd"));
+        assert!(!is_in_scope(&scope, "src/../../secrets/key.pem"));
+
+        // canonicalize_path rejects traversal
+        assert!(canonicalize_path("../etc/passwd").is_none());
+        assert!(canonicalize_path("src/../../secrets/key.pem").is_none());
+
+        // Absolute path also rejected
+        assert!(canonicalize_path("/etc/passwd").is_none());
+    }
+
+    #[test]
+    fn test_dot_slash_normalized_for_scope() {
+        use crate::agent::{canonicalize_path, is_in_scope};
+
+        let scope = vec!["src/".to_string()];
+
+        // ./src/main.rs should match src/ scope after normalization
+        assert!(is_in_scope(&scope, "./src/main.rs"));
+        assert!(is_in_scope(&scope, "src/main.rs"));
+
+        // canonicalize strips leading ./
+        assert_eq!(
+            canonicalize_path("./src/main.rs"),
+            Some("src/main.rs".to_string())
+        );
+        assert_eq!(
+            canonicalize_path("././src/main.rs"),
+            Some("src/main.rs".to_string())
+        );
+    }
+
+    // --- Agent lifecycle + scope integration ---
+
+    #[test]
+    fn test_suspended_agent_reactivated_with_scope_still_enforced() {
+        let dir = tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        repo.set_enforce_scope(true);
+        repo.register_agent(
+            "cycle-agent",
+            "human",
+            TrustLevel::Standard,
+            vec!["src/".to_string()],
+        )
+        .unwrap();
+
+        // Suspend
+        repo.suspend_agent("cycle-agent").unwrap();
+
+        // Can't seal while suspended
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/ok.rs"), "good").unwrap();
+        assert!(repo
+            .seal(
+                test_agent("cycle-agent"),
+                "blocked".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .is_err());
+
+        // Reactivate
+        repo.reactivate_agent("cycle-agent").unwrap();
+
+        // Can seal in-scope files
+        fs::write(dir.path().join("src/ok.rs"), "updated").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("cycle-agent"),
+                "back in action".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        assert!(!seal.warnings.iter().any(|w| w.contains("AGENT_SCOPE")));
+
+        // But out-of-scope still rejected after reactivation
+        fs::write(dir.path().join("forbidden.txt"), "nope").unwrap();
+        let err = repo
+            .seal(
+                test_agent("cycle-agent"),
+                "out of scope".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, WritError::ScopeViolation(_)));
+    }
+
+    #[test]
+    fn test_update_scope_constraints_changes_enforcement() {
+        let dir = tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        repo.set_enforce_scope(true);
+        repo.register_agent(
+            "evolving-agent",
+            "human",
+            TrustLevel::Standard,
+            vec!["src/".to_string()],
+        )
+        .unwrap();
+
+        // tests/ is out of scope initially
+        fs::create_dir_all(dir.path().join("tests")).unwrap();
+        fs::write(dir.path().join("tests/test.rs"), "test").unwrap();
+        assert!(repo
+            .seal(
+                test_agent("evolving-agent"),
+                "blocked".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .is_err());
+
+        // Update scope to include tests/
+        repo.update_agent(
+            "evolving-agent",
+            AgentUpdate {
+                trust_level: None,
+                scope_constraints: Some(vec!["src/".to_string(), "tests/".to_string()]),
+            },
+        )
+        .unwrap();
+
+        // Now tests/ should be in scope
+        fs::write(dir.path().join("tests/test.rs"), "updated test").unwrap();
+        let seal = repo
+            .seal(
+                test_agent("evolving-agent"),
+                "now in scope".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        assert!(!seal.warnings.iter().any(|w| w.contains("AGENT_SCOPE")));
+    }
+
+    #[test]
+    fn test_multiple_agents_different_scopes_via_seal_paths() {
+        let dir = tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        repo.set_enforce_scope(true);
+
+        repo.register_agent(
+            "frontend-agent",
+            "human",
+            TrustLevel::Standard,
+            vec!["src/ui/".to_string()],
+        )
+        .unwrap();
+        repo.register_agent(
+            "backend-agent",
+            "human",
+            TrustLevel::Standard,
+            vec!["src/api/".to_string()],
+        )
+        .unwrap();
+
+        fs::create_dir_all(dir.path().join("src/ui")).unwrap();
+        fs::create_dir_all(dir.path().join("src/api")).unwrap();
+        fs::write(dir.path().join("src/ui/button.ts"), "export {}").unwrap();
+        fs::write(dir.path().join("src/api/routes.rs"), "fn route() {}").unwrap();
+
+        // frontend-agent seals only their UI files via seal_paths
+        let seal = repo
+            .seal_paths(
+                test_agent("frontend-agent"),
+                "ui work".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                &["src/ui/button.ts".to_string()],
+                false,
+            )
+            .unwrap();
+        assert!(!seal.warnings.iter().any(|w| w.contains("AGENT_SCOPE")));
+
+        // backend-agent seals only their API files
+        let seal = repo
+            .seal_paths(
+                test_agent("backend-agent"),
+                "api work".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                &["src/api/routes.rs".to_string()],
+                false,
+            )
+            .unwrap();
+        assert!(!seal.warnings.iter().any(|w| w.contains("AGENT_SCOPE")));
+
+        // Cross-scope access is rejected: frontend can't seal API files
+        fs::write(dir.path().join("src/api/routes.rs"), "updated").unwrap();
+        let err = repo
+            .seal_paths(
+                test_agent("frontend-agent"),
+                "cross-scope".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                &["src/api/routes.rs".to_string()],
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, WritError::ScopeViolation(_)));
     }
 }
 

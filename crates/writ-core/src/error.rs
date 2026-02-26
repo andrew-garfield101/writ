@@ -38,6 +38,14 @@ pub enum WritError {
     GitError(String),
     /// Bridge state is inconsistent.
     BridgeError(String),
+    /// An agent with this ID was not found.
+    AgentNotFound(String),
+    /// An agent with this ID already exists.
+    AgentAlreadyExists(String),
+    /// Agent is revoked or suspended and cannot perform this action.
+    AgentInactive(String),
+    /// Agent tried to seal files outside their scope constraints.
+    ScopeViolation(String),
     /// Path traversal or absolute path rejected.
     PathTraversal(String),
     /// Invalid hash format.
@@ -91,6 +99,14 @@ impl fmt::Display for WritError {
             WritError::NoGitRepo => write!(f, "no git repository found"),
             WritError::GitError(msg) => write!(f, "git error: {msg}"),
             WritError::BridgeError(msg) => write!(f, "bridge error: {msg}"),
+            WritError::AgentNotFound(id) => write!(f, "agent not found: {id}"),
+            WritError::AgentAlreadyExists(id) => write!(f, "agent '{id}' already exists"),
+            WritError::AgentInactive(id) => {
+                write!(f, "agent '{id}' is revoked or suspended")
+            }
+            WritError::ScopeViolation(msg) => {
+                write!(f, "scope violation: {msg}")
+            }
             WritError::PathTraversal(path) => write!(f, "path rejected (traversal): {path}"),
             WritError::InvalidHash(hash) => write!(f, "invalid object hash: {hash}"),
             WritError::InvalidInput(msg) => write!(f, "invalid input: {msg}"),

@@ -166,6 +166,144 @@ pub fn install_hooks(root: &Path) -> WritResult<Vec<HookResult>> {
     Ok(results)
 }
 
+/// Result of removing framework hooks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UninstallHookResult {
+    pub framework: Framework,
+    pub files_removed: Vec<String>,
+    pub files_updated: Vec<String>,
+}
+
+/// Remove writ integration hooks for Claude Code.
+pub fn unhook_claude_code(root: &Path) -> WritResult<UninstallHookResult> {
+    let mut removed = Vec::new();
+    let mut updated = Vec::new();
+
+    // Remove writ section from CLAUDE.md (or delete if we created the whole file).
+    let claude_md = root.join("CLAUDE.md");
+    if claude_md.exists() {
+        let content = fs::read_to_string(&claude_md)?;
+        if content.contains("## Writ") {
+            let cleaned = remove_writ_section(&content);
+            if cleaned.trim().is_empty() {
+                fs::remove_file(&claude_md)?;
+                removed.push("CLAUDE.md".to_string());
+            } else {
+                atomic_write(&claude_md, cleaned.as_bytes())?;
+                updated.push("CLAUDE.md".to_string());
+            }
+        }
+    }
+
+    // Remove writ command files.
+    let commands_dir = root.join(".claude").join("commands");
+    let seal_cmd = commands_dir.join("writ-seal.md");
+    if seal_cmd.exists() {
+        fs::remove_file(&seal_cmd)?;
+        removed.push(".claude/commands/writ-seal.md".to_string());
+    }
+
+    let context_cmd = commands_dir.join("writ-context.md");
+    if context_cmd.exists() {
+        fs::remove_file(&context_cmd)?;
+        removed.push(".claude/commands/writ-context.md".to_string());
+    }
+
+    // Clean up empty commands dir (only if we emptied it).
+    if commands_dir.exists() && is_dir_empty(&commands_dir) {
+        let _ = fs::remove_dir(&commands_dir);
+    }
+
+    Ok(UninstallHookResult {
+        framework: Framework::ClaudeCode,
+        files_removed: removed,
+        files_updated: updated,
+    })
+}
+
+/// Remove writ integration hooks for Codex / AGENTS.md.
+pub fn unhook_codex(root: &Path) -> WritResult<UninstallHookResult> {
+    let mut removed = Vec::new();
+    let mut updated = Vec::new();
+
+    let agents_md = root.join("AGENTS.md");
+    if agents_md.exists() {
+        let content = fs::read_to_string(&agents_md)?;
+        if content.contains("## Writ") {
+            let cleaned = remove_writ_section(&content);
+            if cleaned.trim().is_empty() {
+                fs::remove_file(&agents_md)?;
+                removed.push("AGENTS.md".to_string());
+            } else {
+                atomic_write(&agents_md, cleaned.as_bytes())?;
+                updated.push("AGENTS.md".to_string());
+            }
+        }
+    }
+
+    Ok(UninstallHookResult {
+        framework: Framework::Codex,
+        files_removed: removed,
+        files_updated: updated,
+    })
+}
+
+/// Remove hooks for all detected frameworks.
+pub fn uninstall_hooks(root: &Path) -> WritResult<Vec<UninstallHookResult>> {
+    let mut results = Vec::new();
+
+    // Always attempt both — even if framework isn't "detected" now,
+    // hooks from a previous install may still exist.
+    let claude_result = unhook_claude_code(root)?;
+    if !claude_result.files_removed.is_empty() || !claude_result.files_updated.is_empty() {
+        results.push(claude_result);
+    }
+
+    let codex_result = unhook_codex(root)?;
+    if !codex_result.files_removed.is_empty() || !codex_result.files_updated.is_empty() {
+        results.push(codex_result);
+    }
+
+    Ok(results)
+}
+
+/// Remove the `## Writ` section and everything after it until the next `## ` heading
+/// (or end of file). Preserves content before and after.
+fn remove_writ_section(content: &str) -> String {
+    let mut result = String::new();
+    let mut in_writ_section = false;
+
+    for line in content.lines() {
+        if line.starts_with("## Writ") {
+            in_writ_section = true;
+            continue;
+        }
+        if in_writ_section && line.starts_with("## ") {
+            // Hit the next section — stop skipping.
+            in_writ_section = false;
+        }
+        if !in_writ_section {
+            result.push_str(line);
+            result.push('\n');
+        }
+    }
+
+    // Trim trailing whitespace/newlines left by the removal.
+    let trimmed = result.trim_end().to_string();
+    if trimmed.is_empty() {
+        trimmed
+    } else {
+        trimmed + "\n"
+    }
+}
+
+/// Check if a directory is empty.
+fn is_dir_empty(path: &Path) -> bool {
+    fs::read_dir(path)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(false)
+}
+
 fn writ_claude_md_section() -> String {
     r#"## Writ
 
@@ -536,5 +674,131 @@ mod tests {
             section.contains("automatically marks the spec as complete"),
             "missing auto-promotion note"
         );
+    }
+
+    // --- Uninstall hook tests ---
+
+    #[test]
+    fn test_unhook_claude_code_removes_created_files() {
+        let dir = tempdir().unwrap();
+        // Install first.
+        hook_claude_code(dir.path()).unwrap();
+        assert!(dir.path().join("CLAUDE.md").exists());
+        assert!(dir.path().join(".claude/commands/writ-seal.md").exists());
+
+        // Uninstall.
+        let result = unhook_claude_code(dir.path()).unwrap();
+        // CLAUDE.md was created by writ (only contains writ section), so it gets deleted.
+        assert!(result.files_removed.contains(&"CLAUDE.md".to_string()));
+        assert!(result
+            .files_removed
+            .contains(&".claude/commands/writ-seal.md".to_string()));
+        assert!(result
+            .files_removed
+            .contains(&".claude/commands/writ-context.md".to_string()));
+        assert!(!dir.path().join("CLAUDE.md").exists());
+        assert!(!dir.path().join(".claude/commands/writ-seal.md").exists());
+    }
+
+    #[test]
+    fn test_unhook_claude_code_preserves_existing_content() {
+        let dir = tempdir().unwrap();
+        // Write existing content, then install hooks.
+        fs::write(
+            dir.path().join("CLAUDE.md"),
+            "# My Project\n\nImportant instructions.\n",
+        )
+        .unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+        assert!(content.contains("## Writ"));
+        assert!(content.contains("Important instructions."));
+
+        // Uninstall should remove writ section but preserve original CLAUDE.md.
+        let result = unhook_claude_code(dir.path()).unwrap();
+        assert!(result.files_updated.contains(&"CLAUDE.md".to_string()));
+        // CLAUDE.md should NOT be in files_removed (it was updated, not deleted).
+        assert!(!result.files_removed.contains(&"CLAUDE.md".to_string()));
+        // Command files are still removed.
+        assert!(result
+            .files_removed
+            .contains(&".claude/commands/writ-seal.md".to_string()));
+
+        let after = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+        assert!(after.contains("Important instructions."));
+        assert!(!after.contains("## Writ"));
+    }
+
+    #[test]
+    fn test_unhook_codex_removes_agents_md() {
+        let dir = tempdir().unwrap();
+        hook_codex(dir.path()).unwrap();
+        assert!(dir.path().join("AGENTS.md").exists());
+
+        let result = unhook_codex(dir.path()).unwrap();
+        assert!(result.files_removed.contains(&"AGENTS.md".to_string()));
+        assert!(!dir.path().join("AGENTS.md").exists());
+    }
+
+    #[test]
+    fn test_unhook_codex_preserves_existing_content() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("AGENTS.md"),
+            "# Agents\n\nExisting agent config.\n",
+        )
+        .unwrap();
+        hook_codex(dir.path()).unwrap();
+
+        let result = unhook_codex(dir.path()).unwrap();
+        assert!(result.files_updated.contains(&"AGENTS.md".to_string()));
+
+        let after = fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
+        assert!(after.contains("Existing agent config."));
+        assert!(!after.contains("## Writ"));
+    }
+
+    #[test]
+    fn test_uninstall_hooks_removes_all() {
+        let dir = tempdir().unwrap();
+        // Install both frameworks.
+        hook_claude_code(dir.path()).unwrap();
+        hook_codex(dir.path()).unwrap();
+
+        let results = uninstall_hooks(dir.path()).unwrap();
+        assert_eq!(results.len(), 2, "should clean up both frameworks");
+    }
+
+    #[test]
+    fn test_uninstall_hooks_noop_when_nothing_installed() {
+        let dir = tempdir().unwrap();
+        let results = uninstall_hooks(dir.path()).unwrap();
+        assert!(results.is_empty(), "nothing to clean up");
+    }
+
+    #[test]
+    fn test_remove_writ_section_middle() {
+        let content = "# Project\n\nIntro.\n\n## Writ\n\nWrit stuff.\n\n## Other\n\nMore stuff.\n";
+        let cleaned = remove_writ_section(content);
+        assert!(cleaned.contains("# Project"));
+        assert!(cleaned.contains("## Other"));
+        assert!(!cleaned.contains("## Writ"));
+        assert!(!cleaned.contains("Writ stuff."));
+    }
+
+    #[test]
+    fn test_remove_writ_section_at_end() {
+        let content = "# Project\n\nIntro.\n\n## Writ\n\nWrit stuff.\n";
+        let cleaned = remove_writ_section(content);
+        assert!(cleaned.contains("# Project"));
+        assert!(!cleaned.contains("## Writ"));
+    }
+
+    #[test]
+    fn test_remove_writ_section_only_content() {
+        let content = "## Writ\n\nAll writ.\n";
+        let cleaned = remove_writ_section(content);
+        assert!(cleaned.trim().is_empty());
     }
 }

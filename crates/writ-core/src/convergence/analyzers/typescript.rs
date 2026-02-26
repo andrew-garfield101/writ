@@ -171,12 +171,44 @@ pub(crate) fn parse_ts_structure(source: &str, is_typescript: bool) -> Vec<Struc
             i = end;
             let content: String = lines[start..i].join("\n");
             let module = extract_ts_import_module(&content);
-            units.push(StructuralUnit::new(
+            let lang_name = if is_typescript {
+                "typescript"
+            } else {
+                "javascript"
+            };
+            let mut unit = StructuralUnit::new(
                 UnitKind::Import,
-                Some(module),
+                Some(module.clone()),
                 (start, i),
-                content,
-            ));
+                content.clone(),
+            );
+            unit.metadata.insert("import_lang".into(), lang_name.into());
+            unit.metadata.insert("import_module".into(), module);
+            // Extract named imports from { ... } block.
+            if let Some(brace_start) = content.find('{') {
+                if let Some(brace_end) = content.find('}') {
+                    let inner = &content[brace_start + 1..brace_end];
+                    let mut names: Vec<String> = inner
+                        .split(',')
+                        .map(|s| {
+                            let s = s.trim();
+                            // Handle `name as alias`.
+                            if let Some(idx) = s.find(" as ") {
+                                s[..idx].trim().to_string()
+                            } else {
+                                s.to_string()
+                            }
+                        })
+                        .filter(|s| !s.is_empty())
+                        .collect();
+                    if !names.is_empty() {
+                        names.sort();
+                        unit.metadata
+                            .insert("import_names".into(), names.join(", "));
+                    }
+                }
+            }
+            units.push(unit);
             continue;
         }
 
@@ -716,5 +748,36 @@ export class ComplexService {
         let analyzer = TypeScriptAnalyzer;
         let units = analyzer.parse_structure("");
         assert!(units.is_empty());
+    }
+
+    #[test]
+    fn test_import_metadata_populated() {
+        let source = "import { useState, useEffect } from 'react';\nimport axios from 'axios';\n";
+        let analyzer = TypeScriptAnalyzer;
+        let units = analyzer.parse_structure(source);
+        let imports: Vec<_> = units
+            .iter()
+            .filter(|u| u.kind == UnitKind::Import)
+            .collect();
+        assert_eq!(imports.len(), 2);
+
+        // Named import
+        assert_eq!(
+            imports[0].metadata.get("import_lang").unwrap(),
+            "typescript"
+        );
+        assert_eq!(imports[0].metadata.get("import_module").unwrap(), "react");
+        assert_eq!(
+            imports[0].metadata.get("import_names").unwrap(),
+            "useEffect, useState"
+        );
+
+        // Default import (no names)
+        assert_eq!(
+            imports[1].metadata.get("import_lang").unwrap(),
+            "typescript"
+        );
+        assert_eq!(imports[1].metadata.get("import_module").unwrap(), "axios");
+        assert!(imports[1].metadata.get("import_names").is_none());
     }
 }

@@ -163,12 +163,18 @@ fn parse_python_structure(source: &str) -> Vec<StructuralUnit> {
             let content = line.to_string();
             let module = extract_import_module(trimmed);
             i += 1;
-            units.push(StructuralUnit::new(
-                UnitKind::Import,
-                Some(module),
-                (start, i),
-                content,
-            ));
+            let mut unit =
+                StructuralUnit::new(UnitKind::Import, Some(module.clone()), (start, i), content);
+            unit.metadata.insert("import_lang".into(), "python".into());
+            unit.metadata.insert("import_module".into(), module);
+            let (_, names) = parse_import_details(trimmed);
+            if !names.is_empty() {
+                let mut sorted = names;
+                sorted.sort();
+                unit.metadata
+                    .insert("import_names".into(), sorted.join(", "));
+            }
+            units.push(unit);
             continue;
         }
 
@@ -543,5 +549,30 @@ mod tests {
         assert_eq!(defs[0].name, "User");
         assert!(defs[0].content.contains("__init__"));
         assert!(defs[0].content.contains("greet"));
+    }
+
+    #[test]
+    fn test_import_metadata_populated() {
+        let source = "from flask import Flask, jsonify\nimport os\n";
+        let analyzer = PythonAnalyzer;
+        let units = analyzer.parse_structure(source);
+        let imports: Vec<_> = units
+            .iter()
+            .filter(|u| u.kind == UnitKind::Import)
+            .collect();
+        assert_eq!(imports.len(), 2);
+
+        // from flask import Flask, jsonify
+        assert_eq!(imports[0].metadata.get("import_lang").unwrap(), "python");
+        assert_eq!(imports[0].metadata.get("import_module").unwrap(), "flask");
+        assert_eq!(
+            imports[0].metadata.get("import_names").unwrap(),
+            "Flask, jsonify"
+        );
+
+        // import os
+        assert_eq!(imports[1].metadata.get("import_lang").unwrap(), "python");
+        assert_eq!(imports[1].metadata.get("import_module").unwrap(), "os");
+        assert!(imports[1].metadata.get("import_names").is_none());
     }
 }

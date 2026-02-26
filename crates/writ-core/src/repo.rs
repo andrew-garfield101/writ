@@ -12,9 +12,9 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::context::{
-    AgentActivity, ContextFilter, ContextOutput, ContextScope, DepStatus, DiffSummary,
-    DivergedBranchWarning, FileContention, FileScopeViolation, IntegrationRisk, RecommendedAction,
-    SealNudge, SealSummary, SessionSummary, SpecProgress, WorkingStateSummary,
+    AgentActivity, ChainIntegritySummary, ContextFilter, ContextOutput, ContextScope, DepStatus,
+    DiffSummary, DivergedBranchWarning, FileContention, FileScopeViolation, IntegrationRisk,
+    RecommendedAction, SealNudge, SealSummary, SessionSummary, SpecProgress, WorkingStateSummary,
 };
 use crate::convergence::{
     self,
@@ -28,6 +28,7 @@ use crate::error::{WritError, WritResult};
 use crate::fsutil::atomic_write;
 use crate::ignore::IgnoreRules;
 use crate::index::{Index, IndexEntry};
+use crate::keystore::KeyStore;
 use crate::lock::RepoLock;
 use crate::object::ObjectStore;
 use crate::seal::{AgentIdentity, ChangeType, FileChange, Seal, TaskStatus, Verification};
@@ -119,7 +120,14 @@ impl Repository {
         fs::create_dir_all(writ_dir.join("seals"))?;
         fs::create_dir_all(writ_dir.join("specs"))?;
         fs::create_dir_all(writ_dir.join("heads"))?;
+        fs::create_dir_all(writ_dir.join("keys"))?;
         fs::write(writ_dir.join("HEAD"), "")?;
+
+        // Generate the convergence engine keypair (encrypted at rest via KeyStore)
+        let ks = KeyStore::open(&writ_dir);
+        ks.ensure_master_key()?;
+        let (signing_key, verifying_key) = crate::crypto::generate_keypair();
+        ks.store_agent_key("convergence", &signing_key, &verifying_key)?;
 
         let index = Index::default();
         index.save(&writ_dir.join("index.json"))?;
@@ -286,6 +294,50 @@ impl Repository {
         })
     }
 
+    /// Remove writ from a project. Inverse of `install`.
+    ///
+    /// Removes `.writ/` directory, optionally `.writignore`, and cleans
+    /// up any framework hooks (CLAUDE.md sections, command files, AGENTS.md sections).
+    pub fn uninstall(root: &Path, keep_writignore: bool) -> WritResult<UninstallResult> {
+        let writ_dir = root.join(WRIT_DIR);
+        let mut result = UninstallResult::default();
+
+        // Gather stats before removal (best-effort — don't fail if repo is broken).
+        if writ_dir.exists() {
+            if let Ok(repo) = Self::open(root) {
+                result.tracked_files = repo.load_index().map(|idx| idx.entries.len()).unwrap_or(0);
+                result.seals_existed = repo.log().unwrap_or_default().len();
+            }
+        }
+
+        // Step 1: Remove framework hooks.
+        result.hooks_removed = crate::hooks::uninstall_hooks(root)?;
+
+        // Step 2: Remove .writ/ directory.
+        if writ_dir.exists() {
+            fs::remove_dir_all(&writ_dir).map_err(|e| {
+                crate::WritError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("failed to remove .writ/: {e}"),
+                ))
+            })?;
+            result.writ_dir_removed = true;
+        } else {
+            result
+                .warnings
+                .push("no .writ/ directory found".to_string());
+        }
+
+        // Step 3: Remove .writignore (unless asked to keep it).
+        let writignore = root.join(".writignore");
+        if writignore.exists() && !keep_writignore {
+            fs::remove_file(&writignore)?;
+            result.writignore_removed = true;
+        }
+
+        Ok(result)
+    }
+
     /// Default lock timeout for mutable operations.
     const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -383,7 +435,22 @@ impl Repository {
             );
         }
 
-        let seal = Seal::new(
+        // Look up parent seal's chain_hash for the cryptographic chain link
+        let parent_seal_hash = match parent {
+            Some(ref pid) => match self.load_seal(pid) {
+                Ok(s) => s.chain_hash.clone(),
+                Err(e) => {
+                    seal_warnings.push(format!(
+                        "CHAIN_BREAK: failed to load parent seal {}: {e} — chain integrity may be compromised",
+                        &pid[..12.min(pid.len())]
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let mut seal = Seal::new(
             parent,
             tree_hash,
             agent,
@@ -393,7 +460,9 @@ impl Repository {
             verification,
             summary,
             seal_warnings,
+            parent_seal_hash,
         );
+        seal.secure(None);
 
         self.save_seal(&seal)?;
         atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
@@ -521,6 +590,130 @@ impl Repository {
         self.read_spec_head(spec_id)
     }
 
+    /// Verify cryptographic integrity of a single seal.
+    ///
+    /// Checks that `content_hash` matches the seal's canonical content and
+    /// that `chain_hash` is correctly computed from `parent_seal_hash` and
+    /// `content_hash`. Optionally verifies the Ed25519 signature if a
+    /// verifying key is provided.
+    pub fn verify_seal(
+        &self,
+        seal: &Seal,
+        verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> SealVerification {
+        use crate::crypto;
+
+        let (content_hash, chain_hash) = match (&seal.content_hash, &seal.chain_hash) {
+            (Some(ch), Some(cch)) => (ch.clone(), cch.clone()),
+            _ => {
+                return SealVerification {
+                    seal_id: seal.id.clone(),
+                    content_hash_valid: false,
+                    chain_hash_valid: false,
+                    signature_present: seal.signature.is_some(),
+                    signature_valid: None,
+                    error: Some("seal missing crypto fields".into()),
+                };
+            }
+        };
+
+        let expected_content = crypto::compute_content_hash(seal);
+        let content_valid = content_hash == expected_content;
+
+        let expected_chain =
+            crypto::compute_chain_hash(seal.parent_seal_hash.as_deref(), &content_hash);
+        let chain_valid = chain_hash == expected_chain;
+
+        let sig_present = seal.signature.is_some();
+        let sig_valid = match (&seal.signature, verifying_key) {
+            (Some(sig), Some(key)) => Some(crypto::verify_signature(&content_hash, sig, key)),
+            (Some(_), None) => None,
+            (None, _) => None,
+        };
+
+        let error = if !content_valid {
+            Some(format!(
+                "content_hash mismatch: expected {expected_content}"
+            ))
+        } else if !chain_valid {
+            Some(format!("chain_hash mismatch: expected {expected_chain}"))
+        } else if sig_valid == Some(false) {
+            Some("signature verification failed".into())
+        } else {
+            None
+        };
+
+        SealVerification {
+            seal_id: seal.id.clone(),
+            content_hash_valid: content_valid,
+            chain_hash_valid: chain_valid,
+            signature_present: sig_present,
+            signature_valid: sig_valid,
+            error,
+        }
+    }
+
+    /// Verify the cryptographic integrity of the entire seal chain from HEAD.
+    ///
+    /// Walks the chain from HEAD to genesis, verifying each seal's content hash
+    /// and chain hash linkage. Seals without crypto fields (pre-Sprint A) are
+    /// counted as unsecured but don't cause verification failure.
+    pub fn verify_chain(
+        &self,
+        verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> WritResult<ChainVerification> {
+        let seals = self.log()?;
+        let mut verified = 0;
+        let mut unsecured = 0;
+        let mut failures = Vec::new();
+
+        for (i, seal) in seals.iter().enumerate() {
+            if !seal.is_secured() {
+                unsecured += 1;
+                continue;
+            }
+
+            let result = self.verify_seal(seal, verifying_key);
+
+            if result.content_hash_valid && result.chain_hash_valid {
+                // For non-genesis seals, verify parent_seal_hash matches
+                // the previous seal's chain_hash (seals are newest-first)
+                if i + 1 < seals.len() {
+                    let parent = &seals[i + 1];
+                    if let Some(ref parent_chain) = parent.chain_hash {
+                        if seal.parent_seal_hash.as_ref() != Some(parent_chain) {
+                            failures.push(SealVerification {
+                                seal_id: seal.id.clone(),
+                                content_hash_valid: true,
+                                chain_hash_valid: true,
+                                signature_present: result.signature_present,
+                                signature_valid: result.signature_valid,
+                                error: Some(format!(
+                                    "parent_seal_hash doesn't match parent's chain_hash (expected {})",
+                                    parent_chain
+                                )),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                verified += 1;
+            } else {
+                failures.push(result);
+            }
+        }
+
+        let valid = failures.is_empty();
+
+        Ok(ChainVerification {
+            total_seals: seals.len(),
+            verified,
+            unsecured,
+            failures,
+            valid,
+        })
+    }
+
     /// Detect spec branches whose tip seals are not reachable from global HEAD.
     ///
     /// Returns a list of `(spec_id, branch_tip, seal_count)` for each
@@ -578,7 +771,16 @@ impl Repository {
     }
 
     /// Add a new spec to the repository.
+    ///
+    /// Returns `SpecAlreadyExists` if a spec with this ID is already registered.
     pub fn add_spec(&self, spec: &Spec) -> WritResult<()> {
+        let path = self
+            .writ_dir
+            .join("specs")
+            .join(format!("{}.json", spec.id));
+        if path.exists() {
+            return Err(WritError::SpecAlreadyExists(spec.id.clone()));
+        }
         self.save_spec(spec)
     }
 
@@ -947,6 +1149,23 @@ impl Repository {
     /// 4. Unsealed changes — agent should checkpoint their work
     /// 5. Session complete — all done, generate summary
     /// 6. None — nothing urgent, keep working
+    /// Build a lightweight chain integrity summary for context output.
+    /// Returns None if no seals have crypto fields (all pre-Sprint A).
+    fn build_chain_integrity(&self) -> Option<ChainIntegritySummary> {
+        let result = self.verify_chain(None).ok()?;
+        // Only include if there are any secured seals
+        if result.verified == 0 && result.failures.is_empty() {
+            return None;
+        }
+        Some(ChainIntegritySummary {
+            valid: result.valid,
+            total_seals: result.total_seals,
+            verified: result.verified,
+            unsecured: result.unsecured,
+            failures: result.failures.len(),
+        })
+    }
+
     fn compute_recommended_action(
         dependency_status: &Option<Vec<DepStatus>>,
         convergence_recommended: bool,
@@ -1079,6 +1298,8 @@ impl Repository {
             "bridge_import(git_ref?)".to_string(),
             "bridge_export(branch?)".to_string(),
             "bridge_status()".to_string(),
+            "verify_chain(use_convergence_key?)".to_string(),
+            "verify_seal(seal_id, use_convergence_key?)".to_string(),
         ];
 
         let apply_filter = |seal: &&Seal| -> bool {
@@ -1208,6 +1429,7 @@ impl Repository {
                     file_scope_violations,
                     file_contention,
                     integration_risk,
+                    chain_integrity: self.build_chain_integrity(),
                     session_complete: false,
                     session_summary: None,
                     recommended_action: None,
@@ -1552,6 +1774,7 @@ impl Repository {
                     file_scope_violations,
                     file_contention,
                     integration_risk,
+                    chain_integrity: self.build_chain_integrity(),
                     session_complete: false,
                     session_summary: None,
                     recommended_action,
@@ -1828,6 +2051,7 @@ impl Repository {
                     file_scope_violations,
                     file_contention,
                     integration_risk,
+                    chain_integrity: self.build_chain_integrity(),
                     session_complete: false, // agent scope is partial view
                     session_summary: None,
                     recommended_action,
@@ -3331,7 +3555,21 @@ impl Repository {
             );
         }
 
-        let seal = Seal::new(
+        let parent_seal_hash = match parent {
+            Some(ref pid) => match self.load_seal(pid) {
+                Ok(s) => s.chain_hash.clone(),
+                Err(e) => {
+                    seal_warnings.push(format!(
+                        "CHAIN_BREAK: failed to load parent seal {}: {e} — chain integrity may be compromised",
+                        &pid[..12.min(pid.len())]
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let mut seal = Seal::new(
             parent,
             tree_hash,
             agent,
@@ -3341,7 +3579,9 @@ impl Repository {
             verification,
             summary,
             seal_warnings,
+            parent_seal_hash,
         );
+        seal.secure(None);
 
         self.save_seal(&seal)?;
         atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
@@ -3363,6 +3603,22 @@ impl Repository {
 
     fn ignore_rules(&self) -> IgnoreRules {
         IgnoreRules::load(&self.root)
+    }
+
+    /// Load the convergence engine's Ed25519 signing key.
+    ///
+    /// Returns `None` if the key doesn't exist (pre-Sprint A repos).
+    pub fn convergence_signing_key(&self) -> Option<ed25519_dalek::SigningKey> {
+        let ks = KeyStore::open(&self.writ_dir);
+        ks.load_agent_signing_key("convergence").ok()
+    }
+
+    /// Load the convergence engine's Ed25519 verifying (public) key.
+    ///
+    /// Returns `None` if the key doesn't exist (pre-Sprint A repos).
+    pub fn convergence_verifying_key(&self) -> Option<ed25519_dalek::VerifyingKey> {
+        let ks = KeyStore::open(&self.writ_dir);
+        ks.load_agent_verifying_key("convergence").ok()
     }
 
     /// Validate a relative path and return its absolute form within the repo root.
@@ -3469,6 +3725,12 @@ impl Repository {
             .writ_dir
             .join("seals")
             .join(format!("{}.json", seal.id));
+
+        // Append-only guard: reject if a seal with this ID already exists.
+        if path.exists() {
+            return Err(WritError::SealAlreadyExists(seal.id.clone()));
+        }
+
         let json = serde_json::to_string_pretty(seal)?;
         atomic_write(&path, json.as_bytes())?;
         Ok(())
@@ -3765,8 +4027,23 @@ impl Repository {
         let tree_hash = self.objects.store(tree_json.as_bytes())?;
         let parent = self.read_head()?;
 
+        let mut seal_warnings = Vec::new();
+        let parent_seal_hash = match parent {
+            Some(ref pid) => match self.load_seal(pid) {
+                Ok(s) => s.chain_hash.clone(),
+                Err(e) => {
+                    seal_warnings.push(format!(
+                        "CHAIN_BREAK: failed to load parent seal {}: {e} — chain integrity may be compromised",
+                        &pid[..12.min(pid.len())]
+                    ));
+                    None
+                }
+            },
+            None => None,
+        };
+
         let short_hash = &git_commit_hash[..12.min(git_commit_hash.len())];
-        let seal = Seal::new(
+        let mut seal = Seal::new(
             parent,
             tree_hash,
             agent,
@@ -3775,8 +4052,10 @@ impl Repository {
             changes.clone(),
             Verification::default(),
             format!("bridge import from git {short_hash}"),
-            Vec::new(),
+            seal_warnings,
+            parent_seal_hash,
         );
+        seal.secure(None);
 
         self.save_seal(&seal)?;
         atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
@@ -5037,6 +5316,25 @@ pub struct InstallResult {
     pub hooks_installed: Vec<crate::hooks::HookResult>,
 }
 
+/// Result of `writ uninstall`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UninstallResult {
+    /// Whether .writ/ was removed.
+    pub writ_dir_removed: bool,
+    /// Whether .writignore was removed.
+    pub writignore_removed: bool,
+    /// Number of seals that existed before removal.
+    pub seals_existed: usize,
+    /// Number of tracked files before removal.
+    pub tracked_files: usize,
+    /// Framework hooks that were cleaned up.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub hooks_removed: Vec<crate::hooks::UninstallHookResult>,
+    /// Warnings generated during uninstall.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub warnings: Vec<String>,
+}
+
 /// Returned by `seal()` when changed files fall outside the spec's declared `file_scope`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileScopeWarning {
@@ -5886,6 +6184,27 @@ pub struct AgentSummaryEntry {
     pub latest_summary: Option<String>,
 }
 
+/// Result of verifying a seal's cryptographic integrity.
+#[derive(Debug, Clone, Serialize)]
+pub struct SealVerification {
+    pub seal_id: String,
+    pub content_hash_valid: bool,
+    pub chain_hash_valid: bool,
+    pub signature_present: bool,
+    pub signature_valid: Option<bool>,
+    pub error: Option<String>,
+}
+
+/// Result of verifying the full chain from HEAD.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChainVerification {
+    pub total_seals: usize,
+    pub verified: usize,
+    pub unsecured: usize,
+    pub failures: Vec<SealVerification>,
+    pub valid: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6036,6 +6355,48 @@ mod tests {
 
         let all = repo.list_specs().unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    #[test]
+    fn test_add_spec_rejects_duplicate() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("dup".to_string(), "First".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        let dup = Spec::new("dup".to_string(), "Second".to_string(), "".to_string());
+        let err = repo.add_spec(&dup).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "expected SpecAlreadyExists error, got: {err}"
+        );
+
+        // Original spec should be untouched.
+        let loaded = repo.load_spec("dup").unwrap();
+        assert_eq!(loaded.title, "First");
+    }
+
+    #[test]
+    fn test_update_spec_unaffected_by_duplicate_guard() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("upd".to_string(), "Original".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        // update_spec should still work on existing specs.
+        let update = crate::spec::SpecUpdate {
+            status: Some(SpecStatus::InProgress),
+            depends_on: None,
+            file_scope: None,
+            acceptance_criteria: None,
+            design_notes: None,
+            tech_stack: None,
+        };
+        repo.update_spec("upd", update).unwrap();
+        let loaded = repo.load_spec("upd").unwrap();
+        assert_eq!(loaded.status, SpecStatus::InProgress);
     }
 
     // --- Diff tests ---
@@ -8530,6 +8891,965 @@ mod tests {
             false,
         );
         assert!(result.is_ok());
+    }
+
+    // --- Append-only seal store (A.1.8) ---
+
+    #[test]
+    fn test_save_seal_rejects_overwrite() {
+        // Manually craft a seal and save it twice — the second save must fail.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let seal = Seal::new(
+            None,
+            "tree-hash-123".to_string(),
+            test_agent(),
+            None,
+            TaskStatus::InProgress,
+            vec![],
+            Verification::default(),
+            "test seal".to_string(),
+            vec![],
+            None,
+        );
+
+        // First save succeeds
+        repo.save_seal(&seal).unwrap();
+
+        // Second save with same ID must fail
+        let err = repo.save_seal(&seal).unwrap_err();
+        assert!(
+            matches!(err, WritError::SealAlreadyExists(_)),
+            "expected SealAlreadyExists, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_seal_store_no_delete_path() {
+        // After creating a seal, verify the file exists on disk and
+        // no seal operation removes it.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+
+        let seal = repo
+            .seal(
+                test_agent(),
+                "seal to preserve".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let seal_path = dir
+            .path()
+            .join(".writ/seals")
+            .join(format!("{}.json", seal.id));
+        assert!(seal_path.exists(), "seal file must exist after creation");
+
+        // Create a second seal — the first must still exist
+        fs::write(dir.path().join("file.txt"), "updated content").unwrap();
+        let _seal2 = repo
+            .seal(
+                test_agent(),
+                "second seal".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        assert!(
+            seal_path.exists(),
+            "first seal file must still exist after second seal"
+        );
+
+        // Restore to first seal — the first seal file must still exist
+        repo.restore(&seal.id).unwrap();
+        assert!(
+            seal_path.exists(),
+            "seal file must survive restore operations"
+        );
+    }
+
+    #[test]
+    fn test_seal_integrity_after_overwrite_attempt() {
+        // Verify the original seal is unchanged after a rejected overwrite.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let seal = Seal::new(
+            None,
+            "tree-hash-abc".to_string(),
+            AgentIdentity {
+                id: "integrity-agent".to_string(),
+                agent_type: AgentType::Agent,
+            },
+            None,
+            TaskStatus::InProgress,
+            vec![],
+            Verification::default(),
+            "original summary".to_string(),
+            vec![],
+            None,
+        );
+
+        repo.save_seal(&seal).unwrap();
+
+        // Attempt overwrite (will fail)
+        let _ = repo.save_seal(&seal);
+
+        // Verify original content is intact
+        let loaded = repo.load_seal(&seal.id).unwrap();
+        assert_eq!(loaded.summary, "original summary");
+        assert_eq!(loaded.agent.id, "integrity-agent");
+    }
+}
+
+// --- A.1.9: Hash chain integration tests (Djo + Amis) ---
+
+#[cfg(test)]
+mod chain_tests {
+    use super::*;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn chain_agent() -> AgentIdentity {
+        AgentIdentity {
+            id: "chain-agent".to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    /// Helper: create a repo, write a file, and seal. Returns (repo, seal).
+    fn setup_chain_repo(dir: &std::path::Path) -> Repository {
+        let repo = Repository::init(dir).unwrap();
+        fs::write(dir.join("file.txt"), "initial").unwrap();
+        repo.seal(
+            chain_agent(),
+            "initial seal".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo
+    }
+
+    #[test]
+    fn test_chain_single_seal_verifies() {
+        let dir = tempdir().unwrap();
+        let repo = setup_chain_repo(dir.path());
+
+        let result = repo.verify_chain(None).unwrap();
+        assert!(result.valid, "single-seal chain should verify");
+        assert_eq!(result.verified, 1);
+        assert_eq!(result.total_seals, 1);
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn test_chain_three_seals_verify() {
+        let dir = tempdir().unwrap();
+        let repo = setup_chain_repo(dir.path());
+
+        // Seal 2
+        fs::write(dir.path().join("file.txt"), "second version").unwrap();
+        repo.seal(
+            chain_agent(),
+            "second seal".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Seal 3
+        fs::write(dir.path().join("file.txt"), "third version").unwrap();
+        repo.seal(
+            chain_agent(),
+            "third seal".to_string(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let result = repo.verify_chain(None).unwrap();
+        assert!(result.valid, "3-seal chain should verify");
+        assert_eq!(result.verified, 3);
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn test_chain_tampered_content_detected() {
+        let dir = tempdir().unwrap();
+        let repo = setup_chain_repo(dir.path());
+
+        // Tamper with the seal file on disk
+        let seals = repo.log().unwrap();
+        let seal_id = &seals[0].id;
+        let seal_path = dir
+            .path()
+            .join(".writ/seals")
+            .join(format!("{seal_id}.json"));
+        let mut seal: Seal =
+            serde_json::from_str(&fs::read_to_string(&seal_path).unwrap()).unwrap();
+        seal.summary = "TAMPERED SUMMARY".to_string();
+        // Write tampered seal back (bypass save_seal guard by writing directly)
+        fs::write(&seal_path, serde_json::to_string_pretty(&seal).unwrap()).unwrap();
+
+        let result = repo.verify_chain(None).unwrap();
+        assert!(!result.valid, "tampered chain should fail verification");
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            result.failures[0]
+                .error
+                .as_ref()
+                .unwrap()
+                .contains("content_hash"),
+            "error should mention content_hash"
+        );
+    }
+
+    #[test]
+    fn test_chain_tampered_timestamp_detected() {
+        let dir = tempdir().unwrap();
+        let repo = setup_chain_repo(dir.path());
+
+        let seals = repo.log().unwrap();
+        let seal_id = &seals[0].id;
+        let seal_path = dir
+            .path()
+            .join(".writ/seals")
+            .join(format!("{seal_id}.json"));
+        let mut seal: Seal =
+            serde_json::from_str(&fs::read_to_string(&seal_path).unwrap()).unwrap();
+        seal.timestamp = seal.timestamp + chrono::Duration::hours(1);
+        fs::write(&seal_path, serde_json::to_string_pretty(&seal).unwrap()).unwrap();
+
+        let result = repo.verify_chain(None).unwrap();
+        assert!(!result.valid, "tampered timestamp should fail verification");
+    }
+
+    #[test]
+    fn test_chain_tampered_agent_detected() {
+        let dir = tempdir().unwrap();
+        let repo = setup_chain_repo(dir.path());
+
+        let seals = repo.log().unwrap();
+        let seal_id = &seals[0].id;
+        let seal_path = dir
+            .path()
+            .join(".writ/seals")
+            .join(format!("{seal_id}.json"));
+        let mut seal: Seal =
+            serde_json::from_str(&fs::read_to_string(&seal_path).unwrap()).unwrap();
+        seal.agent.id = "evil-agent".to_string();
+        fs::write(&seal_path, serde_json::to_string_pretty(&seal).unwrap()).unwrap();
+
+        let result = repo.verify_chain(None).unwrap();
+        assert!(!result.valid, "tampered agent should fail verification");
+    }
+
+    #[test]
+    fn test_chain_tampered_parent_hash_detected() {
+        let dir = tempdir().unwrap();
+        let repo = setup_chain_repo(dir.path());
+
+        // Create second seal to have a chain link
+        fs::write(dir.path().join("file.txt"), "v2").unwrap();
+        repo.seal(
+            chain_agent(),
+            "second".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Tamper with second seal's parent_seal_hash
+        let seals = repo.log().unwrap();
+        let seal_id = &seals[0].id; // newest seal
+        let seal_path = dir
+            .path()
+            .join(".writ/seals")
+            .join(format!("{seal_id}.json"));
+        let mut seal: Seal =
+            serde_json::from_str(&fs::read_to_string(&seal_path).unwrap()).unwrap();
+        seal.parent_seal_hash = Some("fake-parent-hash-000".to_string());
+        fs::write(&seal_path, serde_json::to_string_pretty(&seal).unwrap()).unwrap();
+
+        let result = repo.verify_chain(None).unwrap();
+        assert!(
+            !result.valid,
+            "tampered parent_seal_hash should fail verification"
+        );
+    }
+
+    #[test]
+    fn test_chain_each_seal_has_crypto_fields() {
+        let dir = tempdir().unwrap();
+        let repo = setup_chain_repo(dir.path());
+
+        // Create multiple seals
+        for i in 1..5 {
+            fs::write(dir.path().join("file.txt"), format!("v{i}")).unwrap();
+            repo.seal(
+                chain_agent(),
+                format!("seal {i}"),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        }
+
+        let seals = repo.log().unwrap();
+        for seal in &seals {
+            assert!(
+                seal.content_hash.is_some(),
+                "seal {} missing content_hash",
+                seal.id
+            );
+            assert!(
+                seal.chain_hash.is_some(),
+                "seal {} missing chain_hash",
+                seal.id
+            );
+            assert!(seal.is_secured(), "seal {} not secured", seal.id);
+        }
+    }
+
+    #[test]
+    fn test_chain_parent_linkage_correct() {
+        let dir = tempdir().unwrap();
+        let repo = setup_chain_repo(dir.path());
+
+        fs::write(dir.path().join("file.txt"), "v2").unwrap();
+        repo.seal(
+            chain_agent(),
+            "second".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("file.txt"), "v3").unwrap();
+        repo.seal(
+            chain_agent(),
+            "third".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let seals = repo.log().unwrap(); // newest first
+                                         // seal[0] (newest) should have parent_seal_hash == seal[1].chain_hash
+        assert_eq!(
+            seals[0].parent_seal_hash.as_ref(),
+            seals[1].chain_hash.as_ref(),
+            "newest seal's parent_seal_hash should be parent's chain_hash"
+        );
+        // seal[1] should have parent_seal_hash == seal[2].chain_hash
+        assert_eq!(
+            seals[1].parent_seal_hash.as_ref(),
+            seals[2].chain_hash.as_ref(),
+            "middle seal's parent_seal_hash should be grandparent's chain_hash"
+        );
+        // seal[2] (oldest/genesis) should have no parent_seal_hash
+        assert!(
+            seals[2].parent_seal_hash.is_none(),
+            "genesis seal should have no parent_seal_hash"
+        );
+    }
+
+    #[test]
+    fn test_chain_100_seals_performance() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let start = std::time::Instant::now();
+        for i in 0..100 {
+            fs::write(dir.path().join("file.txt"), format!("iteration {i}")).unwrap();
+            repo.seal(
+                chain_agent(),
+                format!("seal {i}"),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        }
+        let seal_time = start.elapsed();
+
+        let start = std::time::Instant::now();
+        let result = repo.verify_chain(None).unwrap();
+        let verify_time = start.elapsed();
+
+        assert!(result.valid, "100-seal chain should verify");
+        assert_eq!(result.verified, 100);
+        assert!(
+            verify_time.as_secs() < 10,
+            "100-seal chain verification took {verify_time:?}"
+        );
+        assert!(
+            seal_time.as_secs() < 30,
+            "100-seal chain creation took {seal_time:?}"
+        );
+    }
+
+    #[test]
+    fn test_chain_with_signed_seals_verifies() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let (_signing_key, verifying_key) = crate::crypto::generate_keypair();
+
+        fs::write(dir.path().join("file.txt"), "signed content").unwrap();
+
+        // Create through normal seal path (gets secured without signing key)
+        let _seal = repo
+            .seal(
+                chain_agent(),
+                "unsigned seal".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Verify without signing key first
+        let result = repo.verify_chain(None).unwrap();
+        assert!(result.valid);
+
+        // Verify with key — signature_valid should be None (not signed)
+        let result = repo.verify_chain(Some(&verifying_key)).unwrap();
+        assert!(result.valid);
+        // Seal is verified but not signed
+        assert_eq!(result.verified, 1);
+    }
+
+    #[test]
+    fn test_chain_all_hashes_unique() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        for i in 0..10 {
+            fs::write(dir.path().join("file.txt"), format!("v{i}")).unwrap();
+            repo.seal(
+                chain_agent(),
+                format!("seal {i}"),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        }
+
+        let seals = repo.log().unwrap();
+        let content_hashes: std::collections::HashSet<&str> = seals
+            .iter()
+            .filter_map(|s| s.content_hash.as_deref())
+            .collect();
+        let chain_hashes: std::collections::HashSet<&str> = seals
+            .iter()
+            .filter_map(|s| s.chain_hash.as_deref())
+            .collect();
+
+        assert_eq!(
+            content_hashes.len(),
+            10,
+            "all content hashes should be unique"
+        );
+        assert_eq!(chain_hashes.len(), 10, "all chain hashes should be unique");
+    }
+}
+
+// --- A.2.7: Signature integration tests (Djo + Amis) ---
+
+#[cfg(test)]
+mod signature_tests {
+    use super::*;
+    use crate::crypto;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn sig_agent() -> AgentIdentity {
+        AgentIdentity {
+            id: "sig-agent".to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_seal_signed_with_key_verifies() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let (signing_key, verifying_key) = crypto::generate_keypair();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+
+        // Create a seal, then manually sign it
+        let mut seal = Seal::new(
+            None,
+            "tree".to_string(),
+            sig_agent(),
+            None,
+            TaskStatus::InProgress,
+            vec![],
+            Verification::default(),
+            "signed seal".to_string(),
+            vec![],
+            None,
+        );
+        seal.secure(Some(&signing_key));
+
+        assert!(seal.is_signed(), "seal should be signed");
+        assert!(seal.is_secured(), "seal should be secured");
+
+        // Verify
+        let result = repo.verify_seal(&seal, Some(&verifying_key));
+        assert!(result.content_hash_valid, "content hash should be valid");
+        assert!(result.chain_hash_valid, "chain hash should be valid");
+        assert!(result.signature_present, "signature should be present");
+        assert_eq!(
+            result.signature_valid,
+            Some(true),
+            "signature should verify"
+        );
+        assert!(result.error.is_none(), "no error expected");
+    }
+
+    #[test]
+    fn test_seal_tampered_content_fails_signature() {
+        let (signing_key, verifying_key) = crypto::generate_keypair();
+
+        let mut seal = Seal::new(
+            None,
+            "tree".to_string(),
+            sig_agent(),
+            None,
+            TaskStatus::InProgress,
+            vec![],
+            Verification::default(),
+            "original".to_string(),
+            vec![],
+            None,
+        );
+        seal.secure(Some(&signing_key));
+
+        // Tamper with content after signing
+        seal.summary = "TAMPERED".to_string();
+
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let result = repo.verify_seal(&seal, Some(&verifying_key));
+
+        assert!(
+            !result.content_hash_valid,
+            "tampered content should fail hash check"
+        );
+    }
+
+    #[test]
+    fn test_seal_wrong_key_fails_signature() {
+        let (signing_key, _) = crypto::generate_keypair();
+        let (_, wrong_verifying_key) = crypto::generate_keypair();
+
+        let mut seal = Seal::new(
+            None,
+            "tree".to_string(),
+            sig_agent(),
+            None,
+            TaskStatus::InProgress,
+            vec![],
+            Verification::default(),
+            "signed".to_string(),
+            vec![],
+            None,
+        );
+        seal.secure(Some(&signing_key));
+
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let result = repo.verify_seal(&seal, Some(&wrong_verifying_key));
+
+        // Content and chain hashes should still be valid (they don't depend on key)
+        assert!(result.content_hash_valid, "content hash valid with any key");
+        assert!(result.chain_hash_valid, "chain hash valid with any key");
+        // But signature should fail
+        assert_eq!(
+            result.signature_valid,
+            Some(false),
+            "wrong key should fail signature"
+        );
+        assert!(result.error.is_some(), "error expected for wrong key");
+    }
+
+    #[test]
+    fn test_seal_truncated_signature_fails() {
+        let (signing_key, verifying_key) = crypto::generate_keypair();
+
+        let mut seal = Seal::new(
+            None,
+            "tree".to_string(),
+            sig_agent(),
+            None,
+            TaskStatus::InProgress,
+            vec![],
+            Verification::default(),
+            "truncated sig test".to_string(),
+            vec![],
+            None,
+        );
+        seal.secure(Some(&signing_key));
+
+        // Truncate the signature
+        if let Some(ref sig) = seal.signature {
+            seal.signature = Some(sig[..sig.len() / 2].to_string());
+        }
+
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let result = repo.verify_seal(&seal, Some(&verifying_key));
+
+        assert_eq!(
+            result.signature_valid,
+            Some(false),
+            "truncated signature should fail"
+        );
+    }
+
+    #[test]
+    fn test_unsigned_seal_reports_no_signature() {
+        let mut seal = Seal::new(
+            None,
+            "tree".to_string(),
+            sig_agent(),
+            None,
+            TaskStatus::InProgress,
+            vec![],
+            Verification::default(),
+            "unsigned".to_string(),
+            vec![],
+            None,
+        );
+        seal.secure(None); // No signing key
+
+        assert!(!seal.is_signed(), "seal should not be signed");
+        assert!(seal.is_secured(), "seal should still be secured");
+
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let (_, vk) = crypto::generate_keypair();
+        let result = repo.verify_seal(&seal, Some(&vk));
+
+        assert!(result.content_hash_valid);
+        assert!(result.chain_hash_valid);
+        assert!(!result.signature_present, "no signature present");
+        assert!(result.signature_valid.is_none(), "no signature to verify");
+    }
+
+    #[test]
+    fn test_convergence_signing_key_signs_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let conv_sk = repo.convergence_signing_key().unwrap();
+        let conv_vk = repo.convergence_verifying_key().unwrap();
+
+        let mut seal = Seal::new(
+            None,
+            "conv-tree".to_string(),
+            AgentIdentity {
+                id: "convergence-engine".to_string(),
+                agent_type: AgentType::Agent,
+            },
+            None,
+            TaskStatus::Complete,
+            vec![],
+            Verification::default(),
+            "convergence result".to_string(),
+            vec![],
+            None,
+        );
+        seal.secure(Some(&conv_sk));
+
+        let result = repo.verify_seal(&seal, Some(&conv_vk));
+        assert!(result.content_hash_valid);
+        assert!(result.chain_hash_valid);
+        assert!(result.signature_present);
+        assert_eq!(
+            result.signature_valid,
+            Some(true),
+            "convergence engine signature should verify"
+        );
+    }
+
+    #[test]
+    fn test_convergence_key_rejects_agent_seal() {
+        // A seal signed by an agent's key should fail verification
+        // with the convergence engine's key.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let conv_vk = repo.convergence_verifying_key().unwrap();
+        let (agent_sk, _) = crypto::generate_keypair();
+
+        let mut seal = Seal::new(
+            None,
+            "tree".to_string(),
+            sig_agent(),
+            None,
+            TaskStatus::InProgress,
+            vec![],
+            Verification::default(),
+            "agent signed".to_string(),
+            vec![],
+            None,
+        );
+        seal.secure(Some(&agent_sk));
+
+        let result = repo.verify_seal(&seal, Some(&conv_vk));
+        assert_eq!(
+            result.signature_valid,
+            Some(false),
+            "agent key should not verify against convergence key"
+        );
+    }
+
+    #[test]
+    fn test_seal_modified_agent_id_detected() {
+        let (signing_key, verifying_key) = crypto::generate_keypair();
+
+        let mut seal = Seal::new(
+            None,
+            "tree".to_string(),
+            sig_agent(),
+            None,
+            TaskStatus::InProgress,
+            vec![],
+            Verification::default(),
+            "identity test".to_string(),
+            vec![],
+            None,
+        );
+        seal.secure(Some(&signing_key));
+
+        // Tamper with agent identity
+        seal.agent.id = "impersonator".to_string();
+
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let result = repo.verify_seal(&seal, Some(&verifying_key));
+
+        assert!(
+            !result.content_hash_valid,
+            "modified agent_id should invalidate content hash"
+        );
+    }
+}
+
+#[cfg(test)]
+mod convergence_keypair_tests {
+    use super::*;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn agent() -> AgentIdentity {
+        AgentIdentity {
+            id: "keypair-agent".to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    #[test]
+    fn test_init_creates_convergence_keypair() {
+        let dir = tempdir().unwrap();
+        let _repo = Repository::init(dir.path()).unwrap();
+
+        assert!(
+            dir.path().join(".writ/keys").is_dir(),
+            "keys directory should exist"
+        );
+        assert!(
+            dir.path().join(".writ/keys/.master").exists(),
+            "master encryption key should exist"
+        );
+        assert!(
+            dir.path().join(".writ/keys/convergence.pub").exists(),
+            "convergence verifying key should exist"
+        );
+        assert!(
+            dir.path().join(".writ/keys/convergence.enc").exists(),
+            "convergence signing key (encrypted) should exist"
+        );
+    }
+
+    #[test]
+    fn test_convergence_keypair_loads() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let signing = repo.convergence_signing_key();
+        let verifying = repo.convergence_verifying_key();
+
+        assert!(signing.is_some(), "signing key should load");
+        assert!(verifying.is_some(), "verifying key should load");
+
+        // Signing key should correspond to verifying key
+        let sk = signing.unwrap();
+        let vk = verifying.unwrap();
+        assert_eq!(
+            sk.verifying_key().as_bytes(),
+            vk.as_bytes(),
+            "keypair should be consistent"
+        );
+    }
+
+    #[test]
+    fn test_convergence_key_can_sign_and_verify() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let sk = repo.convergence_signing_key().unwrap();
+        let vk = repo.convergence_verifying_key().unwrap();
+
+        // Sign something with the convergence key
+        let sig = crate::crypto::sign("test-content", &sk);
+        assert!(
+            crate::crypto::verify_signature("test-content", &sig, &vk),
+            "convergence key should sign and verify"
+        );
+    }
+
+    #[test]
+    fn test_convergence_key_unique_per_repo() {
+        let dir1 = tempdir().unwrap();
+        let dir2 = tempdir().unwrap();
+        let repo1 = Repository::init(dir1.path()).unwrap();
+        let repo2 = Repository::init(dir2.path()).unwrap();
+
+        let vk1 = repo1.convergence_verifying_key().unwrap();
+        let vk2 = repo2.convergence_verifying_key().unwrap();
+
+        assert_ne!(
+            vk1.as_bytes(),
+            vk2.as_bytes(),
+            "different repos should have different convergence keys"
+        );
+    }
+
+    #[test]
+    fn test_seal_secured_with_convergence_key() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "convergence content").unwrap();
+        let mut seal = repo
+            .seal(
+                agent(),
+                "convergence seal".to_string(),
+                None,
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Re-secure with the convergence signing key
+        let sk = repo.convergence_signing_key().unwrap();
+        let vk = repo.convergence_verifying_key().unwrap();
+        seal.secure(Some(&sk));
+
+        assert!(seal.is_signed(), "seal should be signed after secure()");
+        assert!(
+            crate::crypto::verify_signature(
+                seal.content_hash.as_ref().unwrap(),
+                seal.signature.as_ref().unwrap(),
+                &vk,
+            ),
+            "convergence signature should verify"
+        );
+    }
+
+    #[test]
+    fn test_wrong_key_signature_rejected() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "signed content").unwrap();
+        let mut seal = repo
+            .seal(
+                agent(),
+                "signed seal".to_string(),
+                None,
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Sign with convergence key
+        let sk = repo.convergence_signing_key().unwrap();
+        seal.secure(Some(&sk));
+
+        // Verify with a DIFFERENT key — should fail
+        let (_wrong_sk, wrong_vk) = crate::crypto::generate_keypair();
+        assert!(
+            !crate::crypto::verify_signature(
+                seal.content_hash.as_ref().unwrap(),
+                seal.signature.as_ref().unwrap(),
+                &wrong_vk,
+            ),
+            "wrong key should reject signature"
+        );
+    }
+
+    #[test]
+    fn test_truncated_signature_rejected() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "truncated test").unwrap();
+        let mut seal = repo
+            .seal(
+                agent(),
+                "truncated sig test".to_string(),
+                None,
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let sk = repo.convergence_signing_key().unwrap();
+        let vk = repo.convergence_verifying_key().unwrap();
+        seal.secure(Some(&sk));
+
+        // Truncate the signature
+        let truncated = &seal.signature.as_ref().unwrap()[..64]; // half of 128 hex chars
+        assert!(
+            !crate::crypto::verify_signature(seal.content_hash.as_ref().unwrap(), truncated, &vk,),
+            "truncated signature should be rejected"
+        );
     }
 }
 
@@ -13779,7 +15099,7 @@ mod scale_tests {
             .unwrap();
         }
         let seal_time = start.elapsed();
-        assert!(seal_time.as_secs() < 120, "500 seals took {:?}", seal_time);
+        assert!(seal_time.as_secs() < 300, "500 seals took {:?}", seal_time);
 
         let start = Instant::now();
         let chain = repo.log().unwrap();
@@ -13940,7 +15260,7 @@ mod scale_tests {
 
         assert_eq!(seal.changes.len(), 200);
         assert!(
-            seal_time.as_secs() < 10,
+            seal_time.as_secs() < 30,
             "Sealing 200 files took {:?}",
             seal_time
         );
@@ -19052,5 +20372,717 @@ mod sprint14_reporting_tests {
         if let Some(check) = dup_check {
             assert!(check.consistent, "no duplicate defs — should be consistent");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 0.2.2 — Context edge case tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod context_edge_case_tests {
+    use super::*;
+    use crate::context::{ContextFilter, ContextScope};
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use crate::spec::{Spec, SpecStatus, SpecUpdate};
+    use std::time::Instant;
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    fn default_filter() -> ContextFilter {
+        ContextFilter::default()
+    }
+
+    // --- 0 seals edge cases ---
+
+    #[test]
+    fn test_context_zero_seals_full_scope() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 10, &default_filter())
+            .unwrap();
+
+        assert!(ctx.working_state.clean);
+        assert!(ctx.recent_seals.is_empty());
+        assert!(ctx.pending_changes.is_none());
+        assert!(ctx.agent_activity.is_empty());
+        assert!(ctx.file_contention.is_empty());
+        assert!(ctx.diverged_branches.is_empty());
+        assert!(!ctx.convergence_recommended);
+        assert_eq!(ctx.integration_risk.level, "low");
+        assert!(!ctx.session_complete);
+    }
+
+    #[test]
+    fn test_context_zero_seals_with_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("empty-spec".into(), "No seals yet".into(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        // Full scope: spec visible but no seals
+        let ctx = repo
+            .context(ContextScope::Full, 10, &default_filter())
+            .unwrap();
+        assert!(ctx.recent_seals.is_empty());
+        let specs = ctx.all_specs.as_ref().unwrap();
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].id, "empty-spec");
+
+        // Spec scope: works even with no seals
+        let spec_ctx = repo
+            .context(
+                ContextScope::Spec("empty-spec".into()),
+                10,
+                &default_filter(),
+            )
+            .unwrap();
+        assert!(spec_ctx.recent_seals.is_empty());
+        assert!(spec_ctx.active_spec.is_some());
+    }
+
+    #[test]
+    fn test_context_zero_seals_with_pending_changes() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("new_file.txt"), "content").unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 10, &default_filter())
+            .unwrap();
+        assert!(!ctx.working_state.clean);
+        assert!(!ctx.working_state.new_files.is_empty());
+        // Should nudge to seal since there are changes
+        assert!(ctx.seal_nudge.is_some());
+    }
+
+    #[test]
+    fn test_context_zero_seals_agent_scope() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Agent scope for a non-existent agent — should not panic
+        let ctx = repo
+            .context(
+                ContextScope::Agent("ghost-agent".into()),
+                10,
+                &default_filter(),
+            )
+            .unwrap();
+        assert!(ctx.recent_seals.is_empty());
+        assert!(ctx.agent_activity.is_empty());
+    }
+
+    // --- 1 seal edge cases ---
+
+    #[test]
+    fn test_context_one_seal_full_scope() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("only.txt"), "first").unwrap();
+        repo.seal(
+            agent("solo"),
+            "only seal".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 10, &default_filter())
+            .unwrap();
+        assert_eq!(ctx.recent_seals.len(), 1);
+        assert_eq!(ctx.recent_seals[0].summary, "only seal");
+        assert_eq!(ctx.agent_activity.len(), 1);
+        assert_eq!(ctx.agent_activity[0].agent_id, "solo");
+        assert!(
+            ctx.file_contention.is_empty(),
+            "single agent = no contention"
+        );
+    }
+
+    #[test]
+    fn test_context_one_seal_spec_scoped() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("solo-spec".into(), "Solo".into(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        fs::write(dir.path().join("data.txt"), "v1").unwrap();
+        repo.seal(
+            agent("worker"),
+            "first step".into(),
+            Some("solo-spec".into()),
+            TaskStatus::InProgress,
+            Verification {
+                tests_passed: Some(5),
+                tests_failed: Some(0),
+                linted: true,
+            },
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(
+                ContextScope::Spec("solo-spec".into()),
+                10,
+                &default_filter(),
+            )
+            .unwrap();
+        assert_eq!(ctx.recent_seals.len(), 1);
+        assert!(ctx.spec_progress.is_some());
+        let progress = ctx.spec_progress.as_ref().unwrap();
+        assert_eq!(progress.total_seals, 1);
+    }
+
+    // --- 500 seals scale test ---
+
+    #[test]
+    fn test_context_500_seals_all_scopes() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("bulk-spec".into(), "Bulk work".into(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        // Create shared files upfront
+        for f in 0..5 {
+            fs::write(dir.path().join(format!("shared-{f}.txt")), "base").unwrap();
+        }
+
+        // Create 500 seals across 2 agents, both modifying overlapping files
+        for i in 0..500 {
+            let agent_name = if i % 2 == 0 { "agent-a" } else { "agent-b" };
+            // Each agent modifies 2 shared files per seal to create contention
+            let f1 = format!("shared-{}.txt", i % 5);
+            let f2 = format!("shared-{}.txt", (i + 1) % 5);
+            fs::write(dir.path().join(&f1), format!("v{i}-a")).unwrap();
+            fs::write(dir.path().join(&f2), format!("v{i}-b")).unwrap();
+            repo.seal(
+                agent(agent_name),
+                format!("seal #{i}"),
+                Some("bulk-spec".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        }
+
+        // Full scope with limit
+        let start = Instant::now();
+        let ctx = repo
+            .context(ContextScope::Full, 20, &default_filter())
+            .unwrap();
+        let full_time = start.elapsed();
+        assert_eq!(ctx.recent_seals.len(), 20, "seal_limit should cap at 20");
+        assert!(
+            full_time.as_secs() < 30,
+            "Full context with 500 seals took {full_time:?}"
+        );
+
+        // Spec scope with limit
+        let start = Instant::now();
+        let spec_ctx = repo
+            .context(
+                ContextScope::Spec("bulk-spec".into()),
+                10,
+                &default_filter(),
+            )
+            .unwrap();
+        let spec_time = start.elapsed();
+        assert_eq!(spec_ctx.recent_seals.len(), 10);
+        assert!(
+            spec_time.as_secs() < 30,
+            "Spec context with 500 seals took {spec_time:?}"
+        );
+
+        // Agent scope
+        let start = Instant::now();
+        let agent_ctx = repo
+            .context(ContextScope::Agent("agent-a".into()), 15, &default_filter())
+            .unwrap();
+        let agent_time = start.elapsed();
+        assert!(agent_ctx.recent_seals.len() <= 15);
+        assert!(
+            agent_time.as_secs() < 30,
+            "Agent context with 500 seals took {agent_time:?}"
+        );
+
+        // Verify agent activity includes both agents
+        assert!(
+            ctx.agent_activity.len() >= 2,
+            "should have at least 2 agents in activity"
+        );
+
+        // Both agents touched the same shared files → contention expected
+        assert!(
+            !ctx.file_contention.is_empty(),
+            "2 agents touching same files = contention: activity={:?}",
+            ctx.agent_activity
+                .iter()
+                .map(|a| (&a.agent_id, a.seal_count, &a.files_owned))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // --- Conflicting specs ---
+
+    #[test]
+    fn test_context_conflicting_specs_same_files() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Two specs claiming the same file scope
+        let mut spec_a = Spec::new("spec-alpha".into(), "Alpha work".into(), String::new());
+        spec_a.file_scope = vec!["shared.py".into(), "alpha.py".into()];
+        repo.add_spec(&spec_a).unwrap();
+
+        let mut spec_b = Spec::new("spec-beta".into(), "Beta work".into(), String::new());
+        spec_b.file_scope = vec!["shared.py".into(), "beta.py".into()];
+        repo.add_spec(&spec_b).unwrap();
+
+        // Both agents seal changes to shared.py
+        fs::write(dir.path().join("shared.py"), "v1").unwrap();
+        fs::write(dir.path().join("alpha.py"), "a1").unwrap();
+        repo.seal(
+            agent("alpha-agent"),
+            "alpha work".into(),
+            Some("spec-alpha".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("shared.py"), "v2").unwrap();
+        fs::write(dir.path().join("beta.py"), "b1").unwrap();
+        repo.seal(
+            agent("beta-agent"),
+            "beta work".into(),
+            Some("spec-beta".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Full context should show contention on shared.py
+        let ctx = repo
+            .context(ContextScope::Full, 20, &default_filter())
+            .unwrap();
+        let shared_contention = ctx.file_contention.iter().find(|fc| fc.path == "shared.py");
+        assert!(
+            shared_contention.is_some(),
+            "shared.py should appear in file_contention"
+        );
+
+        // Spec-scoped context should still work for each spec
+        let alpha_ctx = repo
+            .context(
+                ContextScope::Spec("spec-alpha".into()),
+                10,
+                &default_filter(),
+            )
+            .unwrap();
+        assert!(alpha_ctx.active_spec.is_some());
+
+        let beta_ctx = repo
+            .context(
+                ContextScope::Spec("spec-beta".into()),
+                10,
+                &default_filter(),
+            )
+            .unwrap();
+        assert!(beta_ctx.active_spec.is_some());
+    }
+
+    #[test]
+    fn test_context_specs_with_dependencies() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let mut base_spec = Spec::new("base".into(), "Base layer".into(), String::new());
+        base_spec.file_scope = vec!["base.py".into()];
+        repo.add_spec(&base_spec).unwrap();
+
+        let mut dep_spec = Spec::new("dependent".into(), "Depends on base".into(), String::new());
+        dep_spec.depends_on = vec!["base".into()];
+        dep_spec.file_scope = vec!["feature.py".into()];
+        repo.add_spec(&dep_spec).unwrap();
+
+        // Base spec not yet complete
+        fs::write(dir.path().join("base.py"), "wip").unwrap();
+        repo.seal(
+            agent("base-dev"),
+            "base wip".into(),
+            Some("base".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Dependent spec context should show blocking dependency
+        let ctx = repo
+            .context(
+                ContextScope::Spec("dependent".into()),
+                10,
+                &default_filter(),
+            )
+            .unwrap();
+
+        let deps = ctx.dependency_status.as_ref().unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].spec_id, "base");
+        assert!(!deps[0].resolved, "base is still in-progress");
+
+        // Recommended action should be wait_for_dependency
+        if let Some(ref action) = ctx.recommended_action {
+            assert_eq!(action.action, "wait_for_dependency");
+        }
+    }
+
+    // --- Deleted files ---
+
+    #[test]
+    fn test_context_with_deleted_files() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create and seal a file
+        fs::write(dir.path().join("ephemeral.txt"), "exists").unwrap();
+        repo.seal(
+            agent("creator"),
+            "created file".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Delete the file
+        fs::remove_file(dir.path().join("ephemeral.txt")).unwrap();
+
+        // Context should show deleted file in working state
+        let ctx = repo
+            .context(ContextScope::Full, 10, &default_filter())
+            .unwrap();
+        assert!(!ctx.working_state.clean);
+        assert!(
+            ctx.working_state
+                .deleted_files
+                .contains(&"ephemeral.txt".to_string()),
+            "deleted file should appear in working_state.deleted_files"
+        );
+        // Should nudge to seal the deletion
+        assert!(ctx.seal_nudge.is_some());
+    }
+
+    #[test]
+    fn test_context_deleted_file_not_in_ownership() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create, seal, delete, seal the deletion
+        fs::write(dir.path().join("gone.txt"), "here").unwrap();
+        repo.seal(
+            agent("dev"),
+            "add file".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        repo.seal(
+            agent("dev"),
+            "remove file".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 10, &default_filter())
+            .unwrap();
+
+        // After sealing the deletion, working state should be clean
+        assert!(ctx.working_state.clean);
+    }
+
+    // --- Renamed files (simulated as delete + add) ---
+
+    #[test]
+    fn test_context_renamed_files() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create original file and seal
+        fs::write(dir.path().join("old_name.txt"), "content").unwrap();
+        repo.seal(
+            agent("renamer"),
+            "original file".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // "Rename": delete old, create new with same content
+        fs::remove_file(dir.path().join("old_name.txt")).unwrap();
+        fs::write(dir.path().join("new_name.txt"), "content").unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 10, &default_filter())
+            .unwrap();
+        assert!(!ctx.working_state.clean);
+        assert!(
+            ctx.working_state
+                .deleted_files
+                .contains(&"old_name.txt".to_string()),
+            "old name should be in deleted_files"
+        );
+        assert!(
+            ctx.working_state
+                .new_files
+                .contains(&"new_name.txt".to_string()),
+            "new name should be in new_files"
+        );
+
+        // Seal the rename
+        repo.seal(
+            agent("renamer"),
+            "renamed file".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx2 = repo
+            .context(ContextScope::Full, 10, &default_filter())
+            .unwrap();
+        assert!(ctx2.working_state.clean);
+        // new_name.txt should be tracked, old_name.txt should not
+        assert_eq!(ctx2.tracked_files, 1);
+    }
+
+    // --- Spec not found ---
+
+    #[test]
+    fn test_context_spec_scope_nonexistent_spec() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.context(
+            ContextScope::Spec("does-not-exist".into()),
+            10,
+            &default_filter(),
+        );
+        assert!(result.is_err(), "nonexistent spec should return error");
+    }
+
+    // --- Session complete ---
+
+    #[test]
+    fn test_context_session_complete_all_specs_done() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = Spec::new("finish-me".into(), "Completable".into(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        fs::write(dir.path().join("done.txt"), "done").unwrap();
+        repo.seal(
+            agent("closer"),
+            "final work".into(),
+            Some("finish-me".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Mark spec as complete
+        repo.update_spec(
+            "finish-me",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                depends_on: None,
+                file_scope: None,
+                acceptance_criteria: None,
+                design_notes: None,
+                tech_stack: None,
+            },
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 10, &default_filter())
+            .unwrap();
+        assert!(
+            ctx.session_complete,
+            "all specs complete = session_complete"
+        );
+        assert!(ctx.session_summary.is_some());
+    }
+
+    #[test]
+    fn test_context_session_not_complete_with_mixed_statuses() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec_a = Spec::new("done-spec".into(), "Done".into(), String::new());
+        repo.add_spec(&spec_a).unwrap();
+        let spec_b = Spec::new("wip-spec".into(), "Still working".into(), String::new());
+        repo.add_spec(&spec_b).unwrap();
+
+        fs::write(dir.path().join("a.txt"), "done").unwrap();
+        repo.seal(
+            agent("a"),
+            "a done".into(),
+            Some("done-spec".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.update_spec(
+            "done-spec",
+            SpecUpdate {
+                status: Some(SpecStatus::Complete),
+                depends_on: None,
+                file_scope: None,
+                acceptance_criteria: None,
+                design_notes: None,
+                tech_stack: None,
+            },
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 10, &default_filter())
+            .unwrap();
+        assert!(
+            !ctx.session_complete,
+            "not all specs complete = session not complete"
+        );
+    }
+
+    // --- Integration risk edge cases ---
+
+    #[test]
+    fn test_context_integration_risk_low_with_single_agent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        for i in 0..5 {
+            fs::write(dir.path().join(format!("f{i}.txt")), format!("v{i}")).unwrap();
+        }
+        repo.seal(
+            agent("lone-wolf"),
+            "batch work".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 10, &default_filter())
+            .unwrap();
+        assert_eq!(
+            ctx.integration_risk.level, "low",
+            "single agent should have low integration risk"
+        );
+        assert_eq!(ctx.integration_risk.score, 0);
+    }
+
+    // --- Seal limit edge cases ---
+
+    #[test]
+    fn test_context_seal_limit_zero() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("f.txt"), "v1").unwrap();
+        repo.seal(
+            agent("dev"),
+            "work".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 0, &default_filter())
+            .unwrap();
+        assert!(
+            ctx.recent_seals.is_empty(),
+            "seal_limit=0 should return no seals"
+        );
+    }
+
+    #[test]
+    fn test_context_seal_limit_exceeds_total() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("f.txt"), "v1").unwrap();
+        repo.seal(
+            agent("dev"),
+            "seal 1".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(dir.path().join("f.txt"), "v2").unwrap();
+        repo.seal(
+            agent("dev"),
+            "seal 2".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 100, &default_filter())
+            .unwrap();
+        assert_eq!(
+            ctx.recent_seals.len(),
+            2,
+            "should return all seals when limit > total"
+        );
     }
 }

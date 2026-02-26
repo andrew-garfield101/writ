@@ -22,6 +22,10 @@ pub enum WritError {
     SealNotFound(String),
     /// A spec with this ID was not found.
     SpecNotFound(String),
+    /// A spec with this ID already exists.
+    SpecAlreadyExists(String),
+    /// A seal with this ID already exists (immutable store).
+    SealAlreadyExists(String),
     /// Spec has no seals — cannot converge.
     SpecHasNoSeals(String),
     /// Convergence has unresolved conflicts.
@@ -67,6 +71,15 @@ impl fmt::Display for WritError {
             WritError::NothingToSeal => write!(f, "no changes to seal"),
             WritError::SealNotFound(id) => write!(f, "seal not found: {id}"),
             WritError::SpecNotFound(id) => write!(f, "spec not found: {id}"),
+            WritError::SpecAlreadyExists(id) => {
+                write!(
+                    f,
+                    "spec '{id}' already exists (use 'writ spec update' to modify)"
+                )
+            }
+            WritError::SealAlreadyExists(id) => {
+                write!(f, "seal '{id}' already exists (immutable)")
+            }
             WritError::SpecHasNoSeals(id) => write!(f, "spec has no seals: {id}"),
             WritError::UnresolvedConflicts(n) => {
                 write!(

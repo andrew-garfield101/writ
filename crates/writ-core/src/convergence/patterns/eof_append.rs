@@ -81,9 +81,15 @@ impl Pattern for EofAppend {
 
         let merged_content = parts.join("\n");
 
+        // Dynamic confidence: base 0.92, penalized by -0.01 per 10 appended
+        // lines (total from both sides). Floor at 0.82.
+        let total_appended = left_appended.len() + right_appended.len();
+        let penalty = (total_appended / 10) as f64 * 0.01;
+        let confidence = (0.92 - penalty).max(0.82);
+
         Some(ResolutionProposal {
             pattern_name: self.name().into(),
-            confidence: 0.90,
+            confidence,
             merged_content,
             explanation: format!(
                 "Both sides preserved base and appended content (left: {} lines, right: {} lines)",
@@ -142,7 +148,12 @@ mod tests {
         assert!(proposal.merged_content.contains("base2"));
         assert!(proposal.merged_content.contains("left_new"));
         assert!(proposal.merged_content.contains("right_new"));
-        assert!((proposal.confidence - 0.90).abs() < f64::EPSILON);
+        // 2 appended lines total (<10): base confidence 0.92.
+        assert!(
+            (proposal.confidence - 0.92).abs() < f64::EPSILON,
+            "expected 0.92, got {}",
+            proposal.confidence
+        );
     }
 
     #[test]
@@ -167,6 +178,44 @@ mod tests {
         );
         // Left side changed base1 → modified — not an EOF append.
         assert!(pattern.resolve(&conflict).is_none());
+    }
+
+    #[test]
+    fn test_confidence_scales_with_appended_lines() {
+        let pattern = EofAppend;
+        // Small append (2 lines total): base 0.92
+        let small = make_conflict(
+            vec![unit("base")],
+            vec![unit("base"), unit("left1")],
+            vec![unit("base"), unit("right1")],
+        );
+        let small_prop = pattern.resolve(&small).unwrap();
+        assert!(
+            (small_prop.confidence - 0.92).abs() < f64::EPSILON,
+            "small append should be 0.92: {}",
+            small_prop.confidence
+        );
+
+        // Large append (30 lines): 0.92 - (30/10)*0.01 = 0.89
+        let mut left_units = vec![unit("base")];
+        let mut right_units = vec![unit("base")];
+        for i in 0..15 {
+            left_units.push(unit(&format!("left_{i}")));
+            right_units.push(unit(&format!("right_{i}")));
+        }
+        let large = make_conflict(vec![unit("base")], left_units, right_units);
+        let large_prop = pattern.resolve(&large).unwrap();
+        assert!(
+            large_prop.confidence < small_prop.confidence,
+            "larger append should lower confidence: small={}, large={}",
+            small_prop.confidence,
+            large_prop.confidence
+        );
+        assert!(
+            large_prop.confidence >= 0.82,
+            "confidence floor is 0.82: {}",
+            large_prop.confidence
+        );
     }
 
     #[test]

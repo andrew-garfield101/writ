@@ -9,6 +9,7 @@
 //! `from flask import Flask, jsonify, request` counts as preserving
 //! the base, and the merged result unions all imported names.
 
+use super::import_utils;
 use super::Pattern;
 use crate::convergence::types::{ClassifiedConflict, ConflictType, ResolutionProposal, UnitKind};
 use std::collections::HashSet;
@@ -16,92 +17,21 @@ use std::collections::HashSet;
 /// Compose base + left additions + right additions.
 pub struct AdditiveComposition;
 
-/// Extract imported names from an import line.
-/// Handles Python `from X import a, b, c` and `import a, b`.
-fn extract_import_names(content: &str) -> HashSet<String> {
-    let trimmed = content.trim();
-    if let Some(after) = trimmed.split(" import ").nth(1) {
-        // `from X import a, b, c` or `import a, b`
-        after
-            .split(',')
-            .map(|s| {
-                let s = s.trim();
-                // Handle `name as alias` — use the original name for matching.
-                s.split(" as ").next().unwrap_or(s).trim().to_string()
-            })
-            .filter(|s| !s.is_empty())
-            .collect()
-    } else {
-        // Single `import X` without commas — the whole line is the name.
-        HashSet::new()
-    }
-}
-
-/// Extract the module source from an import line.
-/// `from flask import ...` → `flask`
-/// `import os` → `os`
-fn extract_import_module(content: &str) -> Option<String> {
-    let trimmed = content.trim();
-    if let Some(rest) = trimmed.strip_prefix("from ") {
-        rest.split_whitespace().next().map(|s| s.to_string())
-    } else if let Some(rest) = trimmed.strip_prefix("import ") {
-        rest.split(',').next().and_then(|s| {
-            let s = s.trim();
-            s.split(" as ").next().map(|n| n.trim().to_string())
-        })
-    } else {
-        None
-    }
-}
-
-/// Check if a side's import line preserves all names from a base import line
-/// (possibly extending it with more names). Returns true if all base names
-/// are present in the side's line.
+/// Check if a side's import line preserves all names from the base import
+/// (language-aware via import_utils).
 fn import_is_preserved(base_content: &str, side_content: &str) -> bool {
-    let base_module = extract_import_module(base_content);
-    let side_module = extract_import_module(side_content);
-
-    // Modules must match.
-    if base_module != side_module || base_module.is_none() {
-        return false;
-    }
-
-    let base_names = extract_import_names(base_content);
-    let side_names = extract_import_names(side_content);
-
-    // All base names must be present in the side.
-    base_names.iter().all(|n| side_names.contains(n))
+    let base_parsed = import_utils::parse_import_content(base_content);
+    let side_parsed = import_utils::parse_import_content(side_content);
+    import_utils::import_is_preserved(&base_parsed, &side_parsed)
 }
 
-/// Merge import names from base, left, and right into a single import line.
-/// Returns a combined import line with the union of all names.
+/// Merge import names from base, left, and right into a single import line
+/// (language-aware via import_utils).
 fn merge_import_line(base: &str, left: &str, right: &str) -> String {
-    let module = extract_import_module(base).unwrap_or_default();
-    let prefix = base.trim();
-
-    // Determine the import style: `from X import ...` or `import X, Y`.
-    let is_from_import = prefix.starts_with("from ");
-
-    // Collect all names from all three versions.
-    let base_names = extract_import_names(base);
-    let left_names = extract_import_names(left);
-    let right_names = extract_import_names(right);
-
-    let mut all_names: Vec<String> = base_names
-        .iter()
-        .chain(left_names.iter())
-        .chain(right_names.iter())
-        .cloned()
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
-    all_names.sort();
-
-    if is_from_import {
-        format!("from {} import {}", module, all_names.join(", "))
-    } else {
-        format!("import {}", all_names.join(", "))
-    }
+    let base_parsed = import_utils::parse_import_content(base);
+    let left_parsed = import_utils::parse_import_content(left);
+    let right_parsed = import_utils::parse_import_content(right);
+    import_utils::merge_same_module(&base_parsed, &left_parsed, &right_parsed)
 }
 
 impl Pattern for AdditiveComposition {
@@ -296,9 +226,20 @@ impl Pattern for AdditiveComposition {
             )
         };
 
+        // Dynamic confidence: base 0.88, +0.02 bonus if only import
+        // extensions (highest quality additive pattern), -0.01 per addition
+        // beyond 5. Floor at 0.78 to stay well above suggest threshold.
+        let total_additions = left_additions.len() + right_additions.len();
+        let only_import_extensions = total_additions == 0 && (import_ext_count > 0);
+        let mut confidence = if only_import_extensions { 0.90 } else { 0.88 };
+        if total_additions > 5 {
+            confidence -= (total_additions - 5) as f64 * 0.01;
+        }
+        confidence = confidence.max(0.78);
+
         Some(ResolutionProposal {
             pattern_name: self.name().into(),
-            confidence: 0.85,
+            confidence,
             merged_content,
             explanation,
             warnings: vec![],
@@ -346,7 +287,12 @@ mod tests {
         assert!(proposal.merged_content.contains("line2"));
         assert!(proposal.merged_content.contains("left_new"));
         assert!(proposal.merged_content.contains("right_new"));
-        assert!((proposal.confidence - 0.85).abs() < f64::EPSILON);
+        // 2 additions total (≤5): base confidence 0.88.
+        assert!(
+            (proposal.confidence - 0.88).abs() < f64::EPSILON,
+            "expected 0.88, got {}",
+            proposal.confidence
+        );
     }
 
     #[test]
@@ -565,36 +511,6 @@ mod tests {
     // ── Helper function tests ──────────────────────────────────────────
 
     #[test]
-    fn test_extract_import_names_from_import() {
-        let names = extract_import_names("from flask import Flask, jsonify, request");
-        assert!(names.contains("Flask"));
-        assert!(names.contains("jsonify"));
-        assert!(names.contains("request"));
-        assert_eq!(names.len(), 3);
-    }
-
-    #[test]
-    fn test_extract_import_names_with_alias() {
-        let names = extract_import_names("from datetime import datetime as dt, timedelta");
-        assert!(names.contains("datetime"));
-        assert!(names.contains("timedelta"));
-        assert_eq!(names.len(), 2);
-    }
-
-    #[test]
-    fn test_extract_import_module() {
-        assert_eq!(
-            extract_import_module("from flask import Flask"),
-            Some("flask".into())
-        );
-        assert_eq!(extract_import_module("import os"), Some("os".into()));
-        assert_eq!(
-            extract_import_module("from flask_cors import CORS"),
-            Some("flask_cors".into())
-        );
-    }
-
-    #[test]
     fn test_import_is_preserved_extension() {
         assert!(import_is_preserved(
             "from flask import Flask, jsonify",
@@ -619,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_import_line() {
+    fn test_merge_import_line_python() {
         let merged = merge_import_line(
             "from flask import Flask, jsonify",
             "from flask import Flask, jsonify, request",
@@ -630,5 +546,214 @@ mod tests {
         assert!(merged.contains("jsonify"));
         assert!(merged.contains("request"));
         assert!(merged.starts_with("from flask import"));
+    }
+
+    // ── Multi-language tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_rust_use_extension_additive() {
+        let pattern = AdditiveComposition;
+        let conflict = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![import_unit("use std::collections::HashMap;")],
+                left_units: vec![import_unit("use std::collections::{HashMap, HashSet};")],
+                right_units: vec![import_unit("use std::collections::{BTreeMap, HashMap};")],
+                base_span: (0, 1),
+                left_span: (0, 1),
+                right_span: (0, 1),
+            },
+            conflict_type: ConflictType::BothModified,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Import],
+                right_unit_kinds: vec![UnitKind::Import],
+                has_name_overlap: false,
+                scope: ConflictScope::Import,
+            },
+        };
+
+        let proposal = pattern.resolve(&conflict).unwrap();
+        assert!(
+            proposal.merged_content.contains("HashMap"),
+            "HashMap missing: {}",
+            proposal.merged_content
+        );
+        assert!(
+            proposal.merged_content.contains("HashSet"),
+            "HashSet missing: {}",
+            proposal.merged_content
+        );
+        assert!(
+            proposal.merged_content.contains("BTreeMap"),
+            "BTreeMap missing: {}",
+            proposal.merged_content
+        );
+    }
+
+    #[test]
+    fn test_ts_import_extension_additive() {
+        let pattern = AdditiveComposition;
+        let conflict = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![import_unit("import { useState } from 'react';")],
+                left_units: vec![import_unit("import { useEffect, useState } from 'react';")],
+                right_units: vec![import_unit("import { useMemo, useState } from 'react';")],
+                base_span: (0, 1),
+                left_span: (0, 1),
+                right_span: (0, 1),
+            },
+            conflict_type: ConflictType::BothModified,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Import],
+                right_unit_kinds: vec![UnitKind::Import],
+                has_name_overlap: false,
+                scope: ConflictScope::Import,
+            },
+        };
+
+        let proposal = pattern.resolve(&conflict).unwrap();
+        assert!(
+            proposal.merged_content.contains("useState"),
+            "useState missing: {}",
+            proposal.merged_content
+        );
+        assert!(
+            proposal.merged_content.contains("useEffect"),
+            "useEffect missing: {}",
+            proposal.merged_content
+        );
+        assert!(
+            proposal.merged_content.contains("useMemo"),
+            "useMemo missing: {}",
+            proposal.merged_content
+        );
+    }
+
+    #[test]
+    fn test_import_extension_only_gets_bonus() {
+        // When the only change is import extensions (no other additions),
+        // confidence gets a +0.02 bonus → 0.90.
+        let pattern = AdditiveComposition;
+        let conflict = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![import_unit("from flask import Flask")],
+                left_units: vec![import_unit("from flask import Flask, jsonify")],
+                right_units: vec![import_unit("from flask import Flask, request")],
+                base_span: (0, 1),
+                left_span: (0, 1),
+                right_span: (0, 1),
+            },
+            conflict_type: ConflictType::BothModified,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Import],
+                right_unit_kinds: vec![UnitKind::Import],
+                has_name_overlap: false,
+                scope: ConflictScope::Import,
+            },
+        };
+        let proposal = pattern.resolve(&conflict).unwrap();
+        assert!(
+            (proposal.confidence - 0.90).abs() < f64::EPSILON,
+            "import-only extension should get bonus: {}",
+            proposal.confidence
+        );
+    }
+
+    #[test]
+    fn test_confidence_scales_with_additions() {
+        let pattern = AdditiveComposition;
+        // 2 additions: base 0.88
+        let small = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![unit("base")],
+                left_units: vec![unit("base"), unit("left1")],
+                right_units: vec![unit("base"), unit("right1")],
+                base_span: (0, 1),
+                left_span: (0, 2),
+                right_span: (0, 2),
+            },
+            conflict_type: ConflictType::BothModified,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Unknown],
+                right_unit_kinds: vec![UnitKind::Unknown],
+                has_name_overlap: false,
+                scope: ConflictScope::Mixed,
+            },
+        };
+        let small_prop = pattern.resolve(&small).unwrap();
+        assert!(
+            (small_prop.confidence - 0.88).abs() < f64::EPSILON,
+            "2 additions should be 0.88: {}",
+            small_prop.confidence
+        );
+
+        // 10 additions: 0.88 - (10-5)*0.01 = 0.83
+        let mut left_units = vec![unit("base")];
+        let mut right_units = vec![unit("base")];
+        for i in 0..5 {
+            left_units.push(unit(&format!("left_{i}")));
+            right_units.push(unit(&format!("right_{i}")));
+        }
+        let large = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![unit("base")],
+                left_units,
+                right_units,
+                base_span: (0, 1),
+                left_span: (0, 6),
+                right_span: (0, 6),
+            },
+            conflict_type: ConflictType::BothModified,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Unknown],
+                right_unit_kinds: vec![UnitKind::Unknown],
+                has_name_overlap: false,
+                scope: ConflictScope::Mixed,
+            },
+        };
+        let large_prop = pattern.resolve(&large).unwrap();
+        assert!(
+            large_prop.confidence < small_prop.confidence,
+            "more additions should lower confidence: small={}, large={}",
+            small_prop.confidence,
+            large_prop.confidence
+        );
+        assert!(
+            large_prop.confidence >= 0.78,
+            "confidence floor is 0.78: {}",
+            large_prop.confidence
+        );
+    }
+
+    #[test]
+    fn test_rust_import_removal_fails() {
+        let pattern = AdditiveComposition;
+        let conflict = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![import_unit("use std::collections::{HashMap, HashSet};")],
+                left_units: vec![import_unit("use std::collections::HashMap;")],
+                right_units: vec![import_unit(
+                    "use std::collections::{BTreeMap, HashMap, HashSet};",
+                )],
+                base_span: (0, 1),
+                left_span: (0, 1),
+                right_span: (0, 1),
+            },
+            conflict_type: ConflictType::BothModified,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Import],
+                right_unit_kinds: vec![UnitKind::Import],
+                has_name_overlap: false,
+                scope: ConflictScope::Import,
+            },
+        };
+
+        // Left removed HashSet — not additive.
+        assert!(pattern.resolve(&conflict).is_none());
     }
 }

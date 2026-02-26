@@ -16,6 +16,7 @@
 pub mod additive;
 pub mod definitions;
 pub mod eof_append;
+pub mod import_utils;
 pub mod imports;
 pub mod superset;
 

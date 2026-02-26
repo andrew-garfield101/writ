@@ -4,6 +4,7 @@
 //! accumulate (union) all imports. Deduplicate exact matches, flag
 //! conflicting imports (same name, different source) for review.
 
+use super::import_utils;
 use super::Pattern;
 use crate::convergence::types::{ClassifiedConflict, ConflictType, ResolutionProposal, UnitKind};
 use std::collections::HashSet;
@@ -27,7 +28,7 @@ impl Pattern for ImportAccumulation {
     fn resolve(&self, conflict: &ClassifiedConflict) -> Option<ResolutionProposal> {
         let mut seen: HashSet<String> = HashSet::new();
         let mut merged_lines: Vec<String> = Vec::new();
-        let mut has_conflicts = false;
+        let mut all_parsed: Vec<import_utils::ParsedImport> = Vec::new();
 
         // Collect all import lines from both sides, deduplicating.
         for unit in conflict
@@ -42,32 +43,7 @@ impl Pattern for ImportAccumulation {
             let normalized = unit.content.trim().to_string();
             if seen.insert(normalized.clone()) {
                 merged_lines.push(unit.content.clone());
-            }
-        }
-
-        // Check for conflicting imports (same name, different source).
-        // This is a simplified check — name extracted from the import line.
-        let mut name_to_source: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        for line in &merged_lines {
-            let trimmed = line.trim();
-            // Extract imported names for conflict detection.
-            if trimmed.starts_with("from ") {
-                if let Some(after) = trimmed.splitn(2, " import ").nth(1) {
-                    let module = trimmed[5..].split_whitespace().next().unwrap_or("");
-                    for name in after.split(',') {
-                        let name = name.trim().to_string();
-                        if name != "*" && !name.is_empty() {
-                            if let Some(prev_source) = name_to_source.get(&name) {
-                                if prev_source != module {
-                                    has_conflicts = true;
-                                }
-                            } else {
-                                name_to_source.insert(name, module.to_string());
-                            }
-                        }
-                    }
-                }
+                all_parsed.push(import_utils::parse_import(unit));
             }
         }
 
@@ -75,7 +51,21 @@ impl Pattern for ImportAccumulation {
             return None;
         }
 
-        let confidence = if has_conflicts { 0.60 } else { 0.95 };
+        // Language-aware conflict detection: same name from different modules.
+        let name_conflicts = import_utils::detect_name_conflicts(&all_parsed);
+        let has_conflicts = !name_conflicts.is_empty();
+
+        // Dynamic confidence: base 0.95 (no conflicts) or 0.60 (conflicts),
+        // penalized by -0.02 per import beyond 10 (complexity penalty).
+        // Floor: 0.60 (conflict case stays at suggest threshold).
+        let base_confidence = if has_conflicts { 0.60 } else { 0.95 };
+        let import_count = merged_lines.len();
+        let penalty = if import_count > 10 {
+            (import_count - 10) as f64 * 0.02
+        } else {
+            0.0
+        };
+        let confidence = (base_confidence - penalty).max(0.60);
         let merged_content = merged_lines.join("\n");
 
         let mut warnings = Vec::new();
@@ -170,6 +160,125 @@ mod tests {
         assert!(
             (proposal.confidence - 0.60).abs() < f64::EPSILON,
             "conflicting imports should lower confidence to 0.60"
+        );
+        assert!(!proposal.warnings.is_empty());
+    }
+
+    /// Helper: create an import unit with metadata.
+    fn import_with_meta(
+        name: &str,
+        content: &str,
+        lang: &str,
+        module: &str,
+        names: &str,
+    ) -> StructuralUnit {
+        let mut unit = import_unit(name, content);
+        unit.metadata.insert("import_lang".into(), lang.into());
+        unit.metadata.insert("import_module".into(), module.into());
+        if !names.is_empty() {
+            unit.metadata.insert("import_names".into(), names.into());
+        }
+        unit
+    }
+
+    #[test]
+    fn test_rust_use_dedup() {
+        let pattern = ImportAccumulation;
+        let conflict = make_import_conflict(
+            vec![
+                import_with_meta("std::io", "use std::io;", "rust", "std::io", ""),
+                import_with_meta(
+                    "std::collections",
+                    "use std::collections::HashMap;",
+                    "rust",
+                    "std::collections",
+                    "HashMap",
+                ),
+            ],
+            vec![
+                import_with_meta("std::io", "use std::io;", "rust", "std::io", ""),
+                import_with_meta(
+                    "serde",
+                    "use serde::{Serialize, Deserialize};",
+                    "rust",
+                    "serde",
+                    "Deserialize, Serialize",
+                ),
+            ],
+        );
+        let proposal = pattern.resolve(&conflict).unwrap();
+        // std::io should appear only once (deduplicated).
+        let io_count = proposal.merged_content.matches("use std::io").count();
+        assert_eq!(
+            io_count, 1,
+            "should deduplicate: {}",
+            proposal.merged_content
+        );
+        assert!(proposal.merged_content.contains("HashMap"));
+        assert!(proposal.merged_content.contains("Serialize"));
+        assert!((proposal.confidence - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_go_import_dedup() {
+        let pattern = ImportAccumulation;
+        let conflict = make_import_conflict(
+            vec![import_with_meta("fmt", "import \"fmt\"", "go", "fmt", "")],
+            vec![import_with_meta("os", "import \"os\"", "go", "os", "")],
+        );
+        let proposal = pattern.resolve(&conflict).unwrap();
+        assert!(proposal.merged_content.contains("\"fmt\""));
+        assert!(proposal.merged_content.contains("\"os\""));
+        assert!((proposal.confidence - 0.95).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_ts_named_import_dedup() {
+        let pattern = ImportAccumulation;
+        let conflict = make_import_conflict(
+            vec![import_with_meta(
+                "react",
+                "import { useState } from 'react';",
+                "typescript",
+                "react",
+                "useState",
+            )],
+            vec![import_with_meta(
+                "axios",
+                "import axios from 'axios';",
+                "typescript",
+                "axios",
+                "",
+            )],
+        );
+        let proposal = pattern.resolve(&conflict).unwrap();
+        assert!(proposal.merged_content.contains("useState"));
+        assert!(proposal.merged_content.contains("axios"));
+    }
+
+    #[test]
+    fn test_rust_conflict_detection() {
+        let pattern = ImportAccumulation;
+        let conflict = make_import_conflict(
+            vec![import_with_meta(
+                "serde",
+                "use serde::Serialize;",
+                "rust",
+                "serde",
+                "Serialize",
+            )],
+            vec![import_with_meta(
+                "other_serde",
+                "use other_serde::Serialize;",
+                "rust",
+                "other_serde",
+                "Serialize",
+            )],
+        );
+        let proposal = pattern.resolve(&conflict).unwrap();
+        assert!(
+            (proposal.confidence - 0.60).abs() < f64::EPSILON,
+            "same name from different modules should lower confidence"
         );
         assert!(!proposal.warnings.is_empty());
     }

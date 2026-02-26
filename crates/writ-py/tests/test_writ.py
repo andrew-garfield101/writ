@@ -2545,3 +2545,430 @@ class TestConvergence:
 
         assert "nav.js" in report["left_only"]
         assert "footer.css" in report["right_only"]
+
+
+class TestConvergenceEdgeCases:
+    """Sprint 0.3.4: Convergence edge cases — empty files, binary files,
+    whitespace-only changes, comment-only changes, large conflicts.
+
+    These tests exercise the convergence pipeline with inputs that fall
+    outside the typical "two agents edit Python functions" path.
+    """
+
+    def _setup_diverged_file(self, tmp_path, filename, base_content,
+                             left_content, right_content):
+        """Helper: create a repo with diverged changes to a single file.
+
+        Returns the repo after sealing base -> left (spec-a) and
+        base -> right (spec-b).
+        """
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec("base", "Baseline")
+        repo.add_spec("spec-a", "Left spec")
+        repo.add_spec("spec-b", "Right spec")
+
+        # Baseline seal
+        p = tmp_path / filename
+        p.write_text(base_content) if isinstance(base_content, str) \
+            else p.write_bytes(base_content)
+        repo.seal(summary="baseline", agent_id="setup",
+                  spec_id="base", status="complete")
+
+        # Left side
+        p.write_text(left_content) if isinstance(left_content, str) \
+            else p.write_bytes(left_content)
+        repo.seal(summary="left changes", agent_id="agent-a",
+                  spec_id="spec-a", status="in-progress")
+
+        # Restore to baseline, then right side
+        seals = repo.log(limit=2)
+        repo.restore(seals[1]["id"])
+        p.write_text(right_content) if isinstance(right_content, str) \
+            else p.write_bytes(right_content)
+        repo.seal(summary="right changes", agent_id="agent-b",
+                  spec_id="spec-b", status="in-progress")
+
+        return repo
+
+    # -- Empty files --
+
+    def test_empty_file_both_add_content_is_conflict(self, tmp_path):
+        """Both sides add different content to an empty file — conflict."""
+        repo = self._setup_diverged_file(
+            tmp_path, "empty.txt",
+            base_content="",
+            left_content="left added this\n",
+            right_content="right added this\n",
+        )
+        report = repo.converge("spec-a", "spec-b")
+        assert report["is_clean"] is False
+        assert len(report["conflicts"]) == 1
+
+    def test_empty_file_one_side_adds_is_clean(self, tmp_path):
+        """Only one side adds content to an empty file — clean merge."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec("base", "Baseline")
+        repo.add_spec("spec-a", "Left")
+        repo.add_spec("spec-b", "Right")
+
+        (tmp_path / "empty.txt").write_text("")
+        repo.seal(summary="baseline", agent_id="setup",
+                  spec_id="base", status="complete")
+
+        # Only left adds content
+        (tmp_path / "empty.txt").write_text("left content\n")
+        repo.seal(summary="left adds", agent_id="a", spec_id="spec-a",
+                  status="in-progress")
+
+        # Right adds a different file (no conflict on empty.txt)
+        (tmp_path / "other.txt").write_text("unrelated\n")
+        repo.seal(summary="right unrelated", agent_id="b",
+                  spec_id="spec-b", status="in-progress")
+
+        report = repo.converge("spec-a", "spec-b")
+        assert report["is_clean"] is True
+
+    # -- Binary files --
+
+    @pytest.mark.xfail(reason="Known bug: binary files go through text merge, "
+                        "producing corrupted UTF-8 output. Tracked for fix.")
+    def test_binary_file_merge_does_not_corrupt(self, tmp_path):
+        """Binary files should not produce corrupted output when merged.
+
+        Found during Sprint 0.3.4: binary bytes were going through UTF-8
+        text processing, producing U+FFFD replacement characters and
+        inflating file size. Binary files that differ on both sides should
+        be treated as a conflict, not silently auto-merged with corruption.
+        """
+        header = b'\x89PNG\r\n\x1a\n'
+        repo = self._setup_diverged_file(
+            tmp_path, "image.png",
+            base_content=header + b'\x00' * 50,
+            left_content=header + b'\xFF' * 50,
+            right_content=header + b'\xAA' * 50,
+        )
+        report = repo.converge("spec-a", "spec-b")
+
+        if report["is_clean"]:
+            # If the engine auto-merges, verify the output is not corrupted.
+            # The merged file should be one of the two inputs, not garbled.
+            merged = report["auto_merged"][0]["content"]
+            merged_bytes = merged.encode("utf-8", errors="replace")
+            # Corruption signal: replacement char U+FFFD or size inflation.
+            assert '\ufffd' not in merged, \
+                "Binary merge produced UTF-8 replacement characters (corruption)"
+            assert len(merged_bytes) <= len(header) + 50 + 10, \
+                f"Binary merge inflated size: {len(merged_bytes)} bytes"
+        else:
+            # Conflict is the correct/safe behavior for divergent binary files.
+            assert len(report["conflicts"]) >= 1
+
+    def test_binary_file_only_one_side_changed(self, tmp_path):
+        """When only one side modifies a binary file, it should merge cleanly."""
+        header = b'\x89PNG\r\n\x1a\n'
+        base = header + b'\x00' * 20
+
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec("base", "Baseline")
+        repo.add_spec("spec-a", "Left")
+        repo.add_spec("spec-b", "Right")
+
+        (tmp_path / "icon.png").write_bytes(base)
+        (tmp_path / "readme.txt").write_text("hello\n")
+        repo.seal(summary="baseline", agent_id="setup",
+                  spec_id="base", status="complete")
+
+        # Only left modifies the binary
+        (tmp_path / "icon.png").write_bytes(header + b'\xFF' * 20)
+        repo.seal(summary="left updates icon", agent_id="a",
+                  spec_id="spec-a", status="in-progress")
+
+        # Right modifies a text file only
+        (tmp_path / "readme.txt").write_text("updated\n")
+        repo.seal(summary="right updates readme", agent_id="b",
+                  spec_id="spec-b", status="in-progress")
+
+        report = repo.converge("spec-a", "spec-b")
+        assert report["is_clean"] is True
+
+    # -- Whitespace-only changes --
+
+    def test_whitespace_only_both_sides_is_conflict(self, tmp_path):
+        """Both sides make different whitespace-only changes — conflict."""
+        repo = self._setup_diverged_file(
+            tmp_path, "code.py",
+            base_content="def hello():\n    print('hi')\n",
+            left_content="def hello():  \n    print('hi')  \n",
+            right_content="def hello():\n    print('hi')\n\n\n",
+        )
+        report = repo.converge("spec-a", "spec-b")
+        assert report["is_clean"] is False
+        assert len(report["conflicts"]) == 1
+
+    def test_whitespace_only_one_side_is_clean(self, tmp_path):
+        """Only one side adds trailing whitespace — clean merge."""
+        base = "def hello():\n    print('hi')\n"
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec("base", "Baseline")
+        repo.add_spec("spec-a", "Left")
+        repo.add_spec("spec-b", "Right")
+
+        (tmp_path / "code.py").write_text(base)
+        repo.seal(summary="baseline", agent_id="setup",
+                  spec_id="base", status="complete")
+
+        # Left adds whitespace
+        (tmp_path / "code.py").write_text("def hello():  \n    print('hi')  \n")
+        repo.seal(summary="left whitespace", agent_id="a",
+                  spec_id="spec-a", status="in-progress")
+
+        # Right adds a new file (no conflict)
+        (tmp_path / "other.py").write_text("pass\n")
+        repo.seal(summary="right new file", agent_id="b",
+                  spec_id="spec-b", status="in-progress")
+
+        report = repo.converge("spec-a", "spec-b")
+        assert report["is_clean"] is True
+
+    # -- Comment-only changes --
+
+    def test_comment_only_both_sides_modify_same_line(self, tmp_path):
+        """Both sides change the same comment differently — conflict."""
+        repo = self._setup_diverged_file(
+            tmp_path, "code.py",
+            base_content="# Initial comment\ndef hello():\n    print('hi')\n",
+            left_content="# Left's comment\ndef hello():\n    print('hi')\n",
+            right_content="# Right's comment\ndef hello():\n    print('hi')\n",
+        )
+        report = repo.converge("spec-a", "spec-b")
+        assert report["is_clean"] is False
+        assert len(report["conflicts"]) == 1
+
+    def test_comment_only_different_locations_is_clean(self, tmp_path):
+        """Both sides add comments at different locations — clean merge."""
+        base = "line1\nline2\nline3\nline4\nline5\n"
+        repo = self._setup_diverged_file(
+            tmp_path, "code.py",
+            base_content=base,
+            left_content="# left comment\nline1\nline2\nline3\nline4\nline5\n",
+            right_content="line1\nline2\nline3\nline4\nline5\n# right comment\n",
+        )
+        report = repo.converge("spec-a", "spec-b")
+        assert report["is_clean"] is True
+        # Both comments should be in the merged output
+        merged = report["auto_merged"][0]["content"]
+        assert "# left comment" in merged
+        assert "# right comment" in merged
+
+    # -- Large conflicts (100+ structural units) --
+
+    def test_large_non_overlapping_definitions(self, tmp_path):
+        """Both sides add 50 unique functions to a 100-function file.
+
+        Tests pipeline performance and correctness with 200 total
+        structural units in the merged output.
+        """
+        # Baseline: 100 functions
+        base_lines = []
+        for i in range(100):
+            base_lines.extend([f"def func_{i}():", f"    return {i}", ""])
+
+        # Left adds 50 new functions
+        left_lines = base_lines.copy()
+        for i in range(100, 150):
+            left_lines.extend([f"def left_func_{i}():", f"    return {i}", ""])
+
+        # Right adds 50 different functions
+        right_lines = base_lines.copy()
+        for i in range(200, 250):
+            right_lines.extend([f"def right_func_{i}():", f"    return {i}", ""])
+
+        repo = self._setup_diverged_file(
+            tmp_path, "big.py",
+            base_content="\n".join(base_lines),
+            left_content="\n".join(left_lines),
+            right_content="\n".join(right_lines),
+        )
+        report = repo.converge("spec-a", "spec-b")
+
+        # Either clean with all 200 functions, or conflict (both acceptable).
+        # The key assertion: no crash, no corruption, reasonable performance.
+        assert isinstance(report, dict)
+        assert "is_clean" in report
+
+        if report["is_clean"]:
+            merged = report["auto_merged"][0]["content"]
+            assert merged.count("def ") == 200
+
+    def test_large_overlapping_modifications_all_conflict(self, tmp_path):
+        """Both sides modify all 50 functions differently — conflict."""
+        base_lines = []
+        for i in range(50):
+            base_lines.extend([f"def func_{i}():", f"    return {i}", ""])
+
+        left_lines = []
+        for i in range(50):
+            left_lines.extend([
+                f"def func_{i}():", f"    # Left modified",
+                f"    return {i * 2}", "",
+            ])
+
+        right_lines = []
+        for i in range(50):
+            right_lines.extend([
+                f"def func_{i}():", f"    # Right modified",
+                f"    return {i * 3}", "",
+            ])
+
+        repo = self._setup_diverged_file(
+            tmp_path, "overlap.py",
+            base_content="\n".join(base_lines),
+            left_content="\n".join(left_lines),
+            right_content="\n".join(right_lines),
+        )
+        report = repo.converge("spec-a", "spec-b")
+        assert report["is_clean"] is False
+        assert len(report["conflicts"]) >= 1
+
+    def test_large_conflict_report_is_json_serializable(self, tmp_path):
+        """Large conflict reports should serialize cleanly for agents."""
+        base_lines = []
+        for i in range(100):
+            base_lines.extend([f"def func_{i}():", f"    return {i}", ""])
+
+        left_lines = base_lines.copy()
+        for i in range(100, 150):
+            left_lines.extend([f"def left_{i}():", f"    return {i}", ""])
+
+        right_lines = base_lines.copy()
+        for i in range(200, 250):
+            right_lines.extend([f"def right_{i}():", f"    return {i}", ""])
+
+        repo = self._setup_diverged_file(
+            tmp_path, "big.py",
+            base_content="\n".join(base_lines),
+            left_content="\n".join(left_lines),
+            right_content="\n".join(right_lines),
+        )
+        report = repo.converge("spec-a", "spec-b")
+        result = json.dumps(report)
+        assert isinstance(result, str)
+        assert len(result) > 0
+
+
+class TestCryptoFields:
+    """Tests for Sprint A cryptographic integrity fields in Python bindings."""
+
+    def test_seal_contains_crypto_fields(self, tmp_repo):
+        """Seals should include content_hash, chain_hash, and signature fields."""
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("hello")
+        seal = repo.seal(summary="test crypto fields")
+
+        # Crypto fields should be present (populated by secure())
+        assert "content_hash" in seal
+        assert "chain_hash" in seal
+        assert seal["content_hash"] is not None
+        assert seal["chain_hash"] is not None
+
+    def test_seal_parent_seal_hash_genesis(self, tmp_repo):
+        """Genesis seal should have null parent_seal_hash."""
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("hello")
+        seal = repo.seal(summary="genesis")
+
+        # Genesis seal has no parent
+        assert seal.get("parent_seal_hash") is None
+
+    def test_seal_parent_seal_hash_chained(self, tmp_repo):
+        """Second seal should chain to first seal's chain_hash."""
+        repo, path = tmp_repo
+        (path / "a.txt").write_text("aaa")
+        first = repo.seal(summary="first")
+
+        (path / "b.txt").write_text("bbb")
+        second = repo.seal(summary="second")
+
+        assert second["parent_seal_hash"] == first["chain_hash"]
+
+    def test_verify_chain_clean(self, tmp_repo):
+        """verify_chain should report valid for a clean chain."""
+        repo, path = tmp_repo
+        (path / "a.txt").write_text("aaa")
+        repo.seal(summary="first")
+        (path / "b.txt").write_text("bbb")
+        repo.seal(summary="second")
+
+        result = repo.verify_chain()
+        assert result["valid"] is True
+        assert result["total_seals"] == 2
+        assert result["verified"] == 2
+        assert result["unsecured"] == 0
+        assert result["failures"] == []
+
+    def test_verify_chain_empty_repo(self, tmp_repo):
+        """verify_chain on empty repo should return valid with 0 seals."""
+        repo, path = tmp_repo
+        result = repo.verify_chain()
+        assert result["valid"] is True
+        assert result["total_seals"] == 0
+
+    def test_verify_seal_valid(self, tmp_repo):
+        """verify_seal should confirm a valid seal."""
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("content")
+        seal = repo.seal(summary="test seal")
+
+        result = repo.verify_seal(seal["id"])
+        assert result["seal_id"] == seal["id"]
+        assert result["content_hash_valid"] is True
+        assert result["chain_hash_valid"] is True
+        assert result["error"] is None
+
+    def test_verify_seal_short_id(self, tmp_repo):
+        """verify_seal should work with short ID prefix."""
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("content")
+        seal = repo.seal(summary="test seal")
+
+        short = seal["id"][:12]
+        result = repo.verify_seal(short)
+        assert result["content_hash_valid"] is True
+
+    def test_context_includes_chain_integrity(self, tmp_repo):
+        """context() should include chain_integrity when secured seals exist."""
+        repo, path = tmp_repo
+        (path / "file.txt").write_text("content")
+        repo.seal(summary="test")
+
+        ctx = repo.context()
+        assert "chain_integrity" in ctx
+        ci = ctx["chain_integrity"]
+        assert ci["valid"] is True
+        assert ci["total_seals"] == 1
+        assert ci["verified"] == 1
+        assert ci["unsecured"] == 0
+        assert ci["failures"] == 0
+
+    def test_context_chain_integrity_multi_seal(self, tmp_repo):
+        """chain_integrity should track multiple seals."""
+        repo, path = tmp_repo
+        for i in range(5):
+            (path / f"file{i}.txt").write_text(f"content {i}")
+            repo.seal(summary=f"seal {i}")
+
+        ctx = repo.context()
+        ci = ctx["chain_integrity"]
+        assert ci["valid"] is True
+        assert ci["total_seals"] == 5
+        assert ci["verified"] == 5
+
+    def test_context_available_operations_include_verify(self, tmp_repo):
+        """available_operations should list verify_chain and verify_seal."""
+        repo, path = tmp_repo
+        ctx = repo.context()
+        ops = ctx["available_operations"]
+        verify_ops = [op for op in ops if "verify" in op]
+        assert len(verify_ops) == 2
+        assert any("verify_chain" in op for op in verify_ops)
+        assert any("verify_seal" in op for op in verify_ops)

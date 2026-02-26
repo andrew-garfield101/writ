@@ -97,6 +97,20 @@ pub struct Seal {
     /// Always present (empty array when no warnings).
     #[serde(default)]
     pub warnings: Vec<String>,
+
+    // -- Cryptographic integrity fields (Sprint A) --
+    /// BLAKE3 hash of the parent seal's chain_hash (None for genesis seal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_seal_hash: Option<String>,
+    /// BLAKE3 hash of this seal's canonical content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// BLAKE3(parent_seal_hash || content_hash) — links this seal to the chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain_hash: Option<String>,
+    /// Ed25519 signature of the content_hash, hex-encoded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 impl Seal {
@@ -104,6 +118,11 @@ impl Seal {
     ///
     /// The `id` field is set to the SHA-256 of the seal's JSON
     /// representation (with `id` set to an empty string during hashing).
+    ///
+    /// `parent_seal_hash` is the chain_hash of the parent seal (None for the
+    /// first seal in a chain). The cryptographic fields (`content_hash`,
+    /// `chain_hash`, `signature`) are populated after construction using
+    /// the `crypto` module.
     pub fn new(
         parent: Option<String>,
         tree: String,
@@ -114,6 +133,7 @@ impl Seal {
         verification: Verification,
         summary: String,
         warnings: Vec<String>,
+        parent_seal_hash: Option<String>,
     ) -> Self {
         let mut seal = Seal {
             id: String::new(),
@@ -127,11 +147,52 @@ impl Seal {
             verification,
             summary,
             warnings,
+            parent_seal_hash,
+            content_hash: None,
+            chain_hash: None,
+            signature: None,
         };
 
         // Compute the seal's ID from its content
         let json = serde_json::to_string(&seal).expect("seal serialization should not fail");
         seal.id = hash_str(&json);
         seal
+    }
+
+    /// Populate cryptographic integrity fields on this seal.
+    ///
+    /// Computes `content_hash` (BLAKE3 of canonical content), `chain_hash`
+    /// (BLAKE3 linking to parent), and optionally `signature` (Ed25519 of
+    /// the content_hash). Recomputes `id` after crypto fields are set.
+    pub fn secure(&mut self, signing_key: Option<&ed25519_dalek::SigningKey>) {
+        use crate::crypto;
+
+        let content = crypto::compute_content_hash(self);
+
+        self.chain_hash = Some(crypto::compute_chain_hash(
+            self.parent_seal_hash.as_deref(),
+            &content,
+        ));
+
+        if let Some(key) = signing_key {
+            self.signature = Some(crypto::sign(&content, key));
+        }
+
+        self.content_hash = Some(content);
+
+        // Recompute ID now that crypto fields are populated
+        self.id = String::new();
+        let json = serde_json::to_string(self).expect("seal serialization should not fail");
+        self.id = hash_str(&json);
+    }
+
+    /// Returns `true` if this seal has all cryptographic integrity fields populated.
+    pub fn is_secured(&self) -> bool {
+        self.content_hash.is_some() && self.chain_hash.is_some()
+    }
+
+    /// Returns `true` if this seal is both secured and signed.
+    pub fn is_signed(&self) -> bool {
+        self.is_secured() && self.signature.is_some()
     }
 }

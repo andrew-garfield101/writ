@@ -100,6 +100,7 @@ Writ puts agent-native metadata inside the VCS:
 | (nothing) | **Integration risk** | Automatic risk scoring from divergence, contention, and scope violations |
 | (nothing) | **File contention** | Which files are touched by which agents, sorted by risk |
 | (nothing) | **Session summary** | Auto-generated commit messages and PR descriptions from seal history |
+| `git verify-commit` | `writ verify --chain` | BLAKE3 hash chains + Ed25519 signatures on every seal — tamper-evident by default |
 
 ## `writ context`
 
@@ -282,14 +283,17 @@ writ/
 │   └── writ-py/      # Python bindings (PyO3) + Agent SDK (Pipeline, Agent, Phase)
 ```
 
-**Storage:** Content-addressable object store (SHA-256, same architecture as git but with SHA-256 instead of SHA-1). Atomic writes (temp + fsync + rename). Hash verification on retrieve. Advisory file locking for concurrency.
+**Storage:** Content-addressable object store (SHA-256). Atomic writes (temp + fsync + rename). Hash verification on retrieve. Advisory file locking for concurrency.
 
-**Test coverage:** 655+ Rust + 231 Python = 886+ tests across core, CLI, and bindings.
+**Integrity:** BLAKE3 hash chains link every seal to its predecessor — tamper with any seal and the chain breaks. Ed25519 digital signatures authenticate who created each checkpoint. `writ verify --chain` validates the entire history in one command.
+
+**Test coverage:** 857 Rust + 230 Python = 1,087 tests across core, CLI, and bindings.
 
 ## CLI reference
 
 ```
 writ install                          # one-command setup (init + git detect + bridge import + hooks)
+writ uninstall [--force]              # clean removal of writ from the project
 writ seal -s "..." --agent ID         # create a structured checkpoint
 writ context [--spec ID] [--format]   # structured context dump (json, human, brief)
 writ log [--all] [--spec ID]          # seal history (--all includes diverged branches)
@@ -300,6 +304,8 @@ writ finish --full                    # same, but with PR-style commit body
 writ finish --dry-run                 # preview without committing
 writ converge LEFT RIGHT [--apply]    # two-spec convergence
 writ converge-all --apply --strategy  # merge all diverged branches (escalate, manual, orchestrator)
+writ verify --chain                   # verify cryptographic integrity of the full seal chain
+writ verify --seal SEAL_ID            # verify a specific seal's hash and signature
 writ spec add --id ID --title "..."   # register a spec
 writ spec status                      # show all specs and their status
 writ state                            # working directory changes
@@ -352,15 +358,21 @@ pytest tests/
 - **CI/CD.** GitHub Actions for automated testing and PyPI publishing on release.
 - **`writ finish`.** One-command round-trip: `writ finish` runs summary + git add + git commit. Supports `--full` for PR-style body and `--dry-run` for preview.
 - **`writ install --spec`.** Create a spec during install for zero-friction setup: `writ install --spec auth --title "Authentication" --description "JWT auth"`.
+- **`writ uninstall`.** Clean removal of writ from any project — removes `.writ/`, `.writignore`, and framework hooks. Supports `--keep-writignore` and `--force` flags.
+- **Cryptographic seal integrity.** Every seal is linked to its predecessor via BLAKE3 hash chains — tamper with any checkpoint and the entire chain breaks. Ed25519 digital signatures authenticate seal authorship. Dedicated convergence engine keypair ensures merge seals are distinguishable from agent seals.
+- **`writ verify`.** `writ verify --chain` validates the full hash chain from genesis to HEAD. `writ verify --seal <id>` checks an individual seal's content hash, chain linkage, and signature. Both support JSON and human output formats.
+- **Multi-language convergence.** Import merging for Python, Rust, Go, TypeScript, and JavaScript — structural understanding, not line-level diffing.
+- **Dynamic confidence scoring.** Convergence pattern confidence adjusts based on merge complexity — larger merges get proportionally more cautious scores.
+- **Linear diff fallback.** Large files (10k+ lines) use an O(n) linear diff algorithm instead of O(n²) LCS, preventing hangs on generated or vendored files.
 
 ### Ahead
 
+- **Agent identity and trust.** Per-agent keypairs, trust levels, and scope constraints. Untrusted agents get lower convergence confidence caps.
+- **Content traceability.** No-silent-addition rule — every line in merged output must trace back to an input. Novel content injected by bugs (or attacks) is automatically detected and rejected.
+- **Security event monitoring.** Append-only audit log for signature failures, scope violations, and authentication events. `writ security events` CLI with severity filtering.
 - **Homebrew distribution.** `brew install writ` via tap.
-- **Agent-scoped context.** `writ context --for-agent=X` filters to only relevant specs/seals.
-- **Shared file annotations.** Cross-cutting concern declarations for files every agent touches.
 - **MCP server.** Model Context Protocol integration for IDE-native writ access.
 - **Storage compression.** zlib/zstd compression on stored objects for reduced disk usage.
-- **Scale hardening.** Performance validation at hundreds of specs and thousands of seals.
 
 ## License
 

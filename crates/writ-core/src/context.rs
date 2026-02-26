@@ -413,6 +413,11 @@ pub struct ContextOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recommended_action: Option<RecommendedAction>,
 
+    /// Cryptographic chain integrity status.
+    /// Omitted if the chain has no secured seals (all pre-Sprint A).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_integrity: Option<ChainIntegritySummary>,
+
     /// Available writ operations for agent discoverability.
     pub available_operations: Vec<String>,
 }
@@ -499,6 +504,24 @@ pub struct SessionSummary {
     pub specs_completed: usize,
     pub files_changed: usize,
     pub message: String,
+}
+
+/// Lightweight chain integrity summary for context output.
+///
+/// Tells agents whether the seal chain is cryptographically valid without
+/// exposing full per-seal verification details (use `verify_chain()` for that).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChainIntegritySummary {
+    /// True if all secured seals pass content_hash + chain_hash verification.
+    pub valid: bool,
+    /// Total seals in the chain.
+    pub total_seals: usize,
+    /// Seals with crypto fields that verified successfully.
+    pub verified: usize,
+    /// Legacy seals without crypto fields (pre-Sprint A).
+    pub unsecured: usize,
+    /// Number of seals that failed verification (0 when valid).
+    pub failures: usize,
 }
 
 /// Actionable recommendation based on current context state.

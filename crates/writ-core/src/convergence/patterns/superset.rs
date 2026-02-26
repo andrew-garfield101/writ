@@ -3,8 +3,12 @@
 //! When one side's content is a strict superset of the other's
 //! (contains everything the other has, plus more), propose the
 //! superset. In multi-agent workflows this is the common case:
-//! a later agent built on an earlier agent's work. Confidence
-//! is 0.88 (above auto-resolve) with a review warning.
+//! a later agent built on an earlier agent's work.
+//!
+//! Dynamic confidence: base 0.82, penalized by -0.02 per unit
+//! beyond 3 in the difference. Always a suggestion (below auto-resolve
+//! threshold of 0.85) since the non-superset side may have
+//! intentionally removed content.
 
 use super::Pattern;
 use crate::convergence::types::{ClassifiedConflict, ConflictType, ResolutionProposal};
@@ -48,43 +52,39 @@ impl Pattern for SupersetContainment {
         let right_is_superset = left_lines.iter().all(|l| right_lines.contains(l))
             && right_lines.len() > left_lines.len();
 
-        if left_is_superset {
-            let content: String = conflict
-                .region
-                .left_units
-                .iter()
-                .map(|u| u.content.as_str())
-                .collect::<Vec<&str>>()
-                .join("\n");
-            Some(ResolutionProposal {
-                pattern_name: self.name().into(),
-                confidence: 0.88,
-                merged_content: content,
-                explanation: "Left side is a strict superset of right side".into(),
-                warnings: vec![
-                    "Right side may have intentionally removed content — review recommended".into(),
-                ],
-            })
+        let (superset_side, subset_side, side_label, other_label) = if left_is_superset {
+            (&conflict.region.left_units, &right_lines, "Left", "Right")
         } else if right_is_superset {
-            let content: String = conflict
-                .region
-                .right_units
-                .iter()
-                .map(|u| u.content.as_str())
-                .collect::<Vec<&str>>()
-                .join("\n");
-            Some(ResolutionProposal {
-                pattern_name: self.name().into(),
-                confidence: 0.88,
-                merged_content: content,
-                explanation: "Right side is a strict superset of left side".into(),
-                warnings: vec![
-                    "Left side may have intentionally removed content — review recommended".into(),
-                ],
-            })
+            (&conflict.region.right_units, &left_lines, "Right", "Left")
         } else {
-            None
-        }
+            return None;
+        };
+
+        let content: String = superset_side
+            .iter()
+            .map(|u| u.content.as_str())
+            .collect::<Vec<&str>>()
+            .join("\n");
+
+        // Dynamic confidence: base 0.82, penalized by -0.02 per extra unit
+        // beyond 3. Floor at 0.75 to stay above suggest threshold.
+        let diff_count = superset_side.len().saturating_sub(subset_side.len());
+        let penalty = if diff_count > 3 {
+            (diff_count - 3) as f64 * 0.02
+        } else {
+            0.0
+        };
+        let confidence = (0.82 - penalty).max(0.75);
+
+        Some(ResolutionProposal {
+            pattern_name: self.name().into(),
+            confidence,
+            merged_content: content,
+            explanation: format!("{side_label} side is a strict superset of {other_label} side"),
+            warnings: vec![format!(
+                "{other_label} side may have intentionally removed content — review recommended"
+            )],
+        })
     }
 }
 
@@ -127,7 +127,14 @@ mod tests {
         );
         let proposal = pattern.resolve(&conflict).unwrap();
         assert!(proposal.merged_content.contains("line3"));
-        assert!((proposal.confidence - 0.88).abs() < f64::EPSILON);
+        // Base confidence 0.82 (diff=1, below penalty threshold of 3).
+        assert!(
+            (proposal.confidence - 0.82).abs() < f64::EPSILON,
+            "expected 0.82, got {}",
+            proposal.confidence
+        );
+        // Must be below auto_resolve (0.85) — this is a suggestion, not auto-applied.
+        assert!(proposal.confidence < 0.85);
         assert!(proposal.explanation.contains("Left"));
     }
 
@@ -172,5 +179,62 @@ mod tests {
         );
         let proposal = pattern.resolve(&conflict).unwrap();
         assert!(!proposal.warnings.is_empty());
+    }
+
+    #[test]
+    fn test_superset_below_auto_resolve() {
+        // SupersetContainment should ALWAYS be below auto_resolve (0.85)
+        // because it always warns about potential intentional removal.
+        let pattern = SupersetContainment;
+        let conflict = make_conflict(
+            vec![unit("a"), unit("b"), unit("c"), unit("d")],
+            vec![unit("a"), unit("b"), unit("c")],
+        );
+        let proposal = pattern.resolve(&conflict).unwrap();
+        assert!(
+            proposal.confidence < 0.85,
+            "superset should be suggestion, not auto-resolve: {}",
+            proposal.confidence
+        );
+    }
+
+    #[test]
+    fn test_confidence_scales_with_diff_size() {
+        let pattern = SupersetContainment;
+        // Small diff (1 extra): base 0.82
+        let small = make_conflict(
+            vec![unit("a"), unit("b"), unit("c")],
+            vec![unit("a"), unit("b")],
+        );
+        let small_prop = pattern.resolve(&small).unwrap();
+
+        // Large diff (7 extra): 0.82 - (7-3)*0.02 = 0.74, clamped to 0.75
+        let large = make_conflict(
+            vec![
+                unit("a"),
+                unit("b"),
+                unit("c"),
+                unit("d"),
+                unit("e"),
+                unit("f"),
+                unit("g"),
+                unit("h"),
+                unit("i"),
+            ],
+            vec![unit("a"), unit("b")],
+        );
+        let large_prop = pattern.resolve(&large).unwrap();
+
+        assert!(
+            small_prop.confidence > large_prop.confidence,
+            "larger diff should have lower confidence: small={}, large={}",
+            small_prop.confidence,
+            large_prop.confidence
+        );
+        assert!(
+            large_prop.confidence >= 0.75,
+            "confidence should never drop below 0.75: {}",
+            large_prop.confidence
+        );
     }
 }

@@ -4794,4 +4794,893 @@ class Config:
             }
         }
     }
+
+    // ===================================================================
+    // TR21: Multi-language convergence stress test
+    // ===================================================================
+
+    /// TR21-1: Python import merging — both sides add different imports.
+    #[test]
+    fn test_tr21_python_import_merge() {
+        let base = "import os\n\ndef main():\n    pass\n";
+        let left = "import os\nimport json\n\ndef main():\n    pass\n";
+        let right = "import os\nimport sys\n\ndef main():\n    pass\n";
+
+        match three_way_merge(base, left, right) {
+            FileMergeResult::Clean(content) => {
+                assert!(content.contains("import os"));
+                assert!(content.contains("import json") || content.contains("import sys"));
+            }
+            FileMergeResult::Conflict(regions) => {
+                let resolved = resolve_conflict_regions(
+                    "main.py", base, left, right, &regions, "agent-a", "agent-b",
+                );
+                assert!(
+                    resolved.content.contains("import json"),
+                    "left import missing: {}",
+                    resolved.content
+                );
+                assert!(
+                    resolved.content.contains("import sys"),
+                    "right import missing: {}",
+                    resolved.content
+                );
+                assert!(
+                    resolved.content.contains("def main"),
+                    "function body lost: {}",
+                    resolved.content
+                );
+            }
+        }
+    }
+
+    /// TR21-2: Python from-imports — both sides extend from same module.
+    #[test]
+    fn test_tr21_python_from_import_extension() {
+        let base = "from flask import Flask\n\napp = Flask(__name__)\n";
+        let left = "from flask import Flask, jsonify\n\napp = Flask(__name__)\n";
+        let right = "from flask import Flask, abort\n\napp = Flask(__name__)\n";
+
+        match three_way_merge(base, left, right) {
+            FileMergeResult::Conflict(regions) => {
+                let resolved =
+                    resolve_conflict_regions("app.py", base, left, right, &regions, "api", "auth");
+                // Both extensions should be present.
+                assert!(
+                    resolved.content.contains("jsonify"),
+                    "jsonify missing: {}",
+                    resolved.content
+                );
+                assert!(
+                    resolved.content.contains("abort"),
+                    "abort missing: {}",
+                    resolved.content
+                );
+                assert!(
+                    resolved.content.contains("Flask"),
+                    "Flask missing: {}",
+                    resolved.content
+                );
+            }
+            FileMergeResult::Clean(content) => {
+                // If it cleanly merged, it should have all imports.
+                assert!(content.contains("Flask"));
+            }
+        }
+    }
+
+    /// TR21-3: Rust use statement merging.
+    #[test]
+    fn test_tr21_rust_use_merge() {
+        let base = "use std::io;\n\nfn main() {\n    println!(\"hello\");\n}\n";
+        let left =
+            "use std::io;\nuse std::collections::HashMap;\n\nfn main() {\n    println!(\"hello\");\n}\n";
+        let right =
+            "use std::io;\nuse serde::{Serialize, Deserialize};\n\nfn main() {\n    println!(\"hello\");\n}\n";
+
+        match three_way_merge(base, left, right) {
+            FileMergeResult::Clean(content) => {
+                assert!(content.contains("std::io"));
+                assert!(
+                    content.contains("HashMap") || content.contains("Serialize"),
+                    "expected at least one new import in clean merge"
+                );
+            }
+            FileMergeResult::Conflict(regions) => {
+                let resolved = resolve_conflict_regions(
+                    "main.rs", base, left, right, &regions, "left", "right",
+                );
+                assert!(
+                    resolved.content.contains("HashMap"),
+                    "HashMap missing: {}",
+                    resolved.content
+                );
+                assert!(
+                    resolved.content.contains("Serialize"),
+                    "Serialize missing: {}",
+                    resolved.content
+                );
+            }
+        }
+    }
+
+    /// TR21-4: Go import merging.
+    #[test]
+    fn test_tr21_go_import_merge() {
+        let base = "package main\n\nimport \"fmt\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n";
+        let left = "package main\n\nimport \"fmt\"\nimport \"os\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n";
+        let right = "package main\n\nimport \"fmt\"\nimport \"strings\"\n\nfunc main() {\n\tfmt.Println(\"hello\")\n}\n";
+
+        match three_way_merge(base, left, right) {
+            FileMergeResult::Clean(content) => {
+                assert!(content.contains("\"fmt\""));
+                assert!(
+                    content.contains("\"os\"") || content.contains("\"strings\""),
+                    "expected at least one new import"
+                );
+            }
+            FileMergeResult::Conflict(regions) => {
+                let resolved = resolve_conflict_regions(
+                    "main.go", base, left, right, &regions, "left", "right",
+                );
+                assert!(
+                    resolved.content.contains("\"os\""),
+                    "os import missing: {}",
+                    resolved.content
+                );
+                assert!(
+                    resolved.content.contains("\"strings\""),
+                    "strings import missing: {}",
+                    resolved.content
+                );
+            }
+        }
+    }
+
+    /// TR21-5: TypeScript/JS import merging.
+    #[test]
+    fn test_tr21_typescript_import_merge() {
+        let base = "import { useState } from 'react';\n\nconst App = () => { return null; };\n";
+        let left = "import { useState } from 'react';\nimport axios from 'axios';\n\nconst App = () => { return null; };\n";
+        let right = "import { useState } from 'react';\nimport { render } from 'react-dom';\n\nconst App = () => { return null; };\n";
+
+        match three_way_merge(base, left, right) {
+            FileMergeResult::Clean(content) => {
+                assert!(content.contains("useState"));
+                assert!(
+                    content.contains("axios") || content.contains("react-dom"),
+                    "expected at least one new import"
+                );
+            }
+            FileMergeResult::Conflict(regions) => {
+                let resolved = resolve_conflict_regions(
+                    "app.tsx", base, left, right, &regions, "left", "right",
+                );
+                assert!(
+                    resolved.content.contains("axios"),
+                    "axios missing: {}",
+                    resolved.content
+                );
+                assert!(
+                    resolved.content.contains("react-dom"),
+                    "react-dom missing: {}",
+                    resolved.content
+                );
+            }
+        }
+    }
+
+    /// TR21-6: Definition composition — both sides add different functions.
+    #[test]
+    fn test_tr21_definition_composition() {
+        let base = "def existing():\n    return True\n";
+        let left = "def existing():\n    return True\n\ndef left_func():\n    return 'left'\n";
+        let right = "def existing():\n    return True\n\ndef right_func():\n    return 'right'\n";
+
+        match three_way_merge(base, left, right) {
+            FileMergeResult::Clean(content) => {
+                assert!(content.contains("left_func"));
+                assert!(content.contains("right_func"));
+                assert!(content.contains("existing"));
+            }
+            FileMergeResult::Conflict(regions) => {
+                let resolved = resolve_conflict_regions(
+                    "funcs.py", base, left, right, &regions, "left", "right",
+                );
+                assert!(
+                    resolved.content.contains("left_func"),
+                    "left_func missing: {}",
+                    resolved.content
+                );
+                assert!(
+                    resolved.content.contains("right_func"),
+                    "right_func missing: {}",
+                    resolved.content
+                );
+            }
+        }
+    }
+
+    /// TR21-7: EOF append — both sides append to end of file.
+    #[test]
+    fn test_tr21_eof_append() {
+        let base = "line1\nline2\nline3\n";
+        let left = "line1\nline2\nline3\nleft_append\n";
+        let right = "line1\nline2\nline3\nright_append\n";
+
+        match three_way_merge(base, left, right) {
+            FileMergeResult::Clean(content) => {
+                assert!(content.contains("left_append"));
+                assert!(content.contains("right_append"));
+            }
+            FileMergeResult::Conflict(regions) => {
+                let resolved = resolve_conflict_regions(
+                    "data.txt", base, left, right, &regions, "left", "right",
+                );
+                assert!(
+                    resolved.content.contains("left_append"),
+                    "left_append missing: {}",
+                    resolved.content
+                );
+                assert!(
+                    resolved.content.contains("right_append"),
+                    "right_append missing: {}",
+                    resolved.content
+                );
+                // Base content preserved.
+                assert!(resolved.content.contains("line1"));
+                assert!(resolved.content.contains("line2"));
+                assert!(resolved.content.contains("line3"));
+            }
+        }
+    }
+
+    /// TR21-8: Superset scenario — one side is strict superset of other.
+    #[test]
+    fn test_tr21_superset_containment() {
+        let base = "line1\nline2\n";
+        let left = "line1\nline2\nnew_line3\nnew_line4\n";
+        let right = "line1\nline2\n"; // unchanged
+
+        match three_way_merge(base, left, right) {
+            FileMergeResult::Clean(content) => {
+                assert!(content.contains("new_line3"));
+                assert!(content.contains("new_line4"));
+            }
+            FileMergeResult::Conflict(_) => {
+                panic!("one side unchanged, should cleanly merge");
+            }
+        }
+    }
+
+    /// TR21-9: Mixed scenario — imports + definitions in same file.
+    #[test]
+    fn test_tr21_mixed_imports_and_definitions() {
+        let base = "import os\n\ndef helper():\n    return os.getcwd()\n";
+        let left =
+            "import os\nimport json\n\ndef helper():\n    return os.getcwd()\n\ndef left_new():\n    return json.dumps({})\n";
+        let right =
+            "import os\nimport sys\n\ndef helper():\n    return os.getcwd()\n\ndef right_new():\n    return sys.argv\n";
+
+        match three_way_merge(base, left, right) {
+            FileMergeResult::Clean(content) => {
+                // All content should be present.
+                assert!(content.contains("import os"));
+            }
+            FileMergeResult::Conflict(regions) => {
+                let resolved = resolve_conflict_regions(
+                    "utils.py", base, left, right, &regions, "left", "right",
+                );
+                // Both new imports should be present.
+                assert!(
+                    resolved.content.contains("json"),
+                    "json missing: {}",
+                    resolved.content
+                );
+                assert!(
+                    resolved.content.contains("sys"),
+                    "sys missing: {}",
+                    resolved.content
+                );
+                // Original function preserved.
+                assert!(
+                    resolved.content.contains("helper"),
+                    "helper missing: {}",
+                    resolved.content
+                );
+            }
+        }
+    }
+
+    /// TR21-10: Stress — many imports from multiple languages in sequence.
+    #[test]
+    fn test_tr21_stress_many_imports() {
+        // 15 imports from each side — tests confidence penalty logic.
+        let base_lines = vec!["import base_mod".to_string()];
+        let mut left_lines = base_lines.clone();
+        let mut right_lines = base_lines.clone();
+
+        for i in 0..15 {
+            left_lines.push(format!("import left_mod_{i}"));
+            right_lines.push(format!("import right_mod_{i}"));
+        }
+
+        let base = base_lines.join("\n");
+        let left = left_lines.join("\n");
+        let right = right_lines.join("\n");
+
+        match three_way_merge(&base, &left, &right) {
+            FileMergeResult::Clean(_) => {} // fine
+            FileMergeResult::Conflict(regions) => {
+                let resolved = resolve_conflict_regions(
+                    "heavy.py", &base, &left, &right, &regions, "left", "right",
+                );
+                // At minimum both sides' content should be present.
+                assert!(resolved.content.contains("left_mod_0"));
+                assert!(resolved.content.contains("right_mod_0"));
+                assert!(resolved.content.contains("left_mod_14"));
+                assert!(resolved.content.contains("right_mod_14"));
+                // Base preserved.
+                assert!(resolved.content.contains("base_mod"));
+            }
+        }
+    }
+
+    // ===================================================================
+    // 0.3.2: N-agent convergence test (3+ agents, same file)
+    // ===================================================================
+
+    /// N-agent test: Agent A adds imports, Agent B adds definitions,
+    /// Agent C adds tests — all to the same file. Chained pairwise merges.
+    #[test]
+    fn test_n_agent_three_way_chained() {
+        let base = "import os\n\ndef existing():\n    pass\n";
+
+        // Agent A: adds imports
+        let agent_a = "import os\nimport json\nimport sys\n\ndef existing():\n    pass\n";
+
+        // Agent B: adds a definition
+        let agent_b =
+            "import os\n\ndef existing():\n    pass\n\ndef new_feature():\n    return 42\n";
+
+        // Agent C: adds a test
+        let agent_c =
+            "import os\n\ndef existing():\n    pass\n\ndef test_existing():\n    assert existing() is None\n";
+
+        // Merge A + B first
+        let merged_ab = match three_way_merge(base, agent_a, agent_b) {
+            FileMergeResult::Clean(c) => c,
+            FileMergeResult::Conflict(regions) => {
+                let resolved = resolve_conflict_regions(
+                    "module.py",
+                    base,
+                    agent_a,
+                    agent_b,
+                    &regions,
+                    "agent-a",
+                    "agent-b",
+                );
+                resolved.content
+            }
+        };
+
+        // Verify A+B merge has both contributions
+        assert!(
+            merged_ab.contains("import json"),
+            "A's import missing after A+B merge: {}",
+            merged_ab
+        );
+        assert!(
+            merged_ab.contains("new_feature"),
+            "B's definition missing after A+B merge: {}",
+            merged_ab
+        );
+
+        // Now merge (A+B) with C, using base as the common ancestor
+        let merged_abc = match three_way_merge(base, &merged_ab, agent_c) {
+            FileMergeResult::Clean(c) => c,
+            FileMergeResult::Conflict(regions) => {
+                let resolved = resolve_conflict_regions(
+                    "module.py",
+                    base,
+                    &merged_ab,
+                    agent_c,
+                    &regions,
+                    "merged-ab",
+                    "agent-c",
+                );
+                resolved.content
+            }
+        };
+
+        // Final merge should have ALL three agents' contributions.
+        assert!(
+            merged_abc.contains("import json"),
+            "A's import missing in final: {}",
+            merged_abc
+        );
+        assert!(
+            merged_abc.contains("import sys"),
+            "A's sys import missing in final: {}",
+            merged_abc
+        );
+        assert!(
+            merged_abc.contains("new_feature"),
+            "B's definition missing in final: {}",
+            merged_abc
+        );
+        assert!(
+            merged_abc.contains("test_existing"),
+            "C's test missing in final: {}",
+            merged_abc
+        );
+        assert!(
+            merged_abc.contains("existing"),
+            "original function lost in final: {}",
+            merged_abc
+        );
+    }
+
+    /// N-agent: 4 agents all add different imports to the same file.
+    #[test]
+    fn test_n_agent_four_imports_chained() {
+        let base = "import os\n\ndef main():\n    pass\n";
+
+        let agent_a = "import os\nimport json\n\ndef main():\n    pass\n";
+        let agent_b = "import os\nimport sys\n\ndef main():\n    pass\n";
+        let agent_c = "import os\nimport pathlib\n\ndef main():\n    pass\n";
+        let agent_d = "import os\nimport re\n\ndef main():\n    pass\n";
+
+        // Chain: (A+B) then ((A+B)+C) then (((A+B)+C)+D)
+        let merge_ab = match three_way_merge(base, agent_a, agent_b) {
+            FileMergeResult::Clean(c) => c,
+            FileMergeResult::Conflict(r) => {
+                resolve_conflict_regions("m.py", base, agent_a, agent_b, &r, "a", "b").content
+            }
+        };
+
+        let merge_abc = match three_way_merge(base, &merge_ab, agent_c) {
+            FileMergeResult::Clean(c) => c,
+            FileMergeResult::Conflict(r) => {
+                resolve_conflict_regions("m.py", base, &merge_ab, agent_c, &r, "ab", "c").content
+            }
+        };
+
+        let merge_abcd = match three_way_merge(base, &merge_abc, agent_d) {
+            FileMergeResult::Clean(c) => c,
+            FileMergeResult::Conflict(r) => {
+                resolve_conflict_regions("m.py", base, &merge_abc, agent_d, &r, "abc", "d").content
+            }
+        };
+
+        // All four agents' imports should be present.
+        assert!(merge_abcd.contains("import json"), "A's json missing");
+        assert!(merge_abcd.contains("import sys"), "B's sys missing");
+        assert!(merge_abcd.contains("import pathlib"), "C's pathlib missing");
+        assert!(merge_abcd.contains("import re"), "D's re missing");
+        assert!(merge_abcd.contains("import os"), "base os missing");
+        assert!(merge_abcd.contains("def main"), "main function lost");
+    }
+
+    // ===================================================================
+    // 0.3.5: Dynamic confidence validation
+    // ===================================================================
+    //
+    // Verify all 5 patterns produce correct confidence values and that
+    // no pattern accidentally auto-resolves when it shouldn't.
+    // (auto_resolve threshold = 0.85, suggest threshold = 0.60)
+
+    #[test]
+    fn test_dynamic_confidence_import_accumulation_base() {
+        use crate::convergence::patterns::Pattern;
+        use crate::convergence::types::*;
+
+        let pattern = patterns::imports::ImportAccumulation;
+
+        // Small set (2 imports, no conflicts): should be 0.95.
+        let conflict = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![],
+                left_units: vec![StructuralUnit::new(
+                    UnitKind::Import,
+                    Some("os".into()),
+                    (0, 1),
+                    "import os".into(),
+                )],
+                right_units: vec![StructuralUnit::new(
+                    UnitKind::Import,
+                    Some("sys".into()),
+                    (0, 1),
+                    "import sys".into(),
+                )],
+                base_span: (0, 0),
+                left_span: (0, 0),
+                right_span: (0, 0),
+            },
+            conflict_type: ConflictType::BothInserted,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Import],
+                right_unit_kinds: vec![UnitKind::Import],
+                has_name_overlap: false,
+                scope: ConflictScope::Import,
+            },
+        };
+
+        let proposal = pattern.resolve(&conflict).unwrap();
+        assert!(
+            (proposal.confidence - 0.95).abs() < f64::EPSILON,
+            "base confidence should be 0.95, got {}",
+            proposal.confidence
+        );
+        assert!(
+            proposal.confidence > 0.85,
+            "should auto-resolve: {}",
+            proposal.confidence
+        );
+    }
+
+    #[test]
+    fn test_dynamic_confidence_import_accumulation_penalized() {
+        use crate::convergence::patterns::Pattern;
+        use crate::convergence::types::*;
+
+        let pattern = patterns::imports::ImportAccumulation;
+
+        // Large set (20 imports): 0.95 - (20-10)*0.02 = 0.75, floored at 0.60.
+        let mut left_units = Vec::new();
+        let mut right_units = Vec::new();
+        for i in 0..10 {
+            left_units.push(StructuralUnit::new(
+                UnitKind::Import,
+                Some(format!("left_{i}")),
+                (0, 1),
+                format!("import left_{i}"),
+            ));
+            right_units.push(StructuralUnit::new(
+                UnitKind::Import,
+                Some(format!("right_{i}")),
+                (0, 1),
+                format!("import right_{i}"),
+            ));
+        }
+
+        let conflict = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![],
+                left_units,
+                right_units,
+                base_span: (0, 0),
+                left_span: (0, 0),
+                right_span: (0, 0),
+            },
+            conflict_type: ConflictType::BothInserted,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Import],
+                right_unit_kinds: vec![UnitKind::Import],
+                has_name_overlap: false,
+                scope: ConflictScope::Import,
+            },
+        };
+
+        let proposal = pattern.resolve(&conflict).unwrap();
+        // 20 total imports, penalty = (20-10)*0.02 = 0.20, so 0.95-0.20=0.75.
+        assert!(
+            proposal.confidence < 0.85,
+            "large import set should NOT auto-resolve: {}",
+            proposal.confidence
+        );
+        assert!(
+            proposal.confidence >= 0.60,
+            "should not drop below suggest threshold: {}",
+            proposal.confidence
+        );
+    }
+
+    #[test]
+    fn test_dynamic_confidence_superset_never_auto_resolves() {
+        use crate::convergence::patterns::Pattern;
+        use crate::convergence::types::*;
+
+        let pattern = patterns::superset::SupersetContainment;
+
+        // Left is superset of right.
+        let conflict = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![],
+                left_units: vec![
+                    StructuralUnit::new(UnitKind::Unknown, None, (0, 1), "line1".into()),
+                    StructuralUnit::new(UnitKind::Unknown, None, (1, 2), "line2".into()),
+                    StructuralUnit::new(UnitKind::Unknown, None, (2, 3), "extra".into()),
+                ],
+                right_units: vec![
+                    StructuralUnit::new(UnitKind::Unknown, None, (0, 1), "line1".into()),
+                    StructuralUnit::new(UnitKind::Unknown, None, (1, 2), "line2".into()),
+                ],
+                base_span: (0, 0),
+                left_span: (0, 0),
+                right_span: (0, 0),
+            },
+            conflict_type: ConflictType::BothModified,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Unknown],
+                right_unit_kinds: vec![UnitKind::Unknown],
+                has_name_overlap: false,
+                scope: ConflictScope::Mixed,
+            },
+        };
+
+        let proposal = pattern.resolve(&conflict);
+        if let Some(p) = proposal {
+            assert!(
+                p.confidence < 0.85,
+                "SupersetContainment must NOT auto-resolve (threshold 0.85), got {}",
+                p.confidence
+            );
+            assert!(
+                p.confidence >= 0.60,
+                "should stay above suggest threshold: {}",
+                p.confidence
+            );
+        }
+    }
+
+    #[test]
+    fn test_dynamic_confidence_definitions_scales() {
+        use crate::convergence::patterns::Pattern;
+        use crate::convergence::types::*;
+
+        let pattern = patterns::definitions::NonOverlappingDefinitions;
+
+        // 2 definitions: base 0.92.
+        let small_conflict = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![],
+                left_units: vec![StructuralUnit::new(
+                    UnitKind::Definition,
+                    Some("func_a".into()),
+                    (0, 3),
+                    "def func_a():\n    pass".into(),
+                )],
+                right_units: vec![StructuralUnit::new(
+                    UnitKind::Definition,
+                    Some("func_b".into()),
+                    (0, 3),
+                    "def func_b():\n    pass".into(),
+                )],
+                base_span: (0, 0),
+                left_span: (0, 0),
+                right_span: (0, 0),
+            },
+            conflict_type: ConflictType::BothInserted,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Definition],
+                right_unit_kinds: vec![UnitKind::Definition],
+                has_name_overlap: false,
+                scope: ConflictScope::Definition,
+            },
+        };
+
+        let small_p = pattern.resolve(&small_conflict).unwrap();
+        assert!(
+            (small_p.confidence - 0.92).abs() < f64::EPSILON,
+            "2 defs should be 0.92, got {}",
+            small_p.confidence
+        );
+        assert!(
+            small_p.confidence > 0.85,
+            "small def set should auto-resolve"
+        );
+
+        // 8 definitions: 0.92 - (8-3)*0.02 = 0.82, below auto-resolve.
+        let mut left_units = Vec::new();
+        let mut right_units = Vec::new();
+        for i in 0..4 {
+            left_units.push(StructuralUnit::new(
+                UnitKind::Definition,
+                Some(format!("left_{i}")),
+                (0, 3),
+                format!("def left_{i}():\n    pass"),
+            ));
+            right_units.push(StructuralUnit::new(
+                UnitKind::Definition,
+                Some(format!("right_{i}")),
+                (0, 3),
+                format!("def right_{i}():\n    pass"),
+            ));
+        }
+
+        let large_conflict = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![],
+                left_units,
+                right_units,
+                base_span: (0, 0),
+                left_span: (0, 0),
+                right_span: (0, 0),
+            },
+            conflict_type: ConflictType::BothInserted,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Definition],
+                right_unit_kinds: vec![UnitKind::Definition],
+                has_name_overlap: false,
+                scope: ConflictScope::Definition,
+            },
+        };
+
+        let large_p = pattern.resolve(&large_conflict).unwrap();
+        assert!(
+            large_p.confidence < small_p.confidence,
+            "more defs should lower confidence: small={}, large={}",
+            small_p.confidence,
+            large_p.confidence
+        );
+        assert!(
+            large_p.confidence >= 0.80,
+            "floor is 0.80, got {}",
+            large_p.confidence
+        );
+    }
+
+    #[test]
+    fn test_dynamic_confidence_eof_append_scales() {
+        use crate::convergence::patterns::Pattern;
+        use crate::convergence::types::*;
+
+        let pattern = patterns::eof_append::EofAppend;
+
+        // Small append (2 lines): 0.92.
+        let small = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![StructuralUnit::new(
+                    UnitKind::Unknown,
+                    None,
+                    (0, 1),
+                    "base".into(),
+                )],
+                left_units: vec![
+                    StructuralUnit::new(UnitKind::Unknown, None, (0, 1), "base".into()),
+                    StructuralUnit::new(UnitKind::Unknown, None, (1, 2), "left_new".into()),
+                ],
+                right_units: vec![
+                    StructuralUnit::new(UnitKind::Unknown, None, (0, 1), "base".into()),
+                    StructuralUnit::new(UnitKind::Unknown, None, (1, 2), "right_new".into()),
+                ],
+                base_span: (0, 0),
+                left_span: (0, 0),
+                right_span: (0, 0),
+            },
+            conflict_type: ConflictType::BothModified,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![],
+                right_unit_kinds: vec![],
+                has_name_overlap: false,
+                scope: ConflictScope::Mixed,
+            },
+        };
+
+        let small_p = pattern.resolve(&small).unwrap();
+        assert!(
+            (small_p.confidence - 0.92).abs() < f64::EPSILON,
+            "small append should be 0.92, got {}",
+            small_p.confidence
+        );
+
+        // Large append (40 lines): penalty = (40/10)*0.01 = 0.04, so 0.88.
+        let mut left_units = vec![StructuralUnit::new(
+            UnitKind::Unknown,
+            None,
+            (0, 1),
+            "base".into(),
+        )];
+        let mut right_units = left_units.clone();
+        for i in 0..20 {
+            left_units.push(StructuralUnit::new(
+                UnitKind::Unknown,
+                None,
+                (i + 1, i + 2),
+                format!("left_{i}"),
+            ));
+            right_units.push(StructuralUnit::new(
+                UnitKind::Unknown,
+                None,
+                (i + 1, i + 2),
+                format!("right_{i}"),
+            ));
+        }
+
+        let large = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![StructuralUnit::new(
+                    UnitKind::Unknown,
+                    None,
+                    (0, 1),
+                    "base".into(),
+                )],
+                left_units,
+                right_units,
+                base_span: (0, 0),
+                left_span: (0, 0),
+                right_span: (0, 0),
+            },
+            conflict_type: ConflictType::BothModified,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![],
+                right_unit_kinds: vec![],
+                has_name_overlap: false,
+                scope: ConflictScope::Mixed,
+            },
+        };
+
+        let large_p = pattern.resolve(&large).unwrap();
+        assert!(
+            large_p.confidence < small_p.confidence,
+            "large append should have lower confidence"
+        );
+        assert!(
+            large_p.confidence >= 0.82,
+            "floor is 0.82, got {}",
+            large_p.confidence
+        );
+    }
+
+    /// Verify no pattern can produce confidence above 1.0 or below suggest threshold
+    /// from size factors alone (excludes conflict-based penalties like ImportAccumulation
+    /// which intentionally goes to 0.60 on name conflicts).
+    #[test]
+    fn test_dynamic_confidence_bounds() {
+        use crate::convergence::patterns::Pattern;
+        use crate::convergence::types::*;
+
+        // Test with maximally large inputs to push penalties to their limits.
+        let mut units: Vec<StructuralUnit> = Vec::new();
+        for i in 0..100 {
+            units.push(StructuralUnit::new(
+                UnitKind::Import,
+                Some(format!("mod_{i}")),
+                (i, i + 1),
+                format!("import mod_{i}"),
+            ));
+        }
+
+        // ImportAccumulation with 200 imports.
+        let import_conflict = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![],
+                left_units: units.clone(),
+                right_units: units.clone(),
+                base_span: (0, 0),
+                left_span: (0, 0),
+                right_span: (0, 0),
+            },
+            conflict_type: ConflictType::BothInserted,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Import],
+                right_unit_kinds: vec![UnitKind::Import],
+                has_name_overlap: false,
+                scope: ConflictScope::Import,
+            },
+        };
+
+        let p = patterns::imports::ImportAccumulation;
+        if let Some(proposal) = p.resolve(&import_conflict) {
+            assert!(
+                proposal.confidence >= 0.60,
+                "import confidence below floor: {}",
+                proposal.confidence
+            );
+            assert!(
+                proposal.confidence <= 1.0,
+                "confidence above 1.0: {}",
+                proposal.confidence
+            );
+        }
+    }
 }

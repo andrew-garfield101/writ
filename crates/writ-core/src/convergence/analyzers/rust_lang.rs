@@ -229,12 +229,31 @@ fn parse_rust_structure(source: &str) -> Vec<StructuralUnit> {
             i = end;
             let content: String = lines[start..i].join("\n");
             let module = extract_use_module(lines[start].trim());
-            units.push(StructuralUnit::new(
+            let mut unit = StructuralUnit::new(
                 UnitKind::Import,
-                Some(module),
+                Some(module.clone()),
                 (start, i),
-                content,
-            ));
+                content.clone(),
+            );
+            unit.metadata.insert("import_lang".into(), "rust".into());
+            // For multi-line use, collapse to single line for parsing.
+            let single_line = content.lines().collect::<Vec<_>>().join(" ");
+            let (parsed_module, names) = parse_use_details(&single_line);
+            unit.metadata.insert(
+                "import_module".into(),
+                if parsed_module.is_empty() {
+                    module
+                } else {
+                    parsed_module
+                },
+            );
+            if !names.is_empty() {
+                let mut sorted = names;
+                sorted.sort();
+                unit.metadata
+                    .insert("import_names".into(), sorted.join(", "));
+            }
+            units.push(unit);
             continue;
         }
 
@@ -775,5 +794,37 @@ fn complex_function(
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "Result");
         assert_eq!(defs[0].def_kind, "type_alias");
+    }
+
+    #[test]
+    fn test_import_metadata_populated() {
+        let source =
+            "use std::collections::{HashMap, HashSet};\nuse std::io;\nextern crate serde;\n";
+        let analyzer = RustAnalyzer;
+        let units = analyzer.parse_structure(source);
+        let imports: Vec<_> = units
+            .iter()
+            .filter(|u| u.kind == UnitKind::Import)
+            .collect();
+        assert_eq!(imports.len(), 3);
+
+        // use std::collections::{HashMap, HashSet};
+        assert_eq!(imports[0].metadata.get("import_lang").unwrap(), "rust");
+        assert_eq!(
+            imports[0].metadata.get("import_module").unwrap(),
+            "std::collections"
+        );
+        assert_eq!(
+            imports[0].metadata.get("import_names").unwrap(),
+            "HashMap, HashSet"
+        );
+
+        // use std::io;
+        assert_eq!(imports[1].metadata.get("import_lang").unwrap(), "rust");
+        assert_eq!(imports[1].metadata.get("import_module").unwrap(), "std::io");
+        assert!(imports[1].metadata.get("import_names").is_none());
+
+        // extern crate serde;
+        assert_eq!(imports[2].metadata.get("import_lang").unwrap(), "rust");
     }
 }

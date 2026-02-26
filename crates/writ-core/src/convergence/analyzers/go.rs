@@ -176,12 +176,29 @@ fn parse_go_structure(source: &str) -> Vec<StructuralUnit> {
             }
             let content: String = lines[start..i].join("\n");
             let module = extract_go_module(lines[start].trim());
-            units.push(StructuralUnit::new(
+            let mut unit = StructuralUnit::new(
                 UnitKind::Import,
-                Some(module),
+                Some(module.clone()),
                 (start, i),
-                content,
-            ));
+                content.clone(),
+            );
+            unit.metadata.insert("import_lang".into(), "go".into());
+            let (parsed_module, names) = parse_go_import_details(&content);
+            unit.metadata.insert(
+                "import_module".into(),
+                if parsed_module.is_empty() {
+                    module
+                } else {
+                    parsed_module
+                },
+            );
+            if !names.is_empty() {
+                let mut sorted = names;
+                sorted.sort();
+                unit.metadata
+                    .insert("import_names".into(), sorted.join(", "));
+            }
+            units.push(unit);
             continue;
         }
 
@@ -591,5 +608,33 @@ func ComplexFunction(
         let analyzer = GoAnalyzer;
         let units = analyzer.parse_structure("");
         assert!(units.is_empty());
+    }
+
+    #[test]
+    fn test_import_metadata_populated() {
+        let source = "package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nimport \"net/http\"\n";
+        let analyzer = GoAnalyzer;
+        let units = analyzer.parse_structure(source);
+        let imports: Vec<_> = units
+            .iter()
+            .filter(|u| u.kind == UnitKind::Import)
+            .collect();
+        assert_eq!(imports.len(), 2);
+
+        // Grouped import
+        assert_eq!(imports[0].metadata.get("import_lang").unwrap(), "go");
+        assert_eq!(
+            imports[0].metadata.get("import_module").unwrap(),
+            "(grouped)"
+        );
+        assert_eq!(imports[0].metadata.get("import_names").unwrap(), "fmt, os");
+
+        // Single import
+        assert_eq!(imports[1].metadata.get("import_lang").unwrap(), "go");
+        assert_eq!(
+            imports[1].metadata.get("import_module").unwrap(),
+            "net/http"
+        );
+        assert!(imports[1].metadata.get("import_names").is_none());
     }
 }

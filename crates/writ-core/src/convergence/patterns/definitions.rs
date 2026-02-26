@@ -75,9 +75,18 @@ impl Pattern for NonOverlappingDefinitions {
         let merged_content = parts.join("\n\n");
         let total_defs = left_names.len() + right_names.len();
 
+        // Dynamic confidence: base 0.92, penalized by -0.02 per definition
+        // beyond 3. Floor at 0.80 to stay well above suggest threshold.
+        let penalty = if total_defs > 3 {
+            (total_defs - 3) as f64 * 0.02
+        } else {
+            0.0
+        };
+        let confidence = (0.92 - penalty).max(0.80);
+
         Some(ResolutionProposal {
             pattern_name: self.name().into(),
-            confidence: 0.90,
+            confidence,
             merged_content,
             explanation: format!(
                 "Composed {} non-overlapping definitions from both sides (left: [{}], right: [{}])",
@@ -132,7 +141,12 @@ mod tests {
         let proposal = pattern.resolve(&conflict).unwrap();
         assert!(proposal.merged_content.contains("User"));
         assert!(proposal.merged_content.contains("Product"));
-        assert!((proposal.confidence - 0.90).abs() < f64::EPSILON);
+        // 2 definitions total (≤3): base confidence 0.92.
+        assert!(
+            (proposal.confidence - 0.92).abs() < f64::EPSILON,
+            "expected 0.92, got {}",
+            proposal.confidence
+        );
     }
 
     #[test]
@@ -194,6 +208,71 @@ mod tests {
         let proposal = pattern.resolve(&conflict).unwrap();
         assert!(proposal.merged_content.contains("process"));
         assert!(proposal.merged_content.contains("Config"));
+    }
+
+    #[test]
+    fn test_confidence_scales_with_definition_count() {
+        let pattern = NonOverlappingDefinitions;
+        // 2 defs: base 0.92
+        let small = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![],
+                left_units: vec![def_unit("A", "class A:\n    pass")],
+                right_units: vec![def_unit("B", "class B:\n    pass")],
+                base_span: (0, 0),
+                left_span: (0, 3),
+                right_span: (0, 3),
+            },
+            conflict_type: ConflictType::BothInserted,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Definition],
+                right_unit_kinds: vec![UnitKind::Definition],
+                has_name_overlap: false,
+                scope: ConflictScope::Definition,
+            },
+        };
+        let small_prop = pattern.resolve(&small).unwrap();
+        assert!(
+            (small_prop.confidence - 0.92).abs() < f64::EPSILON,
+            "2 defs should be 0.92: {}",
+            small_prop.confidence
+        );
+
+        // 6 defs: 0.92 - (6-3)*0.02 = 0.86
+        let large = ClassifiedConflict {
+            region: StructuralConflictRegion {
+                base_units: vec![],
+                left_units: vec![
+                    def_unit("A", "class A:\n    pass"),
+                    def_unit("B", "class B:\n    pass"),
+                    def_unit("C", "class C:\n    pass"),
+                ],
+                right_units: vec![
+                    def_unit("D", "class D:\n    pass"),
+                    def_unit("E", "class E:\n    pass"),
+                    def_unit("F", "class F:\n    pass"),
+                ],
+                base_span: (0, 0),
+                left_span: (0, 9),
+                right_span: (0, 9),
+            },
+            conflict_type: ConflictType::BothInserted,
+            requires_review: false,
+            structural_info: StructuralInfo {
+                left_unit_kinds: vec![UnitKind::Definition; 3],
+                right_unit_kinds: vec![UnitKind::Definition; 3],
+                has_name_overlap: false,
+                scope: ConflictScope::Definition,
+            },
+        };
+        let large_prop = pattern.resolve(&large).unwrap();
+        assert!(
+            (large_prop.confidence - 0.86).abs() < f64::EPSILON,
+            "6 defs should be 0.86: {}",
+            large_prop.confidence
+        );
+        assert!(large_prop.confidence >= 0.80, "floor is 0.80");
     }
 
     #[test]

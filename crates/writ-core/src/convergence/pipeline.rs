@@ -1091,4 +1091,259 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Sprint 0.3.3 — Phase 4/5 feature flag verification
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a conflict that Phase 3 can only suggest (not auto-resolve),
+    /// so it would fall through to Phase 4/5 if enabled.
+    fn make_unresolvable_conflict_input() -> PipelineInput {
+        // Both sides modify the same line differently — no pattern can auto-resolve
+        make_input("conflict.py", "value = 1\n", "value = 2\n", "value = 3\n")
+    }
+
+    #[test]
+    fn test_phase4_skipped_when_disabled() {
+        // Default config has enable_phase4_spec_aware = false
+        let pipeline = ConvergencePipeline::new();
+        assert!(!pipeline.config.enable_phase4_spec_aware);
+
+        let input = make_unresolvable_conflict_input();
+        let output = pipeline.run(&input);
+
+        // Conflict should escalate, NOT be resolved by Phase 4
+        assert!(
+            !output.fully_resolved,
+            "unresolvable conflict should not be resolved when Phase 4 is disabled"
+        );
+        assert!(
+            !output.escalations.is_empty(),
+            "should have escalations when Phase 4 is disabled"
+        );
+        // Verify no resolution claims to come from Phase 4
+        for res in &output.resolutions {
+            if let RegionResolutionStatus::Resolved { method, .. } = &res.resolution {
+                assert!(
+                    !method.contains("phase4") && !method.contains("spec-aware"),
+                    "Phase 4 should not have resolved anything: {method}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_phase5_skipped_when_disabled() {
+        // Default config has enable_phase5_llm = false
+        let pipeline = ConvergencePipeline::new();
+        assert!(!pipeline.config.enable_phase5_llm);
+
+        let input = make_unresolvable_conflict_input();
+        let output = pipeline.run(&input);
+
+        assert!(
+            !output.fully_resolved,
+            "unresolvable conflict should not be resolved when Phase 5 is disabled"
+        );
+        assert!(
+            !output.escalations.is_empty(),
+            "should have escalations when Phase 5 is disabled"
+        );
+    }
+
+    #[test]
+    fn test_both_phase4_and_phase5_disabled_escalates() {
+        let config = PipelineConfig {
+            enable_phase4_spec_aware: false,
+            enable_phase5_llm: false,
+            enable_phase6_verification: true,
+            ..PipelineConfig::default()
+        };
+        let pipeline = ConvergencePipeline::with_config(config);
+
+        let input = make_unresolvable_conflict_input();
+        let output = pipeline.run(&input);
+
+        assert!(
+            !output.fully_resolved,
+            "both phases disabled — conflict must escalate"
+        );
+        assert!(
+            !output.escalations.is_empty(),
+            "both phases disabled — must have escalations"
+        );
+    }
+
+    #[test]
+    fn test_phase4_enabled_but_no_spec_context_is_noop() {
+        // Phase 4 enabled but spec_context is None — should behave as if disabled
+        let config = PipelineConfig {
+            enable_phase4_spec_aware: true,
+            enable_phase5_llm: false,
+            enable_phase6_verification: true,
+            ..PipelineConfig::default()
+        };
+        let pipeline = ConvergencePipeline::with_config(config);
+
+        // Input has spec_context = None (the make_input default)
+        let input = make_unresolvable_conflict_input();
+        assert!(input.spec_context.is_none());
+
+        let output = pipeline.run(&input);
+
+        assert!(
+            !output.fully_resolved,
+            "Phase 4 enabled but no spec_context — should still escalate"
+        );
+    }
+
+    #[test]
+    fn test_phase5_enabled_with_noop_backend_is_inert() {
+        // Phase 5 enabled but NoOpBackend always returns None
+        let config = PipelineConfig {
+            enable_phase4_spec_aware: false,
+            enable_phase5_llm: true,
+            enable_phase6_verification: true,
+            ..PipelineConfig::default()
+        };
+        let pipeline = ConvergencePipeline::with_config(config);
+
+        let input = make_unresolvable_conflict_input();
+        let output = pipeline.run(&input);
+
+        // NoOpBackend returns None → conflict still escalates
+        assert!(
+            !output.fully_resolved,
+            "Phase 5 with NoOpBackend should not resolve anything"
+        );
+        assert!(
+            !output.escalations.is_empty(),
+            "Phase 5 with NoOpBackend — conflict should escalate"
+        );
+    }
+
+    #[test]
+    fn test_phase4_enabled_with_spec_context_no_side_effects_on_clean_merge() {
+        // Phase 4 enabled with full spec_context, but the merge is clean
+        // (Phase 1-3 handle it) — Phase 4 should not interfere.
+        let config = PipelineConfig {
+            enable_phase4_spec_aware: true,
+            enable_phase5_llm: false,
+            enable_phase6_verification: true,
+            ..PipelineConfig::default()
+        };
+        let pipeline = ConvergencePipeline::with_config(config);
+
+        // Clean merge: disjoint imports — Phase 3 auto-resolves
+        let mut input = make_input(
+            "app.py",
+            "import os\n",
+            "import os\nimport json\n",
+            "import os\nimport sys\n",
+        );
+        input.spec_context = Some(SpecContext {
+            left_file_scope: vec!["app.py".into()],
+            right_file_scope: vec!["app.py".into()],
+            left_description: "Add JSON support".into(),
+            right_description: "Add sys support".into(),
+            left_seal_summary: "added json import".into(),
+            right_seal_summary: "added sys import".into(),
+            left_acceptance_criteria: vec![],
+            right_acceptance_criteria: vec![],
+            left_design_notes: vec![],
+            right_design_notes: vec![],
+            file_path: "app.py".into(),
+        });
+
+        let output = pipeline.run(&input);
+
+        assert!(
+            output.fully_resolved,
+            "clean merge should still resolve with Phase 4 enabled"
+        );
+        let content = output.merged_content.unwrap();
+        assert!(content.contains("import json"));
+        assert!(content.contains("import sys"));
+    }
+
+    #[test]
+    fn test_all_phases_disabled_still_runs_phases_1_through_3() {
+        // Even with Phase 4/5/6 all disabled, Phases 1-3 should still work
+        let config = PipelineConfig {
+            enable_phase4_spec_aware: false,
+            enable_phase5_llm: false,
+            enable_phase6_verification: false,
+            ..PipelineConfig::default()
+        };
+        let pipeline = ConvergencePipeline::with_config(config);
+
+        // Clean merge that Phase 3 can handle
+        let input = make_input(
+            "test.py",
+            "import os\n",
+            "import os\nimport json\n",
+            "import os\nimport sys\n",
+        );
+        let output = pipeline.run(&input);
+
+        assert!(
+            output.fully_resolved,
+            "Phases 1-3 should still resolve clean merges even with 4/5/6 disabled"
+        );
+        // No verification when Phase 6 disabled
+        assert!(
+            output.verification.is_none(),
+            "Phase 6 disabled — no verification should be present"
+        );
+    }
+
+    #[test]
+    fn test_phase6_disabled_skips_verification() {
+        let config = PipelineConfig {
+            enable_phase4_spec_aware: false,
+            enable_phase5_llm: false,
+            enable_phase6_verification: false,
+            ..PipelineConfig::default()
+        };
+        let pipeline = ConvergencePipeline::with_config(config);
+
+        let input = make_input(
+            "test.py",
+            "import os\n",
+            "import os\nimport json\n",
+            "import os\nimport sys\n",
+        );
+        let output = pipeline.run(&input);
+
+        assert!(output.fully_resolved);
+        assert!(
+            output.verification.is_none(),
+            "verification should be None when Phase 6 is disabled"
+        );
+    }
+
+    #[test]
+    fn test_phase6_enabled_runs_verification() {
+        let config = PipelineConfig {
+            enable_phase4_spec_aware: false,
+            enable_phase5_llm: false,
+            enable_phase6_verification: true,
+            ..PipelineConfig::default()
+        };
+        let pipeline = ConvergencePipeline::with_config(config);
+
+        let input = make_input(
+            "test.py",
+            "import os\n",
+            "import os\nimport json\n",
+            "import os\nimport sys\n",
+        );
+        let output = pipeline.run(&input);
+
+        assert!(output.fully_resolved);
+        assert!(
+            output.verification.is_some(),
+            "verification should be present when Phase 6 is enabled"
+        );
+    }
 }

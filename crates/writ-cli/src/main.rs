@@ -22,6 +22,21 @@ enum Commands {
     /// Initialize a new writ repository.
     Init,
 
+    /// Remove writ from this project (inverse of install).
+    Uninstall {
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        force: bool,
+
+        /// Keep the .writignore file.
+        #[arg(long)]
+        keep_writignore: bool,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
     /// One-command setup: init + detect git + import baseline.
     Install {
         /// Output format: "human" (default) or "json".
@@ -283,6 +298,21 @@ enum Commands {
         #[command(subcommand)]
         action: RemoteCommands,
     },
+
+    /// Verify seal chain integrity and signatures.
+    Verify {
+        /// Verify the full hash chain from genesis to HEAD.
+        #[arg(long)]
+        chain: bool,
+
+        /// Verify a specific seal by ID (or prefix).
+        #[arg(long)]
+        seal: Option<String>,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -452,6 +482,11 @@ fn main() {
 
     let result = match cli.command {
         Commands::Init => cmd_init(&cwd),
+        Commands::Uninstall {
+            force,
+            keep_writignore,
+            format,
+        } => cmd_uninstall(&cwd, force, keep_writignore, &format),
         Commands::Install {
             format,
             spec,
@@ -584,6 +619,11 @@ fn main() {
             RemoteCommands::List => cmd_remote_list(&cwd),
             RemoteCommands::Status { remote, format } => cmd_remote_status(&cwd, &remote, &format),
         },
+        Commands::Verify {
+            chain,
+            seal,
+            format,
+        } => cmd_verify(&cwd, chain, seal.as_deref(), &format),
     };
 
     if let Err(e) = result {
@@ -705,6 +745,100 @@ fn cmd_install(
         println!("ready. next steps:");
         for op in &result.available_operations {
             println!("  {}", op);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_uninstall(
+    cwd: &PathBuf,
+    force: bool,
+    keep_writignore: bool,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Check if .writ/ exists at all.
+    if !cwd.join(".writ").exists() {
+        if format == "json" {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "error": "no writ repository found"
+                }))?
+            );
+        } else {
+            eprintln!("error: no writ repository found in current directory");
+        }
+        process::exit(1);
+    }
+
+    if !force {
+        // Preview what will be removed.
+        let repo = Repository::open(cwd).ok();
+        let seal_count = repo
+            .as_ref()
+            .and_then(|r| r.log().ok())
+            .map(|s| s.len())
+            .unwrap_or(0);
+        let tracked = repo
+            .as_ref()
+            .and_then(|r| r.state().ok())
+            .map(|s| s.tracked_count)
+            .unwrap_or(0);
+
+        eprintln!("warning: this will remove writ from this project");
+        eprintln!(
+            "  .writ/ directory ({} seal(s), {} tracked file(s))",
+            seal_count, tracked
+        );
+        if !keep_writignore && cwd.join(".writignore").exists() {
+            eprintln!("  .writignore");
+        }
+        eprintln!("  framework hooks (CLAUDE.md sections, command files, AGENTS.md sections)");
+        eprintln!();
+        eprintln!("  note: this does NOT affect git or your source files");
+        eprint!("continue? [y/N] ");
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("uninstall cancelled");
+            return Ok(());
+        }
+    }
+
+    let result = Repository::uninstall(cwd, keep_writignore)?;
+
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&result)?),
+        _ => {
+            if result.writ_dir_removed {
+                println!(
+                    "removed .writ/ ({} seal(s), {} tracked file(s))",
+                    result.seals_existed, result.tracked_files
+                );
+            }
+
+            if result.writignore_removed {
+                println!("removed .writignore");
+            }
+
+            for hook in &result.hooks_removed {
+                for f in &hook.files_removed {
+                    println!("  - {f}");
+                }
+                for f in &hook.files_updated {
+                    println!("  ~ {f} (writ section removed)");
+                }
+            }
+
+            for w in &result.warnings {
+                eprintln!("warning: {w}");
+            }
+
+            println!();
+            println!("writ has been removed. your source files and git history are untouched.");
+            println!("to reinstall: writ install");
         }
     }
 
@@ -2372,6 +2506,168 @@ fn cmd_remote_status(
             println!("  remote HEAD: {remote_h}");
             println!("  ahead:  {}", status.ahead);
             println!("  behind: {}", status.behind);
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// writ verify
+// ---------------------------------------------------------------------------
+
+fn cmd_verify(
+    cwd: &std::path::Path,
+    chain: bool,
+    seal_id: Option<&str>,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+
+    if let Some(id) = seal_id {
+        return cmd_verify_seal(&repo, id, format);
+    }
+
+    if chain {
+        return cmd_verify_chain(&repo, format);
+    }
+
+    // Default: verify the full chain
+    cmd_verify_chain(&repo, format)
+}
+
+fn cmd_verify_seal(
+    repo: &Repository,
+    seal_id: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let full_id = repo.resolve_seal_id(seal_id)?;
+    let seal = repo.load_seal(&full_id)?;
+    let short_id = &seal.id[..12.min(seal.id.len())];
+
+    // Pre-security seals: no crypto fields at all
+    if !seal.is_secured() {
+        match format {
+            "json" => {
+                let json = serde_json::json!({
+                    "seal_id": seal.id,
+                    "status": "pre-security",
+                    "message": "seal created before cryptographic integrity was enabled"
+                });
+                println!("{}", serde_json::to_string_pretty(&json).unwrap());
+            }
+            _ => {
+                println!("verify seal {short_id}");
+                println!("  status: N/A (pre-security seal)");
+            }
+        }
+        return Ok(());
+    }
+
+    let result = repo.verify_seal(&seal, None);
+
+    // Determine signature status text
+    let sig_status = match (seal.signature.is_some(), result.signature_valid) {
+        (true, Some(true)) => ("OK", "verified".to_string()),
+        (true, Some(false)) => ("FAIL", "signature verification failed".to_string()),
+        (true, None) => ("N/A", "present (unverified — no key provided)".to_string()),
+        (false, _) => ("N/A", "not present".to_string()),
+    };
+
+    let all_ok = result.content_hash_valid && result.chain_hash_valid;
+
+    match format {
+        "json" => {
+            let json = serde_json::json!({
+                "seal_id": seal.id,
+                "valid": all_ok,
+                "content_hash_valid": result.content_hash_valid,
+                "chain_hash_valid": result.chain_hash_valid,
+                "signature_present": result.signature_present,
+                "signature_valid": result.signature_valid,
+                "error": result.error,
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        }
+        _ => {
+            println!("verify seal {short_id}");
+            let ch_status = if result.content_hash_valid {
+                "OK"
+            } else {
+                "FAIL"
+            };
+            let cc_status = if result.chain_hash_valid {
+                "OK"
+            } else {
+                "FAIL"
+            };
+            println!(
+                "  content_hash: {ch_status} — {}",
+                seal.content_hash.as_deref().map_or("", |h| &h[..12])
+            );
+            println!(
+                "  chain_hash: {cc_status} — {}",
+                seal.chain_hash.as_deref().map_or("", |h| &h[..12])
+            );
+            println!("  signature: {} — {}", sig_status.0, sig_status.1);
+            if all_ok {
+                println!("  result: VALID");
+            } else {
+                println!(
+                    "  result: INVALID — {}",
+                    result.error.as_deref().unwrap_or("unknown")
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let result = repo.verify_chain(None)?;
+
+    if result.total_seals == 0 {
+        match format {
+            "json" => println!(r#"{{"valid":true,"seals_checked":0,"message":"empty chain"}}"#),
+            _ => println!("no seals to verify"),
+        }
+        return Ok(());
+    }
+
+    match format {
+        "json" => {
+            let json = serde_json::json!({
+                "valid": result.valid,
+                "seals_checked": result.total_seals,
+                "seals_verified": result.verified,
+                "seals_unsecured": result.unsecured,
+                "failures": result.failures.iter().map(|f| {
+                    serde_json::json!({
+                        "seal": &f.seal_id[..12.min(f.seal_id.len())],
+                        "error": f.error,
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            println!("{}", serde_json::to_string_pretty(&json).unwrap());
+        }
+        _ => {
+            println!(
+                "chain verification: {} seals checked, {} verified, {} pre-security",
+                result.total_seals, result.verified, result.unsecured
+            );
+            if !result.failures.is_empty() {
+                for f in &result.failures {
+                    let short_id = &f.seal_id[..12.min(f.seal_id.len())];
+                    println!(
+                        "  FAIL {short_id}: {}",
+                        f.error.as_deref().unwrap_or("unknown")
+                    );
+                }
+                println!("  result: INVALID ({} error(s))", result.failures.len());
+            } else {
+                println!("  result: VALID");
+            }
         }
     }
 

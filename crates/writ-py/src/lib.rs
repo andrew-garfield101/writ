@@ -665,6 +665,43 @@ impl PyRepository {
         let status = self.inner.remote_status(remote).map_err(writ_err)?;
         to_pydict(py, &status)
     }
+
+    /// Verify the cryptographic integrity of the seal chain from HEAD.
+    ///
+    /// Returns a dict with: total_seals, verified, unsecured, failures, valid.
+    /// If `use_convergence_key` is True, uses the repo's convergence verifying
+    /// key for signature verification. Otherwise signatures are not checked.
+    #[pyo3(signature = (use_convergence_key=false))]
+    fn verify_chain(&self, py: Python, use_convergence_key: bool) -> PyResult<PyObject> {
+        let vk = if use_convergence_key {
+            self.inner.convergence_verifying_key()
+        } else {
+            None
+        };
+        let result = self.inner.verify_chain(vk.as_ref()).map_err(writ_err)?;
+        to_pydict(py, &result)
+    }
+
+    /// Verify a single seal's cryptographic integrity.
+    ///
+    /// Returns a dict with: seal_id, content_hash_valid, chain_hash_valid,
+    /// signature_present, signature_valid, error.
+    #[pyo3(signature = (seal_id, use_convergence_key=false))]
+    fn verify_seal(
+        &self,
+        py: Python,
+        seal_id: &str,
+        use_convergence_key: bool,
+    ) -> PyResult<PyObject> {
+        let seal = self.inner.get_seal(seal_id).map_err(writ_err)?;
+        let vk = if use_convergence_key {
+            self.inner.convergence_verifying_key()
+        } else {
+            None
+        };
+        let result = self.inner.verify_seal(&seal, vk.as_ref());
+        to_pydict(py, &result)
+    }
 }
 
 // ---------------------------------------------------------------------------

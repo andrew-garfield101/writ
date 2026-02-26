@@ -8,6 +8,7 @@
 pub mod bridge;
 pub mod context;
 pub mod convergence;
+pub mod crypto;
 pub mod diff;
 pub mod error;
 pub mod fsutil;
@@ -15,6 +16,7 @@ pub mod hash;
 pub mod hooks;
 pub mod ignore;
 pub mod index;
+pub mod keystore;
 pub mod lock;
 pub mod object;
 pub mod remote;

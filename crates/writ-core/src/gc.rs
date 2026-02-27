@@ -4,6 +4,7 @@
 //! of expired specs, old security events, and other working state.
 //! Seals are immutable and never deleted.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
@@ -87,6 +88,27 @@ impl Default for StorageAllocation {
     }
 }
 
+/// Object storage configuration (compression, size limits).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// Compression algorithm ("zstd" or "none").
+    pub compression: String,
+    /// Compression level (1 = fast, 22 = max). Default: 3.
+    pub compression_level: i32,
+    /// Maximum decompressed object size in bytes. Default: 100 MB.
+    pub max_object_size_bytes: usize,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            compression: "zstd".to_string(),
+            compression_level: 3,
+            max_object_size_bytes: 100 * 1024 * 1024, // 100 MB
+        }
+    }
+}
+
 /// Top-level GC configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcConfig {
@@ -102,6 +124,9 @@ pub struct GcConfig {
     pub allocation: StorageAllocation,
     /// Emit storage warning at this percentage of budget.
     pub warning_threshold_pct: u8,
+    /// Object store compression settings.
+    #[serde(default)]
+    pub storage: StorageConfig,
 }
 
 impl Default for GcConfig {
@@ -120,6 +145,11 @@ impl GcConfig {
             security_events: SecurityEventGcConfig::default(),
             allocation: StorageAllocation::default(),
             warning_threshold_pct: 80,
+            storage: StorageConfig {
+                compression: "zstd".to_string(),
+                compression_level: 3,
+                max_object_size_bytes: 100 * 1024 * 1024, // 100 MB
+            },
         }
     }
 
@@ -141,6 +171,11 @@ impl GcConfig {
             },
             allocation: StorageAllocation::default(),
             warning_threshold_pct: 80,
+            storage: StorageConfig {
+                compression: "zstd".to_string(),
+                compression_level: 1, // minimize CPU on weak processor
+                max_object_size_bytes: 10 * 1024 * 1024, // 10 MB
+            },
         }
     }
 
@@ -162,6 +197,11 @@ impl GcConfig {
             },
             allocation: StorageAllocation::default(),
             warning_threshold_pct: 80,
+            storage: StorageConfig {
+                compression: "zstd".to_string(),
+                compression_level: 3,
+                max_object_size_bytes: 100 * 1024 * 1024, // 100 MB
+            },
         }
     }
 
@@ -183,6 +223,11 @@ impl GcConfig {
             },
             allocation: StorageAllocation::default(),
             warning_threshold_pct: 80,
+            storage: StorageConfig {
+                compression: "zstd".to_string(),
+                compression_level: 6, // better ratio, servers have CPU headroom
+                max_object_size_bytes: 256 * 1024 * 1024, // 256 MB
+            },
         }
     }
 
@@ -247,6 +292,9 @@ pub struct StorageReport {
     pub other_bytes: u64,
     /// Configured budget in bytes.
     pub budget_bytes: u64,
+    /// Object store compression statistics (None if objects dir missing).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<crate::object::CompressionStats>,
 }
 
 impl StorageReport {
@@ -270,6 +318,7 @@ impl StorageReport {
             gc_bytes: 0,
             other_bytes: 0,
             budget_bytes,
+            compression: None,
         };
 
         if !writ_dir.exists() {
@@ -323,6 +372,13 @@ impl StorageReport {
             }
         }
 
+        // Compression statistics from the object store.
+        let objects_dir = writ_dir.join("objects");
+        if objects_dir.exists() {
+            let store = crate::object::ObjectStore::new(&objects_dir);
+            report.compression = store.compression_stats().ok();
+        }
+
         Ok(report)
     }
 }
@@ -354,6 +410,18 @@ pub enum GcAction {
         severity: String,
         reason: String,
     },
+    /// Prune orphaned objects not referenced by any seal.
+    PruneObjects {
+        count: usize,
+        total_bytes: u64,
+        reason: String,
+    },
+    /// Recompress legacy (uncompressed) objects with zstd.
+    RecompressObjects {
+        count: usize,
+        estimated_savings_bytes: u64,
+        reason: String,
+    },
 }
 
 /// Summary of planned GC actions.
@@ -363,6 +431,8 @@ pub struct GcSummary {
     pub transitions: usize,
     pub deletions: usize,
     pub events_to_clean: usize,
+    pub objects_to_prune: usize,
+    pub objects_to_recompress: usize,
     pub summary_line: String,
 }
 
@@ -516,6 +586,35 @@ impl GcPlan {
             });
         }
 
+        // --- Object orphan scan ---
+        let all_seals = load_all_seals(writ_dir)?;
+        let orphans = find_orphaned_objects(writ_dir, &all_seals)?;
+        let objects_to_prune = orphans.len();
+        if !orphans.is_empty() {
+            let total_bytes: u64 = orphans.iter().map(|o| o.size_bytes).sum();
+            actions.push(GcAction::PruneObjects {
+                count: orphans.len(),
+                total_bytes,
+                reason: format!(
+                    "{} orphaned object(s), {:.1} MB reclaimable",
+                    orphans.len(),
+                    total_bytes as f64 / 1_048_576.0
+                ),
+            });
+        }
+
+        // --- Recompression scan ---
+        let uncompressed = find_uncompressed_objects(writ_dir)?;
+        let objects_to_recompress = uncompressed.len();
+        if !uncompressed.is_empty() {
+            let total_bytes: u64 = uncompressed.iter().map(|o| o.size_bytes).sum();
+            actions.push(GcAction::RecompressObjects {
+                count: uncompressed.len(),
+                estimated_savings_bytes: total_bytes / 3, // rough estimate: ~33% savings
+                reason: format!("{} legacy uncompressed object(s)", uncompressed.len()),
+            });
+        }
+
         // --- Summary ---
         let transitions = actions
             .iter()
@@ -537,6 +636,12 @@ impl GcPlan {
         if transitions > 0 {
             summary_parts.push(format!("{} transition(s)", transitions));
         }
+        if objects_to_prune > 0 {
+            summary_parts.push(format!("{} object(s) to prune", objects_to_prune));
+        }
+        if objects_to_recompress > 0 {
+            summary_parts.push(format!("{} object(s) to recompress", objects_to_recompress));
+        }
 
         let summary_line = if summary_parts.is_empty() {
             "Nothing to clean".into()
@@ -554,6 +659,8 @@ impl GcPlan {
                 transitions,
                 deletions,
                 events_to_clean,
+                objects_to_prune,
+                objects_to_recompress,
                 summary_line,
             },
         })
@@ -587,6 +694,10 @@ pub struct GcExecutionResult {
     pub specs_cleaned: Vec<String>,
     pub events_cleaned: usize,
     pub transitions_applied: Vec<(String, String, String)>, // (spec_id, from, to)
+    pub objects_pruned: usize,
+    pub bytes_freed: u64,
+    pub objects_recompressed: usize,
+    pub recompression_savings: u64,
 }
 
 /// Execute a GC plan safely.
@@ -608,6 +719,10 @@ pub fn execute_plan(
     let mut specs_cleaned = Vec::new();
     let mut events_cleaned = 0usize;
     let mut transitions_applied = Vec::new();
+    let mut objects_pruned = 0usize;
+    let mut bytes_freed = 0u64;
+    let mut objects_recompressed = 0usize;
+    let mut recompression_savings = 0u64;
 
     let gc_dir = writ_dir.join("gc");
     fs::create_dir_all(&gc_dir)?;
@@ -720,6 +835,88 @@ pub fn execute_plan(
                 // because the SecurityEventLogger owns the file format.
                 // The executor just records that this action should happen.
             }
+
+            GcAction::PruneObjects {
+                count: _,
+                total_bytes: _,
+                reason,
+            } => {
+                // Safety: re-verify reachability at execution time.
+                // The plan may be stale — a seal created between plan generation
+                // and execution could reference a previously-orphaned object.
+                let fresh_seals = load_all_seals(writ_dir)?;
+                let fresh_orphans = find_orphaned_objects(writ_dir, &fresh_seals)?;
+
+                let objects_dir = writ_dir.join("objects");
+                for orphan in &fresh_orphans {
+                    let (prefix, rest) = orphan.hash.split_at(2);
+                    let obj_path = objects_dir.join(prefix).join(rest);
+                    if obj_path.exists() {
+                        fs::remove_file(&obj_path)?;
+                        objects_pruned += 1;
+                        bytes_freed += orphan.size_bytes;
+
+                        // Write tombstone for the pruned object
+                        write_tombstone(
+                            &gc_dir,
+                            &Tombstone {
+                                id: orphan.hash.clone(),
+                                object_type: "object".into(),
+                                final_state: "orphaned".into(),
+                                cleaned_at: Utc::now(),
+                                reason: reason.clone(),
+                            },
+                        )?;
+
+                        // Clean up empty prefix directory
+                        let prefix_dir = objects_dir.join(prefix);
+                        if let Ok(mut entries) = prefix_dir.read_dir() {
+                            if entries.next().is_none() {
+                                fs::remove_dir(&prefix_dir).ok();
+                            }
+                        }
+                    }
+                }
+                executed += 1;
+            }
+
+            GcAction::RecompressObjects {
+                count: _,
+                estimated_savings_bytes: _,
+                reason: _,
+            } => {
+                // Re-scan for uncompressed objects at execution time
+                let fresh_uncompressed = find_uncompressed_objects(writ_dir)?;
+                let objects_dir = writ_dir.join("objects");
+                let compression_level = 3; // default; could be loaded from config
+
+                for obj in &fresh_uncompressed {
+                    let (prefix, rest) = obj.hash.split_at(2);
+                    let obj_path = objects_dir.join(prefix).join(rest);
+                    if !obj_path.exists() {
+                        continue;
+                    }
+
+                    let raw_data = fs::read(&obj_path)?;
+                    // Legacy objects: entire file is raw content (no magic byte)
+                    let content = &raw_data[..];
+                    let compressed = crate::object::compress_object(content, compression_level);
+
+                    if compressed.len() < raw_data.len() {
+                        // Worth compressing — atomic rewrite
+                        crate::fsutil::atomic_write(&obj_path, &compressed)?;
+                        objects_recompressed += 1;
+                        recompression_savings += raw_data.len() as u64 - compressed.len() as u64;
+                    } else {
+                        // Not worth it — mark with MAGIC_RAW so we don't retry
+                        let mut raw_prefixed = Vec::with_capacity(1 + content.len());
+                        raw_prefixed.push(0x00); // MAGIC_RAW
+                        raw_prefixed.extend_from_slice(content);
+                        crate::fsutil::atomic_write(&obj_path, &raw_prefixed)?;
+                    }
+                }
+                executed += 1;
+            }
         }
     }
 
@@ -731,7 +928,7 @@ pub fn execute_plan(
         executed,
         skipped,
         0, // actions_failed — not tracked yet
-        0, // space_freed_bytes — not tracked yet
+        bytes_freed + recompression_savings,
         duration_ms,
         skipped_details,
     );
@@ -745,6 +942,10 @@ pub fn execute_plan(
         specs_cleaned,
         events_cleaned,
         transitions_applied,
+        objects_pruned,
+        bytes_freed,
+        objects_recompressed,
+        recompression_savings,
     })
 }
 
@@ -785,6 +986,175 @@ pub fn read_tombstones(writ_dir: &Path) -> WritResult<Vec<Tombstone>> {
         records.push(record);
     }
     Ok(records)
+}
+
+// ---------------------------------------------------------------------------
+// Object Reachability + Pruning
+// ---------------------------------------------------------------------------
+
+/// An unreferenced object identified by reachability analysis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrphanedObject {
+    pub hash: String,
+    pub size_bytes: u64,
+}
+
+/// Load all seals from `.writ/seals/` without going through Repository.
+///
+/// This reads every `.json` file in the seals directory and deserializes it.
+/// Used by GC plan generation which only has `writ_dir`, not a full repo.
+pub fn load_all_seals(writ_dir: &Path) -> WritResult<Vec<crate::seal::Seal>> {
+    let seals_dir = writ_dir.join("seals");
+    if !seals_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut seals = Vec::new();
+    for entry in fs::read_dir(&seals_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("json") {
+            let data = fs::read_to_string(&path)?;
+            let seal: crate::seal::Seal = serde_json::from_str(&data)?;
+            seals.push(seal);
+        }
+    }
+    Ok(seals)
+}
+
+/// Find orphaned objects not referenced by any seal.
+///
+/// Walks all seals to build a set of referenced hashes (tree, old_hash,
+/// new_hash), then walks `.writ/objects/` to find on-disk objects not in
+/// the referenced set.
+///
+/// **CRITICAL SAFETY:** The `seals` parameter MUST include ALL seals from
+/// `.writ/seals/` — including flagged/suspicious seals. Flagged seals'
+/// objects must NOT be pruned (they contain forensic evidence for
+/// investigating compromised agents). Use `load_all_seals()` to ensure
+/// no seals are filtered out.
+pub fn find_orphaned_objects(
+    writ_dir: &Path,
+    seals: &[crate::seal::Seal],
+) -> WritResult<Vec<OrphanedObject>> {
+    // 1. Build referenced hash set from all seals
+    let mut referenced = HashSet::new();
+    for seal in seals {
+        referenced.insert(seal.tree.clone());
+        for change in &seal.changes {
+            if let Some(ref h) = change.old_hash {
+                referenced.insert(h.clone());
+            }
+            if let Some(ref h) = change.new_hash {
+                referenced.insert(h.clone());
+            }
+        }
+    }
+
+    // 2. Walk objects directory, find orphans
+    let objects_dir = writ_dir.join("objects");
+    if !objects_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut orphans = Vec::new();
+    for prefix_entry in fs::read_dir(&objects_dir)? {
+        let prefix_entry = prefix_entry?;
+        if !prefix_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let prefix = prefix_entry.file_name().to_str().unwrap_or("").to_string();
+        if prefix.len() != 2 {
+            continue;
+        }
+
+        for obj_entry in fs::read_dir(prefix_entry.path())? {
+            let obj_entry = obj_entry?;
+            if !obj_entry.file_type()?.is_file() {
+                continue;
+            }
+            let rest = obj_entry.file_name().to_str().unwrap_or("").to_string();
+            let hash = format!("{}{}", prefix, rest);
+
+            if !referenced.contains(&hash) {
+                let size_bytes = obj_entry.metadata()?.len();
+                orphans.push(OrphanedObject { hash, size_bytes });
+            }
+        }
+    }
+
+    Ok(orphans)
+}
+
+/// A legacy or explicit-raw object that can be recompressed.
+#[derive(Debug, Clone)]
+pub struct UncompressedObject {
+    pub hash: String,
+    pub size_bytes: u64,
+    /// True if the object has no magic byte (legacy pre-compression format).
+    /// False should not occur in practice since MAGIC_RAW objects are skipped.
+    pub is_legacy: bool,
+}
+
+/// Find objects that can be recompressed (legacy objects without magic byte).
+///
+/// Only legacy objects (no magic byte prefix) are candidates. Objects with
+/// `MAGIC_RAW` (0x00) were already evaluated and found incompressible — they
+/// won't be retried. Objects with `MAGIC_ZSTD` (0x01) are already compressed.
+pub fn find_uncompressed_objects(writ_dir: &Path) -> WritResult<Vec<UncompressedObject>> {
+    let objects_dir = writ_dir.join("objects");
+    if !objects_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut uncompressed = Vec::new();
+    for prefix_entry in fs::read_dir(&objects_dir)? {
+        let prefix_entry = prefix_entry?;
+        if !prefix_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let prefix = prefix_entry.file_name().to_str().unwrap_or("").to_string();
+        if prefix.len() != 2 {
+            continue;
+        }
+
+        for obj_entry in fs::read_dir(prefix_entry.path())? {
+            let obj_entry = obj_entry?;
+            if !obj_entry.file_type()?.is_file() {
+                continue;
+            }
+
+            let path = obj_entry.path();
+            let size_bytes = obj_entry.metadata()?.len();
+
+            // Read just the first byte to check format
+            if size_bytes == 0 {
+                continue;
+            }
+            let mut first_byte = [0u8; 1];
+            let mut file = File::open(&path)?;
+            use std::io::Read;
+            if file.read(&mut first_byte)? == 0 {
+                continue;
+            }
+
+            // Skip already-compressed (MAGIC_ZSTD = 0x01)
+            // Skip already-evaluated raw (MAGIC_RAW = 0x00)
+            if first_byte[0] == 0x01 || first_byte[0] == 0x00 {
+                continue;
+            }
+
+            // Legacy object — no magic byte, entire content is raw
+            let rest = obj_entry.file_name().to_str().unwrap_or("").to_string();
+            let hash = format!("{}{}", prefix, rest);
+            uncompressed.push(UncompressedObject {
+                hash,
+                size_bytes,
+                is_legacy: true,
+            });
+        }
+    }
+
+    Ok(uncompressed)
 }
 
 // ---------------------------------------------------------------------------
@@ -892,6 +1262,64 @@ mod tests {
         assert!(rpi.specs.retention_period_secs < dev.specs.retention_period_secs);
     }
 
+    // --- StorageConfig tests ---
+
+    #[test]
+    fn test_storage_config_default_level_3() {
+        let config = StorageConfig::default();
+        assert_eq!(config.compression, "zstd");
+        assert_eq!(config.compression_level, 3);
+        assert_eq!(config.max_object_size_bytes, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_storage_config_per_profile_levels() {
+        let rpi = GcConfig::raspberry_pi();
+        assert_eq!(rpi.storage.compression_level, 1);
+        assert_eq!(rpi.storage.max_object_size_bytes, 10 * 1024 * 1024);
+
+        let dev = GcConfig::development();
+        assert_eq!(dev.storage.compression_level, 3);
+
+        let prod = GcConfig::production();
+        assert_eq!(prod.storage.compression_level, 3);
+
+        let ent = GcConfig::enterprise();
+        assert_eq!(ent.storage.compression_level, 6);
+        assert_eq!(ent.storage.max_object_size_bytes, 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_storage_config_json_roundtrip() {
+        let config = StorageConfig {
+            compression: "zstd".to_string(),
+            compression_level: 6,
+            max_object_size_bytes: 256 * 1024 * 1024,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let recovered: StorageConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.compression_level, 6);
+        assert_eq!(recovered.compression, "zstd");
+    }
+
+    #[test]
+    fn test_storage_config_backward_compat_missing_field() {
+        // Old GcConfig JSON without storage field should deserialize OK
+        // because #[serde(default)] on the storage field.
+        let json = r#"{
+            "mode": "manual",
+            "budget_bytes": 1000000,
+            "specs": {"stale_timeout_secs": 7200, "expiry_timeout_secs": 86400, "retention_period_secs": 604800, "grace_period_secs": 3600},
+            "security_events": {"retention_critical": 730, "retention_warning": 180, "retention_info": 30},
+            "allocation": {"seal_pct": 60, "working_state_pct": 20, "security_event_pct": 15, "headroom_pct": 5},
+            "warning_threshold_pct": 80
+        }"#;
+        let config: GcConfig = serde_json::from_str(json).unwrap();
+        // Should get defaults when storage field is missing.
+        assert_eq!(config.storage.compression_level, 3);
+        assert_eq!(config.storage.compression, "zstd");
+    }
+
     // --- Storage report tests ---
 
     #[test]
@@ -937,6 +1365,7 @@ mod tests {
             gc_bytes: 0,
             other_bytes: 800,
             budget_bytes: 1000,
+            compression: None,
         };
         assert!((report.usage_pct() - 80.0).abs() < 0.01);
     }
@@ -953,6 +1382,7 @@ mod tests {
             gc_bytes: 0,
             other_bytes: 1000,
             budget_bytes: u64::MAX,
+            compression: None,
         };
         assert_eq!(report.usage_pct(), 0.0);
     }
@@ -1221,6 +1651,8 @@ mod tests {
                 transitions: 0,
                 deletions: 1,
                 events_to_clean: 0,
+                objects_to_prune: 0,
+                objects_to_recompress: 0,
                 summary_line: "test".into(),
             },
         };
@@ -1253,6 +1685,8 @@ mod tests {
                 transitions: 0,
                 deletions: 0,
                 events_to_clean: 5,
+                objects_to_prune: 0,
+                objects_to_recompress: 0,
                 summary_line: "test".into(),
             },
         };
@@ -1289,6 +1723,8 @@ mod tests {
                 transitions: 1,
                 deletions: 0,
                 events_to_clean: 0,
+                objects_to_prune: 0,
+                objects_to_recompress: 0,
                 summary_line: "test".into(),
             },
         };
@@ -1448,6 +1884,8 @@ mod tests {
                 transitions: 1,
                 deletions: 0,
                 events_to_clean: 0,
+                objects_to_prune: 0,
+                objects_to_recompress: 0,
                 summary_line: "test".into(),
             },
         };
@@ -1486,6 +1924,8 @@ mod tests {
                 transitions: 0,
                 deletions: 0,
                 events_to_clean: 5,
+                objects_to_prune: 0,
+                objects_to_recompress: 0,
                 summary_line: "test".into(),
             },
         };
@@ -1513,6 +1953,8 @@ mod tests {
                 transitions: 0,
                 deletions: 0,
                 events_to_clean: 12,
+                objects_to_prune: 0,
+                objects_to_recompress: 0,
                 summary_line: "test".into(),
             },
         };
@@ -1530,18 +1972,18 @@ mod tests {
         let config = GcConfig::default();
         // info retention = 30d, warning retention = 180d, critical retention = 730d
         let events = vec![
-            make_event_at(Severity::Info, 31),     // past 30d → clean
-            make_event_at(Severity::Info, 35),     // past 30d → clean
-            make_event_at(Severity::Warning, 181), // past 180d → clean
+            make_event_at(Severity::Info, 31),      // past 30d → clean
+            make_event_at(Severity::Info, 35),      // past 30d → clean
+            make_event_at(Severity::Warning, 181),  // past 180d → clean
             make_event_at(Severity::Critical, 365), // within 730d → keep
         ];
 
         let plan = GcPlan::generate(dir.path(), &config, &[], &events).unwrap();
 
         // Should produce separate actions for info and warning, none for critical
-        let info_action = plan.actions.iter().find(|a| {
-            matches!(a, GcAction::CleanSecurityEvents { severity, .. } if severity == "info")
-        });
+        let info_action = plan.actions.iter().find(
+            |a| matches!(a, GcAction::CleanSecurityEvents { severity, .. } if severity == "info"),
+        );
         let warning_action = plan.actions.iter().find(|a| {
             matches!(a, GcAction::CleanSecurityEvents { severity, .. } if severity == "warning")
         });
@@ -1551,7 +1993,10 @@ mod tests {
 
         assert!(info_action.is_some(), "expected info cleanup action");
         assert!(warning_action.is_some(), "expected warning cleanup action");
-        assert!(critical_action.is_none(), "critical should NOT appear in plan");
+        assert!(
+            critical_action.is_none(),
+            "critical should NOT appear in plan"
+        );
 
         // Verify counts
         if let Some(GcAction::CleanSecurityEvents { count, .. }) = info_action {
@@ -1592,6 +2037,8 @@ mod tests {
                 transitions: 0,
                 deletions: 0,
                 events_to_clean: 6,
+                objects_to_prune: 0,
+                objects_to_recompress: 0,
                 summary_line: "test".into(),
             },
         };
@@ -1649,5 +2096,771 @@ mod tests {
         let recovered: Tombstone = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered.id, "spec-123");
         assert_eq!(recovered.object_type, "spec");
+    }
+
+    // --- Reachability / orphan detection tests ---
+
+    use crate::seal::{
+        AgentIdentity, AgentType, ChangeType, FileChange, Seal, TaskStatus, Verification,
+    };
+
+    /// Helper: create a minimal seal for reachability tests.
+    fn make_test_seal(tree: &str, changes: Vec<FileChange>, spec_id: Option<&str>) -> Seal {
+        Seal {
+            id: format!("seal-{}", tree.chars().take(8).collect::<String>()),
+            parent: None,
+            timestamp: Utc::now(),
+            tree: tree.to_string(),
+            agent: AgentIdentity {
+                id: "test-agent".into(),
+                agent_type: AgentType::Agent,
+            },
+            spec_id: spec_id.map(|s| s.to_string()),
+            status: TaskStatus::InProgress,
+            changes,
+            verification: Verification::default(),
+            summary: "test seal".into(),
+            warnings: Vec::new(),
+            parent_seal_hash: None,
+            content_hash: None,
+            chain_hash: None,
+            signature: None,
+        }
+    }
+
+    /// Helper: write an object file on disk (simulating ObjectStore).
+    fn write_test_object(writ_dir: &Path, hash: &str, content: &[u8]) {
+        let (prefix, rest) = hash.split_at(2);
+        let dir = writ_dir.join("objects").join(prefix);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(rest), content).unwrap();
+    }
+
+    /// Helper: write a seal JSON file on disk.
+    fn write_test_seal(writ_dir: &Path, seal: &Seal) {
+        let dir = writ_dir.join("seals");
+        fs::create_dir_all(&dir).unwrap();
+        let json = serde_json::to_string_pretty(seal).unwrap();
+        fs::write(dir.join(format!("{}.json", seal.id)), json).unwrap();
+    }
+
+    #[test]
+    fn test_no_orphans_when_all_referenced() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let tree_hash = "aa".to_string() + &"a".repeat(62);
+        let file_hash = "bb".to_string() + &"b".repeat(62);
+
+        write_test_object(writ_dir, &tree_hash, b"tree data");
+        write_test_object(writ_dir, &file_hash, b"file data");
+
+        let seal = make_test_seal(
+            &tree_hash,
+            vec![FileChange {
+                path: "src/main.rs".into(),
+                change_type: ChangeType::Added,
+                old_hash: None,
+                new_hash: Some(file_hash.clone()),
+            }],
+            None,
+        );
+
+        let orphans = find_orphaned_objects(writ_dir, &[seal]).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "all objects are referenced, should be no orphans"
+        );
+    }
+
+    #[test]
+    fn test_orphan_detected() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let tree_hash = "aa".to_string() + &"a".repeat(62);
+        let file_hash = "bb".to_string() + &"b".repeat(62);
+        let orphan_hash = "cc".to_string() + &"c".repeat(62);
+
+        write_test_object(writ_dir, &tree_hash, b"tree data");
+        write_test_object(writ_dir, &file_hash, b"file data");
+        write_test_object(writ_dir, &orphan_hash, b"orphan data");
+
+        let seal = make_test_seal(
+            &tree_hash,
+            vec![FileChange {
+                path: "src/main.rs".into(),
+                change_type: ChangeType::Added,
+                old_hash: None,
+                new_hash: Some(file_hash.clone()),
+            }],
+            None,
+        );
+
+        let orphans = find_orphaned_objects(writ_dir, &[seal]).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].hash, orphan_hash);
+    }
+
+    #[test]
+    fn test_tree_hash_included_in_referenced() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let tree_hash = "aa".to_string() + &"a".repeat(62);
+        write_test_object(writ_dir, &tree_hash, b"tree index content");
+
+        let seal = make_test_seal(&tree_hash, vec![], None);
+
+        let orphans = find_orphaned_objects(writ_dir, &[seal]).unwrap();
+        assert!(orphans.is_empty(), "tree hash should be referenced");
+    }
+
+    #[test]
+    fn test_old_hash_included_in_referenced() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let tree_hash = "aa".to_string() + &"a".repeat(62);
+        let old_hash = "bb".to_string() + &"b".repeat(62);
+        let new_hash = "cc".to_string() + &"c".repeat(62);
+
+        write_test_object(writ_dir, &tree_hash, b"tree");
+        write_test_object(writ_dir, &old_hash, b"old version");
+        write_test_object(writ_dir, &new_hash, b"new version");
+
+        let seal = make_test_seal(
+            &tree_hash,
+            vec![FileChange {
+                path: "src/lib.rs".into(),
+                change_type: ChangeType::Modified,
+                old_hash: Some(old_hash.clone()),
+                new_hash: Some(new_hash.clone()),
+            }],
+            None,
+        );
+
+        let orphans = find_orphaned_objects(writ_dir, &[seal]).unwrap();
+        assert!(orphans.is_empty(), "old_hash should be referenced");
+    }
+
+    #[test]
+    fn test_new_hash_included_in_referenced() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let tree_hash = "aa".to_string() + &"a".repeat(62);
+        let new_hash = "dd".to_string() + &"d".repeat(62);
+
+        write_test_object(writ_dir, &tree_hash, b"tree");
+        write_test_object(writ_dir, &new_hash, b"new content");
+
+        let seal = make_test_seal(
+            &tree_hash,
+            vec![FileChange {
+                path: "README.md".into(),
+                change_type: ChangeType::Added,
+                old_hash: None,
+                new_hash: Some(new_hash.clone()),
+            }],
+            None,
+        );
+
+        let orphans = find_orphaned_objects(writ_dir, &[seal]).unwrap();
+        assert!(orphans.is_empty(), "new_hash should be referenced");
+    }
+
+    #[test]
+    fn test_multiple_specs_all_contribute() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let tree1 = "aa".to_string() + &"a".repeat(62);
+        let tree2 = "bb".to_string() + &"b".repeat(62);
+        let file1 = "cc".to_string() + &"c".repeat(62);
+        let file2 = "dd".to_string() + &"d".repeat(62);
+
+        write_test_object(writ_dir, &tree1, b"tree1");
+        write_test_object(writ_dir, &tree2, b"tree2");
+        write_test_object(writ_dir, &file1, b"file1");
+        write_test_object(writ_dir, &file2, b"file2");
+
+        let seal1 = make_test_seal(
+            &tree1,
+            vec![FileChange {
+                path: "a.rs".into(),
+                change_type: ChangeType::Added,
+                old_hash: None,
+                new_hash: Some(file1.clone()),
+            }],
+            Some("spec-a"),
+        );
+        let seal2 = make_test_seal(
+            &tree2,
+            vec![FileChange {
+                path: "b.rs".into(),
+                change_type: ChangeType::Added,
+                old_hash: None,
+                new_hash: Some(file2.clone()),
+            }],
+            Some("spec-b"),
+        );
+
+        let orphans = find_orphaned_objects(writ_dir, &[seal1, seal2]).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "objects from both specs should be referenced"
+        );
+    }
+
+    #[test]
+    fn test_empty_repo_no_orphans() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        // No objects dir, no seals
+        let orphans = find_orphaned_objects(writ_dir, &[]).unwrap();
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn test_orphan_has_correct_size() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let orphan_hash = "ee".to_string() + &"e".repeat(62);
+        let content = b"this is exactly 29 bytes long";
+        write_test_object(writ_dir, &orphan_hash, content);
+
+        let orphans = find_orphaned_objects(writ_dir, &[]).unwrap();
+        assert_eq!(orphans.len(), 1);
+        assert_eq!(orphans[0].size_bytes, content.len() as u64);
+    }
+
+    #[test]
+    fn test_flagged_seal_objects_not_orphaned() {
+        // Security interlock: objects referenced ONLY by a flagged seal
+        // must NOT be treated as orphans. The key is that load_all_seals()
+        // includes flagged seals in the list — we verify here that if the
+        // seal list includes the flagged seal, its objects are protected.
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let flagged_tree = "ff".to_string() + &"f".repeat(62);
+        let flagged_file = "ab".to_string() + &"1".repeat(62);
+
+        write_test_object(writ_dir, &flagged_tree, b"flagged tree");
+        write_test_object(writ_dir, &flagged_file, b"flagged content");
+
+        // Create a seal that would be flagged (but still exists on disk)
+        let flagged_seal = make_test_seal(
+            &flagged_tree,
+            vec![FileChange {
+                path: "malicious.rs".into(),
+                change_type: ChangeType::Added,
+                old_hash: None,
+                new_hash: Some(flagged_file.clone()),
+            }],
+            Some("compromised-spec"),
+        );
+
+        // Write the seal to disk (flagged seals stay in .writ/seals/)
+        write_test_seal(writ_dir, &flagged_seal);
+
+        // load_all_seals includes the flagged seal
+        let all_seals = load_all_seals(writ_dir).unwrap();
+        assert_eq!(all_seals.len(), 1);
+
+        let orphans = find_orphaned_objects(writ_dir, &all_seals).unwrap();
+        assert!(
+            orphans.is_empty(),
+            "objects referenced by flagged seal must NOT be orphaned — forensic evidence"
+        );
+    }
+
+    #[test]
+    fn test_objects_dir_missing_returns_empty() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        // Create seals but no objects dir
+        let seal = make_test_seal(&("aa".to_string() + &"a".repeat(62)), vec![], None);
+        let orphans = find_orphaned_objects(writ_dir, &[seal]).unwrap();
+        assert!(orphans.is_empty());
+    }
+
+    #[test]
+    fn test_load_all_seals_reads_from_disk() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let seal1 = make_test_seal(
+            &("aa".to_string() + &"a".repeat(62)),
+            vec![],
+            Some("spec-1"),
+        );
+        let seal2 = make_test_seal(
+            &("bb".to_string() + &"b".repeat(62)),
+            vec![],
+            Some("spec-2"),
+        );
+
+        write_test_seal(writ_dir, &seal1);
+        write_test_seal(writ_dir, &seal2);
+
+        let loaded = load_all_seals(writ_dir).unwrap();
+        assert_eq!(loaded.len(), 2);
+    }
+
+    #[test]
+    fn test_load_all_seals_empty_dir() {
+        let dir = tempdir().unwrap();
+        let loaded = load_all_seals(dir.path()).unwrap();
+        assert!(loaded.is_empty());
+    }
+
+    // --- PruneObjects plan + executor tests ---
+
+    /// Helper: set up a writ_dir with objects, seals, and specs for plan generation.
+    fn setup_gc_writ_dir(writ_dir: &Path) {
+        fs::create_dir_all(writ_dir.join("seals")).unwrap();
+        fs::create_dir_all(writ_dir.join("specs")).unwrap();
+        fs::create_dir_all(writ_dir.join("objects")).unwrap();
+        fs::create_dir_all(writ_dir.join("gc")).unwrap();
+    }
+
+    #[test]
+    fn test_plan_includes_prune_objects_when_orphans_exist() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Create an orphan object (not referenced by any seal)
+        let orphan_hash = "cc".to_string() + &"c".repeat(62);
+        write_test_object(writ_dir, &orphan_hash, b"orphan data");
+
+        let config = GcConfig::default();
+        let plan = GcPlan::generate(writ_dir, &config, &[], &[]).unwrap();
+
+        let prune_action = plan
+            .actions
+            .iter()
+            .find(|a| matches!(a, GcAction::PruneObjects { .. }));
+        assert!(prune_action.is_some(), "should have PruneObjects action");
+        if let Some(GcAction::PruneObjects {
+            count, total_bytes, ..
+        }) = prune_action
+        {
+            assert_eq!(*count, 1);
+            assert_eq!(*total_bytes, 11); // "orphan data" = 11 bytes
+        }
+        assert_eq!(plan.summary.objects_to_prune, 1);
+    }
+
+    #[test]
+    fn test_plan_no_prune_when_no_orphans() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Create object referenced by a seal
+        let tree_hash = "aa".to_string() + &"a".repeat(62);
+        write_test_object(writ_dir, &tree_hash, b"tree");
+
+        let seal = make_test_seal(&tree_hash, vec![], None);
+        write_test_seal(writ_dir, &seal);
+
+        let config = GcConfig::default();
+        let plan = GcPlan::generate(writ_dir, &config, &[], &[]).unwrap();
+
+        let prune_action = plan
+            .actions
+            .iter()
+            .find(|a| matches!(a, GcAction::PruneObjects { .. }));
+        assert!(prune_action.is_none(), "no orphans means no PruneObjects");
+        assert_eq!(plan.summary.objects_to_prune, 0);
+    }
+
+    #[test]
+    fn test_executor_prunes_orphan_files() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        let orphan_hash = "dd".to_string() + &"d".repeat(62);
+        write_test_object(writ_dir, &orphan_hash, b"orphan");
+
+        let plan = GcPlan {
+            generated_at: Utc::now(),
+            storage: StorageReport::scan(writ_dir, 1_000_000).unwrap(),
+            actions: vec![GcAction::PruneObjects {
+                count: 1,
+                total_bytes: 6,
+                reason: "test".into(),
+            }],
+            summary: GcSummary {
+                total_actions: 1,
+                transitions: 0,
+                deletions: 0,
+                events_to_clean: 0,
+                objects_to_prune: 1,
+                objects_to_recompress: 0,
+                summary_line: "test".into(),
+            },
+        };
+
+        let result = execute_plan(writ_dir, &plan, &[]).unwrap();
+        assert_eq!(result.objects_pruned, 1);
+        assert!(result.bytes_freed > 0);
+
+        // Verify file was actually deleted
+        let (prefix, rest) = orphan_hash.split_at(2);
+        let obj_path = writ_dir.join("objects").join(prefix).join(rest);
+        assert!(!obj_path.exists(), "orphan object should be deleted");
+    }
+
+    #[test]
+    fn test_executor_does_not_prune_referenced() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        let tree_hash = "aa".to_string() + &"a".repeat(62);
+        write_test_object(writ_dir, &tree_hash, b"tree data");
+
+        let seal = make_test_seal(&tree_hash, vec![], None);
+        write_test_seal(writ_dir, &seal);
+
+        // Plan says to prune (from a stale plan), but the object is referenced
+        let plan = GcPlan {
+            generated_at: Utc::now(),
+            storage: StorageReport::scan(writ_dir, 1_000_000).unwrap(),
+            actions: vec![GcAction::PruneObjects {
+                count: 1,
+                total_bytes: 9,
+                reason: "stale plan".into(),
+            }],
+            summary: GcSummary {
+                total_actions: 1,
+                transitions: 0,
+                deletions: 0,
+                events_to_clean: 0,
+                objects_to_prune: 1,
+                objects_to_recompress: 0,
+                summary_line: "test".into(),
+            },
+        };
+
+        let result = execute_plan(writ_dir, &plan, &[]).unwrap();
+        // Re-verification should find no orphans → nothing pruned
+        assert_eq!(result.objects_pruned, 0);
+        assert_eq!(result.bytes_freed, 0);
+
+        // Object should still exist
+        let (prefix, rest) = tree_hash.split_at(2);
+        assert!(writ_dir.join("objects").join(prefix).join(rest).exists());
+    }
+
+    #[test]
+    fn test_executor_writes_tombstones_for_pruned() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        let orphan_hash = "ee".to_string() + &"e".repeat(62);
+        write_test_object(writ_dir, &orphan_hash, b"orphan");
+
+        let plan = GcPlan {
+            generated_at: Utc::now(),
+            storage: StorageReport::scan(writ_dir, 1_000_000).unwrap(),
+            actions: vec![GcAction::PruneObjects {
+                count: 1,
+                total_bytes: 6,
+                reason: "orphan cleanup".into(),
+            }],
+            summary: GcSummary {
+                total_actions: 1,
+                transitions: 0,
+                deletions: 0,
+                events_to_clean: 0,
+                objects_to_prune: 1,
+                objects_to_recompress: 0,
+                summary_line: "test".into(),
+            },
+        };
+
+        execute_plan(writ_dir, &plan, &[]).unwrap();
+
+        let tombstones = read_tombstones(writ_dir).unwrap();
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].id, orphan_hash);
+        assert_eq!(tombstones[0].object_type, "object");
+        assert_eq!(tombstones[0].final_state, "orphaned");
+    }
+
+    #[test]
+    fn test_executor_reports_bytes_freed_in_audit() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        let orphan_hash = "ff".to_string() + &"f".repeat(62);
+        let content = b"some orphan content here";
+        write_test_object(writ_dir, &orphan_hash, content);
+
+        let plan = GcPlan {
+            generated_at: Utc::now(),
+            storage: StorageReport::scan(writ_dir, 1_000_000).unwrap(),
+            actions: vec![GcAction::PruneObjects {
+                count: 1,
+                total_bytes: content.len() as u64,
+                reason: "test".into(),
+            }],
+            summary: GcSummary {
+                total_actions: 1,
+                transitions: 0,
+                deletions: 0,
+                events_to_clean: 0,
+                objects_to_prune: 1,
+                objects_to_recompress: 0,
+                summary_line: "test".into(),
+            },
+        };
+
+        let result = execute_plan(writ_dir, &plan, &[]).unwrap();
+        assert_eq!(result.bytes_freed, content.len() as u64);
+        assert_eq!(result.audit.space_freed_bytes, content.len() as u64);
+    }
+
+    #[test]
+    fn test_staleness_safety_object_becomes_referenced() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        let obj_hash = "ab".to_string() + &"1".repeat(62);
+        write_test_object(writ_dir, &obj_hash, b"data");
+
+        // Generate plan — object is orphaned at this point
+        let config = GcConfig::default();
+        let plan = GcPlan::generate(writ_dir, &config, &[], &[]).unwrap();
+        assert_eq!(plan.summary.objects_to_prune, 1);
+
+        // Now create a seal referencing the object (simulating activity between plan and execute)
+        let seal = make_test_seal(&obj_hash, vec![], None);
+        write_test_seal(writ_dir, &seal);
+
+        // Execute — should re-verify and NOT prune the now-referenced object
+        let result = execute_plan(writ_dir, &plan, &[]).unwrap();
+        assert_eq!(
+            result.objects_pruned, 0,
+            "re-verification should protect newly-referenced object"
+        );
+
+        // Object still on disk
+        let (prefix, rest) = obj_hash.split_at(2);
+        assert!(writ_dir.join("objects").join(prefix).join(rest).exists());
+    }
+
+    #[test]
+    fn test_empty_prefix_dir_cleaned_after_prune() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Create orphan with unique prefix
+        let orphan_hash = "zz".to_string() + &"9".repeat(62);
+        write_test_object(writ_dir, &orphan_hash, b"lone orphan");
+
+        let prefix_dir = writ_dir.join("objects").join("zz");
+        assert!(prefix_dir.exists());
+
+        let plan = GcPlan {
+            generated_at: Utc::now(),
+            storage: StorageReport::scan(writ_dir, 1_000_000).unwrap(),
+            actions: vec![GcAction::PruneObjects {
+                count: 1,
+                total_bytes: 11,
+                reason: "test".into(),
+            }],
+            summary: GcSummary {
+                total_actions: 1,
+                transitions: 0,
+                deletions: 0,
+                events_to_clean: 0,
+                objects_to_prune: 1,
+                objects_to_recompress: 0,
+                summary_line: "test".into(),
+            },
+        };
+
+        execute_plan(writ_dir, &plan, &[]).unwrap();
+
+        // Prefix directory should be removed since it's now empty
+        assert!(
+            !prefix_dir.exists(),
+            "empty prefix dir should be cleaned up"
+        );
+    }
+
+    // --- Recompression tests ---
+
+    /// Helper: write a legacy object (no magic byte, raw content on disk).
+    fn write_legacy_object(writ_dir: &Path, hash: &str, content: &[u8]) {
+        let (prefix, rest) = hash.split_at(2);
+        let dir = writ_dir.join("objects").join(prefix);
+        fs::create_dir_all(&dir).unwrap();
+        // Legacy: write content directly, no magic byte
+        fs::write(dir.join(rest), content).unwrap();
+    }
+
+    /// Helper: write a compressed object (MAGIC_ZSTD prefix).
+    fn write_compressed_object(writ_dir: &Path, hash: &str, content: &[u8]) {
+        let (prefix, rest) = hash.split_at(2);
+        let dir = writ_dir.join("objects").join(prefix);
+        fs::create_dir_all(&dir).unwrap();
+        let compressed = crate::object::compress_object(content, 3);
+        fs::write(dir.join(rest), compressed).unwrap();
+    }
+
+    /// Helper: write an explicit raw object (MAGIC_RAW = 0x00 prefix).
+    fn write_explicit_raw_object(writ_dir: &Path, hash: &str, content: &[u8]) {
+        let (prefix, rest) = hash.split_at(2);
+        let dir = writ_dir.join("objects").join(prefix);
+        fs::create_dir_all(&dir).unwrap();
+        let mut data = Vec::with_capacity(1 + content.len());
+        data.push(0x00); // MAGIC_RAW
+        data.extend_from_slice(content);
+        fs::write(dir.join(rest), data).unwrap();
+    }
+
+    #[test]
+    fn test_find_uncompressed_detects_legacy() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let hash = "aa".to_string() + &"a".repeat(62);
+        write_legacy_object(writ_dir, &hash, b"legacy source code content here");
+
+        let uncompressed = find_uncompressed_objects(writ_dir).unwrap();
+        assert_eq!(uncompressed.len(), 1);
+        assert_eq!(uncompressed[0].hash, hash);
+        assert!(uncompressed[0].is_legacy);
+    }
+
+    #[test]
+    fn test_find_uncompressed_skips_compressed() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let hash = "bb".to_string() + &"b".repeat(62);
+        write_compressed_object(writ_dir, &hash, b"already compressed content");
+
+        let uncompressed = find_uncompressed_objects(writ_dir).unwrap();
+        assert!(
+            uncompressed.is_empty(),
+            "compressed objects should be skipped"
+        );
+    }
+
+    #[test]
+    fn test_find_uncompressed_skips_explicit_raw() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+
+        let hash = "cc".to_string() + &"c".repeat(62);
+        write_explicit_raw_object(writ_dir, &hash, b"already tried, not worth compressing");
+
+        let uncompressed = find_uncompressed_objects(writ_dir).unwrap();
+        assert!(
+            uncompressed.is_empty(),
+            "MAGIC_RAW objects should be skipped (already evaluated)"
+        );
+    }
+
+    #[test]
+    fn test_recompression_rewrites_legacy() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Create a legacy object with repetitive content (compresses well)
+        let hash = "dd".to_string() + &"d".repeat(62);
+        let content = "fn main() { println!(\"hello world\"); }\n".repeat(100);
+        write_legacy_object(writ_dir, &hash, content.as_bytes());
+
+        let plan = GcPlan {
+            generated_at: Utc::now(),
+            storage: StorageReport::scan(writ_dir, 1_000_000).unwrap(),
+            actions: vec![GcAction::RecompressObjects {
+                count: 1,
+                estimated_savings_bytes: 1000,
+                reason: "test".into(),
+            }],
+            summary: GcSummary {
+                total_actions: 1,
+                transitions: 0,
+                deletions: 0,
+                events_to_clean: 0,
+                objects_to_prune: 0,
+                objects_to_recompress: 1,
+                summary_line: "test".into(),
+            },
+        };
+
+        let result = execute_plan(writ_dir, &plan, &[]).unwrap();
+        assert_eq!(result.objects_recompressed, 1);
+        assert!(result.recompression_savings > 0);
+
+        // Verify on-disk file now has MAGIC_ZSTD prefix
+        let (prefix, rest) = hash.split_at(2);
+        let on_disk = fs::read(writ_dir.join("objects").join(prefix).join(rest)).unwrap();
+        assert_eq!(
+            on_disk[0], 0x01,
+            "should have MAGIC_ZSTD prefix after recompression"
+        );
+    }
+
+    #[test]
+    fn test_incompressible_gets_raw_prefix() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Create a legacy object with random-ish incompressible content.
+        // Use content that starts with a byte that isn't 0x00 or 0x01 (so it's detected as legacy).
+        let hash = "ee".to_string() + &"e".repeat(62);
+        // Random bytes are generally incompressible
+        let content: Vec<u8> = (0..256u16).map(|i| (i % 251) as u8 + 2).collect();
+        write_legacy_object(writ_dir, &hash, &content);
+
+        let plan = GcPlan {
+            generated_at: Utc::now(),
+            storage: StorageReport::scan(writ_dir, 1_000_000).unwrap(),
+            actions: vec![GcAction::RecompressObjects {
+                count: 1,
+                estimated_savings_bytes: 0,
+                reason: "test".into(),
+            }],
+            summary: GcSummary {
+                total_actions: 1,
+                transitions: 0,
+                deletions: 0,
+                events_to_clean: 0,
+                objects_to_prune: 0,
+                objects_to_recompress: 1,
+                summary_line: "test".into(),
+            },
+        };
+
+        let result = execute_plan(writ_dir, &plan, &[]).unwrap();
+        // Incompressible: should not count as recompressed
+        assert_eq!(result.objects_recompressed, 0);
+
+        // Verify on-disk file now has MAGIC_RAW prefix (won't retry)
+        let (prefix, rest) = hash.split_at(2);
+        let on_disk = fs::read(writ_dir.join("objects").join(prefix).join(rest)).unwrap();
+        assert_eq!(
+            on_disk[0], 0x00,
+            "incompressible object should get MAGIC_RAW prefix"
+        );
     }
 }

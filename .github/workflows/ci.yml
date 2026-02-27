@@ -79,7 +79,7 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install maturin pytest
+          pip install maturin pytest pyyaml
 
       - name: Build and install writ-vcs
         working-directory: crates/writ-py

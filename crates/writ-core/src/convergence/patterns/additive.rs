@@ -250,15 +250,8 @@ impl Pattern for AdditiveComposition {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convergence::test_utils::helpers::*;
     use crate::convergence::types::*;
-
-    fn unit(content: &str) -> StructuralUnit {
-        StructuralUnit::new(UnitKind::Unknown, None, (0, 1), content.into())
-    }
-
-    fn import_unit(content: &str) -> StructuralUnit {
-        StructuralUnit::new(UnitKind::Import, None, (0, 1), content.into())
-    }
 
     #[test]
     fn test_additive_composition_both_add() {

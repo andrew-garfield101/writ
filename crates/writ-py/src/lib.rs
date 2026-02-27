@@ -702,6 +702,130 @@ impl PyRepository {
         let result = self.inner.verify_seal(&seal, vk.as_ref());
         to_pydict(py, &result)
     }
+
+    // -------------------------------------------------------------------
+    // GC & lifecycle
+    // -------------------------------------------------------------------
+
+    /// Get a storage report for this repository.
+    ///
+    /// Returns a dict with: total_bytes, seal_bytes, working_state_bytes,
+    /// security_event_bytes, key_bytes, agent_bytes, gc_bytes, other_bytes,
+    /// budget_bytes.
+    fn storage_report(&self, py: Python) -> PyResult<PyObject> {
+        let report = self.inner.storage_report().map_err(writ_err)?;
+        to_pydict(py, &report)
+    }
+
+    /// Get GC status: storage report, spec lifecycle counts, stale warnings.
+    ///
+    /// Returns a dict with storage breakdown, per-state spec counts, and
+    /// stale spec candidates.
+    fn gc_status(&self, py: Python) -> PyResult<PyObject> {
+        let writ_dir = self.inner.writ_dir();
+        let config = writ_core::gc::GcConfig::load(writ_dir).map_err(writ_err)?;
+        let specs = self.inner.list_specs().map_err(writ_err)?;
+        let storage =
+            writ_core::gc::StorageReport::scan(writ_dir, config.budget_bytes).map_err(writ_err)?;
+        let stale = self.inner.scan_stale_specs(&config).map_err(writ_err)?;
+
+        let mut active = 0usize;
+        let mut stale_count = 0usize;
+        let mut completed = 0usize;
+        let mut cancelled = 0usize;
+        let mut archived = 0usize;
+
+        for spec in &specs {
+            match spec.lifecycle_state {
+                writ_core::spec::LifecycleState::Active => active += 1,
+                writ_core::spec::LifecycleState::Stale => stale_count += 1,
+                writ_core::spec::LifecycleState::Completed => completed += 1,
+                writ_core::spec::LifecycleState::Cancelled => cancelled += 1,
+                writ_core::spec::LifecycleState::Archived => archived += 1,
+            }
+        }
+
+        let result = serde_json::json!({
+            "storage": storage,
+            "usage_pct": storage.usage_pct(),
+            "specs": {
+                "total": specs.len(),
+                "active": active,
+                "stale": stale_count,
+                "completed": completed,
+                "cancelled": cancelled,
+                "archived": archived,
+            },
+            "stale_candidates": stale.iter().map(|(id, secs)| {
+                serde_json::json!({"spec_id": id, "inactive_seconds": secs})
+            }).collect::<Vec<_>>(),
+            "mode": config.mode,
+            "budget_bytes": config.budget_bytes,
+        });
+        to_pydict(py, &result)
+    }
+
+    /// Generate a GC plan without executing it (dry run).
+    ///
+    /// Returns a dict with: generated_at, storage, actions, summary.
+    fn gc_dry_run(&self, py: Python) -> PyResult<PyObject> {
+        let writ_dir = self.inner.writ_dir();
+        let config = writ_core::gc::GcConfig::load(writ_dir).map_err(writ_err)?;
+        let specs = self.inner.list_specs().map_err(writ_err)?;
+        let logger = writ_core::security::SecurityEventLogger::new(writ_dir);
+        let events = logger.read_events(None).map_err(writ_err)?;
+        let plan = writ_core::gc::GcPlan::generate(writ_dir, &config, &specs, &events)
+            .map_err(writ_err)?;
+        to_pydict(py, &plan)
+    }
+
+    /// Run garbage collection (generate plan and execute).
+    ///
+    /// Returns a dict with: audit record, specs_cleaned, events_cleaned,
+    /// transitions_applied.
+    fn gc(&self, py: Python) -> PyResult<PyObject> {
+        let writ_dir = self.inner.writ_dir();
+        let config = writ_core::gc::GcConfig::load(writ_dir).map_err(writ_err)?;
+        let specs = self.inner.list_specs().map_err(writ_err)?;
+        let logger = writ_core::security::SecurityEventLogger::new(writ_dir);
+        let events = logger.read_events(None).map_err(writ_err)?;
+        let plan = writ_core::gc::GcPlan::generate(writ_dir, &config, &specs, &events)
+            .map_err(writ_err)?;
+        let result = writ_core::gc::execute_plan(writ_dir, &plan, &specs).map_err(writ_err)?;
+
+        // If events were marked for cleaning, actually clean the events file.
+        if result.events_cleaned > 0 {
+            logger
+                .clean_events(&config.security_events)
+                .map_err(writ_err)?;
+        }
+
+        let output = serde_json::json!({
+            "audit": result.audit,
+            "specs_cleaned": result.specs_cleaned,
+            "events_cleaned": result.events_cleaned,
+            "transitions_applied": result.transitions_applied.iter().map(|(id, from, to)| {
+                serde_json::json!({"spec_id": id, "from": from, "to": to})
+            }).collect::<Vec<_>>(),
+        });
+        to_pydict(py, &output)
+    }
+
+    /// Cancel a spec (transition lifecycle to Cancelled).
+    ///
+    /// Allowed from Active or Stale states.
+    fn cancel_spec(&self, spec_id: &str) -> PyResult<()> {
+        self.inner.cancel_spec(spec_id).map_err(writ_err)?;
+        Ok(())
+    }
+
+    /// Complete a spec's lifecycle (transition to Completed).
+    ///
+    /// Requires the spec's user-facing status to already be 'complete'.
+    fn complete_spec(&self, spec_id: &str) -> PyResult<()> {
+        self.inner.complete_spec(spec_id).map_err(writ_err)?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------

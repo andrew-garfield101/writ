@@ -149,33 +149,7 @@ fn units_to_content(units: &[super::types::StructuralUnit]) -> String {
 mod tests {
     use super::*;
     use crate::convergence::analyzers::generic::GenericAnalyzer;
-    use crate::convergence::types::StructuralUnit;
-
-    /// Helper: create a simple unit with given kind and content.
-    fn unit(kind: UnitKind, content: &str) -> StructuralUnit {
-        StructuralUnit::new(kind, None, (0, 1), content.into())
-    }
-
-    /// Helper: create a named unit (for definitions).
-    fn named_unit(kind: UnitKind, name: &str, content: &str) -> StructuralUnit {
-        StructuralUnit::new(kind, Some(name.into()), (0, 1), content.into())
-    }
-
-    /// Helper: build a region from unit vectors.
-    fn make_region(
-        base: Vec<StructuralUnit>,
-        left: Vec<StructuralUnit>,
-        right: Vec<StructuralUnit>,
-    ) -> StructuralConflictRegion {
-        StructuralConflictRegion {
-            base_units: base,
-            left_units: left,
-            right_units: right,
-            base_span: (0, 0),
-            left_span: (0, 0),
-            right_span: (0, 0),
-        }
-    }
+    use crate::convergence::test_utils::helpers::{make_region, named_unit, typed_unit as unit};
 
     #[test]
     fn test_classify_clean_identical_changes() {

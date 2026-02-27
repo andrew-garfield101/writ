@@ -552,7 +552,9 @@ impl Repository {
             self.write_spec_head(sid, &seal.id)?;
             if let Ok(mut spec) = self.load_spec(sid) {
                 spec.sealed_by.push(seal.id.clone());
-                spec.updated_at = chrono::Utc::now();
+                let now = chrono::Utc::now();
+                spec.updated_at = now;
+                spec.last_activity = now;
 
                 let promoted = self.auto_promote_spec_status(&mut spec, &seal.status);
                 self.save_spec(&spec)?;
@@ -562,6 +564,9 @@ impl Repository {
                 }
             }
         }
+
+        // GC.3.3c: Lightweight storage pressure check (best-effort, never blocks seal).
+        self.check_storage_pressure(&seal);
 
         Ok(seal)
     }
@@ -961,6 +966,134 @@ impl Repository {
         let data = fs::read_to_string(&path)?;
         let spec: Spec = serde_json::from_str(&data)?;
         Ok(spec)
+    }
+
+    // --- Spec lifecycle management (GC.1.2) ---
+
+    /// Transition a spec's lifecycle state, validating legal transitions.
+    ///
+    /// Legal transitions:
+    /// - Active → Stale (timeout-based)
+    /// - Active → Cancelled (manual)
+    /// - Active → Completed (manual, requires status == Complete)
+    /// - Stale → Active (reassignment)
+    /// - Stale → Cancelled (manual or expiry)
+    /// - Completed → Archived (retention period)
+    /// - Cancelled → Archived (retention period)
+    pub fn transition_spec_lifecycle(
+        &self,
+        spec_id: &str,
+        target: crate::spec::LifecycleState,
+    ) -> WritResult<()> {
+        use crate::spec::LifecycleState;
+
+        let mut spec = self.load_spec(spec_id)?;
+        let current = &spec.lifecycle_state;
+
+        let allowed = matches!(
+            (current, &target),
+            (LifecycleState::Active, LifecycleState::Stale)
+                | (LifecycleState::Active, LifecycleState::Cancelled)
+                | (LifecycleState::Active, LifecycleState::Completed)
+                | (LifecycleState::Stale, LifecycleState::Active)
+                | (LifecycleState::Stale, LifecycleState::Cancelled)
+                | (LifecycleState::Completed, LifecycleState::Archived)
+                | (LifecycleState::Cancelled, LifecycleState::Archived)
+        );
+
+        if !allowed {
+            return Err(WritError::InvalidLifecycleTransition(format!(
+                "spec '{}': {:?} → {:?} is not a legal transition",
+                spec_id, current, target
+            )));
+        }
+
+        spec.lifecycle_state = target;
+        spec.updated_at = chrono::Utc::now();
+        self.save_spec(&spec)?;
+        Ok(())
+    }
+
+    /// Cancel a spec (transition to Cancelled).
+    ///
+    /// Allowed from Active or Stale states. Returns error if spec is
+    /// already in a terminal state (Cancelled, Completed, Archived).
+    pub fn cancel_spec(&self, spec_id: &str) -> WritResult<()> {
+        use crate::spec::LifecycleState;
+
+        let spec = self.load_spec(spec_id)?;
+        match spec.lifecycle_state {
+            LifecycleState::Active | LifecycleState::Stale => {
+                self.transition_spec_lifecycle(spec_id, LifecycleState::Cancelled)
+            }
+            other => Err(WritError::InvalidLifecycleTransition(format!(
+                "spec '{}': cannot cancel from {:?} (already terminal)",
+                spec_id, other
+            ))),
+        }
+    }
+
+    /// Complete a spec's lifecycle (transition to Completed).
+    ///
+    /// Requires that the spec's user-facing `status` is `Complete` — the
+    /// agent must have sealed with `--status complete` first.
+    pub fn complete_spec(&self, spec_id: &str) -> WritResult<()> {
+        use crate::spec::LifecycleState;
+
+        let spec = self.load_spec(spec_id)?;
+        if spec.status != crate::spec::SpecStatus::Complete {
+            return Err(WritError::InvalidLifecycleTransition(format!(
+                "spec '{}': status must be 'complete' before lifecycle completion (current: {:?})",
+                spec_id, spec.status
+            )));
+        }
+        match spec.lifecycle_state {
+            LifecycleState::Active | LifecycleState::Stale => {
+                self.transition_spec_lifecycle(spec_id, LifecycleState::Completed)
+            }
+            other => Err(WritError::InvalidLifecycleTransition(format!(
+                "spec '{}': cannot complete from {:?}",
+                spec_id, other
+            ))),
+        }
+    }
+
+    /// Scan for stale specs (Active specs past the stale timeout).
+    ///
+    /// Returns `(spec_id, seconds_since_last_activity)` for each stale
+    /// spec, without transitioning them. The caller decides what to do.
+    pub fn scan_stale_specs(&self, config: &crate::gc::GcConfig) -> WritResult<Vec<(String, u64)>> {
+        use crate::spec::LifecycleState;
+
+        let specs = self.list_specs()?;
+        let now = chrono::Utc::now();
+        let mut stale = Vec::new();
+
+        for spec in &specs {
+            if spec.lifecycle_state != LifecycleState::Active {
+                continue;
+            }
+            let age = now
+                .signed_duration_since(spec.last_activity)
+                .num_seconds()
+                .max(0) as u64;
+            if age >= config.specs.stale_timeout_secs {
+                stale.push((spec.id.clone(), age));
+            }
+        }
+
+        Ok(stale)
+    }
+
+    /// Get a storage report for this repository.
+    pub fn storage_report(&self) -> WritResult<crate::gc::StorageReport> {
+        let config = crate::gc::GcConfig::load(&self.writ_dir)?;
+        crate::gc::StorageReport::scan(&self.writ_dir, config.budget_bytes)
+    }
+
+    /// Get the path to the `.writ/` directory.
+    pub fn writ_dir(&self) -> &std::path::Path {
+        &self.writ_dir
     }
 
     /// Diff working tree against the last seal (HEAD).
@@ -1447,6 +1580,23 @@ impl Repository {
             "verify_seal(seal_id, use_convergence_key?)".to_string(),
         ];
 
+        // Lazy stale detection (GC.3.3a) — runs on every context() call.
+        let stale_specs: Vec<String> = {
+            let gc_config = crate::gc::GcConfig::load(&self.writ_dir).unwrap_or_default();
+            self.scan_stale_specs(&gc_config)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, age_secs)| {
+                    let hours = age_secs / 3600;
+                    if hours > 0 {
+                        format!("spec '{}' inactive for {}h", id, hours)
+                    } else {
+                        format!("spec '{}' inactive for {}m", id, age_secs / 60)
+                    }
+                })
+                .collect()
+        };
+
         let apply_filter = |seal: &&Seal| -> bool {
             if let Some(ref status) = filter.status {
                 let status_str = match status {
@@ -1575,6 +1725,7 @@ impl Repository {
                     file_contention,
                     integration_risk,
                     chain_integrity: self.build_chain_integrity(),
+                    stale_specs: stale_specs.clone(),
                     session_complete: false,
                     session_summary: None,
                     recommended_action: None,
@@ -1920,6 +2071,7 @@ impl Repository {
                     file_contention,
                     integration_risk,
                     chain_integrity: self.build_chain_integrity(),
+                    stale_specs: stale_specs.clone(),
                     session_complete: false,
                     session_summary: None,
                     recommended_action,
@@ -2197,6 +2349,7 @@ impl Repository {
                     file_contention,
                     integration_risk,
                     chain_integrity: self.build_chain_integrity(),
+                    stale_specs,
                     session_complete: false, // agent scope is partial view
                     session_summary: None,
                     recommended_action,
@@ -3913,7 +4066,9 @@ impl Repository {
             self.write_spec_head(sid, &seal.id)?;
             if let Ok(mut spec) = self.load_spec(sid) {
                 spec.sealed_by.push(seal.id.clone());
-                spec.updated_at = chrono::Utc::now();
+                let now = chrono::Utc::now();
+                spec.updated_at = now;
+                spec.last_activity = now;
                 self.save_spec(&spec)?;
             }
         }
@@ -3922,6 +4077,42 @@ impl Repository {
     }
 
     // --- Internal helpers ---
+
+    /// Check storage pressure after a seal and emit warnings/events.
+    ///
+    /// Best-effort: failures are silently ignored. Seals are never refused.
+    fn check_storage_pressure(&self, seal: &Seal) {
+        let config = match crate::gc::GcConfig::load(&self.writ_dir) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // Quick size estimate: sum of file sizes in .writ/ via StorageReport::scan.
+        // This is fast for typical repos (< 10k files in .writ/).
+        let report = match crate::gc::StorageReport::scan(&self.writ_dir, config.budget_bytes) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+
+        let usage_pct = report.usage_pct();
+
+        if usage_pct >= config.warning_threshold_pct as f64 {
+            let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+            let _ = logger.emit_event(&crate::security::SecurityEvent {
+                timestamp: chrono::Utc::now(),
+                severity: crate::security::Severity::Warning,
+                event_type: "storage_pressure".to_string(),
+                agent_id: Some(seal.agent.id.clone()),
+                details: format!(
+                    "Storage at {:.1}% of budget ({}/{} bytes) after seal {}",
+                    usage_pct,
+                    report.total_bytes,
+                    config.budget_bytes,
+                    &seal.id[..12.min(seal.id.len())]
+                ),
+            });
+        }
+    }
 
     fn ignore_rules(&self) -> IgnoreRules {
         IgnoreRules::load(&self.root)
@@ -5471,6 +5662,8 @@ impl Repository {
             acceptance_criteria,
             design_notes,
             tech_stack,
+            lifecycle_state: existing.lifecycle_state.clone(),
+            last_activity: std::cmp::max(incoming.last_activity, existing.last_activity),
         }
     }
 
@@ -10073,6 +10266,8 @@ mod verify_all_chains_tests {
             tech_stack: vec![],
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            lifecycle_state: crate::spec::LifecycleState::Active,
+            last_activity: chrono::Utc::now(),
         };
         repo.add_spec(&spec).unwrap();
 
@@ -10128,6 +10323,8 @@ mod verify_all_chains_tests {
                 tech_stack: vec![],
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                lifecycle_state: crate::spec::LifecycleState::Active,
+                last_activity: chrono::Utc::now(),
             };
             repo.add_spec(&spec).unwrap();
         }
@@ -12655,6 +12852,8 @@ mod remote_tests {
             acceptance_criteria: vec![],
             design_notes: vec![],
             tech_stack: vec![],
+            lifecycle_state: crate::spec::LifecycleState::Active,
+            last_activity: now,
         };
 
         let spec_in_progress = crate::spec::Spec {
@@ -23766,5 +23965,447 @@ mod context_edge_case_tests {
             2,
             "should return all seals when limit > total"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spec Lifecycle State Machine Tests (GC.1.2)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+    use crate::seal::{AgentIdentity, AgentType, TaskStatus, Verification};
+    use crate::spec::{LifecycleState, SpecStatus};
+
+    fn agent(id: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: id.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    fn setup_repo() -> (tempfile::TempDir, Repository) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        (dir, repo)
+    }
+
+    fn create_spec(repo: &Repository, id: &str) {
+        let spec = crate::spec::Spec::new(id.into(), "Test".into(), "desc".into());
+        repo.add_spec(&spec).unwrap();
+    }
+
+    #[test]
+    fn test_transition_active_to_stale() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Stale)
+            .unwrap();
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Stale);
+    }
+
+    #[test]
+    fn test_transition_active_to_cancelled() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Cancelled)
+            .unwrap();
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Cancelled);
+    }
+
+    #[test]
+    fn test_transition_active_to_completed() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Completed)
+            .unwrap();
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Completed);
+    }
+
+    #[test]
+    fn test_transition_stale_to_active() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Stale)
+            .unwrap();
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Active)
+            .unwrap();
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Active);
+    }
+
+    #[test]
+    fn test_transition_stale_to_cancelled() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Stale)
+            .unwrap();
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Cancelled)
+            .unwrap();
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Cancelled);
+    }
+
+    #[test]
+    fn test_transition_completed_to_archived() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Completed)
+            .unwrap();
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Archived)
+            .unwrap();
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Archived);
+    }
+
+    #[test]
+    fn test_transition_cancelled_to_archived() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Cancelled)
+            .unwrap();
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Archived)
+            .unwrap();
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Archived);
+    }
+
+    #[test]
+    fn test_illegal_transition_active_to_archived() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        let result = repo.transition_spec_lifecycle("my-spec", LifecycleState::Archived);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, WritError::InvalidLifecycleTransition(_)),
+            "expected InvalidLifecycleTransition, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_illegal_transition_archived_to_active() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        // Active → Completed → Archived
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Completed)
+            .unwrap();
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Archived)
+            .unwrap();
+
+        let result = repo.transition_spec_lifecycle("my-spec", LifecycleState::Active);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_illegal_transition_completed_to_active() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Completed)
+            .unwrap();
+
+        let result = repo.transition_spec_lifecycle("my-spec", LifecycleState::Active);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_transition_updates_timestamp() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        let before = repo.load_spec("my-spec").unwrap().updated_at;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Stale)
+            .unwrap();
+
+        let after = repo.load_spec("my-spec").unwrap().updated_at;
+        assert!(after > before);
+    }
+
+    #[test]
+    fn test_cancel_spec_from_active() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        repo.cancel_spec("my-spec").unwrap();
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Cancelled);
+    }
+
+    #[test]
+    fn test_cancel_spec_from_stale() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        repo.transition_spec_lifecycle("my-spec", LifecycleState::Stale)
+            .unwrap();
+        repo.cancel_spec("my-spec").unwrap();
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Cancelled);
+    }
+
+    #[test]
+    fn test_cancel_spec_already_cancelled_fails() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        repo.cancel_spec("my-spec").unwrap();
+        let result = repo.cancel_spec("my-spec");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_complete_spec_requires_status_complete() {
+        let (_dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+        // Spec is Pending, not Complete
+        let result = repo.complete_spec("my-spec");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("status must be 'complete'"));
+    }
+
+    #[test]
+    fn test_complete_spec_with_correct_status() {
+        let (dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        // Seal to get the spec to Complete status
+        fs::write(dir.path().join("test.txt"), "hello").unwrap();
+        repo.seal(
+            agent("test-agent"),
+            "done".into(),
+            Some("my-spec".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.status, SpecStatus::Complete);
+
+        repo.complete_spec("my-spec").unwrap();
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Completed);
+    }
+
+    #[test]
+    fn test_seal_updates_last_activity() {
+        let (dir, repo) = setup_repo();
+        create_spec(&repo, "my-spec");
+
+        let before = repo.load_spec("my-spec").unwrap().last_activity;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        fs::write(dir.path().join("work.txt"), "content").unwrap();
+        repo.seal(
+            agent("worker"),
+            "did work".into(),
+            Some("my-spec".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let after = repo.load_spec("my-spec").unwrap().last_activity;
+        assert!(after > before, "last_activity should advance after seal");
+    }
+
+    #[test]
+    fn test_scan_stale_specs_identifies_stale() {
+        let (_dir, repo) = setup_repo();
+
+        // Create spec with very old last_activity
+        let mut spec = crate::spec::Spec::new("old-spec".into(), "Old".into(), "desc".into());
+        spec.last_activity = chrono::Utc::now() - chrono::Duration::hours(5);
+        repo.add_spec(&spec).unwrap();
+
+        // Create fresh spec
+        create_spec(&repo, "fresh-spec");
+
+        let config = crate::gc::GcConfig::default(); // stale_timeout = 2h
+        let stale = repo.scan_stale_specs(&config).unwrap();
+
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].0, "old-spec");
+        assert!(stale[0].1 >= 5 * 3600); // at least 5 hours old
+    }
+
+    #[test]
+    fn test_scan_stale_specs_ignores_terminal_states() {
+        let (_dir, repo) = setup_repo();
+
+        // Create cancelled spec with old activity — should NOT be flagged
+        let mut spec =
+            crate::spec::Spec::new("cancelled-spec".into(), "Cancelled".into(), "desc".into());
+        spec.last_activity = chrono::Utc::now() - chrono::Duration::hours(10);
+        spec.lifecycle_state = LifecycleState::Cancelled;
+        repo.add_spec(&spec).unwrap();
+
+        // Create completed spec with old activity — should NOT be flagged
+        let mut spec =
+            crate::spec::Spec::new("completed-spec".into(), "Completed".into(), "desc".into());
+        spec.last_activity = chrono::Utc::now() - chrono::Duration::hours(10);
+        spec.lifecycle_state = LifecycleState::Completed;
+        repo.add_spec(&spec).unwrap();
+
+        let config = crate::gc::GcConfig::default();
+        let stale = repo.scan_stale_specs(&config).unwrap();
+        assert!(
+            stale.is_empty(),
+            "terminal specs should not be flagged as stale"
+        );
+    }
+
+    #[test]
+    fn test_scan_stale_specs_empty_repo() {
+        let (_dir, repo) = setup_repo();
+        let config = crate::gc::GcConfig::default();
+        let stale = repo.scan_stale_specs(&config).unwrap();
+        assert!(stale.is_empty());
+    }
+
+    #[test]
+    fn test_storage_report_on_repo() {
+        let (_dir, repo) = setup_repo();
+        let report = repo.storage_report().unwrap();
+        // Fresh repo has some storage (HEAD file, index.json, keys, etc.)
+        assert!(report.total_bytes > 0);
+    }
+
+    #[test]
+    fn test_transition_nonexistent_spec_fails() {
+        let (_dir, repo) = setup_repo();
+        let result = repo.transition_spec_lifecycle("no-such-spec", LifecycleState::Stale);
+        assert!(matches!(result, Err(WritError::SpecNotFound(_))));
+    }
+
+    #[test]
+    fn test_context_includes_stale_spec_warnings() {
+        let (_dir, repo) = setup_repo();
+
+        // Create a spec with old last_activity
+        let mut spec = crate::spec::Spec::new("stale-spec".into(), "Stale".into(), "desc".into());
+        spec.last_activity = chrono::Utc::now() - chrono::Duration::hours(5);
+        repo.add_spec(&spec).unwrap();
+
+        let filter = crate::context::ContextFilter {
+            status: None,
+            agent: None,
+        };
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        assert!(
+            !ctx.stale_specs.is_empty(),
+            "should have stale spec warnings"
+        );
+        assert!(
+            ctx.stale_specs[0].contains("stale-spec"),
+            "warning should mention spec ID"
+        );
+        assert!(
+            ctx.stale_specs[0].contains("inactive"),
+            "warning should mention inactivity"
+        );
+    }
+
+    #[test]
+    fn test_context_no_stale_warnings_for_fresh_specs() {
+        let (_dir, repo) = setup_repo();
+
+        // Create a fresh spec
+        create_spec(&repo, "fresh-spec");
+
+        let filter = crate::context::ContextFilter {
+            status: None,
+            agent: None,
+        };
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        assert!(
+            ctx.stale_specs.is_empty(),
+            "fresh specs should not produce stale warnings"
+        );
+    }
+
+    #[test]
+    fn test_storage_pressure_emits_event() {
+        let (dir, repo) = setup_repo();
+
+        // Set a tiny budget so we're immediately over the threshold
+        let config = crate::gc::GcConfig {
+            budget_bytes: 100, // 100 bytes — we're way over
+            ..crate::gc::GcConfig::default()
+        };
+        config.save(&dir.path().join(".writ")).unwrap();
+
+        // Create a file and seal — should trigger storage pressure event
+        fs::write(dir.path().join("big.txt"), "content").unwrap();
+        repo.seal(
+            agent("test-agent"),
+            "test".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Verify a storage_pressure event was emitted
+        let logger = crate::security::SecurityEventLogger::new(&dir.path().join(".writ"));
+        let events = logger.read_events(None).unwrap();
+        let pressure_events: Vec<_> = events
+            .iter()
+            .filter(|e| e.event_type == "storage_pressure")
+            .collect();
+        assert!(
+            !pressure_events.is_empty(),
+            "storage_pressure event should be emitted when over budget"
+        );
+    }
+
+    #[test]
+    fn test_seal_always_succeeds_regardless_of_storage_pressure() {
+        let (dir, repo) = setup_repo();
+
+        // Set a tiny budget
+        let config = crate::gc::GcConfig {
+            budget_bytes: 1, // 1 byte — absurdly small
+            ..crate::gc::GcConfig::default()
+        };
+        config.save(&dir.path().join(".writ")).unwrap();
+
+        // Seal should still succeed (seals are never refused)
+        fs::write(dir.path().join("test.txt"), "content").unwrap();
+        let result = repo.seal(
+            agent("test-agent"),
+            "should succeed".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        );
+        assert!(result.is_ok(), "seal must always succeed: {:?}", result);
     }
 }

@@ -1,0 +1,94 @@
+scenario: multi_file_mixed
+version: 1
+description: >
+  Two agents work on overlapping and non-overlapping files. One file
+  has non-overlapping definitions, one is disjoint, one is new per-agent.
+  Tests mixed pattern resolution across multiple files.
+tags: [multi-file, mixed-patterns]
+
+setup:
+  specs:
+    - id: backend
+    - id: frontend
+  baseline:
+    - path: models.py
+      content: |
+        # models
+    - path: config.py
+      content: |
+        DEBUG = True
+
+agents:
+  - id: backend-dev
+    spec: backend
+    changes:
+      - path: models.py
+        action: write
+        content: |
+          from dataclasses import dataclass
+
+          @dataclass
+          class Order:
+              id: str
+              total: float
+      - path: config.py
+        action: write
+        content: |
+          DEBUG = True
+          DB_URL = "postgres://localhost/app"
+      - path: api.py
+        action: write
+        content: |
+          def get_orders():
+              return []
+
+  - id: frontend-dev
+    spec: frontend
+    changes:
+      - path: models.py
+        action: write
+        content: |
+          from dataclasses import dataclass
+
+          @dataclass
+          class UserPrefs:
+              theme: str
+              language: str
+      - path: config.py
+        action: write
+        content: |
+          DEBUG = True
+          UI_THEME = "dark"
+      - path: views.py
+        action: write
+        content: |
+          def render_dashboard():
+              return "<div>dashboard</div>"
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: no_escalations
+    - type: not_degraded
+    - type: all_definitions_preserved
+      file: models.py
+      definitions: [Order, UserPrefs]
+    - type: file_contains
+      file: config.py
+      content: DB_URL
+    - type: file_contains
+      file: config.py
+      content: UI_THEME
+    - type: file_contains
+      file: api.py
+      content: get_orders
+    - type: file_contains
+      file: views.py
+      content: render_dashboard
+  verification:
+    - type: syntax_valid
+      file: models.py
+  security:
+    - type: chain_valid

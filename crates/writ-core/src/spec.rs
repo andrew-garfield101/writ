@@ -7,7 +7,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-/// Completion status of a spec.
+/// Completion status of a spec (user-facing).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum SpecStatus {
@@ -19,6 +19,31 @@ pub enum SpecStatus {
     Complete,
     /// Blocked by a dependency.
     Blocked,
+}
+
+/// GC lifecycle state (separate from user-facing status).
+///
+/// Added as an additive field — existing repos without this field
+/// deserialize as `Active` via `#[serde(default)]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LifecycleState {
+    /// Spec is active and in use.
+    Active,
+    /// No seal activity within stale timeout.
+    Stale,
+    /// All work done, awaiting retention-based cleanup.
+    Completed,
+    /// Manually or automatically cancelled.
+    Cancelled,
+    /// Past retention period, metadata only.
+    Archived,
+}
+
+impl Default for LifecycleState {
+    fn default() -> Self {
+        LifecycleState::Active
+    }
 }
 
 /// A requirement specification tracked by writ.
@@ -52,6 +77,14 @@ pub struct Spec {
     /// Languages, frameworks, dependencies relevant to this spec.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tech_stack: Vec<String>,
+    /// GC lifecycle state — separate from user-facing `status`.
+    /// Defaults to `Active` for backward compatibility with existing repos.
+    #[serde(default)]
+    pub lifecycle_state: LifecycleState,
+    /// Timestamp of last meaningful activity (seal referencing this spec).
+    /// Used by GC stale detection. Defaults to `created_at` for existing specs.
+    #[serde(default = "Utc::now")]
+    pub last_activity: DateTime<Utc>,
 }
 
 impl std::str::FromStr for SpecStatus {
@@ -102,6 +135,8 @@ impl Spec {
             acceptance_criteria: Vec::new(),
             design_notes: Vec::new(),
             tech_stack: Vec::new(),
+            lifecycle_state: LifecycleState::Active,
+            last_activity: now,
         }
     }
 }
@@ -120,5 +155,67 @@ mod tests {
         assert_eq!("complete".parse::<SpecStatus>(), Ok(SpecStatus::Complete));
         assert_eq!("blocked".parse::<SpecStatus>(), Ok(SpecStatus::Blocked));
         assert!("unknown".parse::<SpecStatus>().is_err());
+    }
+
+    #[test]
+    fn test_lifecycle_state_default_is_active() {
+        assert_eq!(LifecycleState::default(), LifecycleState::Active);
+    }
+
+    #[test]
+    fn test_spec_new_has_active_lifecycle() {
+        let spec = Spec::new("test".into(), "Test".into(), "desc".into());
+        assert_eq!(spec.lifecycle_state, LifecycleState::Active);
+    }
+
+    #[test]
+    fn test_backward_compat_missing_lifecycle_state() {
+        // Simulate a spec from a pre-GC repo (no lifecycle_state or last_activity)
+        let json = r#"{
+            "id": "old-spec",
+            "title": "Old Spec",
+            "description": "from before GC sprint",
+            "status": "in-progress",
+            "depends_on": [],
+            "file_scope": [],
+            "created_at": "2026-02-20T00:00:00Z",
+            "updated_at": "2026-02-20T00:00:00Z",
+            "sealed_by": []
+        }"#;
+        let spec: Spec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Active);
+        assert_eq!(spec.status, SpecStatus::InProgress);
+    }
+
+    #[test]
+    fn test_lifecycle_state_serialization_roundtrip() {
+        let spec = Spec::new("test".into(), "Test".into(), "desc".into());
+        let json = serde_json::to_string(&spec).unwrap();
+        let recovered: Spec = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.lifecycle_state, LifecycleState::Active);
+    }
+
+    #[test]
+    fn test_lifecycle_state_serde_values() {
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Active).unwrap(),
+            "\"active\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Stale).unwrap(),
+            "\"stale\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Completed).unwrap(),
+            "\"completed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Cancelled).unwrap(),
+            "\"cancelled\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LifecycleState::Archived).unwrap(),
+            "\"archived\""
+        );
     }
 }

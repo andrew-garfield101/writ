@@ -184,11 +184,9 @@ fn build_sub_conflict(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convergence::test_utils::helpers::{self, import_unit, stmt_unit, ws_unit};
 
-    fn import_unit(content: &str) -> StructuralUnit {
-        StructuralUnit::new(UnitKind::Import, None, (0, 1), content.into())
-    }
-
+    /// Definition unit without metadata (decompose tests don't check it).
     fn def_unit(name: &str, content: &str) -> StructuralUnit {
         StructuralUnit::new(
             UnitKind::Definition,
@@ -198,14 +196,7 @@ mod tests {
         )
     }
 
-    fn stmt_unit(content: &str) -> StructuralUnit {
-        StructuralUnit::new(UnitKind::Statement, None, (0, 1), content.into())
-    }
-
-    fn ws_unit(content: &str) -> StructuralUnit {
-        StructuralUnit::new(UnitKind::Whitespace, None, (0, 1), content.into())
-    }
-
+    /// Preserves local arg order: (base, left, right, scope, conflict_type).
     fn make_conflict(
         base: Vec<StructuralUnit>,
         left: Vec<StructuralUnit>,
@@ -213,29 +204,7 @@ mod tests {
         scope: ConflictScope,
         conflict_type: ConflictType,
     ) -> ClassifiedConflict {
-        let region = StructuralConflictRegion {
-            base_units: base,
-            left_units: left,
-            right_units: right,
-            base_span: (0, 0),
-            left_span: (0, 0),
-            right_span: (0, 0),
-        };
-        let (left_def_names, right_def_names) = region.definition_names();
-        let has_name_overlap = left_def_names
-            .iter()
-            .any(|name| right_def_names.contains(name));
-        ClassifiedConflict {
-            region,
-            conflict_type,
-            requires_review: false,
-            structural_info: StructuralInfo {
-                left_unit_kinds: vec![],
-                right_unit_kinds: vec![],
-                has_name_overlap,
-                scope,
-            },
-        }
+        helpers::make_full_conflict(conflict_type, base, left, right, scope)
     }
 
     // ── Decomposition logic tests ──────────────────────────────────────

@@ -1,0 +1,52 @@
+scenario: disjoint_files
+version: 1
+description: >
+  Two agents write to completely separate files. No overlap, no conflict.
+  This is the simplest convergence case — validates basic merge logic.
+tags: [basic, no-conflict]
+
+setup:
+  specs:
+    - id: spec-a
+    - id: spec-b
+  baseline:
+    - path: base.py
+      content: |
+        # baseline file
+
+agents:
+  - id: agent-a
+    spec: spec-a
+    changes:
+      - path: module_a.py
+        action: write
+        content: |
+          def feature_a():
+              return "A"
+
+  - id: agent-b
+    spec: spec-b
+    changes:
+      - path: module_b.py
+        action: write
+        content: |
+          def feature_b():
+              return "B"
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: no_escalations
+    - type: is_clean
+      expected: true
+    - type: not_degraded
+    - type: file_contains
+      file: module_a.py
+      content: feature_a
+    - type: file_contains
+      file: module_b.py
+      content: feature_b
+  security:
+    - type: chain_valid

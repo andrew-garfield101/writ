@@ -1,0 +1,69 @@
+scenario: rust_definitions
+version: 1
+description: >
+  Two agents add different struct definitions to a Rust file.
+  Tests NonOverlappingDefinitions pattern with Rust syntax.
+tags: [pattern-2, definitions, rust, cross-language]
+
+setup:
+  specs:
+    - id: spec-a
+    - id: spec-b
+  baseline:
+    - path: models.rs
+      content: |
+        // Domain models
+
+agents:
+  - id: agent-a
+    spec: spec-a
+    changes:
+      - path: models.rs
+        action: write
+        content: |
+          use serde::{Serialize, Deserialize};
+
+          #[derive(Debug, Serialize, Deserialize)]
+          pub struct User {
+              pub id: String,
+              pub name: String,
+          }
+
+          impl User {
+              pub fn new(id: String, name: String) -> Self {
+                  Self { id, name }
+              }
+          }
+
+  - id: agent-b
+    spec: spec-b
+    changes:
+      - path: models.rs
+        action: write
+        content: |
+          use serde::{Serialize, Deserialize};
+
+          #[derive(Debug, Serialize, Deserialize)]
+          pub struct Product {
+              pub id: String,
+              pub price: f64,
+          }
+
+          impl Product {
+              pub fn new(id: String, price: f64) -> Self {
+                  Self { id, price }
+              }
+          }
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: no_escalations
+    - type: not_degraded
+    - type: all_definitions_preserved
+      file: models.rs
+      definitions: [User, Product]
+  security:
+    - type: chain_valid

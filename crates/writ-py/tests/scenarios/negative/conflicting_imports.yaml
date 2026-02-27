@@ -1,0 +1,66 @@
+# Negative test: Both agents modify the same file with different structural changes.
+# The engine detects a conflict. Depending on pattern matching, it may auto-resolve
+# or escalate. We verify that conflicts are detected.
+scenario: conflicting_imports
+version: 1
+description: >
+  Two agents both restructure a file — adding different imports,
+  different global variables, and different function bodies.
+  Tests that convergence detects the conflicts.
+tags: [negative, imports, conflict]
+
+setup:
+  specs:
+    - id: feat-logging
+    - id: feat-metrics
+  baseline:
+    - path: service.py
+      content: |
+        import os
+
+        def run():
+            return os.getpid()
+
+agents:
+  - id: agent-logging
+    spec: feat-logging
+    changes:
+      - path: service.py
+        action: write
+        content: |
+          import os
+          import logging
+
+          logger = logging.getLogger(__name__)
+
+          def run():
+              logger.info("Starting service")
+              return os.getpid()
+  - id: agent-metrics
+    spec: feat-metrics
+    changes:
+      - path: service.py
+        action: write
+        content: |
+          import os
+          import time
+
+          metrics = {"start": time.time()}
+
+          def run():
+              metrics["calls"] = metrics.get("calls", 0) + 1
+              return os.getpid()
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    # Both agents changed service.py — conflict expected
+    - type: total_conflicts
+      expected: 1
+    # The file should still exist after convergence
+    - type: file_exists
+      file: service.py
+  security:
+    - type: chain_valid

@@ -157,32 +157,8 @@ impl Default for PatternRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convergence::test_utils::helpers::*;
     use crate::convergence::types::*;
-
-    fn make_conflict(
-        conflict_type: ConflictType,
-        left_units: Vec<StructuralUnit>,
-        right_units: Vec<StructuralUnit>,
-    ) -> ClassifiedConflict {
-        ClassifiedConflict {
-            region: StructuralConflictRegion {
-                base_units: vec![],
-                left_units,
-                right_units,
-                base_span: (0, 0),
-                left_span: (0, 0),
-                right_span: (0, 0),
-            },
-            conflict_type,
-            requires_review: conflict_type.always_requires_review(),
-            structural_info: StructuralInfo {
-                left_unit_kinds: vec![],
-                right_unit_kinds: vec![],
-                has_name_overlap: false,
-                scope: ConflictScope::Mixed,
-            },
-        }
-    }
 
     #[test]
     fn test_registry_creation() {
@@ -193,7 +169,7 @@ mod tests {
     #[test]
     fn test_delete_vs_modify_always_skipped() {
         let registry = PatternRegistry::new();
-        let conflict = make_conflict(ConflictType::DeleteVsModify, vec![], vec![]);
+        let conflict = make_typed_conflict(ConflictType::DeleteVsModify, vec![], vec![], vec![]);
         match registry.evaluate(&conflict) {
             PatternResult::NoMatch => {} // expected
             other => panic!("DeleteVsModify should be NoMatch, got: {other:?}"),

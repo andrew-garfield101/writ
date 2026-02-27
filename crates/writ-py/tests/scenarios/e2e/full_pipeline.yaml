@@ -1,0 +1,183 @@
+scenario: full_pipeline
+version: 1
+description: >
+  Canonical E2E test covering convergence + security integration.
+  Three agents working on overlapping and disjoint files. Tests:
+  - Multi-agent convergence (3 agents, mixed overlap)
+  - NonOverlappingDefinitions pattern
+  - EOF append pattern
+  - Disjoint file merge
+  - Conflict escalation
+  - Seal chain integrity
+  - Post-convergence syntax validity
+  If this test passes, the core writ promise is working.
+origin: Test architecture spec v1.0
+tags: [e2e, convergence, security, canonical]
+
+setup:
+  specs:
+    - id: auth-migration
+      file_scope: ["src/backend/auth.py", "src/backend/models.py"]
+    - id: api-routes
+      file_scope: ["src/backend/models.py", "src/shared/types.py"]
+    - id: frontend-ui
+      file_scope: ["src/frontend/app.tsx"]
+
+  baseline:
+    - path: src/backend/models.py
+      content: |
+        class BaseModel:
+            pass
+
+    - path: src/shared/types.py
+      content: |
+        from typing import TypedDict
+
+        class ApiResponse(TypedDict):
+            status: int
+            message: str
+
+    - path: src/frontend/app.tsx
+      content: |
+        import React from 'react';
+
+        export default function App() {
+            return <div>Hello World</div>;
+        }
+
+    - path: config.py
+      content: |
+        APP_NAME = "writ"
+        VERSION = "0.1.0"
+
+agents:
+  - id: agent-alpha
+    spec: auth-migration
+    changes:
+      - path: src/backend/models.py
+        action: write
+        content: |
+          from dataclasses import dataclass
+          from datetime import datetime
+
+          @dataclass
+          class User:
+              id: str
+              username: str
+              email: str
+              created_at: datetime
+
+          @dataclass
+          class AuthSession:
+              user_id: str
+              token: str
+              expires_at: datetime
+
+      - path: config.py
+        action: write
+        content: |
+          APP_NAME = "writ"
+          VERSION = "0.1.0"
+          AUTH_SECRET = "dev-secret-key"
+
+  - id: agent-beta
+    spec: api-routes
+    changes:
+      - path: src/backend/models.py
+        action: write
+        content: |
+          from dataclasses import dataclass
+
+          @dataclass
+          class Order:
+              id: str
+              user_id: str
+              total: float
+              status: str
+
+          @dataclass
+          class Payment:
+              order_id: str
+              amount: float
+              method: str
+
+      - path: src/shared/types.py
+        action: write
+        content: |
+          from typing import TypedDict
+
+          class ApiResponse(TypedDict):
+              status: int
+              message: str
+              data: dict
+
+          class PaginatedResponse(TypedDict):
+              items: list
+              total: int
+              page: int
+
+      - path: config.py
+        action: write
+        content: |
+          APP_NAME = "writ"
+          VERSION = "0.1.0"
+          API_RATE_LIMIT = 100
+
+  - id: agent-gamma
+    spec: frontend-ui
+    changes:
+      - path: src/frontend/app.tsx
+        action: write
+        content: |
+          import React, { useState } from 'react';
+
+          export default function App() {
+              const [count, setCount] = useState(0);
+              return (
+                  <div>
+                      <h1>Dashboard</h1>
+                      <button onClick={() => setCount(c => c + 1)}>
+                          Clicked {count} times
+                      </button>
+                  </div>
+              );
+          }
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: not_degraded
+    # models.py: both added different classes — should compose
+    - type: all_definitions_preserved
+      file: src/backend/models.py
+      definitions: [User, AuthSession, Order, Payment]
+    # types.py: only beta changes it — clean
+    - type: file_contains
+      file: src/shared/types.py
+      content: PaginatedResponse
+    # app.tsx: only gamma changes it — clean
+    - type: file_contains
+      file: src/frontend/app.tsx
+      content: Dashboard
+
+  verification:
+    - type: syntax_valid
+      file: src/backend/models.py
+
+  security:
+    - type: chain_valid
+    - type: chain_no_failures
+    - type: seal_has_content_hash
+    - type: seal_has_chain_hash
+
+  metadata:
+    - type: spec_exists
+      spec_id: auth-migration
+    - type: spec_exists
+      spec_id: api-routes
+    - type: spec_exists
+      spec_id: frontend-ui
+    - type: context_has_field
+      field: writ_version

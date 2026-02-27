@@ -1,0 +1,64 @@
+scenario: both_add_and_conflict
+version: 1
+description: >
+  Two agents each have multiple files — some disjoint, some conflicting.
+  Tests that convergence handles mixed outcomes: some files merge cleanly
+  while others escalate.
+tags: [mixed, conflict, partial-escalation]
+
+setup:
+  specs:
+    - id: spec-a
+    - id: spec-b
+  baseline:
+    - path: shared.py
+      content: |
+        config_value = "original"
+    - path: utils.py
+      content: |
+        def helper():
+            pass
+
+agents:
+  - id: agent-a
+    spec: spec-a
+    changes:
+      - path: shared.py
+        action: write
+        content: |
+          config_value = "agent_a_version"
+      - path: feature_a.py
+        action: write
+        content: |
+          def new_feature():
+              return "A"
+
+  - id: agent-b
+    spec: spec-b
+    changes:
+      - path: shared.py
+        action: write
+        content: |
+          config_value = "agent_b_version"
+      - path: feature_b.py
+        action: write
+        content: |
+          def another_feature():
+              return "B"
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: has_escalations
+    - type: escalated_file
+      file: shared.py
+    - type: file_contains
+      file: feature_a.py
+      content: new_feature
+    - type: file_contains
+      file: feature_b.py
+      content: another_feature
+  security:
+    - type: chain_valid

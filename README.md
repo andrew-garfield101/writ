@@ -137,9 +137,9 @@ repo.seal(summary="stripe integration", agent_id="pay-dev", spec_id="payments", 
 repo.seal(summary="42 tests passing", agent_id="test-bot", spec_id="test-suite", tests_passed=42)
 ```
 
-### Convergence
+## Convergence
 
-When specs overlap, convergence handles the merge. Git merges lines. Writ merges *meaning*.
+The most complex problem in multi-agent development isn't writing code — it's merging it. When five agents work concurrently on overlapping files, traditional line-based merging falls apart. Writ merges *meaning*, not lines.
 
 The convergence engine understands code structurally — it knows the difference between an import, a function definition, and a statement. When two agents both add imports to the same file, writ doesn't see a "conflict" — it sees two additive changes and composes them. When two agents modify the same function body differently, writ knows that's a real conflict and escalates it with full context.
 
@@ -147,7 +147,7 @@ The core principle: **compose, don't choose.** Multi-agent work is fundamentally
 
 The resolution pipeline is layered and auditable. Deterministic structural patterns handle the common cases with high confidence. Spec-aware resolution uses writ's first-class spec and seal metadata — file scope, acceptance criteria, design notes — to make informed decisions that no other VCS can make. Every resolution is tagged with its method and confidence score, so you always know *how* and *why* a merge decision was made.
 
-Post-merge verification catches structural damage automatically — duplicate definitions, unbalanced delimiters, content loss, leftover conflict markers — before bad merges reach the working tree. The engine rejects broken output rather than silently applying it.
+Post-merge verification catches structural damage automatically — duplicate definitions, unbalanced delimiters, content loss, leftover conflict markers — before bad merges reach the working tree. Content traceability ensures every line in merged output traces back to an input — novel content injected by bugs or hallucinations is detected and rejected. The engine rejects broken output rather than silently applying it.
 
 ```bash
 # Merge ALL diverged branches at once — escalate what can't be auto-resolved
@@ -236,6 +236,43 @@ git add . && git commit -m "checkpoint before agent work"
 git checkout -- .
 ```
 
+## Security
+
+Writ is built for environments where multiple autonomous agents have write access to the same codebase. That demands security guarantees that traditional VCS was never designed for.
+
+**Cryptographic integrity.** Every seal is chained to its predecessor via BLAKE3 hashes — tamper with any checkpoint and the entire chain breaks. Ed25519 digital signatures authenticate who created each seal. `writ verify --chain` validates the full history in one command.
+
+**Agent identity.** Every agent is a registered entity with a trust level, role, and scope constraints. Untrusted or newly introduced agents receive lower convergence confidence caps, limiting their influence on automated merge decisions. Agents can be suspended or revoked without deleting their history.
+
+**Scope enforcement.** Specs declare which files they own. When an agent seals changes to files outside its spec's scope, writ flags the violation — in context output, in the audit log, and optionally as a hard rejection. No more agents silently modifying files they shouldn't touch.
+
+**Content traceability.** The no-silent-addition rule: every line in merged output must trace back to an input (base, left, or right). Novel content — whether from a convergence bug or an LLM hallucination — is automatically detected and flagged before it reaches the working tree.
+
+**Audit trail.** An append-only security event log records scope violations, signature failures, agent revocations, and convergence anomalies. Events are severity-classified (info, warning, critical) with configurable retention. `writ security events` surfaces the history with filtering by severity and event type.
+
+```bash
+writ verify --chain                        # validate full seal chain integrity
+writ security events --severity warning    # review security audit log
+```
+
+## Lifecycle and storage management
+
+As projects grow — more agents, more specs, more seals — storage and state need active management. Writ includes a built-in garbage collection system that keeps repositories clean without ever compromising the immutable seal history.
+
+**Spec lifecycle.** Specs progress through a managed lifecycle: active, stale, completed, cancelled, archived. Stale detection is automatic — `writ context` warns when specs go inactive so nothing falls through the cracks.
+
+**Storage-aware.** Writ tracks storage usage across categories (seals, working state, security events, keys) and alerts when usage approaches configured budgets. Storage pressure warnings are emitted as security events — seals are never refused.
+
+**Safe cleanup.** `writ gc` generates a plan, shows what it will do, and asks before executing. Seals are immutable and never deleted — GC only cleans expired working state, archived specs past retention, and old security events. Every cleanup action is recorded in an audit trail with tombstones for removed objects.
+
+**Deployment profiles.** Pre-configured storage budgets and retention periods for different environments — from a 500MB Raspberry Pi to unlimited enterprise. `writ init --profile production` sets sensible defaults for your environment.
+
+```bash
+writ gc status                             # storage breakdown + stale spec warnings
+writ gc run --dry-run                      # preview cleanup plan without executing
+writ gc run                                # execute with confirmation prompt
+```
+
 ## `writ install`
 
 One command. That's it. No config files, no setup wizards, no 12-step onboarding.
@@ -287,12 +324,13 @@ writ/
 
 **Integrity:** BLAKE3 hash chains link every seal to its predecessor — tamper with any seal and the chain breaks. Ed25519 digital signatures authenticate who created each checkpoint. `writ verify --chain` validates the entire history in one command.
 
-**Test coverage:** 857 Rust + 230 Python = 1,087 tests across core, CLI, and bindings.
+**Test coverage:** 1,248 Rust + 253 Python = 1,501 tests across core, CLI, and bindings.
 
 ## CLI reference
 
 ```
 writ install                          # one-command setup (init + git detect + bridge import + hooks)
+writ install --profile production     # setup with a deployment profile (storage budgets, retention)
 writ uninstall [--force]              # clean removal of writ from the project
 writ seal -s "..." --agent ID         # create a structured checkpoint
 writ context [--spec ID] [--format]   # structured context dump (json, human, brief)
@@ -306,8 +344,15 @@ writ converge LEFT RIGHT [--apply]    # two-spec convergence
 writ converge-all --apply --strategy  # merge all diverged branches (escalate, manual, orchestrator)
 writ verify --chain                   # verify cryptographic integrity of the full seal chain
 writ verify --seal SEAL_ID            # verify a specific seal's hash and signature
+writ security events [--severity]     # security audit log with filtering
 writ spec add --id ID --title "..."   # register a spec
-writ spec status                      # show all specs and their status
+writ spec status [--state active]     # show specs, optionally filtered by lifecycle state
+writ spec cancel ID                   # cancel a spec (lifecycle transition)
+writ spec complete ID                 # complete a spec (requires status = complete)
+writ gc status                        # storage breakdown + stale spec warnings
+writ gc run [--dry-run] [--yes]       # generate and execute cleanup plan
+writ gc storage                       # detailed storage usage by category
+writ gc log [--limit N]               # GC audit history
 writ state                            # working directory changes
 writ diff                             # content-level diff
 writ show SEAL_ID [--diff]            # inspect a seal
@@ -354,6 +399,11 @@ pytest tests/
 - **Agent SDK.** `Agent`, `Phase`, `Pipeline` abstractions with auto-summary on completion.
 - **Restore / rollback.** `writ restore SEAL_ID` restores working directory to any seal's state. Immutable history preserved.
 - **Security hardening.** Path traversal protection, hash validation, input sanitization.
+- **Agent identity and trust.** Per-agent registration with trust levels, roles, and scope constraints. Untrusted agents receive lower convergence confidence caps. Agents can be suspended or revoked without losing history.
+- **Content traceability.** No-silent-addition rule — every line in merged output must trace back to an input. Novel content injected by bugs or hallucinations is automatically detected and flagged.
+- **Security event monitoring.** Append-only audit log for signature failures, scope violations, agent revocations, and convergence anomalies. `writ security events` CLI with severity and event-type filtering.
+- **Garbage collection.** Spec lifecycle management (active → stale → completed → archived), storage tracking with deployment profiles, safe cleanup with audit trails and tombstones. Seals are never deleted.
+- **Deployment profiles.** Pre-configured storage budgets and retention periods: raspberry-pi (500MB), development (5GB), production (100GB), enterprise (unlimited).
 - **Remote sync.** `writ push` / `writ pull` for distributed workflows.
 - **CI/CD.** GitHub Actions for automated testing and PyPI publishing on release.
 - **`writ finish`.** One-command round-trip: `writ finish` runs summary + git add + git commit. Supports `--full` for PR-style body and `--dry-run` for preview.
@@ -367,9 +417,6 @@ pytest tests/
 
 ### Ahead
 
-- **Agent identity and trust.** Per-agent keypairs, trust levels, and scope constraints. Untrusted agents get lower convergence confidence caps.
-- **Content traceability.** No-silent-addition rule — every line in merged output must trace back to an input. Novel content injected by bugs (or attacks) is automatically detected and rejected.
-- **Security event monitoring.** Append-only audit log for signature failures, scope violations, and authentication events. `writ security events` CLI with severity filtering.
 - **Homebrew distribution.** `brew install writ` via tap.
 - **MCP server.** Model Context Protocol integration for IDE-native writ access.
 - **Storage compression.** zlib/zstd compression on stored objects for reduced disk usage.

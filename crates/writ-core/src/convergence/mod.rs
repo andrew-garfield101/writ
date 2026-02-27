@@ -31,6 +31,10 @@ pub mod phase4;
 pub mod phase5;
 pub mod phase6;
 pub mod pipeline;
+#[cfg(test)]
+pub mod prop_tests;
+#[cfg(test)]
+pub mod test_utils;
 pub mod traceability;
 pub mod types;
 

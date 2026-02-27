@@ -1,0 +1,49 @@
+scenario: same_line_conflict
+version: 1
+description: >
+  Two agents modify the same line in a file with different content.
+  This is a true BothModified conflict — should escalate with escalate strategy.
+tags: [conflict, escalation, both-modified]
+
+setup:
+  specs:
+    - id: spec-a
+    - id: spec-b
+  baseline:
+    - path: shared.py
+      content: |
+        line1
+        original
+        line3
+
+agents:
+  - id: agent-a
+    spec: spec-a
+    changes:
+      - path: shared.py
+        action: write
+        content: |
+          line1
+          left_change
+          line3
+
+  - id: agent-b
+    spec: spec-b
+    changes:
+      - path: shared.py
+        action: write
+        content: |
+          line1
+          right_change
+          line3
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: has_escalations
+    - type: escalated_file
+      file: shared.py
+  security:
+    - type: chain_valid

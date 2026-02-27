@@ -1,0 +1,56 @@
+scenario: eof_append
+version: 1
+description: >
+  Two agents append different lines to the end of a config file.
+  Pattern 5 (EofAppend) should cleanly compose both additions.
+tags: [pattern-5, eof-append, config]
+
+setup:
+  specs:
+    - id: spec-a
+    - id: spec-b
+  baseline:
+    - path: config.py
+      content: |
+        DEBUG = True
+        PORT = 8080
+
+agents:
+  - id: agent-a
+    spec: spec-a
+    changes:
+      - path: config.py
+        action: write
+        content: |
+          DEBUG = True
+          PORT = 8080
+          DB_HOST = 'localhost'
+
+  - id: agent-b
+    spec: spec-b
+    changes:
+      - path: config.py
+        action: write
+        content: |
+          DEBUG = True
+          PORT = 8080
+          CACHE_TTL = 300
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: no_escalations
+    - type: not_degraded
+    - type: file_contains
+      file: config.py
+      content: DB_HOST
+    - type: file_contains
+      file: config.py
+      content: CACHE_TTL
+    - type: file_contains
+      file: config.py
+      content: "DEBUG = True"
+  security:
+    - type: chain_valid

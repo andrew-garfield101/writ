@@ -385,41 +385,10 @@ fn truncate(s: &str, max_len: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::convergence::types::{
-        StructuralConflictRegion, StructuralInfo, StructuralUnit, UnitKind,
+    use crate::convergence::test_utils::helpers::{
+        make_typed_conflict as make_conflict, typed_unit as unit,
     };
-
-    /// Helper: create a simple structural unit.
-    fn unit(kind: UnitKind, content: &str) -> StructuralUnit {
-        StructuralUnit::new(kind, None, (0, 1), content.into())
-    }
-
-    /// Helper: build a classified conflict from unit vectors.
-    fn make_conflict(
-        conflict_type: ConflictType,
-        base: Vec<StructuralUnit>,
-        left: Vec<StructuralUnit>,
-        right: Vec<StructuralUnit>,
-    ) -> ClassifiedConflict {
-        ClassifiedConflict {
-            region: StructuralConflictRegion {
-                base_units: base,
-                left_units: left,
-                right_units: right,
-                base_span: (0, 0),
-                left_span: (0, 0),
-                right_span: (0, 0),
-            },
-            conflict_type,
-            requires_review: conflict_type.always_requires_review(),
-            structural_info: StructuralInfo {
-                left_unit_kinds: vec![],
-                right_unit_kinds: vec![],
-                has_name_overlap: false,
-                scope: ConflictScope::Mixed,
-            },
-        }
-    }
+    use crate::convergence::types::UnitKind;
 
     /// Helper: build a spec context with defaults.
     fn make_context(

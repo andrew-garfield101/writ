@@ -418,6 +418,12 @@ pub struct ContextOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain_integrity: Option<ChainIntegritySummary>,
 
+    /// Specs that have been inactive longer than the stale timeout.
+    /// Each entry is a human-readable warning like "spec 'foo' inactive for 3h".
+    /// Populated by lazy stale detection during `context()`.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub stale_specs: Vec<String>,
+
     /// Available writ operations for agent discoverability.
     pub available_operations: Vec<String>,
 }

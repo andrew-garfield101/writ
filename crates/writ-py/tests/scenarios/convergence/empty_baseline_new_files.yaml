@@ -1,0 +1,72 @@
+scenario: empty_baseline_new_files
+version: 1
+description: >
+  No baseline files exist — both agents create entirely new files
+  from scratch. Tests convergence with empty starting state.
+tags: [no-baseline, new-files]
+
+setup:
+  specs:
+    - id: spec-a
+    - id: spec-b
+  baseline:
+    - path: .gitkeep
+      content: ""
+
+agents:
+  - id: agent-a
+    spec: spec-a
+    changes:
+      - path: server.py
+        action: write
+        content: |
+          from flask import Flask
+          app = Flask(__name__)
+
+          @app.route("/")
+          def index():
+              return "Hello"
+      - path: requirements.txt
+        action: write
+        content: |
+          flask==3.0.0
+
+  - id: agent-b
+    spec: spec-b
+    changes:
+      - path: database.py
+        action: write
+        content: |
+          import sqlite3
+
+          def get_db():
+              return sqlite3.connect("app.db")
+      - path: schema.sql
+        action: write
+        content: |
+          CREATE TABLE users (
+              id INTEGER PRIMARY KEY,
+              name TEXT NOT NULL
+          );
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: no_escalations
+    - type: not_degraded
+    - type: file_contains
+      file: server.py
+      content: Flask
+    - type: file_contains
+      file: database.py
+      content: sqlite3
+    - type: file_contains
+      file: requirements.txt
+      content: flask
+    - type: file_contains
+      file: schema.sql
+      content: CREATE TABLE
+  security:
+    - type: chain_valid

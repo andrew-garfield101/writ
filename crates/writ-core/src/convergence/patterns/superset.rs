@@ -91,32 +91,7 @@ impl Pattern for SupersetContainment {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::convergence::types::*;
-
-    fn unit(content: &str) -> StructuralUnit {
-        StructuralUnit::new(UnitKind::Unknown, None, (0, 1), content.into())
-    }
-
-    fn make_conflict(left: Vec<StructuralUnit>, right: Vec<StructuralUnit>) -> ClassifiedConflict {
-        ClassifiedConflict {
-            region: StructuralConflictRegion {
-                base_units: vec![],
-                left_units: left,
-                right_units: right,
-                base_span: (0, 0),
-                left_span: (0, 0),
-                right_span: (0, 0),
-            },
-            conflict_type: ConflictType::BothModified,
-            requires_review: false,
-            structural_info: StructuralInfo {
-                left_unit_kinds: vec![],
-                right_unit_kinds: vec![],
-                has_name_overlap: false,
-                scope: ConflictScope::Mixed,
-            },
-        }
-    }
+    use crate::convergence::test_utils::helpers::*;
 
     #[test]
     fn test_left_superset() {

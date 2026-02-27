@@ -1,0 +1,65 @@
+scenario: three_agent_disjoint
+version: 1
+description: >
+  Three agents each write a separate file. No overlap, clean merge.
+  Tests N-agent convergence with sequential merge steps.
+tags: [n-agent, no-conflict, three-agent]
+
+setup:
+  specs:
+    - id: spec-a
+    - id: spec-b
+    - id: spec-c
+  baseline:
+    - path: base.txt
+      content: |
+        base
+
+agents:
+  - id: agent-a
+    spec: spec-a
+    changes:
+      - path: a.py
+        action: write
+        content: |
+          def a():
+              pass
+
+  - id: agent-b
+    spec: spec-b
+    changes:
+      - path: b.py
+        action: write
+        content: |
+          def b():
+              pass
+
+  - id: agent-c
+    spec: spec-c
+    changes:
+      - path: c.py
+        action: write
+        content: |
+          def c():
+              pass
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: no_escalations
+    - type: is_clean
+      expected: true
+    - type: not_degraded
+    - type: file_contains
+      file: a.py
+      content: "def a"
+    - type: file_contains
+      file: b.py
+      content: "def b"
+    - type: file_contains
+      file: c.py
+      content: "def c"
+  security:
+    - type: chain_valid

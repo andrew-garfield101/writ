@@ -13,6 +13,7 @@ pub mod crypto;
 pub mod diff;
 pub mod error;
 pub mod fsutil;
+pub mod gc;
 pub mod hash;
 pub mod hooks;
 pub mod ignore;

@@ -1,0 +1,138 @@
+scenario: ten_agents_disjoint
+version: 1
+description: >
+  Ten agents each write a separate file. Tests convergence scalability
+  with many spec branches merging sequentially.
+tags: [scale, ten-agent, no-conflict]
+
+setup:
+  specs:
+    - id: spec-0
+    - id: spec-1
+    - id: spec-2
+    - id: spec-3
+    - id: spec-4
+    - id: spec-5
+    - id: spec-6
+    - id: spec-7
+    - id: spec-8
+    - id: spec-9
+  baseline:
+    - path: base.py
+      content: |
+        # base
+
+agents:
+  - id: agent-0
+    spec: spec-0
+    changes:
+      - path: module_0.py
+        action: write
+        content: |
+          def feature_0(): return 0
+  - id: agent-1
+    spec: spec-1
+    changes:
+      - path: module_1.py
+        action: write
+        content: |
+          def feature_1(): return 1
+  - id: agent-2
+    spec: spec-2
+    changes:
+      - path: module_2.py
+        action: write
+        content: |
+          def feature_2(): return 2
+  - id: agent-3
+    spec: spec-3
+    changes:
+      - path: module_3.py
+        action: write
+        content: |
+          def feature_3(): return 3
+  - id: agent-4
+    spec: spec-4
+    changes:
+      - path: module_4.py
+        action: write
+        content: |
+          def feature_4(): return 4
+  - id: agent-5
+    spec: spec-5
+    changes:
+      - path: module_5.py
+        action: write
+        content: |
+          def feature_5(): return 5
+  - id: agent-6
+    spec: spec-6
+    changes:
+      - path: module_6.py
+        action: write
+        content: |
+          def feature_6(): return 6
+  - id: agent-7
+    spec: spec-7
+    changes:
+      - path: module_7.py
+        action: write
+        content: |
+          def feature_7(): return 7
+  - id: agent-8
+    spec: spec-8
+    changes:
+      - path: module_8.py
+        action: write
+        content: |
+          def feature_8(): return 8
+  - id: agent-9
+    spec: spec-9
+    changes:
+      - path: module_9.py
+        action: write
+        content: |
+          def feature_9(): return 9
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: no_escalations
+    - type: is_clean
+      expected: true
+    - type: not_degraded
+    - type: file_contains
+      file: module_0.py
+      content: feature_0
+    - type: file_contains
+      file: module_1.py
+      content: feature_1
+    - type: file_contains
+      file: module_2.py
+      content: feature_2
+    - type: file_contains
+      file: module_3.py
+      content: feature_3
+    - type: file_contains
+      file: module_4.py
+      content: feature_4
+    - type: file_contains
+      file: module_5.py
+      content: feature_5
+    - type: file_contains
+      file: module_6.py
+      content: feature_6
+    - type: file_contains
+      file: module_7.py
+      content: feature_7
+    - type: file_contains
+      file: module_8.py
+      content: feature_8
+    - type: file_contains
+      file: module_9.py
+      content: feature_9
+  security:
+    - type: chain_valid
+    - type: chain_no_failures

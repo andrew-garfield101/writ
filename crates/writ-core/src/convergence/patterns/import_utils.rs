@@ -574,27 +574,11 @@ pub fn detect_name_conflicts(imports: &[ParsedImport]) -> Vec<(String, String, S
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::convergence::types::UnitKind;
+    use crate::convergence::test_utils::helpers::{self, import_unit as bare_import};
 
-    /// Helper: create an import unit with metadata.
+    /// Import with metadata — uses module as both name and module key.
     fn import_with_meta(content: &str, lang: &str, module: &str, names: &str) -> StructuralUnit {
-        let mut unit = StructuralUnit::new(
-            UnitKind::Import,
-            Some(module.into()),
-            (0, 1),
-            content.into(),
-        );
-        unit.metadata.insert("import_lang".into(), lang.into());
-        unit.metadata.insert("import_module".into(), module.into());
-        if !names.is_empty() {
-            unit.metadata.insert("import_names".into(), names.into());
-        }
-        unit
-    }
-
-    /// Helper: create a bare import unit (no metadata).
-    fn bare_import(content: &str) -> StructuralUnit {
-        StructuralUnit::new(UnitKind::Import, None, (0, 1), content.into())
+        helpers::import_with_meta(module, content, lang, module, names)
     }
 
     // ── Language detection ─────────────────────────────────────────────

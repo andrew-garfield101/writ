@@ -1,0 +1,54 @@
+scenario: whitespace_only_change
+version: 1
+description: >
+  One agent makes a meaningful change, the other only adds whitespace.
+  Tests that whitespace-only changes don't cause unnecessary conflicts.
+tags: [edge-case, whitespace]
+
+setup:
+  specs:
+    - id: spec-a
+    - id: spec-b
+  baseline:
+    - path: code.py
+      content: |
+        def hello():
+            return "hello"
+
+agents:
+  - id: agent-a
+    spec: spec-a
+    changes:
+      - path: code.py
+        action: write
+        content: |
+          def hello():
+              return "hello"
+
+          def goodbye():
+              return "goodbye"
+
+  - id: agent-b
+    spec: spec-b
+    changes:
+      - path: code.py
+        action: write
+        content: |
+          def hello():
+              return "hello"
+
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: not_degraded
+    - type: file_contains
+      file: code.py
+      content: hello
+    - type: file_contains
+      file: code.py
+      content: goodbye
+  security:
+    - type: chain_valid

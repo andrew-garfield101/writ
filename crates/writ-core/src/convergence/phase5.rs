@@ -317,17 +317,11 @@ impl LlmResolver for StructuredLlmResolver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convergence::test_utils::helpers::make_unit;
     use crate::convergence::types::*;
 
-    fn make_unit(kind: UnitKind, name: Option<&str>, content: &str) -> StructuralUnit {
-        StructuralUnit::new(
-            kind,
-            name.map(|s| s.to_string()),
-            (0, 1),
-            content.to_string(),
-        )
-    }
-
+    /// Phase5 conflict builder — populates unit_kinds from actual units
+    /// and uses (0,1) spans (needed for prompt-building tests).
     fn make_conflict(
         conflict_type: ConflictType,
         base: Vec<StructuralUnit>,

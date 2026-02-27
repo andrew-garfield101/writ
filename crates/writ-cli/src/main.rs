@@ -21,7 +21,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize a new writ repository.
-    Init,
+    Init {
+        /// Deployment profile for GC configuration.
+        /// Values: raspberry-pi, development (default), production, enterprise.
+        #[arg(long, default_value = "development")]
+        profile: String,
+    },
 
     /// Remove writ from this project (inverse of install).
     Uninstall {
@@ -334,6 +339,12 @@ enum Commands {
         #[command(subcommand)]
         action: SecurityCommands,
     },
+
+    /// Garbage collection — lifecycle management and storage cleanup.
+    Gc {
+        #[command(subcommand)]
+        action: GcCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -457,7 +468,28 @@ enum SpecCommands {
     },
 
     /// Show all specs and their status.
-    Status,
+    Status {
+        /// Filter by lifecycle state: active, stale, completed, cancelled, archived.
+        #[arg(long)]
+        state: Option<String>,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Cancel a spec (transitions lifecycle to Cancelled).
+    Cancel {
+        /// Spec ID to cancel.
+        id: String,
+    },
+
+    /// Complete a spec's lifecycle (transitions to Completed).
+    /// Requires the spec's user-facing status to already be 'complete'.
+    Complete {
+        /// Spec ID to complete.
+        id: String,
+    },
 
     /// Show details of a single spec.
     Show {
@@ -600,6 +632,49 @@ enum SecurityCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum GcCommands {
+    /// Run garbage collection (generate plan and execute).
+    Run {
+        /// Dry run: show what would be cleaned without executing.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip confirmation prompt for large cleanups.
+        #[arg(long)]
+        yes: bool,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Show current storage usage and lifecycle state summary.
+    Status {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Show detailed storage breakdown by category.
+    Storage {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Show GC audit history.
+    Log {
+        /// Maximum number of entries to show.
+        #[arg(long, short, default_value = "10")]
+        limit: usize,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+}
+
 fn main() {
     // Reset SIGPIPE to default so piping to `head`, `grep`, etc. doesn't
     // cause a Rust BrokenPipe panic (exit 101) which kills `set -euo pipefail` scripts.
@@ -615,7 +690,7 @@ fn main() {
     });
 
     let result = match cli.command {
-        Commands::Init => cmd_init(&cwd),
+        Commands::Init { profile } => cmd_init(&cwd, &profile),
         Commands::Uninstall {
             force,
             keep_writignore,
@@ -710,7 +785,11 @@ fn main() {
                 design_notes,
                 tech_stack,
             ),
-            SpecCommands::Status => cmd_spec_status(&cwd),
+            SpecCommands::Status { state, format } => {
+                cmd_spec_status(&cwd, state.as_deref(), &format)
+            }
+            SpecCommands::Cancel { id } => cmd_spec_cancel(&cwd, &id),
+            SpecCommands::Complete { id } => cmd_spec_complete(&cwd, &id),
             SpecCommands::Show { id } => cmd_spec_show(&cwd, &id),
             SpecCommands::Update {
                 id,
@@ -800,6 +879,16 @@ fn main() {
                 &format,
             ),
         },
+        Commands::Gc { action } => match action {
+            GcCommands::Run {
+                dry_run,
+                yes,
+                format,
+            } => cmd_gc_run(&cwd, dry_run, yes, &format),
+            GcCommands::Status { format } => cmd_gc_status(&cwd, &format),
+            GcCommands::Storage { format } => cmd_gc_storage(&cwd, &format),
+            GcCommands::Log { limit, format } => cmd_gc_log(&cwd, limit, &format),
+        },
     };
 
     if let Err(e) = result {
@@ -808,9 +897,15 @@ fn main() {
     }
 }
 
-fn cmd_init(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_init(cwd: &PathBuf, profile: &str) -> Result<(), Box<dyn std::error::Error>> {
     Repository::init(cwd)?;
+
+    // Save GC config from the selected profile.
+    let gc_config = writ_core::gc::GcConfig::from_profile(profile)?;
+    gc_config.save(&cwd.join(".writ"))?;
+
     println!("initialized writ repository in .writ/");
+    println!("  gc profile: {profile}");
     Ok(())
 }
 
@@ -2056,12 +2151,45 @@ fn cmd_spec_add(
     Ok(())
 }
 
-fn cmd_spec_status(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_spec_status(
+    cwd: &PathBuf,
+    state_filter: Option<&str>,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use writ_core::spec::LifecycleState;
+
     let repo = Repository::open(cwd)?;
-    let specs = repo.list_specs()?;
+    let mut specs = repo.list_specs()?;
+
+    // Filter by lifecycle state if requested.
+    if let Some(state) = state_filter {
+        let target = match state.to_lowercase().as_str() {
+            "active" => LifecycleState::Active,
+            "stale" => LifecycleState::Stale,
+            "completed" => LifecycleState::Completed,
+            "cancelled" => LifecycleState::Cancelled,
+            "archived" => LifecycleState::Archived,
+            other => {
+                return Err(format!(
+                    "unknown lifecycle state: '{}'. Valid: active, stale, completed, cancelled, archived",
+                    other
+                ).into());
+            }
+        };
+        specs.retain(|s| s.lifecycle_state == target);
+    }
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&specs)?);
+        return Ok(());
+    }
 
     if specs.is_empty() {
-        println!("no specs registered");
+        if let Some(state) = state_filter {
+            println!("no specs with lifecycle state '{state}'");
+        } else {
+            println!("no specs registered");
+        }
         return Ok(());
     }
 
@@ -2073,12 +2201,27 @@ fn cmd_spec_status(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
             writ_core::spec::SpecStatus::Blocked => "x ",
         };
         let seal_count = spec.sealed_by.len();
+        let lifecycle = format!("{:?}", spec.lifecycle_state);
         println!(
-            "  {status_marker}{:<20} {:?}  ({seal_count} seal(s))",
+            "  {status_marker}{:<20} {:?}  [{lifecycle}]  ({seal_count} seal(s))",
             spec.id, spec.status
         );
     }
 
+    Ok(())
+}
+
+fn cmd_spec_cancel(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    repo.cancel_spec(id)?;
+    println!("spec '{}' cancelled", id);
+    Ok(())
+}
+
+fn cmd_spec_complete(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    repo.complete_spec(id)?;
+    println!("spec '{}' lifecycle completed", id);
     Ok(())
 }
 
@@ -3296,6 +3439,365 @@ fn cmd_security_events(
                 println!("[{}] {} {}{}", sev_label, ts, event.event_type, agent);
                 println!("  {}", event.details);
                 println!();
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// GC commands
+// -------------------------------------------------------------------
+
+fn cmd_gc_run(
+    cwd: &PathBuf,
+    dry_run: bool,
+    yes: bool,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let writ_dir = cwd.join(".writ");
+    if !writ_dir.exists() {
+        return Err("not a writ repository (no .writ directory)".into());
+    }
+
+    let config = writ_core::gc::GcConfig::load(&writ_dir)?;
+    let repo = Repository::open(cwd)?;
+    let specs = repo.list_specs()?;
+    let logger = writ_core::security::SecurityEventLogger::new(&writ_dir);
+    let events = logger.read_events(None)?;
+
+    let plan = writ_core::gc::GcPlan::generate(&writ_dir, &config, &specs, &events)?;
+
+    if dry_run {
+        match format {
+            "json" => {
+                println!("{}", serde_json::to_string_pretty(&plan)?);
+            }
+            _ => {
+                println!("GC dry run — {}", plan.summary.summary_line);
+                println!();
+                println!(
+                    "  storage: {:.1} MB / {:.1} MB ({:.1}%)",
+                    plan.storage.total_bytes as f64 / 1_048_576.0,
+                    plan.storage.budget_bytes as f64 / 1_048_576.0,
+                    plan.storage.usage_pct()
+                );
+                println!();
+
+                if plan.actions.is_empty() {
+                    println!("  nothing to clean");
+                } else {
+                    println!(
+                        "  {} action(s) planned ({} transition(s), {} deletion(s), {} event(s) to clean):",
+                        plan.summary.total_actions,
+                        plan.summary.transitions,
+                        plan.summary.deletions,
+                        plan.summary.events_to_clean
+                    );
+                    println!();
+                    for action in &plan.actions {
+                        match action {
+                            writ_core::gc::GcAction::TransitionSpec {
+                                spec_id,
+                                from,
+                                to,
+                                reason,
+                            } => {
+                                println!("    transition  {spec_id}: {from} -> {to}");
+                                println!("                {reason}");
+                            }
+                            writ_core::gc::GcAction::CleanSpec {
+                                spec_id,
+                                lifecycle_state,
+                                reason,
+                            } => {
+                                println!("    clean-spec  {spec_id} ({lifecycle_state})");
+                                println!("                {reason}");
+                            }
+                            writ_core::gc::GcAction::CleanSecurityEvents {
+                                count,
+                                severity,
+                                reason,
+                            } => {
+                                println!("    clean-events  {count} {severity} event(s)");
+                                println!("                  {reason}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Execute for real.
+    if plan.actions.is_empty() {
+        match format {
+            "json" => println!("{}", serde_json::to_string_pretty(&plan)?),
+            _ => println!("nothing to clean"),
+        }
+        return Ok(());
+    }
+
+    // Confirm unless --yes was passed.
+    if !yes {
+        eprintln!("{}", plan.summary.summary_line);
+        eprintln!(
+            "{} action(s): {} transition(s), {} deletion(s), {} event(s)",
+            plan.summary.total_actions,
+            plan.summary.transitions,
+            plan.summary.deletions,
+            plan.summary.events_to_clean
+        );
+        eprint!("proceed? [y/N] ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("gc cancelled");
+            return Ok(());
+        }
+    }
+
+    let result = writ_core::gc::execute_plan(&writ_dir, &plan, &specs)?;
+
+    // If events were marked for cleaning, actually clean the events file.
+    if result.events_cleaned > 0 {
+        let gc_config = writ_core::gc::GcConfig::load(&writ_dir)?;
+        logger.clean_events(&gc_config.security_events)?;
+    }
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&result.audit)?);
+        }
+        _ => {
+            println!("GC complete:");
+            println!(
+                "  executed: {} action(s) in {}ms",
+                result.audit.actions_executed, result.audit.duration_ms
+            );
+            if !result.specs_cleaned.is_empty() {
+                println!("  cleaned specs: {}", result.specs_cleaned.join(", "));
+            }
+            if !result.transitions_applied.is_empty() {
+                for (id, from, to) in &result.transitions_applied {
+                    println!("  transitioned: {id} ({from} -> {to})");
+                }
+            }
+            if result.events_cleaned > 0 {
+                println!("  cleaned events: {}", result.events_cleaned);
+            }
+            if result.audit.actions_skipped > 0 {
+                println!("  skipped: {} (safety rules)", result.audit.actions_skipped);
+                for s in &result.audit.skipped_details {
+                    println!("    - {}: {}", s.action, s.reason);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_gc_status(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let writ_dir = cwd.join(".writ");
+    if !writ_dir.exists() {
+        return Err("not a writ repository (no .writ directory)".into());
+    }
+
+    let config = writ_core::gc::GcConfig::load(&writ_dir)?;
+    let repo = Repository::open(cwd)?;
+    let specs = repo.list_specs()?;
+    let storage = writ_core::gc::StorageReport::scan(&writ_dir, config.budget_bytes)?;
+
+    // Count specs by lifecycle state.
+    let mut active = 0usize;
+    let mut stale = 0usize;
+    let mut completed = 0usize;
+    let mut cancelled = 0usize;
+    let mut archived = 0usize;
+
+    for spec in &specs {
+        match spec.lifecycle_state {
+            writ_core::spec::LifecycleState::Active => active += 1,
+            writ_core::spec::LifecycleState::Stale => stale += 1,
+            writ_core::spec::LifecycleState::Completed => completed += 1,
+            writ_core::spec::LifecycleState::Cancelled => cancelled += 1,
+            writ_core::spec::LifecycleState::Archived => archived += 1,
+        }
+    }
+
+    match format {
+        "json" => {
+            let status = serde_json::json!({
+                "storage": storage,
+                "usage_pct": storage.usage_pct(),
+                "specs": {
+                    "total": specs.len(),
+                    "active": active,
+                    "stale": stale,
+                    "completed": completed,
+                    "cancelled": cancelled,
+                    "archived": archived,
+                },
+                "mode": config.mode,
+                "budget_bytes": config.budget_bytes,
+            });
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        _ => {
+            println!("GC status:");
+            println!();
+            println!(
+                "  storage: {:.1} MB / {:.1} MB ({:.1}%)",
+                storage.total_bytes as f64 / 1_048_576.0,
+                storage.budget_bytes as f64 / 1_048_576.0,
+                storage.usage_pct()
+            );
+            println!("  mode: {:?}", config.mode);
+            println!();
+            println!("  specs ({} total):", specs.len());
+            println!("    active:    {active}");
+            if stale > 0 {
+                println!("    stale:     {stale}");
+            }
+            if completed > 0 {
+                println!("    completed: {completed}");
+            }
+            if cancelled > 0 {
+                println!("    cancelled: {cancelled}");
+            }
+            if archived > 0 {
+                println!("    archived:  {archived}");
+            }
+
+            // Show stale warnings.
+            let stale_specs = repo.scan_stale_specs(&config)?;
+            if !stale_specs.is_empty() {
+                println!();
+                println!("  stale candidates:");
+                for (id, secs) in &stale_specs {
+                    println!("    {id}: inactive for {}h", secs / 3600);
+                }
+            }
+
+            if storage.usage_pct() >= config.warning_threshold_pct as f64 {
+                println!();
+                println!(
+                    "  WARNING: storage usage above {}% threshold",
+                    config.warning_threshold_pct
+                );
+                println!("  run `writ gc run` to free space");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_gc_storage(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    let storage = repo.storage_report()?;
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&storage)?);
+        }
+        _ => {
+            println!("Storage breakdown:");
+            println!();
+            println!(
+                "  total:           {:.1} MB",
+                storage.total_bytes as f64 / 1_048_576.0
+            );
+            println!(
+                "  seals:           {:.1} MB",
+                storage.seal_bytes as f64 / 1_048_576.0
+            );
+            println!(
+                "  working state:   {:.1} MB",
+                storage.working_state_bytes as f64 / 1_048_576.0
+            );
+            println!(
+                "  security events: {:.1} MB",
+                storage.security_event_bytes as f64 / 1_048_576.0
+            );
+            println!(
+                "  keys:            {:.1} MB",
+                storage.key_bytes as f64 / 1_048_576.0
+            );
+            println!(
+                "  agents:          {:.1} MB",
+                storage.agent_bytes as f64 / 1_048_576.0
+            );
+            println!(
+                "  gc metadata:     {:.1} MB",
+                storage.gc_bytes as f64 / 1_048_576.0
+            );
+            println!(
+                "  other:           {:.1} MB",
+                storage.other_bytes as f64 / 1_048_576.0
+            );
+            println!();
+            if storage.budget_bytes == u64::MAX {
+                println!("  budget: unlimited (enterprise)");
+            } else {
+                println!(
+                    "  budget: {:.1} MB ({:.1}% used)",
+                    storage.budget_bytes as f64 / 1_048_576.0,
+                    storage.usage_pct()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_gc_log(cwd: &PathBuf, limit: usize, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let writ_dir = cwd.join(".writ");
+    if !writ_dir.exists() {
+        return Err("not a writ repository (no .writ directory)".into());
+    }
+
+    let logger = writ_core::security::GcAuditLogger::new(&writ_dir);
+    let records = logger.read_last(limit)?;
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&records)?);
+        }
+        _ => {
+            if records.is_empty() {
+                println!("no GC audit records");
+                return Ok(());
+            }
+
+            println!("{} GC audit record(s):", records.len());
+            println!();
+            for record in &records {
+                let ts = record.executed_at.format("%Y-%m-%d %H:%M:%S UTC");
+                println!(
+                    "  {} ({:?}) — {}/{} executed, {} skipped, {}ms",
+                    ts,
+                    record.triggered_by,
+                    record.actions_executed,
+                    record.actions_planned,
+                    record.actions_skipped,
+                    record.duration_ms
+                );
+                if record.space_freed_bytes > 0 {
+                    println!(
+                        "    freed: {:.1} MB",
+                        record.space_freed_bytes as f64 / 1_048_576.0
+                    );
+                }
+                if !record.skipped_details.is_empty() {
+                    for s in &record.skipped_details {
+                        println!("    skipped: {} — {}", s.action, s.reason);
+                    }
+                }
             }
         }
     }

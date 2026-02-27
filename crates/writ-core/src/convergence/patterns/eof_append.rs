@@ -104,41 +104,12 @@ impl Pattern for EofAppend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::convergence::types::*;
-
-    fn unit(content: &str) -> StructuralUnit {
-        StructuralUnit::new(UnitKind::Unknown, None, (0, 1), content.into())
-    }
-
-    fn make_conflict(
-        base: Vec<StructuralUnit>,
-        left: Vec<StructuralUnit>,
-        right: Vec<StructuralUnit>,
-    ) -> ClassifiedConflict {
-        ClassifiedConflict {
-            region: StructuralConflictRegion {
-                base_units: base,
-                left_units: left,
-                right_units: right,
-                base_span: (0, 0),
-                left_span: (0, 0),
-                right_span: (0, 0),
-            },
-            conflict_type: ConflictType::BothModified,
-            requires_review: false,
-            structural_info: StructuralInfo {
-                left_unit_kinds: vec![],
-                right_unit_kinds: vec![],
-                has_name_overlap: false,
-                scope: ConflictScope::Mixed,
-            },
-        }
-    }
+    use crate::convergence::test_utils::helpers::*;
 
     #[test]
     fn test_both_append() {
         let pattern = EofAppend;
-        let conflict = make_conflict(
+        let conflict = make_conflict_with_base(
             vec![unit("base1"), unit("base2")],
             vec![unit("base1"), unit("base2"), unit("left_new")],
             vec![unit("base1"), unit("base2"), unit("right_new")],
@@ -159,7 +130,7 @@ mod tests {
     #[test]
     fn test_left_only_append() {
         let pattern = EofAppend;
-        let conflict = make_conflict(
+        let conflict = make_conflict_with_base(
             vec![unit("base")],
             vec![unit("base"), unit("left_new")],
             vec![unit("base")],
@@ -171,7 +142,7 @@ mod tests {
     #[test]
     fn test_base_modified_returns_none() {
         let pattern = EofAppend;
-        let conflict = make_conflict(
+        let conflict = make_conflict_with_base(
             vec![unit("base1"), unit("base2")],
             vec![unit("modified"), unit("base2"), unit("left_new")],
             vec![unit("base1"), unit("base2"), unit("right_new")],
@@ -184,7 +155,7 @@ mod tests {
     fn test_confidence_scales_with_appended_lines() {
         let pattern = EofAppend;
         // Small append (2 lines total): base 0.92
-        let small = make_conflict(
+        let small = make_conflict_with_base(
             vec![unit("base")],
             vec![unit("base"), unit("left1")],
             vec![unit("base"), unit("right1")],
@@ -203,7 +174,7 @@ mod tests {
             left_units.push(unit(&format!("left_{i}")));
             right_units.push(unit(&format!("right_{i}")));
         }
-        let large = make_conflict(vec![unit("base")], left_units, right_units);
+        let large = make_conflict_with_base(vec![unit("base")], left_units, right_units);
         let large_prop = pattern.resolve(&large).unwrap();
         assert!(
             large_prop.confidence < small_prop.confidence,
@@ -221,7 +192,7 @@ mod tests {
     #[test]
     fn test_empty_base_does_not_match() {
         let pattern = EofAppend;
-        let conflict = make_conflict(vec![], vec![unit("left")], vec![unit("right")]);
+        let conflict = make_conflict_with_base(vec![], vec![unit("left")], vec![unit("right")]);
         assert!(!pattern.matches(&conflict));
     }
 }

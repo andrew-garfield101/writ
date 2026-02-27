@@ -52,6 +52,8 @@ pub enum WritError {
     InvalidHash(String),
     /// Input validation failure.
     InvalidInput(String),
+    /// Attempted an illegal lifecycle state transition.
+    InvalidLifecycleTransition(String),
     /// No remote configured with this name.
     RemoteNotFound(String),
     /// The remote directory is not a valid writ remote.
@@ -110,6 +112,9 @@ impl fmt::Display for WritError {
             WritError::PathTraversal(path) => write!(f, "path rejected (traversal): {path}"),
             WritError::InvalidHash(hash) => write!(f, "invalid object hash: {hash}"),
             WritError::InvalidInput(msg) => write!(f, "invalid input: {msg}"),
+            WritError::InvalidLifecycleTransition(msg) => {
+                write!(f, "invalid lifecycle transition: {msg}")
+            }
             WritError::RemoteNotFound(name) => write!(f, "remote not found: '{name}'"),
             WritError::InvalidRemote(path) => write!(f, "not a valid writ remote: {path}"),
             WritError::RemoteAlreadyExists(name) => {

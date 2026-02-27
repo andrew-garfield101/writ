@@ -1,0 +1,77 @@
+scenario: large_import_merge
+version: 1
+description: >
+  Two agents add many different imports to the same file.
+  Tests import accumulation at higher scale.
+tags: [pattern-1, imports, scale]
+
+setup:
+  specs:
+    - id: spec-a
+    - id: spec-b
+  baseline:
+    - path: app.py
+      content: |
+        import os
+
+        def main():
+            pass
+
+agents:
+  - id: agent-a
+    spec: spec-a
+    changes:
+      - path: app.py
+        action: write
+        content: |
+          import os
+          import sys
+          import json
+          import logging
+
+          def main():
+              pass
+
+  - id: agent-b
+    spec: spec-b
+    changes:
+      - path: app.py
+        action: write
+        content: |
+          import os
+          import pathlib
+          import datetime
+          import collections
+
+          def main():
+              pass
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: not_degraded
+    - type: file_contains
+      file: app.py
+      content: "import os"
+    - type: file_contains
+      file: app.py
+      content: "import sys"
+    - type: file_contains
+      file: app.py
+      content: "import json"
+    - type: file_contains
+      file: app.py
+      content: "import logging"
+    - type: file_contains
+      file: app.py
+      content: "import pathlib"
+    - type: file_contains
+      file: app.py
+      content: "import datetime"
+    - type: file_contains
+      file: app.py
+      content: "import collections"
+  security:
+    - type: chain_valid

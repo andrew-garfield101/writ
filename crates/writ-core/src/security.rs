@@ -11,7 +11,73 @@ use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+use chrono::Duration;
+
 use crate::error::{WritError, WritResult};
+
+// ---------------------------------------------------------------------------
+// GC Retention Configuration for Security Events
+// ---------------------------------------------------------------------------
+
+/// Retention periods for security events, by severity.
+///
+/// Events older than their severity's retention period are eligible for
+/// garbage collection. Critical events are retained longest, info events
+/// shortest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityEventGcConfig {
+    /// Retention period for Critical events (default: 2 years).
+    #[serde(with = "duration_days_serde")]
+    pub retention_critical: Duration,
+    /// Retention period for Warning events (default: 6 months / 180 days).
+    #[serde(with = "duration_days_serde")]
+    pub retention_warning: Duration,
+    /// Retention period for Info events (default: 30 days).
+    #[serde(with = "duration_days_serde")]
+    pub retention_info: Duration,
+}
+
+impl Default for SecurityEventGcConfig {
+    fn default() -> Self {
+        SecurityEventGcConfig {
+            retention_critical: Duration::days(730), // 2 years
+            retention_warning: Duration::days(180),  // 6 months
+            retention_info: Duration::days(30),      // 30 days
+        }
+    }
+}
+
+impl SecurityEventGcConfig {
+    /// Get the retention duration for a given severity.
+    pub fn retention_for(&self, severity: &Severity) -> Duration {
+        match severity {
+            Severity::Critical => self.retention_critical,
+            Severity::Warning => self.retention_warning,
+            Severity::Info => self.retention_info,
+        }
+    }
+}
+
+/// Serde helper to serialize/deserialize `chrono::Duration` as integer days.
+mod duration_days_serde {
+    use chrono::Duration;
+    use serde::{self, Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_i64(duration.num_days())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let days = i64::deserialize(deserializer)?;
+        Ok(Duration::days(days))
+    }
+}
 
 /// Severity level for security events.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,6 +165,104 @@ impl SecurityEventLogger {
             }
         }
         Ok(events)
+    }
+
+    /// Return events whose age exceeds their severity-based retention threshold.
+    ///
+    /// These events are eligible for garbage collection. The returned list is
+    /// suitable for feeding into `GcPlan` generation.
+    pub fn events_past_retention(
+        &self,
+        config: &SecurityEventGcConfig,
+    ) -> WritResult<Vec<SecurityEvent>> {
+        let all = self.read_events(None)?;
+        let now = Utc::now();
+        let mut past = Vec::new();
+        for event in all {
+            let age = now - event.timestamp;
+            let retention = config.retention_for(&event.severity);
+            if age > retention {
+                past.push(event);
+            }
+        }
+        Ok(past)
+    }
+
+    /// Return only events that are within their retention period.
+    ///
+    /// Used by `writ security events` CLI to hide expired events even before
+    /// GC actually runs. Also used by the event cleanup executor to determine
+    /// which events to keep.
+    pub fn read_events_within_retention(
+        &self,
+        config: &SecurityEventGcConfig,
+    ) -> WritResult<Vec<SecurityEvent>> {
+        let all = self.read_events(None)?;
+        let now = Utc::now();
+        let mut within = Vec::new();
+        for event in all {
+            let age = now - event.timestamp;
+            let retention = config.retention_for(&event.severity);
+            if age <= retention {
+                within.push(event);
+            }
+        }
+        Ok(within)
+    }
+
+    /// Rewrite the events file, removing events past their retention period.
+    ///
+    /// Uses exclusive file locking during the rewrite to prevent concurrent
+    /// append corruption. This is the **only** operation that modifies the
+    /// events file — normally it is append-only.
+    ///
+    /// Returns the number of events removed.
+    pub fn clean_events(&self, config: &SecurityEventGcConfig) -> WritResult<usize> {
+        if !self.events_path.exists() {
+            return Ok(0);
+        }
+
+        // Open for read+write (we'll truncate after filtering).
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.events_path)?;
+        file.lock_exclusive().map_err(WritError::Io)?;
+
+        // Read all events under the lock.
+        let reader = BufReader::new(&file);
+        let now = Utc::now();
+        let mut keep = Vec::new();
+        let mut removed = 0usize;
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: SecurityEvent = serde_json::from_str(&line)?;
+            let age = now - event.timestamp;
+            let retention = config.retention_for(&event.severity);
+            if age <= retention {
+                keep.push(line);
+            } else {
+                removed += 1;
+            }
+        }
+
+        // Rewrite the file with only surviving events.
+        // Truncate + seek to start.
+        file.set_len(0)?;
+        use std::io::Seek;
+        let mut writer = std::io::BufWriter::new(&file);
+        writer.seek(std::io::SeekFrom::Start(0))?;
+        for line in &keep {
+            writeln!(writer, "{}", line)?;
+        }
+        writer.flush()?;
+
+        // Lock released on File drop.
+        Ok(removed)
     }
 
     /// Convenience: emit a Critical scope violation event.
@@ -225,6 +389,155 @@ impl SecurityEventLogger {
             agent_id: None,
             details: format!("Seal '{}': {}", seal_id, details),
         })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GC Audit Record — written after every GC run
+// ---------------------------------------------------------------------------
+
+/// How a GC run was triggered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GcTrigger {
+    /// Manual invocation via `writ gc`.
+    Manual,
+    /// Scheduled (post-beta).
+    Scheduled,
+}
+
+/// A single skipped action with its reason.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkippedAction {
+    /// Description of what was skipped.
+    pub action: String,
+    /// Why it was skipped.
+    pub reason: String,
+}
+
+/// Record of a completed GC execution.
+///
+/// Appended to `.writ/gc/audit.jsonl` after every `writ gc` run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcAuditRecord {
+    /// Unique identifier (BLAKE3 hash of timestamp + random bytes).
+    pub id: String,
+    /// When the GC run was executed.
+    pub executed_at: DateTime<Utc>,
+    /// How GC was triggered.
+    pub triggered_by: GcTrigger,
+    /// Number of actions in the GC plan.
+    pub actions_planned: usize,
+    /// Number of actions successfully executed.
+    pub actions_executed: usize,
+    /// Number of actions skipped (safety checks, already cleaned, etc.).
+    pub actions_skipped: usize,
+    /// Number of actions that failed during execution.
+    pub actions_failed: usize,
+    /// Total bytes freed by this GC run.
+    pub space_freed_bytes: u64,
+    /// How long the GC run took.
+    pub duration_ms: u64,
+    /// Details of each skipped action.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_details: Vec<SkippedAction>,
+}
+
+impl GcAuditRecord {
+    /// Generate a unique ID for this audit record.
+    fn generate_id() -> String {
+        use rand::RngCore;
+        let mut random = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut random);
+        let now = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let input = format!("{now}:{random:?}");
+        crate::crypto::blake3_hex(input.as_bytes())[..16].to_string()
+    }
+
+    /// Create a new audit record for a completed GC run.
+    pub fn new(
+        triggered_by: GcTrigger,
+        actions_planned: usize,
+        actions_executed: usize,
+        actions_skipped: usize,
+        actions_failed: usize,
+        space_freed_bytes: u64,
+        duration_ms: u64,
+        skipped_details: Vec<SkippedAction>,
+    ) -> Self {
+        GcAuditRecord {
+            id: Self::generate_id(),
+            executed_at: Utc::now(),
+            triggered_by,
+            actions_planned,
+            actions_executed,
+            actions_skipped,
+            actions_failed,
+            space_freed_bytes,
+            duration_ms,
+            skipped_details,
+        }
+    }
+}
+
+/// Append-only GC audit log at `.writ/gc/audit.jsonl`.
+pub struct GcAuditLogger {
+    audit_path: PathBuf,
+}
+
+impl GcAuditLogger {
+    /// Create a logger for the given `.writ/` directory.
+    pub fn new(writ_dir: &Path) -> Self {
+        GcAuditLogger {
+            audit_path: writ_dir.join("gc").join("audit.jsonl"),
+        }
+    }
+
+    /// Append an audit record. Creates `.writ/gc/` if needed.
+    pub fn write_record(&self, record: &GcAuditRecord) -> WritResult<()> {
+        if let Some(parent) = self.audit_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.audit_path)?;
+        file.lock_exclusive().map_err(WritError::Io)?;
+
+        let mut writer = std::io::BufWriter::new(&file);
+        serde_json::to_writer(&mut writer, record)?;
+        writeln!(writer)?;
+        writer.flush()?;
+
+        Ok(())
+    }
+
+    /// Read all audit records, most recent last.
+    pub fn read_records(&self) -> WritResult<Vec<GcAuditRecord>> {
+        if !self.audit_path.exists() {
+            return Ok(Vec::new());
+        }
+        let file = File::open(&self.audit_path)?;
+        file.lock_shared().map_err(WritError::Io)?;
+        let reader = BufReader::new(file);
+        let mut records = Vec::new();
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: GcAuditRecord = serde_json::from_str(&line)?;
+            records.push(record);
+        }
+        Ok(records)
+    }
+
+    /// Read the last N audit records (most recent last).
+    pub fn read_last(&self, limit: usize) -> WritResult<Vec<GcAuditRecord>> {
+        let all = self.read_records()?;
+        let start = all.len().saturating_sub(limit);
+        Ok(all[start..].to_vec())
     }
 }
 
@@ -776,5 +1089,373 @@ mod tests {
         assert_eq!(events[0].severity, Severity::Critical);
         assert!(events[0].details.contains("seal-xyz"));
         assert!(events[0].details.contains("signature verification failed"));
+    }
+
+    // --- GC retention filtering tests (GC.2.3a/b) ---
+
+    /// Helper: emit an event with a specific timestamp in the past.
+    fn emit_event_at(
+        logger: &SecurityEventLogger,
+        severity: Severity,
+        event_type: &str,
+        days_ago: i64,
+    ) {
+        let event = SecurityEvent {
+            timestamp: Utc::now() - chrono::Duration::days(days_ago),
+            severity,
+            event_type: event_type.to_string(),
+            agent_id: None,
+            details: format!("test event {event_type} from {days_ago} days ago"),
+        };
+        logger.emit_event(&event).unwrap();
+    }
+
+    #[test]
+    fn test_info_event_past_default_retention() {
+        // Default info retention = 30 days. Event at 31 days → past retention.
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+        let config = SecurityEventGcConfig::default();
+
+        emit_event_at(&logger, Severity::Info, "old_info", 31);
+        emit_event_at(&logger, Severity::Info, "recent_info", 5);
+
+        let past = logger.events_past_retention(&config).unwrap();
+        assert_eq!(past.len(), 1);
+        assert_eq!(past[0].event_type, "old_info");
+
+        let within = logger.read_events_within_retention(&config).unwrap();
+        assert_eq!(within.len(), 1);
+        assert_eq!(within[0].event_type, "recent_info");
+    }
+
+    #[test]
+    fn test_warning_event_within_default_retention() {
+        // Default warning retention = 180 days. Event at 31 days → within retention.
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+        let config = SecurityEventGcConfig::default();
+
+        emit_event_at(&logger, Severity::Warning, "recent_warning", 31);
+
+        let past = logger.events_past_retention(&config).unwrap();
+        assert!(
+            past.is_empty(),
+            "warning at 31d should be within 180d retention"
+        );
+
+        let within = logger.read_events_within_retention(&config).unwrap();
+        assert_eq!(within.len(), 1);
+    }
+
+    #[test]
+    fn test_critical_event_long_retention() {
+        // Default critical retention = 730 days (2 years).
+        // Event at 500 days → within retention. Event at 800 days → past.
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+        let config = SecurityEventGcConfig::default();
+
+        emit_event_at(&logger, Severity::Critical, "within_crit", 500);
+        emit_event_at(&logger, Severity::Critical, "past_crit", 800);
+
+        let past = logger.events_past_retention(&config).unwrap();
+        assert_eq!(past.len(), 1);
+        assert_eq!(past[0].event_type, "past_crit");
+
+        let within = logger.read_events_within_retention(&config).unwrap();
+        assert_eq!(within.len(), 1);
+        assert_eq!(within[0].event_type, "within_crit");
+    }
+
+    #[test]
+    fn test_custom_retention_config() {
+        // Custom: info retention = 7 days.
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+        let config = SecurityEventGcConfig {
+            retention_info: chrono::Duration::days(7),
+            ..SecurityEventGcConfig::default()
+        };
+
+        emit_event_at(&logger, Severity::Info, "old_info", 10);
+        emit_event_at(&logger, Severity::Info, "recent_info", 3);
+
+        let past = logger.events_past_retention(&config).unwrap();
+        assert_eq!(past.len(), 1);
+        assert_eq!(past[0].event_type, "old_info");
+    }
+
+    #[test]
+    fn test_retention_empty_events_file() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+        let config = SecurityEventGcConfig::default();
+
+        let past = logger.events_past_retention(&config).unwrap();
+        assert!(past.is_empty());
+
+        let within = logger.read_events_within_retention(&config).unwrap();
+        assert!(within.is_empty());
+    }
+
+    #[test]
+    fn test_retention_config_defaults() {
+        let config = SecurityEventGcConfig::default();
+        assert_eq!(config.retention_critical.num_days(), 730);
+        assert_eq!(config.retention_warning.num_days(), 180);
+        assert_eq!(config.retention_info.num_days(), 30);
+    }
+
+    #[test]
+    fn test_retention_config_serde_roundtrip() {
+        let config = SecurityEventGcConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let recovered: SecurityEventGcConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.retention_critical.num_days(), 730);
+        assert_eq!(recovered.retention_warning.num_days(), 180);
+        assert_eq!(recovered.retention_info.num_days(), 30);
+    }
+
+    // --- Event cleanup tests (GC.2.2c) ---
+
+    #[test]
+    fn test_clean_events_removes_old_info() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+        let config = SecurityEventGcConfig::default();
+
+        emit_event_at(&logger, Severity::Info, "old_info", 31);
+        emit_event_at(&logger, Severity::Info, "recent_info", 5);
+        emit_event_at(&logger, Severity::Warning, "recent_warning", 10);
+
+        let removed = logger.clean_events(&config).unwrap();
+        assert_eq!(removed, 1, "should remove 1 old info event");
+
+        // Verify only 2 events remain
+        let remaining = logger.read_events(None).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().all(|e| e.event_type != "old_info"));
+    }
+
+    #[test]
+    fn test_clean_events_preserves_critical_within_retention() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+        let config = SecurityEventGcConfig::default();
+
+        // Critical at 500 days — within 2-year retention
+        emit_event_at(&logger, Severity::Critical, "crit_within", 500);
+        emit_event_at(&logger, Severity::Info, "old_info", 60);
+
+        let removed = logger.clean_events(&config).unwrap();
+        assert_eq!(removed, 1, "should only remove the old info event");
+
+        let remaining = logger.read_events(None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].event_type, "crit_within");
+    }
+
+    #[test]
+    fn test_clean_events_preserves_warnings_within_retention() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+        let config = SecurityEventGcConfig::default();
+
+        // Warning at 100 days — within 6-month retention
+        emit_event_at(&logger, Severity::Warning, "warn_within", 100);
+        emit_event_at(&logger, Severity::Info, "info_old", 45);
+
+        let removed = logger.clean_events(&config).unwrap();
+        assert_eq!(removed, 1);
+
+        let remaining = logger.read_events(None).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].event_type, "warn_within");
+    }
+
+    #[test]
+    fn test_clean_events_no_file() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+        let config = SecurityEventGcConfig::default();
+
+        let removed = logger.clean_events(&config).unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn test_clean_events_nothing_to_clean() {
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+        let config = SecurityEventGcConfig::default();
+
+        emit_event_at(&logger, Severity::Info, "fresh", 1);
+        emit_event_at(&logger, Severity::Warning, "fresh_w", 1);
+
+        let removed = logger.clean_events(&config).unwrap();
+        assert_eq!(removed, 0);
+
+        let remaining = logger.read_events(None).unwrap();
+        assert_eq!(remaining.len(), 2);
+    }
+
+    #[test]
+    fn test_clean_events_idempotent() {
+        // Running clean twice should produce 0 removals on second run.
+        let dir = tempdir().unwrap();
+        let logger = SecurityEventLogger::new(dir.path());
+        let config = SecurityEventGcConfig::default();
+
+        emit_event_at(&logger, Severity::Info, "old", 31);
+        emit_event_at(&logger, Severity::Info, "fresh", 1);
+
+        let removed1 = logger.clean_events(&config).unwrap();
+        assert_eq!(removed1, 1);
+
+        let removed2 = logger.clean_events(&config).unwrap();
+        assert_eq!(removed2, 0);
+
+        let remaining = logger.read_events(None).unwrap();
+        assert_eq!(remaining.len(), 1);
+    }
+
+    // --- GC Audit Record tests (GC.2.2e) ---
+
+    #[test]
+    fn test_audit_record_creation() {
+        let record = GcAuditRecord::new(
+            GcTrigger::Manual,
+            5,
+            3,
+            1,
+            1,
+            1024,
+            150,
+            vec![SkippedAction {
+                action: "CleanSpec(active-spec)".to_string(),
+                reason: "spec is Active — safety check blocked".to_string(),
+            }],
+        );
+
+        assert!(!record.id.is_empty());
+        assert_eq!(record.id.len(), 16);
+        assert_eq!(record.triggered_by, GcTrigger::Manual);
+        assert_eq!(record.actions_planned, 5);
+        assert_eq!(record.actions_executed, 3);
+        assert_eq!(record.actions_skipped, 1);
+        assert_eq!(record.actions_failed, 1);
+        assert_eq!(record.space_freed_bytes, 1024);
+        assert_eq!(record.duration_ms, 150);
+        assert_eq!(record.skipped_details.len(), 1);
+    }
+
+    #[test]
+    fn test_audit_record_unique_ids() {
+        let r1 = GcAuditRecord::new(GcTrigger::Manual, 0, 0, 0, 0, 0, 0, vec![]);
+        let r2 = GcAuditRecord::new(GcTrigger::Manual, 0, 0, 0, 0, 0, 0, vec![]);
+        assert_ne!(r1.id, r2.id, "audit records should have unique IDs");
+    }
+
+    #[test]
+    fn test_audit_record_json_roundtrip() {
+        let record = GcAuditRecord::new(
+            GcTrigger::Manual,
+            3,
+            2,
+            1,
+            0,
+            2048,
+            250,
+            vec![SkippedAction {
+                action: "test".to_string(),
+                reason: "test reason".to_string(),
+            }],
+        );
+
+        let json = serde_json::to_string(&record).unwrap();
+        let recovered: GcAuditRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.id, record.id);
+        assert_eq!(recovered.triggered_by, GcTrigger::Manual);
+        assert_eq!(recovered.actions_planned, 3);
+        assert_eq!(recovered.skipped_details.len(), 1);
+    }
+
+    #[test]
+    fn test_audit_logger_write_and_read() {
+        let dir = tempdir().unwrap();
+        let audit_logger = GcAuditLogger::new(dir.path());
+
+        let record = GcAuditRecord::new(GcTrigger::Manual, 5, 5, 0, 0, 4096, 100, vec![]);
+        audit_logger.write_record(&record).unwrap();
+
+        let records = audit_logger.read_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, record.id);
+        assert_eq!(records[0].space_freed_bytes, 4096);
+    }
+
+    #[test]
+    fn test_audit_logger_appends_multiple() {
+        let dir = tempdir().unwrap();
+        let audit_logger = GcAuditLogger::new(dir.path());
+
+        for i in 0..3 {
+            let record =
+                GcAuditRecord::new(GcTrigger::Manual, i, i, 0, 0, (i as u64) * 100, 50, vec![]);
+            audit_logger.write_record(&record).unwrap();
+        }
+
+        let records = audit_logger.read_records().unwrap();
+        assert_eq!(records.len(), 3);
+    }
+
+    #[test]
+    fn test_audit_logger_read_last() {
+        let dir = tempdir().unwrap();
+        let audit_logger = GcAuditLogger::new(dir.path());
+
+        for i in 0..5 {
+            let record = GcAuditRecord::new(GcTrigger::Manual, i, i, 0, 0, 0, 0, vec![]);
+            audit_logger.write_record(&record).unwrap();
+        }
+
+        let last3 = audit_logger.read_last(3).unwrap();
+        assert_eq!(last3.len(), 3);
+        // Should be the last 3 records (actions_planned = 2, 3, 4)
+        assert_eq!(last3[0].actions_planned, 2);
+        assert_eq!(last3[1].actions_planned, 3);
+        assert_eq!(last3[2].actions_planned, 4);
+    }
+
+    #[test]
+    fn test_audit_logger_no_file() {
+        let dir = tempdir().unwrap();
+        let audit_logger = GcAuditLogger::new(dir.path());
+
+        let records = audit_logger.read_records().unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn test_audit_logger_creates_gc_directory() {
+        let dir = tempdir().unwrap();
+        let gc_dir = dir.path().join("gc");
+        assert!(!gc_dir.exists());
+
+        let audit_logger = GcAuditLogger::new(dir.path());
+        let record = GcAuditRecord::new(GcTrigger::Manual, 0, 0, 0, 0, 0, 0, vec![]);
+        audit_logger.write_record(&record).unwrap();
+
+        assert!(gc_dir.exists());
+        assert!(dir.path().join("gc/audit.jsonl").exists());
+    }
+
+    #[test]
+    fn test_gc_trigger_serde() {
+        let manual_json = serde_json::to_string(&GcTrigger::Manual).unwrap();
+        let scheduled_json = serde_json::to_string(&GcTrigger::Scheduled).unwrap();
+        assert_eq!(manual_json, "\"manual\"");
+        assert_eq!(scheduled_json, "\"scheduled\"");
     }
 }

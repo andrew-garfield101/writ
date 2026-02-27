@@ -102,17 +102,12 @@ impl Pattern for NonOverlappingDefinitions {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convergence::test_utils::helpers;
     use crate::convergence::types::*;
 
+    /// Class definition with span (0,3) — matches this pattern's test expectations.
     fn def_unit(name: &str, content: &str) -> StructuralUnit {
-        let mut unit = StructuralUnit::new(
-            UnitKind::Definition,
-            Some(name.into()),
-            (0, 3),
-            content.into(),
-        );
-        unit.metadata.insert("def_kind".into(), "class".into());
-        unit
+        helpers::def_unit_with_span(name, content, "class", (0, 3))
     }
 
     #[test]

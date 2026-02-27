@@ -92,35 +92,10 @@ impl Pattern for ImportAccumulation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convergence::test_utils::helpers::{
+        import_with_meta, make_import_conflict, named_import as import_unit,
+    };
     use crate::convergence::types::*;
-
-    fn import_unit(name: &str, content: &str) -> StructuralUnit {
-        StructuralUnit::new(UnitKind::Import, Some(name.into()), (0, 1), content.into())
-    }
-
-    fn make_import_conflict(
-        left: Vec<StructuralUnit>,
-        right: Vec<StructuralUnit>,
-    ) -> ClassifiedConflict {
-        ClassifiedConflict {
-            region: StructuralConflictRegion {
-                base_units: vec![],
-                left_units: left,
-                right_units: right,
-                base_span: (0, 0),
-                left_span: (0, 0),
-                right_span: (0, 0),
-            },
-            conflict_type: ConflictType::BothInserted,
-            requires_review: false,
-            structural_info: StructuralInfo {
-                left_unit_kinds: vec![UnitKind::Import],
-                right_unit_kinds: vec![UnitKind::Import],
-                has_name_overlap: false,
-                scope: ConflictScope::Import,
-            },
-        }
-    }
 
     #[test]
     fn test_union_disjoint_imports() {
@@ -162,23 +137,6 @@ mod tests {
             "conflicting imports should lower confidence to 0.60"
         );
         assert!(!proposal.warnings.is_empty());
-    }
-
-    /// Helper: create an import unit with metadata.
-    fn import_with_meta(
-        name: &str,
-        content: &str,
-        lang: &str,
-        module: &str,
-        names: &str,
-    ) -> StructuralUnit {
-        let mut unit = import_unit(name, content);
-        unit.metadata.insert("import_lang".into(), lang.into());
-        unit.metadata.insert("import_module".into(), module.into());
-        if !names.is_empty() {
-            unit.metadata.insert("import_names".into(), names.into());
-        }
-        unit
     }
 
     #[test]

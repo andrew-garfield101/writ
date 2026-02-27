@@ -1,0 +1,52 @@
+scenario: delete_vs_ignore
+version: 1
+description: >
+  One agent deletes a baseline file while another agent creates a new file.
+  Note: in the sequential-seal runner, baseline-restore before agent B means
+  the deleted file reappears in B's seal tree. Tests that convergence
+  handles this gracefully without errors or degradation.
+tags: [deletion, no-conflict, runner-limitation]
+
+setup:
+  specs:
+    - id: spec-a
+    - id: spec-b
+  baseline:
+    - path: keep.py
+      content: |
+        keep this
+    - path: remove.py
+      content: |
+        remove this
+
+agents:
+  - id: agent-a
+    spec: spec-a
+    changes:
+      - path: remove.py
+        action: delete
+
+  - id: agent-b
+    spec: spec-b
+    changes:
+      - path: new.py
+        action: write
+        content: |
+          new content
+
+convergence:
+  strategy: escalate
+
+assertions:
+  convergence:
+    - type: not_degraded
+    - type: file_contains
+      file: new.py
+      content: new content
+    - type: file_exists
+      file: keep.py
+    # NOTE: file_deleted assertion omitted — sequential-seal runner restores
+    # baseline before agent B, so remove.py reappears in the merged tree.
+    # True deletion testing requires a parallel runner or Layer 5 live agent.
+  security:
+    - type: chain_valid

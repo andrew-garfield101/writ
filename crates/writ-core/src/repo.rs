@@ -10312,10 +10312,7 @@ mod chain_tests {
         );
 
         // The failure should reference the missing seal
-        let missing_failure = result
-            .failures
-            .iter()
-            .find(|f| f.seal_id == *first_seal_id);
+        let missing_failure = result.failures.iter().find(|f| f.seal_id == *first_seal_id);
         assert!(
             missing_failure.is_some(),
             "failure should reference the missing seal ID"
@@ -10344,12 +10341,17 @@ mod chain_tests {
         fs::remove_file(&seal_path).unwrap();
 
         let result = repo.verify_chain(None).unwrap();
-        assert!(!result.valid, "chain with missing HEAD seal should be invalid");
+        assert!(
+            !result.valid,
+            "chain with missing HEAD seal should be invalid"
+        );
         assert_eq!(result.total_seals, 0, "no seals could be loaded");
         assert_eq!(result.failures.len(), 1);
-        assert!(
-            result.failures[0].error.as_ref().unwrap().contains("chain broken"),
-        );
+        assert!(result.failures[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("chain broken"),);
     }
 
     #[test]
@@ -10444,7 +10446,11 @@ mod chain_tests {
         {
             let repo = Repository::open(dir.path()).unwrap();
             let result = repo.verify_chain(None).unwrap();
-            assert!(result.valid, "chain should verify after repo reopen: {:?}", result.failures);
+            assert!(
+                result.valid,
+                "chain should verify after repo reopen: {:?}",
+                result.failures
+            );
             assert_eq!(result.verified, 2);
             assert!(result.failures.is_empty());
         }

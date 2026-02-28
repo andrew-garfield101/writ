@@ -1326,13 +1326,55 @@ mod tests {
     #[test]
     fn test_storage_config_from_profile_names() {
         // All valid profile name variants should load correctly
-        assert_eq!(GcConfig::from_profile("raspberry-pi").unwrap().storage.compression_level, 1);
-        assert_eq!(GcConfig::from_profile("raspberry_pi").unwrap().storage.compression_level, 1);
-        assert_eq!(GcConfig::from_profile("development").unwrap().storage.compression_level, 3);
-        assert_eq!(GcConfig::from_profile("dev").unwrap().storage.compression_level, 3);
-        assert_eq!(GcConfig::from_profile("production").unwrap().storage.compression_level, 3);
-        assert_eq!(GcConfig::from_profile("prod").unwrap().storage.compression_level, 3);
-        assert_eq!(GcConfig::from_profile("enterprise").unwrap().storage.compression_level, 6);
+        assert_eq!(
+            GcConfig::from_profile("raspberry-pi")
+                .unwrap()
+                .storage
+                .compression_level,
+            1
+        );
+        assert_eq!(
+            GcConfig::from_profile("raspberry_pi")
+                .unwrap()
+                .storage
+                .compression_level,
+            1
+        );
+        assert_eq!(
+            GcConfig::from_profile("development")
+                .unwrap()
+                .storage
+                .compression_level,
+            3
+        );
+        assert_eq!(
+            GcConfig::from_profile("dev")
+                .unwrap()
+                .storage
+                .compression_level,
+            3
+        );
+        assert_eq!(
+            GcConfig::from_profile("production")
+                .unwrap()
+                .storage
+                .compression_level,
+            3
+        );
+        assert_eq!(
+            GcConfig::from_profile("prod")
+                .unwrap()
+                .storage
+                .compression_level,
+            3
+        );
+        assert_eq!(
+            GcConfig::from_profile("enterprise")
+                .unwrap()
+                .storage
+                .compression_level,
+            6
+        );
         assert!(GcConfig::from_profile("unknown").is_err());
     }
 
@@ -1341,7 +1383,10 @@ mod tests {
         // Every profile should use zstd compression
         for name in &["dev", "raspberry-pi", "prod", "enterprise"] {
             let config = GcConfig::from_profile(name).unwrap();
-            assert_eq!(config.storage.compression, "zstd", "profile '{name}' should use zstd");
+            assert_eq!(
+                config.storage.compression, "zstd",
+                "profile '{name}' should use zstd"
+            );
         }
     }
 

@@ -3523,6 +3523,28 @@ fn cmd_gc_run(
                                 println!("    clean-events  {count} {severity} event(s)");
                                 println!("                  {reason}");
                             }
+                            writ_core::gc::GcAction::PruneObjects {
+                                count,
+                                total_bytes,
+                                reason,
+                            } => {
+                                println!(
+                                    "    prune-objects  {count} object(s), {:.1} MB",
+                                    *total_bytes as f64 / 1_048_576.0
+                                );
+                                println!("                   {reason}");
+                            }
+                            writ_core::gc::GcAction::RecompressObjects {
+                                count,
+                                estimated_savings_bytes,
+                                reason,
+                            } => {
+                                println!(
+                                    "    recompress     {count} object(s), ~{:.1} MB savings",
+                                    *estimated_savings_bytes as f64 / 1_048_576.0
+                                );
+                                println!("                   {reason}");
+                            }
                         }
                     }
                 }
@@ -3543,13 +3565,26 @@ fn cmd_gc_run(
     // Confirm unless --yes was passed.
     if !yes {
         eprintln!("{}", plan.summary.summary_line);
-        eprintln!(
+        let mut details = format!(
             "{} action(s): {} transition(s), {} deletion(s), {} event(s)",
             plan.summary.total_actions,
             plan.summary.transitions,
             plan.summary.deletions,
             plan.summary.events_to_clean
         );
+        if plan.summary.objects_to_prune > 0 {
+            details.push_str(&format!(
+                ", {} object(s) to prune",
+                plan.summary.objects_to_prune
+            ));
+        }
+        if plan.summary.objects_to_recompress > 0 {
+            details.push_str(&format!(
+                ", {} object(s) to recompress",
+                plan.summary.objects_to_recompress
+            ));
+        }
+        eprintln!("{details}");
         eprint!("proceed? [y/N] ");
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
@@ -3587,6 +3622,20 @@ fn cmd_gc_run(
             }
             if result.events_cleaned > 0 {
                 println!("  cleaned events: {}", result.events_cleaned);
+            }
+            if result.objects_pruned > 0 {
+                println!(
+                    "  pruned: {} object(s), {:.1} MB freed",
+                    result.objects_pruned,
+                    result.bytes_freed as f64 / 1_048_576.0
+                );
+            }
+            if result.objects_recompressed > 0 {
+                println!(
+                    "  recompressed: {} object(s), {:.1} MB saved",
+                    result.objects_recompressed,
+                    result.recompression_savings as f64 / 1_048_576.0
+                );
             }
             if result.audit.actions_skipped > 0 {
                 println!("  skipped: {} (safety rules)", result.audit.actions_skipped);
@@ -3739,6 +3788,20 @@ fn cmd_gc_storage(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error:
                 "  other:           {:.1} MB",
                 storage.other_bytes as f64 / 1_048_576.0
             );
+            // Compression stats (if available)
+            if let Some(ref cs) = storage.compression {
+                println!();
+                println!(
+                    "  compression: {} compressed, {} raw, {} legacy",
+                    cs.compressed_objects, cs.raw_objects, cs.legacy_objects
+                );
+                println!(
+                    "    ratio: {:.1}x ({:.1} MB content in {:.1} MB on disk)",
+                    cs.compression_ratio,
+                    cs.total_content_bytes as f64 / 1_048_576.0,
+                    cs.total_disk_bytes as f64 / 1_048_576.0
+                );
+            }
             println!();
             if storage.budget_bytes == u64::MAX {
                 println!("  budget: unlimited (enterprise)");

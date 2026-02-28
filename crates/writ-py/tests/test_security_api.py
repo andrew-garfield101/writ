@@ -300,6 +300,105 @@ class TestChainIntegrityContract:
         assert len(result["failures"]) == 0
 
 
+# ── Graceful chain degradation (Amis fix: walk_chain_graceful) ────────
+
+
+class TestChainGracefulDegradation:
+    """Verify verify_chain handles missing/corrupted seals gracefully.
+
+    When a seal file is deleted from .writ/seals/, verify_chain should
+    return {valid: false, failures: [...]} instead of throwing RuntimeError.
+    Covers Amis's fix for the "object not found" bug.
+    """
+
+    def test_missing_mid_chain_seal_returns_failure_not_error(self, tmp_path):
+        """Delete a middle seal from disk — verify_chain should not throw."""
+        repo = writ.Repository.init(str(tmp_path))
+        seal_ids = []
+        for i in range(3):
+            (tmp_path / f"file_{i}.txt").write_text(f"content {i}")
+            seal = repo.seal(
+                summary=f"seal {i}",
+                agent_id="test",
+                agent_type="agent",
+                status="in-progress",
+            )
+            seal_ids.append(seal["id"])
+
+        # Delete the middle seal file from disk
+        mid_seal_path = tmp_path / ".writ" / "seals" / f"{seal_ids[1]}.json"
+        assert mid_seal_path.exists(), f"Expected seal file at {mid_seal_path}"
+        mid_seal_path.unlink()
+
+        # Should NOT throw — should return graceful failure
+        result = repo.verify_chain()
+        assert isinstance(result, dict)
+        assert result["valid"] is False
+        assert len(result["failures"]) > 0
+
+    def test_missing_head_seal_returns_failure(self, tmp_path):
+        """Delete the HEAD seal — verify_chain should degrade gracefully."""
+        repo = writ.Repository.init(str(tmp_path))
+        (tmp_path / "a.txt").write_text("first")
+        seal1 = repo.seal(summary="first")
+        (tmp_path / "b.txt").write_text("second")
+        seal2 = repo.seal(summary="second")
+
+        # Delete the latest seal
+        head_path = tmp_path / ".writ" / "seals" / f"{seal2['id']}.json"
+        assert head_path.exists()
+        head_path.unlink()
+
+        result = repo.verify_chain()
+        assert isinstance(result, dict)
+        assert result["valid"] is False
+        assert len(result["failures"]) > 0
+
+    def test_missing_genesis_seal_still_verifies_loaded(self, tmp_path):
+        """Delete genesis seal — loaded seals should still be verified."""
+        repo = writ.Repository.init(str(tmp_path))
+        seal_ids = []
+        for i in range(3):
+            (tmp_path / f"file_{i}.txt").write_text(f"content {i}")
+            seal = repo.seal(
+                summary=f"seal {i}",
+                agent_id="test",
+                agent_type="agent",
+                status="in-progress",
+            )
+            seal_ids.append(seal["id"])
+
+        # Delete the genesis (first) seal
+        genesis_path = tmp_path / ".writ" / "seals" / f"{seal_ids[0]}.json"
+        assert genesis_path.exists()
+        genesis_path.unlink()
+
+        result = repo.verify_chain()
+        assert isinstance(result, dict)
+        assert result["valid"] is False
+        # Should have at least 1 failure for the chain break
+        assert len(result["failures"]) >= 1
+        # The other seals that could be loaded should still count
+        assert result["total_seals"] >= 1
+
+    def test_intact_chain_passes_after_verify(self, tmp_path):
+        """Sanity check: intact chain still passes (no false positives)."""
+        repo = writ.Repository.init(str(tmp_path))
+        for i in range(5):
+            (tmp_path / f"file_{i}.txt").write_text(f"content {i}")
+            repo.seal(
+                summary=f"seal {i}",
+                agent_id="test",
+                agent_type="agent",
+                status="in-progress",
+            )
+
+        result = repo.verify_chain()
+        assert result["valid"] is True
+        assert len(result["failures"]) == 0
+        assert result["total_seals"] == 5
+
+
 # ── Error handling contract ───────────────────────────────────────────
 
 

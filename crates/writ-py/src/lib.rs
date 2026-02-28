@@ -745,6 +745,12 @@ impl PyRepository {
             }
         }
 
+        // Orphan analysis
+        let all_seals = writ_core::gc::load_all_seals(writ_dir).map_err(writ_err)?;
+        let orphans =
+            writ_core::gc::find_orphaned_objects(writ_dir, &all_seals).map_err(writ_err)?;
+        let orphan_bytes: u64 = orphans.iter().map(|o| o.size_bytes).sum();
+
         let result = serde_json::json!({
             "storage": storage,
             "usage_pct": storage.usage_pct(),
@@ -759,6 +765,8 @@ impl PyRepository {
             "stale_candidates": stale.iter().map(|(id, secs)| {
                 serde_json::json!({"spec_id": id, "inactive_seconds": secs})
             }).collect::<Vec<_>>(),
+            "orphaned_objects": orphans.len(),
+            "orphaned_bytes": orphan_bytes,
             "mode": config.mode,
             "budget_bytes": config.budget_bytes,
         });
@@ -807,6 +815,10 @@ impl PyRepository {
             "transitions_applied": result.transitions_applied.iter().map(|(id, from, to)| {
                 serde_json::json!({"spec_id": id, "from": from, "to": to})
             }).collect::<Vec<_>>(),
+            "objects_pruned": result.objects_pruned,
+            "bytes_freed": result.bytes_freed,
+            "objects_recompressed": result.objects_recompressed,
+            "recompression_savings": result.recompression_savings,
         });
         to_pydict(py, &output)
     }

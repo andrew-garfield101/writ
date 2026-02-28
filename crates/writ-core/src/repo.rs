@@ -142,7 +142,8 @@ impl Repository {
 
     /// Open an existing writ repository.
     ///
-    /// Searches for `.writ/` in the given directory.
+    /// Searches for `.writ/` in the given directory. Loads compression
+    /// settings from GcConfig if available, otherwise uses defaults.
     pub fn open(root: &Path) -> WritResult<Self> {
         let writ_dir = root.join(WRIT_DIR);
 
@@ -150,7 +151,25 @@ impl Repository {
             return Err(WritError::NotARepo);
         }
 
-        let objects = ObjectStore::new(&writ_dir.join("objects"));
+        // Load storage config for ObjectStore compression settings.
+        let storage_config = crate::gc::GcConfig::load(&writ_dir)
+            .map(|c| c.storage)
+            .unwrap_or_default();
+
+        let objects = if storage_config.compression == "none" {
+            // Compression disabled: store raw with magic byte prefix.
+            ObjectStore::with_config(
+                &writ_dir.join("objects"),
+                0,
+                storage_config.max_object_size_bytes,
+            )
+        } else {
+            ObjectStore::with_config(
+                &writ_dir.join("objects"),
+                storage_config.compression_level,
+                storage_config.max_object_size_bytes,
+            )
+        };
 
         Ok(Self {
             root: root.to_path_buf(),
@@ -746,12 +765,15 @@ impl Repository {
     /// Walks the chain from HEAD to genesis, verifying each seal's content hash
     /// and chain hash linkage. Seals without crypto fields (pre-Sprint A) are
     /// counted as unsecured but don't cause verification failure.
+    ///
+    /// Gracefully handles missing or unreadable seals in the chain — these are
+    /// reported as failures rather than causing verify_chain() to error out.
     pub fn verify_chain(
         &self,
         verifying_key: Option<&ed25519_dalek::VerifyingKey>,
     ) -> WritResult<ChainVerification> {
-        let seals = self.log()?;
-        self.verify_seal_chain(&seals, verifying_key)
+        let start = self.read_head()?;
+        self.verify_chain_from(start, verifying_key)
     }
 
     /// Verify the HEAD chain plus every spec's branch chain.
@@ -795,8 +817,64 @@ impl Repository {
         spec_id: &str,
         verifying_key: Option<&ed25519_dalek::VerifyingKey>,
     ) -> WritResult<ChainVerification> {
-        let seals = self.spec_log(spec_id)?;
-        self.verify_seal_chain(&seals, verifying_key)
+        let start = self.read_spec_head(spec_id)?;
+        self.verify_chain_from(start, verifying_key)
+    }
+
+    /// Walk a seal chain from a starting ID, gracefully handling missing seals.
+    ///
+    /// Returns `(loaded_seals, chain_break)` where `chain_break` is `Some`
+    /// if a seal in the chain couldn't be loaded (missing or corrupt).
+    fn walk_chain_graceful(
+        &self,
+        start: Option<String>,
+    ) -> (Vec<crate::seal::Seal>, Option<(String, String)>) {
+        let mut seals = Vec::new();
+        let mut current = start;
+        let mut chain_break: Option<(String, String)> = None;
+
+        while let Some(seal_id) = current {
+            match self.load_seal(&seal_id) {
+                Ok(seal) => {
+                    current = seal.parent.clone();
+                    seals.push(seal);
+                }
+                Err(e) => {
+                    chain_break = Some((seal_id, format!("{e}")));
+                    break;
+                }
+            }
+        }
+
+        (seals, chain_break)
+    }
+
+    /// Verify a chain starting from a given seal ID. Handles missing seals
+    /// gracefully by recording them as failures instead of propagating errors.
+    fn verify_chain_from(
+        &self,
+        start: Option<String>,
+        verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+    ) -> WritResult<ChainVerification> {
+        let (seals, chain_break) = self.walk_chain_graceful(start);
+        let mut result = self.verify_seal_chain(&seals, verifying_key)?;
+
+        if let Some((missing_id, err_msg)) = chain_break {
+            let error = format!("chain broken: seal not found: {missing_id} ({err_msg})");
+            let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+            let _ = logger.emit_chain_hash_failure(&missing_id, &error);
+            result.failures.push(SealVerification {
+                seal_id: missing_id,
+                content_hash_valid: false,
+                chain_hash_valid: false,
+                signature_present: false,
+                signature_valid: None,
+                error: Some(error),
+            });
+            result.valid = false;
+        }
+
+        Ok(result)
     }
 
     /// Shared implementation for chain verification — used by both
@@ -10194,6 +10272,182 @@ mod chain_tests {
             "all content hashes should be unique"
         );
         assert_eq!(chain_hashes.len(), 10, "all chain hashes should be unique");
+    }
+
+    #[test]
+    fn test_verify_chain_missing_seal_returns_failure_not_error() {
+        // Regression: verify_chain() used to throw "object not found" when a
+        // seal in the chain was missing from disk. Now it returns a failure
+        // entry in the ChainVerification instead.
+        let dir = tempdir().unwrap();
+        let repo = setup_chain_repo(dir.path());
+
+        // Create a second seal
+        fs::write(dir.path().join("file.txt"), "second version").unwrap();
+        repo.seal(
+            chain_agent(),
+            "second seal".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Delete the first seal from disk (simulating a broken chain)
+        let seals = repo.log().unwrap();
+        let first_seal_id = &seals[1].id; // seals[1] is the older/genesis seal
+        let first_seal_path = dir
+            .path()
+            .join(".writ/seals")
+            .join(format!("{first_seal_id}.json"));
+        fs::remove_file(&first_seal_path).unwrap();
+
+        // verify_chain should NOT error — it should return a result with failures
+        let result = repo.verify_chain(None).unwrap();
+        assert!(!result.valid, "chain with missing seal should be invalid");
+        assert!(
+            !result.failures.is_empty(),
+            "should have failure entries for missing seal"
+        );
+
+        // The failure should reference the missing seal
+        let missing_failure = result
+            .failures
+            .iter()
+            .find(|f| f.seal_id == *first_seal_id);
+        assert!(
+            missing_failure.is_some(),
+            "failure should reference the missing seal ID"
+        );
+        let err = missing_failure.unwrap().error.as_ref().unwrap();
+        assert!(
+            err.contains("chain broken"),
+            "error should indicate chain break: {err}"
+        );
+    }
+
+    #[test]
+    fn test_verify_chain_missing_head_seal_returns_failure() {
+        // HEAD points to a seal that doesn't exist on disk
+        let dir = tempdir().unwrap();
+        let repo = setup_chain_repo(dir.path());
+
+        let seals = repo.log().unwrap();
+        let head_id = &seals[0].id;
+
+        // Delete the HEAD seal from disk
+        let seal_path = dir
+            .path()
+            .join(".writ/seals")
+            .join(format!("{head_id}.json"));
+        fs::remove_file(&seal_path).unwrap();
+
+        let result = repo.verify_chain(None).unwrap();
+        assert!(!result.valid, "chain with missing HEAD seal should be invalid");
+        assert_eq!(result.total_seals, 0, "no seals could be loaded");
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            result.failures[0].error.as_ref().unwrap().contains("chain broken"),
+        );
+    }
+
+    #[test]
+    fn test_verify_chain_partial_chain_still_verifies_loaded_seals() {
+        // Chain: seal3 -> seal2 -> seal1 (genesis)
+        // Delete seal1 — seal3 and seal2 should still verify, plus a chain-break failure
+        let dir = tempdir().unwrap();
+        let repo = setup_chain_repo(dir.path());
+
+        fs::write(dir.path().join("file.txt"), "v2").unwrap();
+        repo.seal(
+            chain_agent(),
+            "second".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("file.txt"), "v3").unwrap();
+        repo.seal(
+            chain_agent(),
+            "third".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Delete the genesis seal
+        let seals = repo.log().unwrap();
+        assert_eq!(seals.len(), 3);
+        let genesis_id = &seals[2].id;
+        fs::remove_file(
+            dir.path()
+                .join(".writ/seals")
+                .join(format!("{genesis_id}.json")),
+        )
+        .unwrap();
+
+        let result = repo.verify_chain(None).unwrap();
+        assert!(!result.valid);
+        // seal3 and seal2 were loaded and verified (2 verified)
+        assert_eq!(result.verified, 2, "the two loadable seals should verify");
+        assert_eq!(result.total_seals, 2, "only 2 seals could be loaded");
+        // Plus 1 failure for the missing genesis seal
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].seal_id, *genesis_id);
+    }
+
+    #[test]
+    fn test_verify_chain_reopened_repo_passes() {
+        // Verify chain integrity survives repo close/reopen (cross-process scenario)
+        let dir = tempdir().unwrap();
+
+        // First "process": init and seal
+        {
+            let repo = Repository::init(dir.path()).unwrap();
+            fs::write(dir.path().join("file.txt"), "initial").unwrap();
+            repo.seal(
+                chain_agent(),
+                "baseline".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        }
+
+        // Second "process": open, modify, seal
+        {
+            let repo = Repository::open(dir.path()).unwrap();
+            fs::write(dir.path().join("file.txt"), "updated by agent").unwrap();
+            repo.seal(
+                AgentIdentity {
+                    id: "cli-agent".to_string(),
+                    agent_type: AgentType::Agent,
+                },
+                "agent seal".to_string(),
+                Some("test-spec".to_string()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                true,
+            )
+            .unwrap();
+        }
+
+        // Third "process": open and verify
+        {
+            let repo = Repository::open(dir.path()).unwrap();
+            let result = repo.verify_chain(None).unwrap();
+            assert!(result.valid, "chain should verify after repo reopen: {:?}", result.failures);
+            assert_eq!(result.verified, 2);
+            assert!(result.failures.is_empty());
+        }
     }
 }
 

@@ -66,6 +66,8 @@ pub enum WritError {
     PullDiverged,
     /// Could not acquire the remote lock within the timeout.
     RemoteLockTimeout,
+    /// Decompression bomb: object decompresses to more than the allowed limit.
+    DecompressionBomb { hash: String, limit: usize },
     /// Generic error with a message.
     Other(String),
 }
@@ -128,6 +130,14 @@ impl fmt::Display for WritError {
             }
             WritError::RemoteLockTimeout => {
                 write!(f, "could not acquire remote lock within timeout")
+            }
+            WritError::DecompressionBomb { hash, limit } => {
+                write!(
+                    f,
+                    "decompression bomb: object {} exceeds {} byte limit",
+                    &hash[..hash.len().min(12)],
+                    limit
+                )
             }
             WritError::Other(msg) => write!(f, "{msg}"),
         }

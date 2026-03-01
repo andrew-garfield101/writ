@@ -1,14 +1,10 @@
 # writ
 
-**AI-native version control for agentic systems.**
+**AI native version control for agentic systems.**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
 [![CI](https://github.com/andrew-garfield101/writ/actions/workflows/ci.yml/badge.svg)](https://github.com/andrew-garfield101/writ/actions/workflows/ci.yml)
 
-> [!WARNING]
-> Writ is in early alpha. The core is stable and thoroughly tested (1,350+ Rust tests, 400+ Python tests, 41 YAML scenario tests), but the API may change before 1.0. Use it, break it, file issues.
-
----
 
 Writ is a version control system designed from the ground up for LLMs and multi-agent development fleets. Its core primitives are **specs** (not branches), **seals** (not commits), and **convergence** (not merging). It works alongside git, not instead of it.
 
@@ -94,7 +90,7 @@ That's it. Human checks out a branch, agents work in writ, human gets a commit w
 
 Git's data model was built for humans. Commits carry no structured metadata about which task they serve, which agent made them, or whether tests passed. You can bolt conventions on top, but conventions are things some agents follow and others don't.
 
-Writ puts agent-native metadata inside the VCS:
+Writ puts agent native metadata inside the VCS:
 
 | Git | Writ | What Changes |
 |-----|------|-------------|

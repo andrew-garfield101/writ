@@ -22,5 +22,11 @@ venv/
 # writ's own data (when dogfooding)
 .writ/
 
+# mdbook generated output
+book/book/
+
 # Temporary / scratch directories
 tmp/
+
+# Test run results
+testing/ 

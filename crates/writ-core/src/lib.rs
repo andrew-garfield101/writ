@@ -25,6 +25,7 @@ pub mod remote;
 pub mod repo;
 pub mod seal;
 pub mod security;
+pub mod settings;
 pub mod spec;
 pub mod state;
 

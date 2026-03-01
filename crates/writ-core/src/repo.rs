@@ -52,6 +52,8 @@ pub struct Repository {
     /// When true, seal() rejects files outside an agent's scope constraints.
     /// When false (default), out-of-scope files produce warnings but the seal succeeds.
     enforce_scope: bool,
+    /// Persistent repository settings loaded from `.writ/settings.json`.
+    settings: crate::settings::WritSettings,
 }
 
 /// Snapshot of git working tree state, used by install().
@@ -171,12 +173,17 @@ impl Repository {
             )
         };
 
+        // Load persistent settings (defaults if file missing).
+        let settings = crate::settings::WritSettings::load(&writ_dir).unwrap_or_default();
+        let enforce_scope = settings.enforce_scope.unwrap_or(false);
+
         Ok(Self {
             root: root.to_path_buf(),
             writ_dir,
             objects,
             last_context_head: Mutex::new(None),
-            enforce_scope: false,
+            enforce_scope,
+            settings,
         })
     }
 
@@ -1172,6 +1179,11 @@ impl Repository {
     /// Get the path to the `.writ/` directory.
     pub fn writ_dir(&self) -> &std::path::Path {
         &self.writ_dir
+    }
+
+    /// Get the persistent repository settings.
+    pub fn settings(&self) -> &crate::settings::WritSettings {
+        &self.settings
     }
 
     /// Diff working tree against the last seal (HEAD).
@@ -24667,5 +24679,59 @@ mod lifecycle_tests {
             false,
         );
         assert!(result.is_ok(), "seal must always succeed: {:?}", result);
+    }
+
+    // -----------------------------------------------------------------------
+    // Settings integration tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_open_loads_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+
+        // Write a settings file
+        let settings_json = r#"{"default_agent": "my-bot", "default_format": "json"}"#;
+        fs::write(dir.path().join(".writ/settings.json"), settings_json).unwrap();
+
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(repo.settings().default_agent.as_deref(), Some("my-bot"));
+        assert_eq!(repo.settings().default_format.as_deref(), Some("json"));
+    }
+
+    #[test]
+    fn test_open_no_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        // No settings.json → all defaults
+        assert!(repo.settings().default_agent.is_none());
+        assert!(repo.settings().default_format.is_none());
+        assert!(repo.settings().convergence.strategy.is_none());
+    }
+
+    #[test]
+    fn test_enforce_scope_from_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+
+        // Write settings with enforce_scope = true
+        let settings_json = r#"{"enforce_scope": true}"#;
+        fs::write(dir.path().join(".writ/settings.json"), settings_json).unwrap();
+
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(repo.settings().enforce_scope, Some(true));
+        // The enforce_scope field on Repository should also be true
+        assert!(repo.enforce_scope);
+    }
+
+    #[test]
+    fn test_init_creates_repo_with_default_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // init → open → settings default
+        assert!(repo.settings().default_agent.is_none());
+        assert!(repo.settings().enforce_scope.is_none());
+        assert!(repo.settings().convergence.auto_resolve.is_none());
     }
 }

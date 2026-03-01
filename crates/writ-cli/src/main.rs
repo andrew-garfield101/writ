@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 use writ_core::agent::{AgentUpdate, TrustLevel};
 use writ_core::context::{ContextFilter, ContextScope};
 use writ_core::diff::LineOp;
@@ -345,6 +346,12 @@ enum Commands {
         #[command(subcommand)]
         action: GcCommands,
     },
+
+    /// Persistent repository settings.
+    Config {
+        #[command(subcommand)]
+        action: ConfigCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -675,6 +682,45 @@ enum GcCommands {
     },
 }
 
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Set a configuration value.
+    Set {
+        /// Setting key (e.g., "default_agent", "convergence.auto_resolve").
+        key: String,
+        /// Setting value.
+        value: String,
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Get a configuration value.
+    Get {
+        /// Setting key.
+        key: String,
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// List all configuration settings.
+    List {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Remove a configuration value (reset to default).
+    Unset {
+        /// Setting key.
+        key: String,
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+}
+
 fn main() {
     // Reset SIGPIPE to default so piping to `head`, `grep`, etc. doesn't
     // cause a Rust BrokenPipe panic (exit 101) which kills `set -euo pipefail` scripts.
@@ -889,11 +935,46 @@ fn main() {
             GcCommands::Storage { format } => cmd_gc_storage(&cwd, &format),
             GcCommands::Log { limit, format } => cmd_gc_log(&cwd, limit, &format),
         },
+        Commands::Config { action } => match action {
+            ConfigCommands::Set { key, value, format } => {
+                cmd_config_set(&cwd, &key, &value, &format)
+            }
+            ConfigCommands::Get { key, format } => cmd_config_get(&cwd, &key, &format),
+            ConfigCommands::List { format } => cmd_config_list(&cwd, &format),
+            ConfigCommands::Unset { key, format } => cmd_config_unset(&cwd, &key, &format),
+        },
     };
 
     if let Err(e) = result {
-        eprintln!("error: {e}");
+        eprintln!("{} {e}", "error:".red().bold());
         process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Shared CLI helpers
+// ---------------------------------------------------------------------------
+
+/// Create a cyan braille spinner with the given message (C-2 dedup).
+fn make_spinner(msg: &str) -> indicatif::ProgressBar {
+    let sp = indicatif::ProgressBar::new_spinner();
+    sp.set_style(
+        indicatif::ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
+    );
+    sp.set_message(msg.to_string());
+    sp.enable_steady_tick(std::time::Duration::from_millis(80));
+    sp
+}
+
+/// Color an integration risk level string (C-3 dedup).
+fn color_risk_level(level: &str) -> colored::ColoredString {
+    match level {
+        "low" => level.to_uppercase().green(),
+        "medium" => level.to_uppercase().yellow(),
+        "high" => level.to_uppercase().red(),
+        _ => level.to_uppercase().normal(),
     }
 }
 
@@ -1129,21 +1210,26 @@ fn cmd_state(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Erro
         }
         _ => {
             if state.is_clean() {
-                println!("nothing to seal — working directory clean");
+                println!("{}", "nothing to seal — working directory clean".dimmed());
                 println!("  tracked: {} file(s)", state.tracked_count);
             } else {
                 println!(
                     "{} change(s) detected ({} tracked):\n",
-                    state.changes.len(),
+                    state.changes.len().to_string().bold(),
                     state.tracked_count
                 );
                 for f in &state.changes {
-                    let marker = match f.status {
-                        writ_core::state::FileStatus::New => "+  new",
-                        writ_core::state::FileStatus::Modified => "~  mod",
-                        writ_core::state::FileStatus::Deleted => "-  del",
+                    match f.status {
+                        writ_core::state::FileStatus::New => {
+                            println!("  {}  {}", "+  new".green(), f.path.green());
+                        }
+                        writ_core::state::FileStatus::Modified => {
+                            println!("  {}  {}", "~  mod".yellow(), f.path.yellow());
+                        }
+                        writ_core::state::FileStatus::Deleted => {
+                            println!("  {}  {}", "-  del".red(), f.path.red());
+                        }
                     };
-                    println!("  {marker}  {}", f.path);
                 }
             }
         }
@@ -1350,7 +1436,7 @@ fn cmd_log(
         }
         _ => {
             if seals.is_empty() {
-                println!("no seals yet");
+                println!("{}", "no seals yet".dimmed());
                 return Ok(());
             }
 
@@ -1358,21 +1444,30 @@ fn cmd_log(
                 if i > 0 {
                     println!();
                 }
-                println!("seal {}", &seal.id[..12]);
-                println!("  agent:   {}", seal.agent.id);
+                println!("{} {}", "seal".yellow(), seal.id[..12].yellow().bold());
+                println!("  agent:   {}", seal.agent.id.cyan());
                 println!(
                     "  time:    {}",
-                    seal.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+                    seal.timestamp
+                        .format("%Y-%m-%d %H:%M:%S UTC")
+                        .to_string()
+                        .dimmed()
                 );
                 if let Some(ref spec) = seal.spec_id {
-                    println!("  spec:    {spec}");
+                    println!("  spec:    {}", spec.cyan());
                 }
-                println!("  status:  {:?}", seal.status);
+                let status_str = format!("{:?}", seal.status);
+                let colored_status = match seal.status {
+                    TaskStatus::Complete => status_str.green(),
+                    TaskStatus::Blocked => status_str.red(),
+                    TaskStatus::InProgress => status_str.yellow(),
+                };
+                println!("  status:  {colored_status}");
                 println!("  summary: {}", seal.summary);
                 println!("  changes: {} file(s)", seal.changes.len());
                 if !seal.warnings.is_empty() {
                     for w in &seal.warnings {
-                        println!("  WARNING: {w}");
+                        println!("  {}", format!("WARNING: {w}").yellow());
                     }
                 }
             }
@@ -1390,20 +1485,25 @@ fn print_diverged_branch_warnings(repo: &Repository) {
             let total_seals: usize = diverged.iter().map(|b| b.seal_count).sum();
             eprintln!();
             eprintln!(
-                "  WARNING: {} diverged branch(es) with {} seal(s) not reachable from HEAD:",
+                "  {} {} diverged branch(es) with {} seal(s) not reachable from HEAD:",
+                "WARNING:".yellow().bold(),
                 diverged.len(),
                 total_seals,
             );
             for b in &diverged {
                 eprintln!(
                     "    branch '{}': {} seal(s) by {} (tip: {})",
-                    b.spec_id,
+                    b.spec_id.cyan(),
                     b.seal_count,
-                    b.agents.join(", "),
-                    b.tip_seal,
+                    b.agents.join(", ").cyan(),
+                    &b.tip_seal[..12.min(b.tip_seal.len())],
                 );
             }
-            eprintln!("  Run 'writ converge' to merge, or 'writ log --spec <id>' to inspect.");
+            eprintln!(
+                "  Run {} to merge, or {} to inspect.",
+                "'writ converge'".cyan(),
+                "'writ log --spec <id>'".cyan()
+            );
             eprintln!();
         }
     }
@@ -1452,29 +1552,41 @@ fn cmd_diff(
         _ => {
             // Human-readable unified diff format
             if diff_output.files.is_empty() {
-                println!("no changes");
+                println!("{}", "no changes".dimmed());
             } else {
                 for file_diff in &diff_output.files {
                     if file_diff.is_binary {
-                        println!("Binary file {} differs", file_diff.path);
+                        println!(
+                            "{}",
+                            format!("Binary file {} differs", file_diff.path).dimmed()
+                        );
                         continue;
                     }
 
-                    println!("--- a/{}", file_diff.path);
-                    println!("+++ b/{}", file_diff.path);
+                    println!("{}", format!("--- a/{}", file_diff.path).bold());
+                    println!("{}", format!("+++ b/{}", file_diff.path).bold());
 
                     for hunk in &file_diff.hunks {
                         println!(
-                            "@@ -{},{} +{},{} @@",
-                            hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+                            "{}",
+                            format!(
+                                "@@ -{},{} +{},{} @@",
+                                hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+                            )
+                            .cyan()
                         );
                         for line in &hunk.lines {
-                            let prefix = match line.op {
-                                LineOp::Add => "+",
-                                LineOp::Remove => "-",
-                                LineOp::Context => " ",
-                            };
-                            println!("{prefix}{}", line.content);
+                            match line.op {
+                                LineOp::Add => {
+                                    println!("{}", format!("+{}", line.content).green());
+                                }
+                                LineOp::Remove => {
+                                    println!("{}", format!("-{}", line.content).red());
+                                }
+                                LineOp::Context => {
+                                    println!(" {}", line.content);
+                                }
+                            }
                         }
                     }
                 }
@@ -1541,56 +1653,70 @@ fn cmd_context(
             );
         }
         "human" => {
-            println!("=== writ context ===\n");
+            println!("{}\n", "=== writ context ===".bold());
 
             if let Some(ref ss) = ctx.session_summary {
-                println!("  ✅ SESSION COMPLETE: {}", ss.headline);
+                println!("  {} {}", "SESSION COMPLETE:".green().bold(), ss.headline);
                 println!("     {} file(s) changed. {}", ss.files_changed, ss.message);
                 println!();
             }
 
             if let Some(ref spec) = ctx.active_spec {
-                println!("spec: {} — {}", spec.id, spec.title);
-                println!("  status: {:?}", spec.status);
+                println!("{} {} — {}", "spec:".bold(), spec.id.cyan(), spec.title);
+                let status_str = format!("{:?}", spec.status);
+                let colored_status = match spec.status {
+                    writ_core::spec::SpecStatus::Complete => status_str.green(),
+                    writ_core::spec::SpecStatus::Blocked => status_str.red(),
+                    writ_core::spec::SpecStatus::InProgress => status_str.yellow(),
+                    writ_core::spec::SpecStatus::Pending => status_str.dimmed(),
+                };
+                println!("  status: {colored_status}");
                 println!();
             }
 
-            println!("working state:");
+            println!("{}:", "working state".bold());
             if ctx.working_state.clean {
-                println!("  clean ({} tracked)", ctx.working_state.tracked_count);
+                println!(
+                    "  {} ({} tracked)",
+                    "clean".green(),
+                    ctx.working_state.tracked_count
+                );
             } else {
                 for f in &ctx.working_state.new_files {
-                    println!("  +  new  {f}");
+                    println!("  {}  {}", "+  new".green(), f.green());
                 }
                 for f in &ctx.working_state.modified_files {
-                    println!("  ~  mod  {f}");
+                    println!("  {}  {}", "~  mod".yellow(), f.yellow());
                 }
                 for f in &ctx.working_state.deleted_files {
-                    println!("  -  del  {f}");
+                    println!("  {}  {}", "-  del".red(), f.red());
                 }
             }
             println!();
 
             if let Some(ref nudge) = ctx.seal_nudge {
-                println!("  ⚠ {}", nudge.message);
+                println!("  {} {}", "WARNING:".yellow().bold(), nudge.message);
                 println!();
             }
 
             if let Some(ref pc) = ctx.pending_changes {
                 println!(
-                    "pending: {} file(s), +{} -{}",
-                    pc.files_changed, pc.total_additions, pc.total_deletions
+                    "{} {} file(s), {}, {}",
+                    "pending:".bold(),
+                    pc.files_changed,
+                    format!("+{}", pc.total_additions).green(),
+                    format!("-{}", pc.total_deletions).red()
                 );
                 println!();
             }
 
             if !ctx.recent_seals.is_empty() {
-                println!("recent seals:");
+                println!("{}:", "recent seals".bold());
                 for s in &ctx.recent_seals {
                     let spec_part = s
                         .spec_id
                         .as_deref()
-                        .map(|id| format!(" spec:{id}"))
+                        .map(|id| format!(" spec:{}", id.cyan()))
                         .unwrap_or_default();
                     let verify_part = match &s.verification {
                         Some(v) => {
@@ -1608,12 +1734,22 @@ fn cmd_context(
                         }
                         None => String::new(),
                     };
+                    let status_colored = match s.status.as_str() {
+                        "Complete" | "complete" => s.status.green(),
+                        "Blocked" | "blocked" => s.status.red(),
+                        _ => s.status.yellow(),
+                    };
                     println!(
                         "  {} {} [{}] — {}{}{}",
-                        s.id, s.agent, s.status, s.summary, spec_part, verify_part
+                        s.id.yellow(),
+                        s.agent.cyan(),
+                        status_colored,
+                        s.summary,
+                        spec_part,
+                        verify_part
                     );
                     for p in &s.changed_paths {
-                        println!("    → {p}");
+                        println!("    {} {p}", "→".dimmed());
                     }
                 }
                 println!();
@@ -1623,25 +1759,25 @@ fn cmd_context(
 
             if !ctx.available_operations.is_empty() {
                 println!();
-                println!("available operations:");
+                println!("{}:", "available operations".bold());
                 for op in &ctx.available_operations {
-                    println!("  {op}");
+                    println!("  {}", op.dimmed());
                 }
             }
 
             if !ctx.file_scope_violations.is_empty() {
                 println!();
-                println!("file scope violations:");
+                println!("{}:", "file scope violations".red().bold());
                 for v in &ctx.file_scope_violations {
                     println!(
                         "  seal {} ({}) — {} file(s) outside spec '{}' scope:",
-                        v.seal_id,
-                        v.agent_id,
+                        v.seal_id.yellow(),
+                        v.agent_id.cyan(),
                         v.out_of_scope_files.len(),
                         v.spec_id
                     );
                     for f in &v.out_of_scope_files {
-                        println!("    ! {f}");
+                        println!("    {} {}", "!".red(), f.red());
                     }
                 }
             }
@@ -1650,19 +1786,23 @@ fn cmd_context(
                 let risk = &ctx.integration_risk;
                 println!();
                 println!(
-                    "  INTEGRATION RISK: {} (score: {})",
-                    risk.level.to_uppercase(),
+                    "  {} {} (score: {})",
+                    "INTEGRATION RISK:".bold(),
+                    color_risk_level(&risk.level),
                     risk.score
                 );
                 for f in &risk.factors {
-                    println!("    - {f}");
+                    println!("    {} {f}", "-".dimmed());
                 }
             }
 
             if ctx.convergence_recommended {
                 println!();
-                println!("  *** CONVERGENCE RECOMMENDED ***");
-                println!("  Diverged branches detected — run `writ converge` to merge them.");
+                println!("  {}", "*** CONVERGENCE RECOMMENDED ***".yellow().bold());
+                println!(
+                    "  Diverged branches detected — run {} to merge them.",
+                    "`writ converge`".cyan()
+                );
             }
 
             print_diverged_branch_warnings(&repo);
@@ -2240,68 +2380,100 @@ fn cmd_converge(
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         "brief" => {
-            let status = if report.is_clean { "clean" } else { "conflict" };
+            let status = if report.is_clean {
+                "clean".green().to_string()
+            } else {
+                "conflict".red().to_string()
+            };
             println!(
                 "{} + {} = {} (auto:{} conflicts:{} left:{} right:{})",
-                report.left_spec,
-                report.right_spec,
+                report.left_spec.cyan(),
+                report.right_spec.cyan(),
                 status,
-                report.auto_merged.len(),
-                report.conflicts.len(),
+                report.auto_merged.len().to_string().green(),
+                report.conflicts.len().to_string().red(),
                 report.left_only.len(),
                 report.right_only.len(),
             );
         }
         _ => {
-            println!("convergence: {} + {}", report.left_spec, report.right_spec);
+            println!(
+                "{} {} + {}",
+                "convergence:".bold(),
+                report.left_spec.cyan(),
+                report.right_spec.cyan()
+            );
 
             if let Some(ref base) = report.base_seal_id {
-                println!("  base: seal {}", &base[..12.min(base.len())]);
+                println!(
+                    "  base: seal {}",
+                    base[..12.min(base.len())].yellow().bold()
+                );
             } else {
-                println!("  base: (empty state)");
+                println!("  base: {}", "(empty state)".dimmed());
             }
             println!();
 
             if !report.auto_merged.is_empty() {
-                println!("  auto-merged ({} file(s)):", report.auto_merged.len());
+                println!(
+                    "  {} ({} file(s)):",
+                    "auto-merged".green(),
+                    report.auto_merged.len()
+                );
                 for m in &report.auto_merged {
-                    println!("    ~ {}", m.path);
+                    println!("    {} {}", "~".green(), m.path);
                 }
                 println!();
             }
 
             if !report.left_only.is_empty() {
-                println!("  left only ({} file(s)):", report.left_only.len());
+                println!(
+                    "  {} ({} file(s)):",
+                    "left only".cyan(),
+                    report.left_only.len()
+                );
                 for p in &report.left_only {
-                    println!("    ~ {p}");
+                    println!("    {} {p}", "~".cyan());
                 }
                 println!();
             }
 
             if !report.right_only.is_empty() {
-                println!("  right only ({} file(s)):", report.right_only.len());
+                println!(
+                    "  {} ({} file(s)):",
+                    "right only".cyan(),
+                    report.right_only.len()
+                );
                 for p in &report.right_only {
-                    println!("    ~ {p}");
+                    println!("    {} {p}", "~".cyan());
                 }
                 println!();
             }
 
             if !report.conflicts.is_empty() {
-                println!("  conflicts ({} file(s)):", report.conflicts.len());
+                println!(
+                    "  {} ({} file(s)):",
+                    "conflicts".red().bold(),
+                    report.conflicts.len()
+                );
                 for c in &report.conflicts {
-                    println!("    {}:", c.path);
+                    println!("    {}:", c.path.red());
                     for (i, region) in c.regions.iter().enumerate() {
-                        println!("      region {} (line {}):", i + 1, region.base_start);
+                        println!(
+                            "      region {} (line {}):",
+                            i + 1,
+                            region.base_start.to_string().dimmed()
+                        );
                         if !region.base_lines.is_empty() {
                             for bl in &region.base_lines {
-                                println!("        base:  {bl}");
+                                println!("        {}  {bl}", "base:".dimmed());
                             }
                         }
                         for ll in &region.left_lines {
-                            println!("        left:  {ll}");
+                            println!("        {}  {ll}", "left:".cyan());
                         }
                         for rl in &region.right_lines {
-                            println!("        right: {rl}");
+                            println!("        {} {rl}", "right:".cyan());
                         }
                     }
                 }
@@ -2309,14 +2481,14 @@ fn cmd_converge(
             }
 
             if report.is_clean {
-                println!("  result: clean");
+                println!("  result: {}", "clean".green().bold());
                 if !apply {
-                    println!("  run with --apply to write merged files");
+                    println!("  run with {} to write merged files", "--apply".cyan());
                 }
             } else {
                 println!(
                     "  result: {} conflict(s) — resolve before applying",
-                    report.conflicts.len()
+                    report.conflicts.len().to_string().red().bold()
                 );
             }
         }
@@ -2324,14 +2496,24 @@ fn cmd_converge(
 
     if apply {
         if !report.is_clean {
-            eprintln!("error: cannot --apply with unresolved conflicts");
+            eprintln!(
+                "{} cannot {} with unresolved conflicts",
+                "error:".red().bold(),
+                "--apply".cyan()
+            );
             eprintln!("  use JSON output to inspect conflicts and resolve programmatically");
             std::process::exit(1);
         }
         repo.apply_convergence(&report, &[])?;
         if format != "json" {
-            println!("\n  applied — merged files written to working directory");
-            println!("  seal with `writ seal` to capture the converged state");
+            println!(
+                "\n  {} merged files written to working directory",
+                "applied —".green().bold()
+            );
+            println!(
+                "  seal with {} to capture the converged state",
+                "writ seal".cyan()
+            );
         }
     }
 
@@ -2377,7 +2559,18 @@ fn cmd_converge_all(
 
     // Dry run: run without apply, then show the report.
     let effective_apply = apply && !dry_run;
+
+    let spinner = if format != "json" {
+        Some(make_spinner("converging branches..."))
+    } else {
+        None
+    };
+
     let report = repo.converge_all(strategy, effective_apply)?;
+
+    if let Some(sp) = spinner {
+        sp.finish_and_clear();
+    }
 
     if report.merges.is_empty() {
         match format {
@@ -2393,80 +2586,120 @@ fn cmd_converge_all(
         }
         _ => {
             println!(
-                "converge-all: {} branch(es), strategy: {}",
+                "{} {} branch(es), strategy: {}",
+                "converge-all:".bold(),
                 report.merge_order.len(),
-                report.strategy,
+                report.strategy.cyan(),
             );
-            println!("  base: spec '{}'", report.base_spec);
-            println!("  merging: {}", report.merge_order.join(", "));
+            println!("  base: spec '{}'", report.base_spec.cyan());
+            println!("  merging: {}", report.merge_order.join(", ").cyan());
             println!();
 
             if dry_run {
-                println!("  DRY RUN — showing merge plan without applying:");
+                println!(
+                    "  {} showing merge plan without applying:",
+                    "DRY RUN —".yellow().bold()
+                );
                 println!();
             }
 
             for step in &report.merges {
-                println!("  --- {} <- {} ---", step.left_spec, step.right_spec);
+                println!(
+                    "  {} {} {} {} {}",
+                    "---".dimmed(),
+                    step.left_spec.cyan(),
+                    "<-".dimmed(),
+                    step.right_spec.cyan(),
+                    "---".dimmed()
+                );
                 if let Some(ref err) = step.error {
-                    println!("    ERROR: {err}");
+                    println!("    {} {err}", "ERROR:".red().bold());
                 } else {
-                    println!("    clean: {}", step.clean);
+                    let clean_display = if step.clean {
+                        "true".green()
+                    } else {
+                        "false".yellow()
+                    };
+                    println!("    clean: {clean_display}");
                     println!(
                         "    auto-merged: {}, left-only: {}, right-only: {}, conflicts: {}",
-                        step.auto_merged, step.left_only, step.right_only, step.conflicts,
+                        step.auto_merged.to_string().green(),
+                        step.left_only,
+                        step.right_only,
+                        if step.conflicts > 0 {
+                            step.conflicts.to_string().red()
+                        } else {
+                            step.conflicts.to_string().green()
+                        },
                     );
                     if !step.conflict_files.is_empty() {
                         for path in &step.conflict_files {
-                            println!("      CONFLICT: {path}");
+                            println!("      {} {}", "CONFLICT:".red().bold(), path.red());
                         }
                     }
                     for res in &step.resolutions {
                         println!(
-                            "      resolved: {} (strategy: {}, chose: {})",
+                            "      {} {} (strategy: {}, chose: {})",
+                            "resolved:".green(),
                             res.path,
                             res.strategy,
                             res.chosen_spec.as_deref().unwrap_or("n/a"),
                         );
                     }
                     if effective_apply && step.clean {
-                        println!("    applied");
+                        println!("    {}", "applied".green().bold());
                     }
                 }
                 println!();
             }
 
             if !report.warnings.is_empty() {
-                println!("  WARNINGS:");
+                println!("  {}:", "WARNINGS".yellow().bold());
                 for w in &report.warnings {
-                    println!("    - {w}");
+                    println!("    {} {w}", "-".yellow());
                 }
                 println!();
             }
 
             println!(
-                "  SUMMARY: {} branch(es) processed, {} auto-merged file(s), {} conflict(s), {} resolved",
+                "  {} {} branch(es) processed, {} auto-merged file(s), {} conflict(s), {} resolved",
+                "SUMMARY:".bold(),
                 report.merge_order.len(),
-                report.total_auto_merged,
-                report.total_conflicts,
+                report.total_auto_merged.to_string().green(),
+                if report.total_conflicts > 0 {
+                    report.total_conflicts.to_string().red()
+                } else {
+                    report.total_conflicts.to_string().green()
+                },
                 report.total_resolutions,
             );
             if report.degraded {
-                println!("  STATUS: DEGRADED — most-recent strategy discarded content; review quality report");
+                println!(
+                    "  {} DEGRADED — most-recent strategy discarded content; review quality report",
+                    "STATUS:".red().bold()
+                );
             }
             if !report.escalations.is_empty() {
                 println!(
-                    "  ESCALATIONS: {} conflict(s) require review",
+                    "  {} {} conflict(s) require review",
+                    "ESCALATIONS:".red().bold(),
                     report.escalations.len()
                 );
                 for esc in &report.escalations {
-                    println!("    - {}: {}", esc.file_path, esc.reason);
+                    println!("    {} {}: {}", "-".red(), esc.file_path.red(), esc.reason);
                 }
             }
 
             if let Some(ref qr) = report.quality_report {
                 println!();
-                println!("  QUALITY REPORT (score: {}/100)", qr.quality_score);
+                let score_colored = if qr.quality_score >= 80 {
+                    format!("{}/100", qr.quality_score).green()
+                } else if qr.quality_score >= 50 {
+                    format!("{}/100", qr.quality_score).yellow()
+                } else {
+                    format!("{}/100", qr.quality_score).red()
+                };
+                println!("  {} (score: {})", "QUALITY REPORT".bold(), score_colored);
                 println!("    {}", qr.summary);
                 if qr.min_confidence < 1.0 {
                     println!(
@@ -2477,7 +2710,7 @@ fn cmd_converge_all(
                 }
                 if !qr.file_decisions.is_empty() {
                     println!();
-                    println!("    File decisions:");
+                    println!("    {}:", "File decisions".bold());
                     for d in &qr.file_decisions {
                         let spec_info = d.chosen_spec.as_deref().unwrap_or("-");
                         println!(
@@ -2486,28 +2719,38 @@ fn cmd_converge_all(
                         );
                         for alt in &d.alternatives {
                             println!(
-                                "        discarded: {} ({} lines) — {}",
-                                alt.spec, alt.lines, alt.reason,
+                                "        {} {} ({} lines) — {}",
+                                "discarded:".dimmed(),
+                                alt.spec,
+                                alt.lines,
+                                alt.reason,
                             );
                         }
                     }
                 }
                 if !qr.consistency_checks.is_empty() {
                     println!();
-                    println!("    Consistency checks:");
+                    println!("    {}:", "Consistency checks".bold());
                     for c in &qr.consistency_checks {
-                        let status = if c.consistent { "PASS" } else { "FAIL" };
+                        let status = if c.consistent {
+                            "PASS".green()
+                        } else {
+                            "FAIL".red()
+                        };
                         println!("      {} {}", status, c.metric);
                         if let Some(ref w) = c.warning {
-                            println!("        {w}");
+                            println!("        {}", w.yellow());
                         }
                     }
                 }
             }
 
             if dry_run {
-                println!("  (dry run — no changes applied)");
-                println!("  Run with --apply to merge: writ converge-all --apply --strategy {strategy_str}");
+                println!("  {}", "(dry run — no changes applied)".dimmed());
+                println!(
+                    "  Run with --apply to merge: {}",
+                    format!("writ converge-all --apply --strategy {strategy_str}").cyan()
+                );
             } else if effective_apply {
                 // Post-convergence risk re-evaluation.
                 let post_risk = {
@@ -2526,26 +2769,44 @@ fn cmd_converge_all(
 
                 println!();
                 println!(
-                    "  INTEGRATION RISK: {} ({}) -> {} ({})",
-                    pre_level.to_uppercase(),
+                    "  {} {} ({}) -> {} ({})",
+                    "INTEGRATION RISK:".bold(),
+                    color_risk_level(pre_level),
                     pre_score,
-                    post_level.to_uppercase(),
+                    color_risk_level(post_level),
                     post_score,
                 );
                 if post_score < pre_score {
-                    println!("    Risk reduced by {} points", pre_score - post_score);
+                    println!(
+                        "    {} Risk reduced by {} points",
+                        "↓".green(),
+                        pre_score - post_score
+                    );
                 } else if post_score == 0 {
-                    println!("    All clear — no remaining integration risk");
+                    println!(
+                        "    {}",
+                        "All clear — no remaining integration risk".green()
+                    );
                 }
 
                 println!();
-                println!("  All merges applied. Seal the converged state:");
                 println!(
-                    "    writ seal -s \"converge-all: merged {} branch(es)\" --agent convergence-bot --status complete",
-                    report.merge_order.len(),
+                    "  {} Seal the converged state:",
+                    "All merges applied.".green().bold()
+                );
+                println!(
+                    "    {}",
+                    format!(
+                        "writ seal -s \"converge-all: merged {} branch(es)\" --agent convergence-bot --status complete",
+                        report.merge_order.len(),
+                    )
+                    .cyan()
                 );
             } else {
-                println!("  Run with --apply to merge: writ converge-all --apply --strategy {strategy_str}");
+                println!(
+                    "  Run with --apply to merge: {}",
+                    format!("writ converge-all --apply --strategy {strategy_str}").cyan()
+                );
             }
         }
     }
@@ -2916,31 +3177,39 @@ fn cmd_verify_seal(
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         }
         _ => {
-            println!("verify seal {short_id}");
-            let ch_status = if result.content_hash_valid {
-                "OK"
+            println!("{} {}", "verify seal".bold(), short_id.yellow());
+            let ch_display = if result.content_hash_valid {
+                "OK".green()
             } else {
-                "FAIL"
+                "FAIL".red()
             };
-            let cc_status = if result.chain_hash_valid {
-                "OK"
+            let cc_display = if result.chain_hash_valid {
+                "OK".green()
             } else {
-                "FAIL"
+                "FAIL".red()
             };
             println!(
-                "  content_hash: {ch_status} — {}",
+                "  content_hash: {} — {}",
+                ch_display,
                 seal.content_hash.as_deref().map_or("", |h| &h[..12])
             );
             println!(
-                "  chain_hash: {cc_status} — {}",
+                "  chain_hash:   {} — {}",
+                cc_display,
                 seal.chain_hash.as_deref().map_or("", |h| &h[..12])
             );
-            println!("  signature: {} — {}", sig_status.0, sig_status.1);
+            let sig_display = match sig_status.0 {
+                "OK" => "OK".green(),
+                "FAIL" => "FAIL".red(),
+                _ => "N/A".dimmed(),
+            };
+            println!("  signature:    {} — {}", sig_display, sig_status.1);
             if all_ok {
-                println!("  result: VALID");
+                println!("  result: {}", "VALID".green().bold());
             } else {
                 println!(
-                    "  result: INVALID — {}",
+                    "  result: {} — {}",
+                    "INVALID".red().bold(),
                     result.error.as_deref().unwrap_or("unknown")
                 );
             }
@@ -2951,7 +3220,17 @@ fn cmd_verify_seal(
 }
 
 fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let spinner = if format != "json" {
+        Some(make_spinner("verifying seal chain..."))
+    } else {
+        None
+    };
+
     let result = repo.verify_chain(None)?;
+
+    if let Some(sp) = spinner {
+        sp.finish_and_clear();
+    }
 
     if result.total_seals == 0 {
         match format {
@@ -2979,20 +3258,29 @@ fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<(), Box<dyn std::
         }
         _ => {
             println!(
-                "chain verification: {} seals checked, {} verified, {} pre-security",
-                result.total_seals, result.verified, result.unsecured
+                "{}: {} seals checked, {} verified, {} pre-security",
+                "chain verification".bold(),
+                result.total_seals,
+                result.verified.to_string().green(),
+                result.unsecured.to_string().dimmed()
             );
             if !result.failures.is_empty() {
                 for f in &result.failures {
                     let short_id = &f.seal_id[..12.min(f.seal_id.len())];
                     println!(
-                        "  FAIL {short_id}: {}",
+                        "  {} {}: {}",
+                        "FAIL".red().bold(),
+                        short_id.yellow(),
                         f.error.as_deref().unwrap_or("unknown")
                     );
                 }
-                println!("  result: INVALID ({} error(s))", result.failures.len());
+                println!(
+                    "  result: {} ({} error(s))",
+                    "INVALID".red().bold(),
+                    result.failures.len()
+                );
             } else {
-                println!("  result: VALID");
+                println!("  result: {}", "VALID".green().bold());
             }
         }
     }
@@ -3862,6 +4150,171 @@ fn cmd_gc_log(cwd: &PathBuf, limit: usize, format: &str) -> Result<(), Box<dyn s
                     }
                 }
             }
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Config commands
+// ---------------------------------------------------------------------------
+
+fn cmd_config_set(
+    cwd: &PathBuf,
+    key: &str,
+    value: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let writ_dir = cwd.join(".writ");
+    if !writ_dir.exists() {
+        return Err("not a writ repository (no .writ directory)".into());
+    }
+
+    if !writ_core::settings::WritSettings::is_valid_key(key) {
+        return Err(format!("unknown setting '{key}'").into());
+    }
+
+    let mut settings = writ_core::settings::WritSettings::load(&writ_dir)?;
+    settings.set(key, value)?;
+    settings.save(&writ_dir)?;
+
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "key": key,
+                    "value": value,
+                    "status": "saved"
+                }))?
+            );
+        }
+        _ => {
+            println!("{} {} = {}", "set".green(), key, value);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_config_get(
+    cwd: &PathBuf,
+    key: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let writ_dir = cwd.join(".writ");
+    if !writ_dir.exists() {
+        return Err("not a writ repository (no .writ directory)".into());
+    }
+
+    if !writ_core::settings::WritSettings::is_valid_key(key) {
+        return Err(format!("unknown setting '{key}'").into());
+    }
+
+    let settings = writ_core::settings::WritSettings::load(&writ_dir)?;
+    let value = settings.get(key);
+
+    // Find the default for display purposes
+    let key_meta = writ_core::settings::WritSettings::keys()
+        .iter()
+        .find(|k| k.key == key);
+    let default_str = key_meta.map_or("(unknown)", |k| k.default_value);
+
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "key": key,
+                    "value": value,
+                    "default": default_str,
+                    "source": if value.is_some() { "settings" } else { "default" }
+                }))?
+            );
+        }
+        _ => match value {
+            Some(v) => println!("{}: {}", key, v),
+            None => println!(
+                "{}: {} (default: {})",
+                key,
+                "(not set)".dimmed(),
+                default_str
+            ),
+        },
+    }
+
+    Ok(())
+}
+
+fn cmd_config_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let writ_dir = cwd.join(".writ");
+    if !writ_dir.exists() {
+        return Err("not a writ repository (no .writ directory)".into());
+    }
+
+    let settings = writ_core::settings::WritSettings::load(&writ_dir)?;
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&settings)?);
+        }
+        _ => {
+            println!(
+                "{:<45} {:<15} {}",
+                "KEY".bold(),
+                "VALUE".bold(),
+                "DEFAULT".bold()
+            );
+            for key_info in writ_core::settings::WritSettings::keys() {
+                let value = settings.get(key_info.key);
+                let val_display = match &value {
+                    Some(v) => v.to_string(),
+                    None => "(not set)".dimmed().to_string(),
+                };
+                println!(
+                    "{:<45} {:<15} {}",
+                    key_info.key,
+                    val_display,
+                    key_info.default_value.dimmed()
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_config_unset(
+    cwd: &PathBuf,
+    key: &str,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let writ_dir = cwd.join(".writ");
+    if !writ_dir.exists() {
+        return Err("not a writ repository (no .writ directory)".into());
+    }
+
+    if !writ_core::settings::WritSettings::is_valid_key(key) {
+        return Err(format!("unknown setting '{key}'").into());
+    }
+
+    let mut settings = writ_core::settings::WritSettings::load(&writ_dir)?;
+    settings.unset(key)?;
+    settings.save(&writ_dir)?;
+
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "key": key,
+                    "status": "unset"
+                }))?
+            );
+        }
+        _ => {
+            println!("{} {} (reset to default)", "unset".green(), key);
         }
     }
 

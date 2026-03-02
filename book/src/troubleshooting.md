@@ -2,7 +2,7 @@
 
 ## Something Broke During Agent Work
 
-Writ's restore system is your safety net. Every seal is an immutable snapshot.
+Every seal is an immutable snapshot. This is the safety net — whether an agent went off the rails, a model update produced unexpected behavior, or a convergence produced bad output.
 
 ```bash
 # Find the last known good seal
@@ -18,7 +18,7 @@ writ restore <SEAL_ID>
 writ seal -s "restored to pre-breakage state" --agent human
 ```
 
-Restoring doesn't delete history. All previous seals remain in the log.
+Restoring doesn't delete history. All previous seals remain in the log. And since writ works alongside git, you always have the git safety net underneath.
 
 ## Convergence Produced Unexpected Results
 
@@ -29,9 +29,11 @@ writ converge-all --dry-run --strategy escalate
 ```
 
 Common causes:
-- **Low confidence scores:** The engine wasn't sure about the merge. Review the escalated files manually.
+- **Low confidence scores:** The engine wasn't confident about the merge. Review the escalated files manually.
 - **Structural misparse:** The language analyzer didn't correctly identify a code construct. File a bug report.
-- **Overlapping function edits:** Two agents modified the same function body. This is a real conflict. Review and resolve.
+- **Overlapping function edits:** Two agents modified the same function body. This is a real conflict — review and resolve.
+
+If the merged output is wrong, restore to the pre convergence seal and try again with a different strategy, or resolve the escalated conflicts manually.
 
 ## Seal Chain Verification Fails
 
@@ -58,6 +60,8 @@ writ spec complete <ID>
 writ spec cancel <ID>
 ```
 
+Stale detection keeps nothing from falling through the cracks. Specs that go inactive surface automatically in context output.
+
 ## Storage Growing Too Large
 
 Check storage usage:
@@ -74,7 +78,7 @@ writ gc run --dry-run    # Preview what would be cleaned
 writ gc run              # Execute with confirmation
 ```
 
-GC never deletes seals. It only cleans expired working state, archived specs past retention, and old security events.
+GC never deletes seals. Immutable history is sacred. It only cleans expired working state, archived specs past retention, and old security events.
 
 ## Git and Writ Out of Sync
 
@@ -84,7 +88,7 @@ If your git repo has moved ahead of writ's baseline:
 writ bridge import
 ```
 
-This re-imports the current git state as a new baseline seal.
+This re-imports the current git state as a new baseline seal. Git is the storage layer, writ is the intelligence layer — they stay in sync through the bridge.
 
 ## Getting Help
 

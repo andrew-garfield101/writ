@@ -26,11 +26,11 @@ imported git baseline: 47 file(s), seal d81a5736e16d
 tracked: 47 file(s)
 ```
 
-This creates a `.writ/` directory alongside your existing `.git/` directory. If you have a git repo, writ imports the current state as a baseline seal. Your git workflow is untouched.
+Writ detects your environment automatically. If you're in a git repo, it reads the branch and HEAD. If Claude Code is present, it installs slash commands. If Codex is detected, it adds workflow instructions. For any other framework, the CLI and Python SDK work out of the box. No configuration needed.
 
 ## 2. Create a Seal
 
-A **seal** is writ's version of a commit, but with structured metadata. After making some changes to your project:
+A **seal** is writ's structured checkpoint. After making some changes to your project:
 
 ```bash
 writ seal -s "added authentication endpoint" --agent dev-1 --spec auth
@@ -46,14 +46,11 @@ spec: auth
 status: in-progress
 ```
 
-Key differences from `git commit`:
-- `--agent` identifies who created this checkpoint
-- `--spec` links it to a requirement
-- Status tracking is built in (`in-progress` by default, `complete` when done)
+Every seal records who created it, which spec it serves, and what status the work is in. This is metadata that git forces into commit messages and branch naming conventions. In writ, it's structured data.
 
 ## 3. Check Context
 
-`writ context` returns everything an agent needs to understand the current project state in one call:
+This is the single most important command in writ. One call returns everything an agent needs to understand the current project state:
 
 ```bash
 writ context --format human
@@ -65,7 +62,7 @@ This shows:
 - Working directory changes
 - File contention (files touched by multiple agents)
 - Integration risk level
-- Recommendations for next steps
+- Diverged branches with convergence recommendations
 
 For agents consuming this programmatically:
 
@@ -73,17 +70,18 @@ For agents consuming this programmatically:
 writ context --format json
 ```
 
-Returns a structured JSON object designed to fit efficiently into an LLM's context window.
+Returns structured JSON designed to fit efficiently into an LLM's context window. Compare this to the alternative: `git log`, `git diff`, `git status`, read a few files, parse all the text, synthesize a mental model. With writ, that entire workflow collapses into one call.
 
 ## 4. Add a Spec
 
-Specs are structured requirements that agents work against:
+Specs are structured requirements that agents work against. Think of them as feature tickets that live inside the VCS:
 
 ```bash
-writ spec add --id auth --title "Authentication System" --description "JWT-based auth with token refresh"
+writ spec add --id auth --title "Authentication System" \
+  --description "JWT-based auth with token refresh"
 ```
 
-Now when agents seal work with `--spec auth`, that work is linked to this requirement. Context output will scope to the spec's files and show progress.
+Now when agents seal work with `--spec auth`, that work is permanently linked to this requirement. Context output scopes to the spec's files and shows progress. Convergence merges spec by spec. Scope enforcement can restrict agents to their spec's declared files.
 
 ## 5. Seal Completion
 
@@ -102,7 +100,7 @@ writ seal -s "auth system complete, all tests passing" \
 When the writ session is done, commit everything back to git:
 
 ```bash
-# One-command round trip
+# One command round trip
 writ finish
 
 # Or manually with a generated commit message
@@ -112,18 +110,20 @@ git commit -m "$(writ summary --format commit)"
 gh pr create --body "$(writ summary --format pr)"
 ```
 
-`writ finish` generates a commit message from the full session history, including which agents worked on which specs, what was completed, and what was tested.
+`writ finish` generates a commit message from the full session history — which agents worked on which specs, what was completed, what was tested. Full provenance, automatically.
 
 ## What Just Happened
 
 In five minutes you:
 
-1. **Installed** writ alongside an existing git repo
+1. **Installed** writ alongside an existing git repo with automatic environment detection
 2. **Sealed** a checkpoint with structured metadata (agent, spec, status)
-3. **Checked context** to see the project state in one call
+3. **Checked context** to see the entire project state in one call
 4. **Defined a spec** that agents can work against
 5. **Completed** work with test results attached
 6. **Committed** back to git with auto generated provenance
+
+Git stayed in place the whole time. Writ added the intelligence layer on top.
 
 ## Python SDK
 

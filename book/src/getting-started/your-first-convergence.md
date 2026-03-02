@@ -1,10 +1,10 @@
 # Your First Convergence
 
-This walkthrough demonstrates writ's core value: merging work from multiple agents intelligently.
+This walkthrough demonstrates the core problem writ solves: merging work from multiple agents who touch the same files. Not with line based diffing, but with structural understanding.
 
 ## The Scenario
 
-Two agents work in parallel on different specs. Both touch some of the same files. When they're done, their work needs to be merged.
+Two agents work in parallel on different specs. Both touch some of the same files. When they're done, their work needs to be merged. In git, this produces conflict markers. In writ, it composes naturally.
 
 ## Setup
 
@@ -61,13 +61,13 @@ writ seal -s "added display utilities" --agent frontend-dev --spec frontend
 
 ## The Divergence
 
-Both agents created a `utils.py` with different functions. In git, this would be a merge conflict. In writ:
+Both agents created a `utils.py` with different functions. In git, this is a conflict. Two sides changed the same file — give up, produce markers, make a human figure it out.
 
 ```bash
 writ context --format human
 ```
 
-Context will show:
+Context shows:
 - Two diverged branches (backend, frontend)
 - `convergence_recommended: true`
 - Integration risk assessment
@@ -82,7 +82,7 @@ Writ's convergence engine analyzes the conflict structurally:
 
 1. **Phase 1 (Structural Diff):** Decomposes both versions into structural units (imports, function definitions)
 2. **Phase 2 (Classification):** Both sides added non overlapping function definitions
-3. **Phase 3 (Pattern Resolution):** The `NonOverlappingDefinitions` pattern fires at 0.92 confidence, both sides' functions are composed into one file
+3. **Phase 3 (Pattern Resolution):** The `NonOverlappingDefinitions` pattern fires at 0.92 confidence — both sides' functions are composed into one file
 
 The merged `utils.py` contains all four functions from both agents:
 
@@ -102,7 +102,7 @@ def sanitize_input(text: str) -> str:
     return text.strip().replace("<", "&lt;").replace(">", "&gt;")
 ```
 
-No manual intervention. No conflict markers. Both agents' contributions preserved.
+No manual intervention. No conflict markers. Both agents' contributions preserved. The engine composed additive changes instead of forcing a choice.
 
 ## When Conflicts Are Real
 
@@ -122,17 +122,17 @@ If both agents had modified the *same* function body differently, that's a genui
 }
 ```
 
-Structured data, not text to parse. An orchestrator agent can resolve this programmatically.
+Structured data, not text to parse. An orchestrator agent can resolve this programmatically — no regex parsing of conflict markers required.
 
-## What Made This Work
+## Why This Matters
 
-The key insight: multi-agent work is fundamentally **additive**. Agents build complementary features, not competing implementations. Writ's convergence engine is built around this principle.
+This is a two agent demo. The principle scales. When you have ten agents working across five specs, all touching overlapping files, the merge problem doesn't scale linearly — it explodes combinatorially. Writ's convergence engine handles this by:
 
-It knows that:
-- Two agents adding different imports = **compose them**
-- Two agents adding different functions = **compose them**
-- Two agents appending to the end of a file = **concatenate**
-- Two agents changing the same line differently = **real conflict, escalate**
+1. **Optimizing merge order** — disjoint specs merge first, reducing conflict surface for later merges
+2. **Composing additive changes** — the common case in multi agent work where agents build complementary features
+3. **Escalating real conflicts** — with structured context that agents or humans can act on
+
+Giving each agent a git worktree solves isolation. This is what solves convergence.
 
 ## Next Steps
 

@@ -1,6 +1,8 @@
 # Security Model
 
-Writ is built for environments where multiple autonomous agents have write access to the same codebase. That demands security guarantees beyond what traditional VCS provides.
+Writ is built for environments where multiple autonomous agents have write access to the same codebase. That demands security guarantees that traditional VCS was never designed for.
+
+Whether you're running a zero trust setup where every agent action is verified, a fully autonomous system where agents operate without human oversight, or a mixed environment with humans in the loop — the security model is the same. Trust nothing by default. Verify everything cryptographically. Log every security relevant action.
 
 ## Cryptographic Seal Chains
 
@@ -38,7 +40,7 @@ This means convergence seals (created by the engine during merge) are cryptograp
 
 ## Agent Identity
 
-Every agent in writ is a registered entity, not just a string ID.
+Every agent in writ is a registered entity, not just a string ID. In environments where dozens of agents have write access, knowing *who* did *what* — and being able to prove it cryptographically — is not optional.
 
 ### Registration
 
@@ -55,7 +57,7 @@ writ agent register --id backend-dev --role implementer --trust-level standard
 | **Restricted** | Limited scope. Constrained to specific files. | Reduced confidence caps. Changes more likely to be reviewed. |
 | **Untrusted** | New or unverified. | Lowest confidence caps. Changes almost always escalated. |
 
-Trust levels directly affect convergence. When two agents' changes conflict, the engine factors in their trust levels when scoring confidence. An untrusted agent's changes receive lower confidence, making auto resolution less likely and human review more likely.
+Trust levels directly affect convergence. When two agents' changes conflict, the engine factors in their trust levels when scoring confidence. An untrusted agent's changes receive lower confidence, making auto resolution less likely and human review more likely. This is how writ scales security across fleets of agents with varying levels of trust — from a known, verified lead agent to a newly introduced model that hasn't earned trust yet.
 
 ### Suspension and Revocation
 
@@ -63,7 +65,7 @@ Agents can be:
 - **Suspended:** Temporarily blocked from creating seals. All existing seals remain.
 - **Revoked:** Permanently deactivated. History preserved, but the agent cannot create new seals.
 
-Both actions are recorded as security events in the audit log.
+Both actions are recorded as security events in the audit log. In a fleet of autonomous agents, this is how you respond to a compromised agent immediately — suspend it, review the damage, and all seals created after the compromise timestamp are automatically flagged.
 
 ## Scope Enforcement
 
@@ -96,6 +98,8 @@ Scope violations appear in three places:
 2. Security event log (`writ security events`)
 3. Integration risk scoring (violations increase the risk score)
 
+No more agents silently modifying files they shouldn't touch.
+
 ## Content Traceability
 
 The convergence engine enforces a strict rule: **every line in merged output must trace back to an input** (base, left, or right).
@@ -105,7 +109,7 @@ This prevents:
 - **Convergence bugs** that might inject novel content
 - **Silent data corruption** during complex multi way merges
 
-If the verifier detects content in the merged output that doesn't originate from any input, the merge is rejected. This is the "no silent additions" rule.
+If the verifier detects content in the merged output that doesn't originate from any input, the merge is rejected. This is the "no silent additions" rule — a guarantee that no other VCS provides.
 
 ## Security Event Monitoring
 

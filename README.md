@@ -4,6 +4,8 @@
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
 [![CI](https://github.com/andrew-garfield101/writ/actions/workflows/ci.yml/badge.svg)](https://github.com/andrew-garfield101/writ/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/writ-vcs)](https://pypi.org/project/writ-vcs/)
+[![Docs](https://img.shields.io/badge/docs-andrew--garfield101.github.io%2Fwrit-blue)](https://andrew-garfield101.github.io/writ/)
 
 
 Writ is a version control system designed from the ground up for LLMs and

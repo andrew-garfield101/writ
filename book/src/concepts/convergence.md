@@ -1,10 +1,10 @@
 # Convergence
 
-Convergence is writ's answer to the hardest problem in multi agent development: merging work from parallel agents who touch the same files.
+Giving an agent better git access doesn't make `git merge` smarter. When five agents work concurrently and three of them touch the same file, the merge problem doesn't go away because you gave each agent its own worktree. The work still has to come back together.
 
-Git's merge is line based. It compares lines and gives up when two sides change the same region. Writ's convergence engine understands code **structure**. It decomposes files into semantic units (imports, function definitions, class bodies, statements) and resolves conflicts at that level.
+Git's merge is line based. It compares text and gives up when two sides change the same region. It doesn't know the difference between an import and a function body. It can't tell that two agents adding different functions to the same file is perfectly safe, not a conflict. The tool was built for humans resolving one merge at a time, not for fleets of agents producing changes that need to compose automatically.
 
-The core principle: **compose, don't choose.** Multi agent work is fundamentally additive. Agents build complementary features. The engine is designed to preserve all contributions wherever possible, and escalate clearly when it can't.
+Writ's convergence engine understands code **structure**. It decomposes files into semantic units — imports, function definitions, class bodies, statements — and resolves conflicts at that level. The core principle: **compose, don't choose.** Multi agent work is fundamentally additive. Agents build complementary features. The engine preserves all contributions wherever possible and escalates clearly when it can't.
 
 ## The Pipeline
 
@@ -42,7 +42,7 @@ Five deterministic patterns attempt to resolve conflicts. Each pattern has a bas
 | Pattern | Confidence | What It Resolves |
 |---------|-----------|-----------------|
 | **Import Accumulation** | 0.95 | Both sides add or modify imports. Union them. |
-| **Non overlapping Definitions** | 0.92 | Both sides add functions or classes with different names. Compose them. |
+| **Non Overlapping Definitions** | 0.92 | Both sides add functions or classes with different names. Compose them. |
 | **EOF Append** | 0.92 | Both sides append to the end of the file. Concatenate. |
 | **Additive Composition** | 0.88 | Both sides preserved the base and added content. Compose. |
 | **Superset Containment** | 0.82 | One side contains everything the other has. Use the superset. |
@@ -51,15 +51,17 @@ Confidence scores adjust dynamically based on merge complexity. Larger merges re
 
 ### Phase 4: Spec Aware Resolution (Feature Flagged)
 
-Uses writ's first class spec metadata (file scope, acceptance criteria, design notes) to inform resolution decisions. Currently feature flagged off.
+This is where writ's first class spec metadata gives convergence something no other VCS can offer. Specs carry file scope, acceptance criteria, and design notes. When a conflict is ambiguous at the structural level, spec context can resolve it — does this file belong to spec A or spec B? Which spec has this file in its declared scope? Which agent has the higher trust level for this file?
+
+Currently feature flagged off. When enabled, it uses the same structured metadata that `writ context` surfaces.
 
 ### Phase 5: LLM Assisted Resolution (Feature Flagged)
 
-Sends unresolved conflicts to an LLM for resolution with full context. Currently feature flagged off.
+Sends unresolved conflicts to an LLM for resolution with full context. The LLM can select, reorder, and combine from the inputs — composition only, never novel code generation. Currently feature flagged off.
 
 ### Phase 6: Verification
 
-The `HardenedVerifier` runs integrity checks on the merged output:
+The `HardenedVerifier` runs integrity checks on every merged output:
 
 - **Duplicate definitions:** No function or class name appears twice
 - **Balanced delimiters:** Brackets, braces, and parentheses are balanced
@@ -86,7 +88,7 @@ writ converge-all --apply --strategy escalate
 # Preview what would happen without applying
 writ converge-all --dry-run
 
-# Two-spec convergence
+# Two spec convergence
 writ converge backend frontend --apply
 ```
 
@@ -101,11 +103,13 @@ print(f"Auto-merged: {report['total_auto_merged']}")
 
 | Strategy | Behavior |
 |----------|----------|
-| `escalate` | Auto resolve high-confidence conflicts, escalate the rest. Recommended for most workflows. |
+| `escalate` | Auto resolve high confidence conflicts, escalate the rest. Recommended for most workflows. |
 | `three-way-merge` | Standard three way merge. Leaves conflict markers where resolution fails. |
 | `most-recent` | Prefers the most recently sealed version on conflict. |
 | `most-complete` | Prefers the version with more content on conflict. |
 | `orchestrator` | Reports all conflicts as structured JSON for an orchestrator agent to resolve programmatically. |
+
+The `orchestrator` strategy is designed for automated pipelines. Instead of `<<<<<<<` markers that need text parsing, conflicts come back as structured JSON that orchestrator agents can resolve programmatically. This is the convergence equivalent of what `writ context` does for project state: structured data, not text to parse.
 
 ## Merge Ordering
 
@@ -115,7 +119,7 @@ When multiple specs have diverged, writ optimizes the merge order:
 2. Specs with **minimal overlap** merge next
 3. Specs with **high overlap** merge last, benefiting from the cleaner base established by earlier merges
 
-This greedy overlap minimizing approach reduces total conflict complexity.
+This greedy overlap minimizing approach reduces total conflict complexity. For a fleet of agents working across many specs, ordering matters — it's the difference between cascading conflicts and clean sequential merges.
 
 ## Integration Risk
 
@@ -138,7 +142,7 @@ Integration risk is scored 0 to 100 based on:
 - Scope violations
 - Number of active agents
 
-When risk is high, converge before starting new work.
+When risk is high, converge before starting new work. Context surfaces this automatically so agents don't need to discover it themselves.
 
 ## Example: Import Accumulation
 
@@ -154,7 +158,7 @@ Agent B adds:
 from payments import process_charge
 ```
 
-Git sees conflicting changes to the import block. Writ's `ImportAccumulation` pattern recognizes both as additive import changes and unions them:
+Git sees conflicting changes to the import block and produces conflict markers. Writ's `ImportAccumulation` pattern recognizes both as additive import changes and unions them:
 
 ```python
 from auth import validate_token
@@ -187,4 +191,4 @@ Structured data, not text to parse. An orchestrator agent or human can review an
 
 - **[Security Model](security-model.md)** for how trust levels affect convergence confidence
 - **[Convergence Resolution Guide](../guides/convergence-resolution.md)** for handling escalations
-- **[Multi Agent Workflow](../guides/multi agent-workflow.md)** for production patterns
+- **[Multi Agent Workflow](../guides/multi-agent-workflow.md)** for production patterns

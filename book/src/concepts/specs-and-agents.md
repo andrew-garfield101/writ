@@ -1,10 +1,12 @@
 # Specs and Agents
 
-Writ introduces two first class concepts that git doesn't have: **specs** (structured requirements) and **agents** (registered identities with trust levels).
+Orchestration frameworks coordinate what agents *do*. Writ controls what agents *produce*. Two concepts make this possible: **specs** (structured requirements) and **agents** (registered identities with trust levels).
 
 ## Specs
 
-A spec is a structured requirement that agents work against. Think of it as a feature ticket that lives inside the VCS.
+A spec is a structured requirement that agents work against. In git, the relationship between code and requirements is implicit — a branch named `feature/auth` is convention. Nothing enforces it. Nothing links a commit to a ticket. Nothing tells an agent "these are the files you should be touching."
+
+In writ, that relationship is explicit and machine readable.
 
 ### Creating a Spec
 
@@ -47,15 +49,13 @@ active -> stale -> completed -> archived
 
 ### Why Specs Matter
 
-In git, the relationship between code and requirements is implicit. A branch named `feature/auth` is convention. Nothing enforces it. Nothing links a commit to a ticket.
-
-In writ, the relationship is explicit:
+When a sub agent in an automated pipeline modifies a file that another sub agent depends on, git has no structured record of what changed, who changed it, or which requirement it serves. Writ does:
 
 ```bash
 writ seal -s "added token refresh" --agent dev-1 --spec auth
 ```
 
-This seal is now permanently linked to the `auth` spec. Context output groups work by spec. Convergence merges spec by spec. Scope enforcement can restrict agents to their spec's declared files.
+This seal is now permanently linked to the `auth` spec. Context output groups work by spec. Convergence merges spec by spec. Scope enforcement restricts agents to their spec's declared files. This is the structured provenance that makes multi agent workflows manageable at scale.
 
 ## Agents
 
@@ -76,7 +76,7 @@ writ agent register --id backend-dev --role implementer --trust-level standard
 | `restricted` | Limited scope. For agents that should only touch specific files. | Reduced confidence caps |
 | `untrusted` | New or unverified agents. | Lowest confidence caps, more likely to escalate |
 
-Trust levels affect convergence decisions. When two agents' changes conflict, the higher trust agent's changes receive a confidence boost. An untrusted agent's changes are more likely to be escalated for human review rather than auto resolved.
+Trust levels directly affect convergence. When two agents' changes conflict, the higher trust agent's changes receive a confidence boost. An untrusted agent's changes are more likely to be escalated for human review rather than auto resolved. This matters most in zero trust environments where every agent action needs verification, and in fully autonomous pipelines where human review isn't available for every merge.
 
 ### Agent Identity in Practice
 
@@ -86,7 +86,7 @@ Every seal records which agent created it:
 writ seal -s "implemented login" --agent backend-dev --spec auth
 ```
 
-`writ context` shows per agent activity: which files each agent has modified, their latest work, and how many seals they've created. This makes it easy for any agent (or human) to understand who is doing what.
+`writ context` shows per agent activity: which files each agent has modified, their latest work, and how many seals they've created. For a fleet of agents working concurrently, this is the difference between "which of my 12 agents touched this file" being a five minute archaeology project versus a single structured lookup.
 
 ### Scope Enforcement
 
@@ -109,7 +109,7 @@ Scope violations appear in `writ context` and in the security event log.
 
 ### Suspension and Revocation
 
-Agents can be suspended (temporarily blocked from sealing) or revoked (permanently deactivated) without deleting their history. Every seal they created remains in the log.
+Agents can be suspended (temporarily blocked from sealing) or revoked (permanently deactivated) without deleting their history. Every seal they created remains in the log. In autonomous environments, this is how you respond to a compromised or misbehaving agent without losing the audit trail.
 
 ## How Specs and Agents Work Together
 
@@ -135,7 +135,7 @@ INTEGRATION RISK: LOW (score: 15)
   No file contention between specs
 ```
 
-Every piece of work is linked to a requirement and attributed to an identity. Convergence uses this metadata to make better merge decisions. Security auditing uses it to track who changed what and whether they were authorized.
+Every piece of work is linked to a requirement and attributed to an identity. Convergence uses this metadata to make better merge decisions. Security auditing uses it to track who changed what and whether they were authorized. And context delivers all of it in one call — structured data an agent can act on immediately.
 
 ## Next Steps
 

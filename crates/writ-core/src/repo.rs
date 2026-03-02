@@ -7413,9 +7413,7 @@ mod tests {
             LifecycleState::Cancelled,
         ] {
             let label = format!("{:?}", target);
-            let err = repo
-                .transition_spec_lifecycle("s1", target)
-                .unwrap_err();
+            let err = repo.transition_spec_lifecycle("s1", target).unwrap_err();
             assert!(
                 err.to_string().contains("not a legal transition"),
                 "Archived → {} should be rejected, got: {err}",

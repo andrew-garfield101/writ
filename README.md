@@ -6,13 +6,16 @@
 [![CI](https://github.com/andrew-garfield101/writ/actions/workflows/ci.yml/badge.svg)](https://github.com/andrew-garfield101/writ/actions/workflows/ci.yml)
 
 
-AI is advancing fast. Models get updated, tooling shifts, agents make destructive changes, and code that worked yesterday breaks tomorrow. Fully autonomous environments amplify this — when agents have unsupervised write access, bad merges, silent regressions, and lost work aren't edge cases, they're Tuesday.
+Writ is a version control system designed from the ground up for LLMs and
+agentic systems. Instead of bolting conventions onto a VCS built for humans,
+writ provides elegant, AI native version control through **specs**, **seals**,
+**context**, and **convergence**.
 
-Git and git worktrees are a viable workaround for agent isolation. Writ is a purpose-built solution — designed from the data model up for the reality that agentic development is unpredictable, iterative, and evolving as fast as the models themselves.
+Writ works alongside git, not instead of it.
 
-**One-call context.** Agents waste tokens and compute building situational awareness — `git log`, `git diff`, `git status`, parsing unstructured text, reconstructing project state across multiple tool calls. A single `writ context` returns everything an agent needs — specs, seals, working state, file contention, integration risk — in structured JSON. One call. One structured response. The format agents work best with.
+**One call context.** Agents waste tokens and compute building situational awareness — `git log`, `git diff`, `git status`, parsing unstructured text, reconstructing project state across multiple tool calls. A single `writ context` returns everything an agent needs — specs, seals, working state, file contention, integration risk — in structured JSON. One call. One structured response. The format agents work best with.
 
-**Semantic convergence.** When multiple agents touch the same files, writ merges *meaning*, not lines. Language-aware analyzers decompose code structurally, compose additive changes automatically, and escalate real conflicts with full context. The core principle: compose, don't choose.
+**Semantic convergence.** When multiple agents touch the same files, writ merges *meaning*, not lines. Language aware analyzers decompose code structurally, compose additive changes automatically, and escalate real conflicts with full context. The core principle: compose, don't choose.
 
 **Cryptographic integrity.** BLAKE3 hash chains and Ed25519 signatures on every seal. Agent identity with trust levels and scope enforcement. Content traceability ensures no line in merged output appears from thin air. Tamper with any checkpoint and the chain breaks.
 

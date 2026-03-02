@@ -206,6 +206,18 @@ pub struct PipelineEscalation {
     pub left_spec: String,
     pub right_spec: String,
     pub recommended_action: String,
+    /// Left (base) version of the conflicted file, for resolution commands.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub left_content: Option<String>,
+    /// Right (incoming) version of the conflicted file, for resolution commands.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub right_content: Option<String>,
+    /// Suggested merged content from Phase 3 pattern matching (if available).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub suggested_content: Option<String>,
+    /// Confidence score of the suggestion (0.0–1.0).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub suggestion_confidence: Option<f64>,
 }
 
 /// Result of resolving all conflict regions for a single file.
@@ -1555,6 +1567,10 @@ pub fn resolve_conflict_regions(
                     right_spec: right_spec_id.to_string(),
                     recommended_action: "Review whether deletion or modification is correct"
                         .to_string(),
+                    left_content: Some(left_content.to_string()),
+                    right_content: Some(right_content.to_string()),
+                    suggested_content: None,
+                    suggestion_confidence: None,
                 });
                 resolved_regions.push(RegionResolution {
                     lines: vec![],

@@ -1,0 +1,16 @@
+[book]
+authors = ["Andrew Garfield"]
+language = "en"
+src = "src"
+title = "Writ Documentation"
+description = "AI-native version control for agentic systems"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/andrew-garfield101/writ"
+edit-url-template = "https://github.com/andrew-garfield101/writ/edit/main/book/src/{path}"

@@ -23,9 +23,9 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-          - os: macos-latest
+          - os: macos-13
             target: x86_64-apple-darwin
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -36,6 +36,10 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Setup QEMU
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: docker/setup-qemu-action@v3
 
       - name: Build wheel
         uses: PyO3/maturin-action@v1
@@ -74,7 +78,9 @@ jobs:
     name: Publish to PyPI
     needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
-    environment: pypi
+    environment:
+      name: pypi
+      url: https://pypi.org/p/writ-vcs
     permissions:
       id-token: write
     steps:
@@ -85,10 +91,7 @@ jobs:
           merge-multiple: true
 
       - name: Publish to PyPI
-        uses: PyO3/maturin-action@v1
-        with:
-          command: upload
-          args: --non-interactive dist/*
+        uses: pypa/gh-action-pypi-publish@release/v1
 
   # ── Build CLI binaries for GitHub Release ─────────────────────────────
   build-cli:
@@ -105,10 +108,10 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: writ
             cross: true
-          - os: macos-latest
+          - os: macos-13
             target: x86_64-apple-darwin
             artifact: writ
-          - os: macos-latest
+          - os: macos-14
             target: aarch64-apple-darwin
             artifact: writ
           - os: windows-latest
@@ -179,10 +182,15 @@ jobs:
             pip install writ-vcs
             ```
 
+            **Homebrew (macOS/Linux):**
+            ```bash
+            brew install andrew-garfield101/writ/writ
+            ```
+
             **CLI binary:**
             Download the appropriate archive for your platform below, extract, and place `writ` on your PATH.
 
             **From source:**
             ```bash
-            cargo install --git https://github.com/agarfield/writ writ-cli
+            cargo install --git https://github.com/andrew-garfield101/writ writ-cli
             ```

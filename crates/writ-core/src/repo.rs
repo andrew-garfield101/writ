@@ -3500,6 +3500,16 @@ impl Repository {
                                     left_spec: esc.left_agent.clone(),
                                     right_spec: esc.right_agent.clone(),
                                     recommended_action: esc.recommended_action.clone(),
+                                    left_content: Some(esc.left_content.clone()),
+                                    right_content: Some(esc.right_content.clone()),
+                                    suggested_content: esc
+                                        .phase3_suggestion
+                                        .as_ref()
+                                        .map(|s| s.merged_content.clone()),
+                                    suggestion_confidence: esc
+                                        .phase3_suggestion
+                                        .as_ref()
+                                        .map(|s| s.confidence),
                                 });
                                 // Emit per-escalation security event with agent context.
                                 let _ = conv_logger.emit_convergence_event_with_agent(
@@ -7114,7 +7124,7 @@ pub struct AllChainsVerification {
 mod tests {
     use super::*;
     use crate::seal::AgentType;
-    use crate::spec::SpecStatus;
+    use crate::spec::{LifecycleState, SpecStatus};
     use tempfile::tempdir;
 
     fn test_agent() -> AgentIdentity {
@@ -7260,6 +7270,318 @@ mod tests {
 
         let all = repo.list_specs().unwrap();
         assert_eq!(all.len(), 1);
+    }
+
+    // --- Lifecycle transition tests (Gap 2 coverage) ---
+
+    #[test]
+    fn test_lifecycle_active_to_stale() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Stale)
+            .unwrap();
+        let loaded = repo.load_spec("s1").unwrap();
+        assert_eq!(loaded.lifecycle_state, LifecycleState::Stale);
+    }
+
+    #[test]
+    fn test_lifecycle_active_to_cancelled() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Cancelled)
+            .unwrap();
+        let loaded = repo.load_spec("s1").unwrap();
+        assert_eq!(loaded.lifecycle_state, LifecycleState::Cancelled);
+    }
+
+    #[test]
+    fn test_lifecycle_active_to_completed() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Completed)
+            .unwrap();
+        let loaded = repo.load_spec("s1").unwrap();
+        assert_eq!(loaded.lifecycle_state, LifecycleState::Completed);
+    }
+
+    #[test]
+    fn test_lifecycle_stale_to_active() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Stale)
+            .unwrap();
+        repo.transition_spec_lifecycle("s1", LifecycleState::Active)
+            .unwrap();
+        let loaded = repo.load_spec("s1").unwrap();
+        assert_eq!(loaded.lifecycle_state, LifecycleState::Active);
+    }
+
+    #[test]
+    fn test_lifecycle_stale_to_cancelled() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Stale)
+            .unwrap();
+        repo.transition_spec_lifecycle("s1", LifecycleState::Cancelled)
+            .unwrap();
+        let loaded = repo.load_spec("s1").unwrap();
+        assert_eq!(loaded.lifecycle_state, LifecycleState::Cancelled);
+    }
+
+    #[test]
+    fn test_lifecycle_completed_to_archived() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Completed)
+            .unwrap();
+        repo.transition_spec_lifecycle("s1", LifecycleState::Archived)
+            .unwrap();
+        let loaded = repo.load_spec("s1").unwrap();
+        assert_eq!(loaded.lifecycle_state, LifecycleState::Archived);
+    }
+
+    #[test]
+    fn test_lifecycle_cancelled_to_archived() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Cancelled)
+            .unwrap();
+        repo.transition_spec_lifecycle("s1", LifecycleState::Archived)
+            .unwrap();
+        let loaded = repo.load_spec("s1").unwrap();
+        assert_eq!(loaded.lifecycle_state, LifecycleState::Archived);
+    }
+
+    // --- Invalid transitions (Gap 2: corruption/illegal state handling) ---
+
+    #[test]
+    fn test_lifecycle_rejects_completed_to_active() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Completed)
+            .unwrap();
+        let err = repo
+            .transition_spec_lifecycle("s1", LifecycleState::Active)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("not a legal transition"),
+            "expected IllegalTransition error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_rejects_archived_to_any() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Completed)
+            .unwrap();
+        repo.transition_spec_lifecycle("s1", LifecycleState::Archived)
+            .unwrap();
+
+        // Archived is terminal — no transitions out
+        for target in [
+            LifecycleState::Active,
+            LifecycleState::Stale,
+            LifecycleState::Completed,
+            LifecycleState::Cancelled,
+        ] {
+            let label = format!("{:?}", target);
+            let err = repo
+                .transition_spec_lifecycle("s1", target)
+                .unwrap_err();
+            assert!(
+                err.to_string().contains("not a legal transition"),
+                "Archived → {} should be rejected, got: {err}",
+                label
+            );
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_rejects_active_to_archived_directly() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        let err = repo
+            .transition_spec_lifecycle("s1", LifecycleState::Archived)
+            .unwrap_err();
+        assert!(err.to_string().contains("not a legal transition"));
+    }
+
+    #[test]
+    fn test_lifecycle_rejects_cancelled_to_active() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Cancelled)
+            .unwrap();
+        let err = repo
+            .transition_spec_lifecycle("s1", LifecycleState::Active)
+            .unwrap_err();
+        assert!(err.to_string().contains("not a legal transition"));
+    }
+
+    #[test]
+    fn test_lifecycle_noop_same_state_rejected() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        // Active → Active is not in the allowed transitions list
+        let err = repo
+            .transition_spec_lifecycle("s1", LifecycleState::Active)
+            .unwrap_err();
+        assert!(err.to_string().contains("not a legal transition"));
+    }
+
+    #[test]
+    fn test_lifecycle_nonexistent_spec_errors() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let err = repo
+            .transition_spec_lifecycle("ghost", LifecycleState::Stale)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("ghost") || err.to_string().contains("not found"),
+            "expected spec-not-found error, got: {err}"
+        );
+    }
+
+    // --- cancel_spec convenience method ---
+
+    #[test]
+    fn test_cancel_spec_from_active() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.cancel_spec("s1").unwrap();
+        let loaded = repo.load_spec("s1").unwrap();
+        assert_eq!(loaded.lifecycle_state, LifecycleState::Cancelled);
+    }
+
+    #[test]
+    fn test_cancel_spec_from_stale() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Stale)
+            .unwrap();
+        repo.cancel_spec("s1").unwrap();
+        let loaded = repo.load_spec("s1").unwrap();
+        assert_eq!(loaded.lifecycle_state, LifecycleState::Cancelled);
+    }
+
+    #[test]
+    fn test_cancel_spec_rejects_terminal_states() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        repo.transition_spec_lifecycle("s1", LifecycleState::Completed)
+            .unwrap();
+        let err = repo.cancel_spec("s1").unwrap_err();
+        assert!(err.to_string().contains("already terminal"));
+    }
+
+    // --- complete_spec convenience method ---
+
+    #[test]
+    fn test_complete_spec_requires_complete_status() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        // Status is Pending, not Complete
+        let err = repo.complete_spec("s1").unwrap_err();
+        assert!(err.to_string().contains("status must be 'complete'"));
+    }
+
+    #[test]
+    fn test_complete_spec_succeeds_with_complete_status() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        // Set spec status to Complete
+        let update = crate::spec::SpecUpdate {
+            status: Some(SpecStatus::Complete),
+            depends_on: None,
+            file_scope: None,
+            acceptance_criteria: None,
+            design_notes: None,
+            tech_stack: None,
+        };
+        repo.update_spec("s1", update).unwrap();
+
+        repo.complete_spec("s1").unwrap();
+        let loaded = repo.load_spec("s1").unwrap();
+        assert_eq!(loaded.lifecycle_state, LifecycleState::Completed);
+    }
+
+    #[test]
+    fn test_complete_spec_rejects_from_cancelled() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        // Mark status as complete first
+        let update = crate::spec::SpecUpdate {
+            status: Some(SpecStatus::Complete),
+            depends_on: None,
+            file_scope: None,
+            acceptance_criteria: None,
+            design_notes: None,
+            tech_stack: None,
+        };
+        repo.update_spec("s1", update).unwrap();
+
+        // Cancel the spec lifecycle
+        repo.cancel_spec("s1").unwrap();
+
+        // Now complete_spec should fail — lifecycle is Cancelled
+        let err = repo.complete_spec("s1").unwrap_err();
+        assert!(err.to_string().contains("cannot complete from"));
     }
 
     #[test]

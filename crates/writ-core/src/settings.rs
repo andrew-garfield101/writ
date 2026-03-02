@@ -178,9 +178,10 @@ impl WritSettings {
             "enforce_scope" => self.enforce_scope.map(|v| v.to_string()),
             "convergence.strategy" => self.convergence.strategy.clone(),
             "convergence.auto_resolve" => self.convergence.auto_resolve.map(|v| v.to_string()),
-            "convergence.auto_resolve_min_confidence" => {
-                self.convergence.auto_resolve_min_confidence.map(|v| v.to_string())
-            }
+            "convergence.auto_resolve_min_confidence" => self
+                .convergence
+                .auto_resolve_min_confidence
+                .map(|v| v.to_string()),
             "auto_seal_on_exit" => self.auto_seal_on_exit.map(|v| v.to_string()),
             _ => None,
         }
@@ -216,9 +217,9 @@ impl WritSettings {
                 self.convergence.auto_resolve = Some(parse_bool(value)?);
             }
             "convergence.auto_resolve_min_confidence" => {
-                let v: f64 = value.parse().map_err(|_| {
-                    WritError::InvalidInput(format!("invalid float '{value}'"))
-                })?;
+                let v: f64 = value
+                    .parse()
+                    .map_err(|_| WritError::InvalidInput(format!("invalid float '{value}'")))?;
                 if !(0.0..=1.0).contains(&v) {
                     return Err(WritError::InvalidInput(
                         "confidence must be between 0.0 and 1.0".into(),
@@ -230,9 +231,7 @@ impl WritSettings {
                 self.auto_seal_on_exit = Some(parse_bool(value)?);
             }
             _ => {
-                return Err(WritError::InvalidInput(format!(
-                    "unknown setting '{key}'"
-                )));
+                return Err(WritError::InvalidInput(format!("unknown setting '{key}'")));
             }
         }
         Ok(())
@@ -251,9 +250,7 @@ impl WritSettings {
             }
             "auto_seal_on_exit" => self.auto_seal_on_exit = None,
             _ => {
-                return Err(WritError::InvalidInput(format!(
-                    "unknown setting '{key}'"
-                )));
+                return Err(WritError::InvalidInput(format!("unknown setting '{key}'")));
             }
         }
         Ok(())
@@ -337,7 +334,9 @@ mod tests {
         assert_eq!(loaded.enforce_scope, Some(true));
         assert_eq!(loaded.convergence.strategy.as_deref(), Some("escalate"));
         assert_eq!(loaded.convergence.auto_resolve, Some(true));
-        assert!((loaded.convergence.auto_resolve_min_confidence.unwrap() - 0.70).abs() < f64::EPSILON);
+        assert!(
+            (loaded.convergence.auto_resolve_min_confidence.unwrap() - 0.70).abs() < f64::EPSILON
+        );
         assert_eq!(loaded.auto_seal_on_exit, Some(false));
     }
 
@@ -361,7 +360,8 @@ mod tests {
     #[test]
     fn test_get_set_float_key() {
         let mut s = WritSettings::default();
-        s.set("convergence.auto_resolve_min_confidence", "0.70").unwrap();
+        s.set("convergence.auto_resolve_min_confidence", "0.70")
+            .unwrap();
         assert_eq!(
             s.get("convergence.auto_resolve_min_confidence").as_deref(),
             Some("0.7")
@@ -391,10 +391,14 @@ mod tests {
     #[test]
     fn test_set_confidence_out_of_range() {
         let mut s = WritSettings::default();
-        let err = s.set("convergence.auto_resolve_min_confidence", "1.5").unwrap_err();
+        let err = s
+            .set("convergence.auto_resolve_min_confidence", "1.5")
+            .unwrap_err();
         assert!(err.to_string().contains("between 0.0 and 1.0"));
 
-        let err = s.set("convergence.auto_resolve_min_confidence", "-0.1").unwrap_err();
+        let err = s
+            .set("convergence.auto_resolve_min_confidence", "-0.1")
+            .unwrap_err();
         assert!(err.to_string().contains("between 0.0 and 1.0"));
     }
 
@@ -490,7 +494,10 @@ mod tests {
         let mut s2 = WritSettings::default();
         s2.convergence.auto_resolve = Some(true);
         let json2 = serde_json::to_string_pretty(&s2).unwrap();
-        assert!(json2.contains("convergence"), "non-empty convergence should be serialized");
+        assert!(
+            json2.contains("convergence"),
+            "non-empty convergence should be serialized"
+        );
         assert!(json2.contains("auto_resolve"));
     }
 
@@ -503,7 +510,9 @@ mod tests {
         s.set("convergence.strategy", "orchestrator").unwrap();
 
         // Old v1 names should be rejected
-        let err = s.set("convergence.strategy", "three-way-merge").unwrap_err();
+        let err = s
+            .set("convergence.strategy", "three-way-merge")
+            .unwrap_err();
         assert!(err.to_string().contains("invalid strategy"));
         let err = s.set("convergence.strategy", "most-complete").unwrap_err();
         assert!(err.to_string().contains("invalid strategy"));

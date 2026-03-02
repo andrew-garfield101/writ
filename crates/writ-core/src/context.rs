@@ -544,3 +544,421 @@ pub struct RecommendedAction {
     /// Priority level: "high", "medium", or "low".
     pub priority: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diff::{DiffOutput, FileDiff};
+    use crate::seal::{
+        AgentIdentity, AgentType, ChangeType, FileChange, Seal, TaskStatus, Verification,
+    };
+    use crate::spec::SpecStatus;
+    use crate::state::{FileState, FileStatus, WorkingState};
+
+    // ── Helper: build a minimal seal for testing ─────────────
+
+    fn make_seal(agent_id: &str, summary: &str, status: TaskStatus) -> Seal {
+        Seal::new(
+            None,
+            "tree_hash".to_string(),
+            AgentIdentity {
+                id: agent_id.to_string(),
+                agent_type: AgentType::Agent,
+            },
+            None,
+            status,
+            vec![FileChange {
+                path: "app.py".to_string(),
+                change_type: ChangeType::Modified,
+                old_hash: Some("old".to_string()),
+                new_hash: Some("new".to_string()),
+            }],
+            Verification::default(),
+            summary.to_string(),
+            vec![],
+            None,
+        )
+    }
+
+    // ── VerificationSummary ──────────────────────────────────
+
+    #[test]
+    fn verification_summary_returns_none_for_all_defaults() {
+        let v = Verification::default();
+        assert!(VerificationSummary::from_verification(&v).is_none());
+    }
+
+    #[test]
+    fn verification_summary_returns_some_with_tests_passed() {
+        let v = Verification {
+            tests_passed: Some(10),
+            tests_failed: None,
+            linted: false,
+        };
+        let s = VerificationSummary::from_verification(&v).unwrap();
+        assert_eq!(s.tests_passed, Some(10));
+        assert_eq!(s.tests_failed, None);
+        assert!(!s.linted);
+    }
+
+    #[test]
+    fn verification_summary_returns_some_when_linted() {
+        let v = Verification {
+            tests_passed: None,
+            tests_failed: None,
+            linted: true,
+        };
+        let s = VerificationSummary::from_verification(&v).unwrap();
+        assert!(s.linted);
+    }
+
+    #[test]
+    fn verification_summary_preserves_all_fields() {
+        let v = Verification {
+            tests_passed: Some(42),
+            tests_failed: Some(3),
+            linted: true,
+        };
+        let s = VerificationSummary::from_verification(&v).unwrap();
+        assert_eq!(s.tests_passed, Some(42));
+        assert_eq!(s.tests_failed, Some(3));
+        assert!(s.linted);
+    }
+
+    // ── SealSummary ──────────────────────────────────────────
+
+    #[test]
+    fn seal_summary_truncates_id_to_12_chars() {
+        let seal = make_seal("agent-a", "test seal", TaskStatus::InProgress);
+        let summary = SealSummary::from_seal(&seal);
+        assert_eq!(summary.id.len(), 12);
+        assert_eq!(&summary.id, &seal.id[..12]);
+    }
+
+    #[test]
+    fn seal_summary_formats_in_progress_status() {
+        let seal = make_seal("agent-a", "working", TaskStatus::InProgress);
+        let summary = SealSummary::from_seal(&seal);
+        assert_eq!(summary.status, "in-progress");
+    }
+
+    #[test]
+    fn seal_summary_formats_complete_status() {
+        let seal = make_seal("agent-a", "done", TaskStatus::Complete);
+        let summary = SealSummary::from_seal(&seal);
+        assert_eq!(summary.status, "complete");
+    }
+
+    #[test]
+    fn seal_summary_formats_blocked_status() {
+        let seal = make_seal("agent-a", "stuck", TaskStatus::Blocked);
+        let summary = SealSummary::from_seal(&seal);
+        assert_eq!(summary.status, "blocked");
+    }
+
+    #[test]
+    fn seal_summary_captures_agent_and_summary() {
+        let seal = make_seal("backend-dev", "added auth routes", TaskStatus::InProgress);
+        let summary = SealSummary::from_seal(&seal);
+        assert_eq!(summary.agent, "backend-dev");
+        assert_eq!(summary.summary, "added auth routes");
+    }
+
+    #[test]
+    fn seal_summary_counts_files_changed() {
+        let seal = make_seal("agent-a", "work", TaskStatus::InProgress);
+        let summary = SealSummary::from_seal(&seal);
+        assert_eq!(summary.files_changed, 1);
+    }
+
+    #[test]
+    fn seal_summary_includes_changed_paths() {
+        let seal = make_seal("agent-a", "work", TaskStatus::InProgress);
+        let summary = SealSummary::from_seal(&seal);
+        assert_eq!(summary.changed_paths, vec!["app.py"]);
+    }
+
+    #[test]
+    fn seal_summary_omits_verification_when_default() {
+        let seal = make_seal("agent-a", "work", TaskStatus::InProgress);
+        let summary = SealSummary::from_seal(&seal);
+        assert!(summary.verification.is_none());
+    }
+
+    #[test]
+    fn seal_summary_includes_spec_id_when_present() {
+        let mut seal = make_seal("agent-a", "work", TaskStatus::InProgress);
+        seal.spec_id = Some("backend".to_string());
+        let summary = SealSummary::from_seal(&seal);
+        assert_eq!(summary.spec_id, Some("backend".to_string()));
+    }
+
+    // ── WorkingStateSummary ──────────────────────────────────
+
+    #[test]
+    fn working_state_summary_clean() {
+        let state = WorkingState {
+            changes: vec![],
+            tracked_count: 5,
+        };
+        let summary = WorkingStateSummary::from_state(&state);
+        assert!(summary.clean);
+        assert!(summary.new_files.is_empty());
+        assert!(summary.modified_files.is_empty());
+        assert!(summary.deleted_files.is_empty());
+        assert_eq!(summary.tracked_count, 5);
+    }
+
+    #[test]
+    fn working_state_summary_categorizes_changes() {
+        let state = WorkingState {
+            changes: vec![
+                FileState {
+                    path: "new.py".to_string(),
+                    status: FileStatus::New,
+                    hash: Some("h".to_string()),
+                },
+                FileState {
+                    path: "mod.py".to_string(),
+                    status: FileStatus::Modified,
+                    hash: Some("h".to_string()),
+                },
+                FileState {
+                    path: "del.py".to_string(),
+                    status: FileStatus::Deleted,
+                    hash: None,
+                },
+            ],
+            tracked_count: 2,
+        };
+        let summary = WorkingStateSummary::from_state(&state);
+        assert!(!summary.clean);
+        assert_eq!(summary.new_files, vec!["new.py"]);
+        assert_eq!(summary.modified_files, vec!["mod.py"]);
+        assert_eq!(summary.deleted_files, vec!["del.py"]);
+    }
+
+    // ── DiffSummary ──────────────────────────────────────────
+
+    #[test]
+    fn diff_summary_maps_diff_output() {
+        let diff = DiffOutput {
+            description: "changes".to_string(),
+            files: vec![FileDiff {
+                path: "app.py".to_string(),
+                change_type: ChangeType::Modified,
+                hunks: vec![],
+                is_binary: false,
+                additions: 10,
+                deletions: 3,
+            }],
+            files_changed: 1,
+            total_additions: 10,
+            total_deletions: 3,
+        };
+        let summary = DiffSummary::from_diff(&diff);
+        assert_eq!(summary.files_changed, 1);
+        assert_eq!(summary.total_additions, 10);
+        assert_eq!(summary.total_deletions, 3);
+        assert_eq!(summary.files.len(), 1);
+        assert_eq!(summary.files[0].path, "app.py");
+        assert_eq!(summary.files[0].additions, 10);
+        assert_eq!(summary.files[0].deletions, 3);
+    }
+
+    #[test]
+    fn diff_summary_empty_diff() {
+        let diff = DiffOutput {
+            description: "none".to_string(),
+            files: vec![],
+            files_changed: 0,
+            total_additions: 0,
+            total_deletions: 0,
+        };
+        let summary = DiffSummary::from_diff(&diff);
+        assert_eq!(summary.files_changed, 0);
+        assert!(summary.files.is_empty());
+    }
+
+    // ── DepStatus ────────────────────────────────────────────
+
+    #[test]
+    fn dep_status_from_complete_spec() {
+        let dep = DepStatus::from_spec("auth", &SpecStatus::Complete);
+        assert_eq!(dep.spec_id, "auth");
+        assert_eq!(dep.status, "complete");
+        assert!(dep.resolved);
+    }
+
+    #[test]
+    fn dep_status_from_pending_spec() {
+        let dep = DepStatus::from_spec("db", &SpecStatus::Pending);
+        assert_eq!(dep.status, "pending");
+        assert!(!dep.resolved);
+    }
+
+    #[test]
+    fn dep_status_from_in_progress_spec() {
+        let dep = DepStatus::from_spec("api", &SpecStatus::InProgress);
+        assert_eq!(dep.status, "in-progress");
+        assert!(!dep.resolved);
+    }
+
+    #[test]
+    fn dep_status_from_blocked_spec() {
+        let dep = DepStatus::from_spec("ui", &SpecStatus::Blocked);
+        assert_eq!(dep.status, "blocked");
+        assert!(!dep.resolved);
+    }
+
+    #[test]
+    fn dep_status_not_found() {
+        let dep = DepStatus::not_found("missing-spec");
+        assert_eq!(dep.spec_id, "missing-spec");
+        assert_eq!(dep.status, "not-found");
+        assert!(!dep.resolved);
+    }
+
+    // ── IntegrationRisk::compute ─────────────────────────────
+
+    #[test]
+    fn risk_low_when_no_signals() {
+        let risk = IntegrationRisk::compute(0, 0, 0, 0);
+        assert_eq!(risk.level, "low");
+        assert_eq!(risk.score, 0);
+        assert!(risk.factors.is_empty());
+    }
+
+    #[test]
+    fn risk_medium_with_one_diverged_branch() {
+        let risk = IntegrationRisk::compute(1, 0, 0, 0);
+        assert_eq!(risk.level, "medium");
+        assert_eq!(risk.score, 15);
+        assert_eq!(risk.factors.len(), 1);
+    }
+
+    #[test]
+    fn risk_medium_with_three_diverged_branches() {
+        let risk = IntegrationRisk::compute(3, 0, 0, 0);
+        assert_eq!(risk.level, "medium");
+        assert_eq!(risk.score, 45);
+    }
+
+    #[test]
+    fn risk_high_with_four_plus_diverged_branches() {
+        let risk = IntegrationRisk::compute(4, 0, 0, 0);
+        assert_eq!(risk.level, "medium");
+        assert_eq!(risk.score, 40);
+    }
+
+    #[test]
+    fn risk_high_with_five_agent_file_contention() {
+        let risk = IntegrationRisk::compute(0, 5, 0, 0);
+        assert_eq!(risk.score, 30);
+    }
+
+    #[test]
+    fn risk_medium_with_three_agent_file_contention() {
+        let risk = IntegrationRisk::compute(0, 3, 0, 0);
+        assert_eq!(risk.score, 15);
+    }
+
+    #[test]
+    fn risk_scores_scope_violations() {
+        let risk = IntegrationRisk::compute(0, 0, 1, 0);
+        assert_eq!(risk.score, 5);
+
+        let risk = IntegrationRisk::compute(0, 0, 5, 0);
+        assert_eq!(risk.score, 25);
+    }
+
+    #[test]
+    fn risk_high_with_many_scope_violations() {
+        let risk = IntegrationRisk::compute(0, 0, 6, 0);
+        assert_eq!(risk.score, 20);
+    }
+
+    #[test]
+    fn risk_adds_contested_files_above_five() {
+        let risk = IntegrationRisk::compute(0, 0, 0, 5);
+        assert_eq!(risk.score, 0); // 5 is not > 5
+
+        let risk = IntegrationRisk::compute(0, 0, 0, 6);
+        assert_eq!(risk.score, 10);
+    }
+
+    #[test]
+    fn risk_compounds_multiple_signals() {
+        // 2 diverged (30) + 3 agents on file (15) + 2 violations (10) = 55
+        let risk = IntegrationRisk::compute(2, 3, 2, 0);
+        assert_eq!(risk.score, 30 + 15 + 10);
+        assert_eq!(risk.level, "high");
+    }
+
+    #[test]
+    fn risk_score_capped_at_100() {
+        let risk = IntegrationRisk::compute(10, 10, 10, 10);
+        assert_eq!(risk.score, 100);
+    }
+
+    #[test]
+    fn risk_level_thresholds() {
+        // Score 0 = low
+        assert_eq!(IntegrationRisk::compute(0, 0, 0, 0).level, "low");
+        // Score 1-49 = medium
+        assert_eq!(IntegrationRisk::compute(0, 0, 1, 0).level, "medium");
+        // Score 50+ = high
+        assert_eq!(IntegrationRisk::compute(4, 5, 0, 0).level, "high");
+    }
+
+    // ── Serialization: skip_serializing_if behavior ──────────
+
+    #[test]
+    fn verification_summary_skips_none_fields_in_json() {
+        let v = VerificationSummary {
+            tests_passed: Some(5),
+            tests_failed: None,
+            linted: false,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        assert!(json.contains("tests_passed"));
+        assert!(!json.contains("tests_failed"));
+        assert!(!json.contains("linted"));
+    }
+
+    #[test]
+    fn seal_summary_skips_empty_changed_paths_in_json() {
+        let summary = SealSummary {
+            id: "abc123def456".to_string(),
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            agent: "test".to_string(),
+            summary: "test".to_string(),
+            files_changed: 0,
+            spec_id: None,
+            status: "in-progress".to_string(),
+            verification: None,
+            changed_paths: vec![],
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("changed_paths"));
+        assert!(!json.contains("spec_id"));
+        assert!(!json.contains("verification"));
+    }
+
+    #[test]
+    fn working_state_summary_skips_empty_lists_in_json() {
+        let summary = WorkingStateSummary {
+            clean: true,
+            new_files: vec![],
+            modified_files: vec![],
+            deleted_files: vec![],
+            tracked_count: 3,
+        };
+        let json = serde_json::to_string(&summary).unwrap();
+        assert!(!json.contains("new_files"));
+        assert!(!json.contains("modified_files"));
+        assert!(!json.contains("deleted_files"));
+        assert!(json.contains("clean"));
+        assert!(json.contains("tracked_count"));
+    }
+}

@@ -66,9 +66,9 @@ enum Commands {
 
     /// Show working directory state.
     State {
-        /// Output format: "human" (default), "json", or "brief".
-        #[arg(long, default_value = "human")]
-        format: String,
+        /// Output format: "human" (default from settings), "json", or "brief".
+        #[arg(long)]
+        format: Option<String>,
     },
 
     /// Create a seal (structured checkpoint) from current changes.
@@ -77,10 +77,11 @@ enum Commands {
         #[arg(long, short)]
         summary: String,
 
-        /// Agent or human identifier. Defaults to "human" (sets agent_type=human).
-        /// Any other value sets agent_type=agent.
-        #[arg(long, default_value = "human")]
-        agent: String,
+        /// Agent or human identifier. Uses `default_agent` setting if configured,
+        /// otherwise defaults to "human" (sets agent_type=human).
+        /// Any non-"human" value sets agent_type=agent.
+        #[arg(long)]
+        agent: Option<String>,
 
         /// Linked spec ID.
         #[arg(long)]
@@ -128,16 +129,16 @@ enum Commands {
         #[arg(long)]
         diff: bool,
 
-        /// Output format: "human" (default), "json", or "brief".
-        #[arg(long, default_value = "human")]
-        format: String,
+        /// Output format: "human" (default from settings), "json", or "brief".
+        #[arg(long)]
+        format: Option<String>,
     },
 
     /// Show seal history.
     Log {
-        /// Output format: "human" (default), "json", or "brief".
-        #[arg(long, default_value = "human")]
-        format: String,
+        /// Output format: "human" (default from settings), "json", or "brief".
+        #[arg(long)]
+        format: Option<String>,
 
         /// Maximum number of seals to show.
         #[arg(long, short)]
@@ -163,9 +164,9 @@ enum Commands {
         #[arg(long)]
         to: Option<String>,
 
-        /// Output format: "human" (default), "json", or "brief".
-        #[arg(long, default_value = "human")]
-        format: String,
+        /// Output format: "human" (default from settings), "json", or "brief".
+        #[arg(long)]
+        format: Option<String>,
     },
 
     /// Dump structured context for LLM consumption.
@@ -192,18 +193,19 @@ enum Commands {
         agent: Option<String>,
 
         /// Output format: "json" (default), "human", or "brief".
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Note: context defaults to "json" unlike other commands.
+        #[arg(long)]
+        format: Option<String>,
     },
 
     /// Human-readable summary of all work done in this writ session.
     /// Designed for the round-trip: writ install -> agents work -> writ summary -> git commit.
     Summary {
-        /// Output format: "human" (default), "json", "commit", or "pr".
+        /// Output format: "human" (default from settings), "json", "commit", or "pr".
         /// "commit" outputs a concise one-line commit message.
         /// "pr" outputs a detailed PR description with full spec/agent breakdown.
-        #[arg(long, default_value = "human")]
-        format: String,
+        #[arg(long)]
+        format: Option<String>,
     },
 
     /// One-command round-trip: generate summary, git add, git commit.
@@ -227,9 +229,9 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
-        /// Output format: "human" (default) or "json".
-        #[arg(long, default_value = "human")]
-        format: String,
+        /// Output format: "human" (default from settings) or "json".
+        #[arg(long)]
+        format: Option<String>,
     },
 
     /// Analyze convergence between two specs (three-way merge).
@@ -241,8 +243,9 @@ enum Commands {
         right_spec: String,
 
         /// Output format: "json" (default), "human", or "brief".
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Note: converge defaults to "json" unlike other commands.
+        #[arg(long)]
+        format: Option<String>,
 
         /// Apply the convergence result to the working directory (clean merges only).
         #[arg(long)]
@@ -253,8 +256,9 @@ enum Commands {
     /// This is the recommended way to merge after multi-agent parallel work.
     ConvergeAll {
         /// Output format: "json" (default) or "human".
-        #[arg(long, default_value = "json")]
-        format: String,
+        /// Note: converge-all defaults to "json" unlike other commands.
+        #[arg(long)]
+        format: Option<String>,
 
         /// Automatically apply clean merges and resolve conflicts per strategy.
         #[arg(long)]
@@ -264,10 +268,17 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
 
-        /// Fallback strategy for irreconcilable conflicts: "escalate" (default), "manual", "most-recent" (deprecated), or "orchestrator".
+        /// Fallback strategy for irreconcilable conflicts. Uses `convergence.strategy`
+        /// setting if configured, otherwise defaults to "escalate".
         /// Deterministic patterns always run regardless of strategy.
-        #[arg(long, default_value = "escalate")]
-        strategy: String,
+        #[arg(long)]
+        strategy: Option<String>,
+
+        /// Auto-apply highest-confidence resolutions for escalated conflicts.
+        /// Uses `convergence.auto_resolve_min_confidence` setting as threshold
+        /// (default 0.85). All decisions are logged to security events for audit.
+        #[arg(long)]
+        auto_resolve: bool,
     },
 
     /// Manage specs (requirements).
@@ -324,9 +335,9 @@ enum Commands {
         #[arg(long)]
         seal: Option<String>,
 
-        /// Output format: "human" (default) or "json".
-        #[arg(long, default_value = "human")]
-        format: String,
+        /// Output format: "human" (default from settings) or "json".
+        #[arg(long)]
+        format: Option<String>,
     },
 
     /// Manage agent identities.
@@ -345,6 +356,27 @@ enum Commands {
     Gc {
         #[command(subcommand)]
         action: GcCommands,
+    },
+
+    /// Resolve escalated convergence conflicts.
+    /// Run without arguments to see pending escalations.
+    Resolve {
+        /// File path to resolve. Omit to list pending escalations.
+        file: Option<String>,
+
+        /// Quick resolution strategy: left, right, both, or best.
+        /// "left" keeps the base version. "right" keeps the incoming version.
+        /// "both" concatenates both versions. "best" uses the highest-confidence suggestion.
+        #[arg(long)]
+        accept: Option<String>,
+
+        /// Resolve all pending escalations at once (requires --accept).
+        #[arg(long)]
+        all: bool,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
     },
 
     /// Persistent repository settings.
@@ -748,7 +780,10 @@ fn main() {
             title,
             description,
         } => cmd_install(&cwd, &format, spec, title, description),
-        Commands::State { format } => cmd_state(&cwd, &format),
+        Commands::State { format } => {
+            let format = resolve_format(format.as_deref(), &cwd, "human");
+            cmd_state(&cwd, &format)
+        }
         Commands::Seal {
             summary,
             agent,
@@ -761,32 +796,44 @@ fn main() {
             allow_empty,
             expected_head,
             enforce_scope,
-        } => cmd_seal(
-            &cwd,
-            &summary,
-            &agent,
-            spec,
-            &status,
-            paths,
-            tests_passed,
-            tests_failed,
-            linted,
-            allow_empty,
-            expected_head,
-            enforce_scope,
-        ),
+        } => {
+            let agent = resolve_agent(agent.as_deref(), &cwd);
+            cmd_seal(
+                &cwd,
+                &summary,
+                &agent,
+                spec,
+                &status,
+                paths,
+                tests_passed,
+                tests_failed,
+                linted,
+                allow_empty,
+                expected_head,
+                enforce_scope,
+            )
+        }
         Commands::Show {
             seal_id,
             diff,
             format,
-        } => cmd_show(&cwd, &seal_id, diff, &format),
+        } => {
+            let format = resolve_format(format.as_deref(), &cwd, "human");
+            cmd_show(&cwd, &seal_id, diff, &format)
+        }
         Commands::Log {
             format,
             limit,
             spec,
             all,
-        } => cmd_log(&cwd, &format, limit, spec, all),
-        Commands::Diff { from, to, format } => cmd_diff(&cwd, from, to, &format),
+        } => {
+            let format = resolve_format(format.as_deref(), &cwd, "human");
+            cmd_log(&cwd, &format, limit, spec, all)
+        }
+        Commands::Diff { from, to, format } => {
+            let format = resolve_format(format.as_deref(), &cwd, "human");
+            cmd_diff(&cwd, from, to, &format)
+        }
         Commands::Context {
             spec,
             for_agent,
@@ -794,26 +841,43 @@ fn main() {
             status,
             agent,
             format,
-        } => cmd_context(&cwd, spec, for_agent, seal_limit, status, agent, &format),
-        Commands::Summary { format } => cmd_summary(&cwd, &format),
+        } => {
+            let format = resolve_format(format.as_deref(), &cwd, "json");
+            cmd_context(&cwd, spec, for_agent, seal_limit, status, agent, &format)
+        }
+        Commands::Summary { format } => {
+            let format = resolve_format(format.as_deref(), &cwd, "human");
+            cmd_summary(&cwd, &format)
+        }
         Commands::Finish { full, dry_run } => cmd_finish(&cwd, full, dry_run),
         Commands::Restore {
             seal_id,
             force,
             format,
-        } => cmd_restore(&cwd, &seal_id, force, &format),
+        } => {
+            let format = resolve_format(format.as_deref(), &cwd, "human");
+            cmd_restore(&cwd, &seal_id, force, &format)
+        }
         Commands::Converge {
             left_spec,
             right_spec,
             format,
             apply,
-        } => cmd_converge(&cwd, &left_spec, &right_spec, &format, apply),
+        } => {
+            let format = resolve_format(format.as_deref(), &cwd, "json");
+            cmd_converge(&cwd, &left_spec, &right_spec, &format, apply)
+        }
         Commands::ConvergeAll {
             format,
             apply,
             dry_run,
             strategy,
-        } => cmd_converge_all(&cwd, &format, apply, dry_run, &strategy),
+            auto_resolve,
+        } => {
+            let format = resolve_format(format.as_deref(), &cwd, "json");
+            let strategy = resolve_strategy(strategy.as_deref(), &cwd);
+            cmd_converge_all(&cwd, &format, apply, dry_run, &strategy, auto_resolve)
+        }
         Commands::Spec { action } => match action {
             SpecCommands::Add {
                 id,
@@ -885,7 +949,10 @@ fn main() {
             all_chains,
             seal,
             format,
-        } => cmd_verify(&cwd, chain, all_chains, seal.as_deref(), &format),
+        } => {
+            let format = resolve_format(format.as_deref(), &cwd, "human");
+            cmd_verify(&cwd, chain, all_chains, seal.as_deref(), &format)
+        }
         Commands::Agent { action } => match action {
             AgentCommands::Register {
                 name,
@@ -935,6 +1002,12 @@ fn main() {
             GcCommands::Storage { format } => cmd_gc_storage(&cwd, &format),
             GcCommands::Log { limit, format } => cmd_gc_log(&cwd, limit, &format),
         },
+        Commands::Resolve {
+            file,
+            accept,
+            all,
+            format,
+        } => cmd_resolve(&cwd, file, accept, all, &format),
         Commands::Config { action } => match action {
             ConfigCommands::Set { key, value, format } => {
                 cmd_config_set(&cwd, &key, &value, &format)
@@ -947,6 +1020,9 @@ fn main() {
 
     if let Err(e) = result {
         eprintln!("{} {e}", "error:".red().bold());
+        if let Some(hint) = error_hint(e.as_ref()) {
+            eprintln!("  {} {hint}", "hint:".yellow());
+        }
         process::exit(1);
     }
 }
@@ -954,6 +1030,106 @@ fn main() {
 // ---------------------------------------------------------------------------
 // Shared CLI helpers
 // ---------------------------------------------------------------------------
+
+/// Resolve the effective output format. If the user explicitly passed a value,
+/// use it. Otherwise check settings, then fall back to the given default.
+fn resolve_format(explicit: Option<&str>, cwd: &PathBuf, fallback: &str) -> String {
+    if let Some(f) = explicit {
+        return f.to_string();
+    }
+    Repository::open(cwd)
+        .ok()
+        .and_then(|r| r.settings().default_format.clone())
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+/// Resolve the effective agent ID for seals.
+fn resolve_agent(explicit: Option<&str>, cwd: &PathBuf) -> String {
+    if let Some(a) = explicit {
+        return a.to_string();
+    }
+    Repository::open(cwd)
+        .ok()
+        .and_then(|r| r.settings().default_agent.clone())
+        .unwrap_or_else(|| "human".to_string())
+}
+
+/// Resolve the effective convergence strategy.
+fn resolve_strategy(explicit: Option<&str>, cwd: &PathBuf) -> String {
+    if let Some(s) = explicit {
+        return s.to_string();
+    }
+    Repository::open(cwd)
+        .ok()
+        .and_then(|r| r.settings().convergence.strategy.clone())
+        .unwrap_or_else(|| "escalate".to_string())
+}
+
+/// Return an actionable hint for a given error, or None if no hint is needed.
+fn error_hint(err: &dyn std::error::Error) -> Option<String> {
+    let msg = err.to_string();
+
+    if msg.contains("not a writ repository") {
+        return Some("run `writ init` or `writ install` to create one".into());
+    }
+    if msg.contains(".writ/ already exists") {
+        return Some(
+            "this directory already has writ initialized — use `writ uninstall` first to start fresh"
+                .into(),
+        );
+    }
+    if msg.contains("no changes to seal") {
+        return Some(
+            "make some file changes first, or use `--allow-empty` for metadata-only seals".into(),
+        );
+    }
+    if msg.contains("seal not found") {
+        return Some("use `writ log` to see available seal IDs (prefix match supported)".into());
+    }
+    if msg.contains("spec not found") {
+        return Some("use `writ spec status` to see available specs".into());
+    }
+    if msg.contains("agent not found") {
+        return Some("use `writ agent list` to see registered agents".into());
+    }
+    if msg.contains("could not acquire repository lock") {
+        return Some(
+            "another writ process may be running — wait or remove `.writ/lock` if stale".into(),
+        );
+    }
+    if msg.contains("no git repository found") {
+        return Some("run `git init` first, then `writ install`".into());
+    }
+    if msg.contains("unresolved conflicts") {
+        return Some(
+            "use `writ resolve` to review and fix, or re-run with `--auto-resolve`".into(),
+        );
+    }
+    if msg.contains("push rejected") || msg.contains("Push rejected") {
+        return Some("pull first with `writ pull`, resolve, then push again".into());
+    }
+    if msg.contains("Pull detected diverged") {
+        return Some(
+            "use `writ converge-all --apply` to merge diverged branches after pulling".into(),
+        );
+    }
+    if msg.contains("remote not found") {
+        return Some("use `writ remote list` to see configured remotes".into());
+    }
+    if msg.contains("path rejected (traversal)") {
+        return Some(
+            "writ does not allow absolute paths or `..` — use relative paths within the project"
+                .into(),
+        );
+    }
+    if msg.contains("decompression bomb") {
+        return Some(
+            "this object decompresses beyond the safety limit — it may be corrupted".into(),
+        );
+    }
+
+    None
+}
 
 /// Create a cyan braille spinner with the given message (C-2 dedup).
 fn make_spinner(msg: &str) -> indicatif::ProgressBar {
@@ -1313,68 +1489,80 @@ fn cmd_seal(
         (s, None)
     };
 
-    println!("sealed {}", &seal.id[..12]);
+    println!("{} {}", "sealed".green().bold(), &seal.id[..12].cyan());
 
     if let Some(ref w) = conflict_warning {
         if w.is_clean {
             println!(
-                "  note: HEAD moved ({} intervening seal(s)), but no file overlap",
+                "  {} HEAD moved ({} intervening seal(s)), but no file overlap",
+                "note:".dimmed(),
                 w.intervening_seals.len()
             );
         } else {
             println!(
-                "  WARNING: HEAD moved, {} overlapping file(s):",
+                "  {} HEAD moved, {} overlapping file(s):",
+                "WARNING:".yellow().bold(),
                 w.overlapping_files.len()
             );
             for f in &w.overlapping_files {
-                println!("    ! {f}");
+                println!("    {} {}", "!".yellow(), f.red());
             }
-            println!("  consider running `writ converge` to reconcile");
+            println!(
+                "  consider running {} to reconcile",
+                "`writ converge`".cyan()
+            );
         }
     }
-    println!("  summary: {}", seal.summary);
+    println!("  {} {}", "summary:".dimmed(), seal.summary);
     if seal.verification.tests_passed.is_some()
         || seal.verification.tests_failed.is_some()
         || seal.verification.linted
     {
-        print!("  verified:");
+        print!("  {}:", "verified".dimmed());
         if let Some(p) = seal.verification.tests_passed {
-            print!(" {p} passed");
+            print!(" {} passed", p.to_string().green());
         }
         if let Some(f) = seal.verification.tests_failed {
-            print!(" {f} failed");
+            print!(" {} failed", f.to_string().red());
         }
         if seal.verification.linted {
-            print!(" linted");
+            print!(" {}", "linted".green());
         }
         println!();
     }
-    println!("  changes: {} file(s)", seal.changes.len());
+    println!("  {} {} file(s)", "changes:".dimmed(), seal.changes.len());
     for c in &seal.changes {
         let marker = match c.change_type {
-            ChangeType::Added => "+",
-            ChangeType::Modified => "~",
-            ChangeType::Deleted => "-",
+            ChangeType::Added => "+".green(),
+            ChangeType::Modified => "~".yellow(),
+            ChangeType::Deleted => "-".red(),
         };
         println!("    {marker} {}", c.path);
     }
 
     if seal.changes.is_empty() && !seal.summary.is_empty() && !allow_empty {
-        println!("  HINT: 0 file changes but summary is non-empty.");
+        println!(
+            "  {} 0 file changes but summary is non-empty.",
+            "HINT:".yellow().bold()
+        );
         println!("        Another agent may have sealed overlapping files first.");
-        println!("        Check `writ context` for file ownership.");
+        println!(
+            "        Check {} for file ownership.",
+            "`writ context`".cyan()
+        );
     }
 
     if let Some(ref sid) = seal.spec_id {
         let changed: Vec<String> = seal.changes.iter().map(|c| c.path.clone()).collect();
         if let Some(w) = repo.check_file_scope(sid, &changed) {
             println!(
-                "  SCOPE: {} file(s) outside spec '{}' scope:",
+                "  {} {} file(s) outside spec '{}' scope:",
+                "SCOPE:".yellow().bold(),
                 w.out_of_scope_files.len(),
-                w.spec_id
+                w.spec_id.cyan()
             );
             for f in &w.out_of_scope_files {
-                println!("    ! {f}");
+                println!("    {} {}", "!".yellow(), f.red());
             }
         }
 
@@ -1385,7 +1573,9 @@ fn cmd_seal(
                 .any(|s| s.id != seal.id && s.status == TaskStatus::InProgress);
             if !has_in_progress && prior_seals.len() <= 1 {
                 eprintln!(
-                    "  HINT: This is the only seal for spec '{sid}' and it's marked 'complete'."
+                    "  {} This is the only seal for spec '{}' and it's marked 'complete'.",
+                    "HINT:".yellow().bold(),
+                    sid.cyan()
                 );
                 eprintln!("        Consider using --status in-progress for intermediate work,");
                 eprintln!("        reserving --status complete for the final checkpoint.");
@@ -1838,28 +2028,34 @@ fn cmd_summary(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Er
             println!("{}", summary.commit_message);
         }
         _ => {
-            println!("══════════════════════════════════════════════════════════════");
-            println!("  WRIT SESSION SUMMARY");
-            println!("══════════════════════════════════════════════════════════════");
+            println!(
+                "{}",
+                "══════════════════════════════════════════════════════════════".bold()
+            );
+            println!("  {}", "WRIT SESSION SUMMARY".bold());
+            println!(
+                "{}",
+                "══════════════════════════════════════════════════════════════".bold()
+            );
             println!();
             println!("  {}", summary.headline);
             println!();
 
             if !summary.specs_summary.is_empty() {
-                println!("  Specs:");
+                println!("  {}:", "Specs".bold());
                 for s in &summary.specs_summary {
                     let icon = match s.status.as_str() {
-                        "complete" => "✓",
-                        "in-progress" => "…",
-                        "blocked" => "✗",
-                        _ => "·",
+                        "complete" => "✓".green(),
+                        "in-progress" => "…".yellow(),
+                        "blocked" => "✗".red(),
+                        _ => "·".dimmed(),
                     };
                     println!(
                         "    {icon} {:<25} [{}] {} seal(s) by {}",
-                        s.id,
+                        s.id.cyan(),
                         s.status,
                         s.seal_count,
-                        s.agents.join(", "),
+                        s.agents.join(", ").cyan(),
                     );
                     println!("      {}", s.title);
                 }
@@ -1867,22 +2063,23 @@ fn cmd_summary(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Er
             }
 
             if !summary.agents.is_empty() {
-                println!("  Agents:");
+                println!("  {}:", "Agents".bold());
                 for a in &summary.agents {
                     println!(
                         "    {:<20} {} seal(s) on {}",
-                        a.id,
+                        a.id.cyan(),
                         a.seal_count,
-                        a.specs_touched.join(", "),
+                        a.specs_touched.join(", ").cyan(),
                     );
                 }
                 println!();
             }
 
             println!(
-                "  Total: {} seal(s), {} file(s) changed",
-                summary.total_seals,
-                summary.files_changed.len(),
+                "  {} {} seal(s), {} file(s) changed",
+                "Total:".bold(),
+                summary.total_seals.to_string().bold(),
+                summary.files_changed.len().to_string().bold(),
             );
 
             if !summary.files_to_stage.is_empty() {
@@ -1896,15 +2093,26 @@ fn cmd_summary(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Er
             if summary.convergence_recommended {
                 println!();
                 println!(
-                    "  ⚠ {} diverged branch(es) — run `writ converge` before committing.",
-                    summary.diverged_branch_count
+                    "  {} {} diverged branch(es) — run {} before committing.",
+                    "⚠".yellow().bold(),
+                    summary.diverged_branch_count,
+                    "`writ converge`".cyan()
                 );
             }
 
             println!();
-            println!("──────────────────────────────────────────────────────────────");
-            println!("  Commit message (use `writ summary --format commit`):");
-            println!("──────────────────────────────────────────────────────────────");
+            println!(
+                "{}",
+                "──────────────────────────────────────────────────────────────".dimmed()
+            );
+            println!(
+                "  Commit message (use {}):",
+                "`writ summary --format commit`".cyan()
+            );
+            println!(
+                "{}",
+                "──────────────────────────────────────────────────────────────".dimmed()
+            );
             println!();
             let files = summary.files_changed.len();
             if summary.convergence_recommended {
@@ -1917,9 +2125,15 @@ fn cmd_summary(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Er
                 println!("  {} ({} files)", summary.headline, files);
             }
             println!();
-            println!("  For full PR description: writ summary --format pr");
+            println!(
+                "  For full PR description: {}",
+                "writ summary --format pr".cyan()
+            );
             println!();
-            println!("══════════════════════════════════════════════════════════════");
+            println!(
+                "{}",
+                "══════════════════════════════════════════════════════════════".bold()
+            );
         }
     }
 
@@ -2114,56 +2328,72 @@ fn cmd_show(
             );
         }
         _ => {
-            println!("seal {}", &seal.id[..12]);
-            println!("  full id:   {}", seal.id);
+            println!("{} {}", "seal".bold(), &seal.id[..12].cyan());
+            println!("  {} {}", "full id:".dimmed(), seal.id);
             println!(
-                "  agent:     {} ({:?})",
-                seal.agent.id, seal.agent.agent_type
+                "  {} {} ({:?})",
+                "agent:".dimmed(),
+                seal.agent.id.cyan(),
+                seal.agent.agent_type
             );
             println!(
-                "  time:      {}",
-                seal.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+                "  {} {}",
+                "time:".dimmed(),
+                seal.timestamp
+                    .format("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string()
+                    .dimmed()
             );
             if let Some(ref parent) = seal.parent {
-                println!("  parent:    {}", &parent[..12]);
+                println!("  {} {}", "parent:".dimmed(), &parent[..12].cyan());
             } else {
-                println!("  parent:    (none — initial seal)");
+                println!(
+                    "  {} {}",
+                    "parent:".dimmed(),
+                    "(none — initial seal)".dimmed()
+                );
             }
-            println!("  tree:      {}", &seal.tree[..12]);
+            println!("  {} {}", "tree:".dimmed(), &seal.tree[..12]);
             if let Some(ref spec) = seal.spec_id {
-                println!("  spec:      {spec}");
+                println!("  {} {}", "spec:".dimmed(), spec.cyan());
             }
-            println!("  status:    {:?}", seal.status);
+            let status_str = format!("{:?}", seal.status);
+            let status_colored = match seal.status {
+                TaskStatus::Complete => status_str.green(),
+                TaskStatus::InProgress => status_str.yellow(),
+                TaskStatus::Blocked => status_str.red(),
+            };
+            println!("  {} {}", "status:".dimmed(), status_colored);
             if seal.verification.tests_passed.is_some()
                 || seal.verification.tests_failed.is_some()
                 || seal.verification.linted
             {
-                print!("  verified: ");
+                print!("  {}:", "verified".dimmed());
                 if let Some(p) = seal.verification.tests_passed {
-                    print!(" {p} passed");
+                    print!(" {} passed", p.to_string().green());
                 }
                 if let Some(f) = seal.verification.tests_failed {
-                    print!(" {f} failed");
+                    print!(" {} failed", f.to_string().red());
                 }
                 if seal.verification.linted {
-                    print!(" linted");
+                    print!(" {}", "linted".green());
                 }
                 println!();
             }
-            println!("  summary:   {}", seal.summary);
-            println!("  changes:   {} file(s)", seal.changes.len());
+            println!("  {} {}", "summary:".dimmed(), seal.summary);
+            println!("  {} {} file(s)", "changes:".dimmed(), seal.changes.len());
             for c in &seal.changes {
                 let marker = match c.change_type {
-                    ChangeType::Added => "+",
-                    ChangeType::Modified => "~",
-                    ChangeType::Deleted => "-",
+                    ChangeType::Added => "+".green(),
+                    ChangeType::Modified => "~".yellow(),
+                    ChangeType::Deleted => "-".red(),
                 };
                 println!("    {marker} {}", c.path);
             }
             if !seal.warnings.is_empty() {
-                println!("  warnings:");
+                println!("  {}:", "warnings".yellow());
                 for w in &seal.warnings {
-                    println!("    ! {w}");
+                    println!("    {} {w}", "!".yellow());
                 }
             }
 
@@ -2172,23 +2402,34 @@ fn cmd_show(
                 println!();
                 for file_diff in &diff.files {
                     if file_diff.is_binary {
-                        println!("Binary file {} differs", file_diff.path);
+                        println!(
+                            "{} {} differs",
+                            "Binary file".dimmed(),
+                            file_diff.path.bold()
+                        );
                         continue;
                     }
-                    println!("--- a/{}", file_diff.path);
-                    println!("+++ b/{}", file_diff.path);
+                    println!("{}", format!("--- a/{}", file_diff.path).bold());
+                    println!("{}", format!("+++ b/{}", file_diff.path).bold());
                     for hunk in &file_diff.hunks {
                         println!(
-                            "@@ -{},{} +{},{} @@",
-                            hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+                            "{}",
+                            format!(
+                                "@@ -{},{} +{},{} @@",
+                                hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count
+                            )
+                            .cyan()
                         );
                         for line in &hunk.lines {
-                            let prefix = match line.op {
-                                LineOp::Add => "+",
-                                LineOp::Remove => "-",
-                                LineOp::Context => " ",
+                            match line.op {
+                                LineOp::Add => {
+                                    println!("{}", format!("+{}", line.content).green())
+                                }
+                                LineOp::Remove => {
+                                    println!("{}", format!("-{}", line.content).red())
+                                }
+                                LineOp::Context => println!(" {}", line.content),
                             };
-                            println!("{prefix}{}", line.content);
                         }
                     }
                 }
@@ -2526,6 +2767,7 @@ fn cmd_converge_all(
     apply: bool,
     dry_run: bool,
     strategy_str: &str,
+    auto_resolve: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let strategy = match strategy_str {
         "escalate" => writ_core::convergence::ConvergeStrategy::Escalate,
@@ -2686,8 +2928,54 @@ fn cmd_converge_all(
                     report.escalations.len()
                 );
                 for esc in &report.escalations {
-                    println!("    {} {}: {}", "-".red(), esc.file_path.red(), esc.reason);
+                    let conf_info = esc
+                        .suggestion_confidence
+                        .map(|c| format!(" [confidence: {:.0}%]", c * 100.0))
+                        .unwrap_or_default();
+                    println!(
+                        "    {} {}: {}{}",
+                        "✗".red(),
+                        esc.file_path.red(),
+                        esc.reason,
+                        conf_info.dimmed()
+                    );
                 }
+
+                // Guided next steps for escalated conflicts.
+                println!();
+                println!("  {}:", "NEXT STEPS".bold());
+                println!(
+                    "    1. Review {} escalated file(s):",
+                    report.escalations.len()
+                );
+                for esc in &report.escalations {
+                    println!(
+                        "       {}",
+                        format!("writ resolve {} --accept best", esc.file_path).cyan()
+                    );
+                }
+                let min_conf = repo
+                    .settings()
+                    .convergence
+                    .auto_resolve_min_confidence
+                    .unwrap_or(0.85);
+                println!(
+                    "    2. Or auto-resolve all above {:.0}% confidence:",
+                    min_conf * 100.0
+                );
+                println!(
+                    "       {}",
+                    "writ converge-all --apply --auto-resolve".cyan()
+                );
+                println!("    3. After resolving, seal the result:");
+                println!(
+                    "       {}",
+                    format!(
+                        "writ seal -s \"converged {} branch(es)\" --agent <your-id>",
+                        report.merge_order.len()
+                    )
+                    .cyan()
+                );
             }
 
             if let Some(ref qr) = report.quality_report {
@@ -2811,6 +3099,301 @@ fn cmd_converge_all(
         }
     }
 
+    // Auto-resolve: apply highest-confidence suggestions for escalated conflicts.
+    let auto_resolve_enabled =
+        auto_resolve || repo.settings().convergence.auto_resolve.unwrap_or(false);
+
+    if auto_resolve_enabled && effective_apply && !report.escalations.is_empty() {
+        let min_conf = repo
+            .settings()
+            .convergence
+            .auto_resolve_min_confidence
+            .unwrap_or(0.85);
+
+        let writ_dir = cwd.join(".writ");
+        let logger = writ_core::security::SecurityEventLogger::new(&writ_dir);
+
+        let mut resolved_count = 0usize;
+        let mut remaining_escalations = Vec::new();
+
+        for esc in &report.escalations {
+            if let (Some(content), Some(conf)) = (&esc.suggested_content, esc.suggestion_confidence)
+            {
+                if conf >= min_conf {
+                    let file_path = cwd.join(&esc.file_path);
+                    if let Some(parent) = file_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&file_path, content)?;
+                    resolved_count += 1;
+
+                    let _ = logger.emit_convergence_event(
+                        "convergence_auto_resolved",
+                        writ_core::security::Severity::Info,
+                        &format!(
+                            "auto-resolved '{}' (confidence: {:.0}%, action: {})",
+                            esc.file_path,
+                            conf * 100.0,
+                            esc.recommended_action
+                        ),
+                    );
+
+                    if format != "json" {
+                        println!(
+                            "  {} {} {} (confidence: {:.0}%)",
+                            "AUTO-RESOLVED:".green().bold(),
+                            "✓".green(),
+                            esc.file_path,
+                            conf * 100.0
+                        );
+                    }
+                } else {
+                    remaining_escalations.push(esc.clone());
+                }
+            } else {
+                remaining_escalations.push(esc.clone());
+            }
+        }
+
+        // Save unresolved escalations for `writ resolve`.
+        if !remaining_escalations.is_empty() {
+            let pending_dir = writ_dir.join("convergence");
+            std::fs::create_dir_all(&pending_dir)?;
+            let pending_path = pending_dir.join("pending.json");
+            let json = serde_json::to_string_pretty(&remaining_escalations)?;
+            std::fs::write(&pending_path, json)?;
+
+            if format != "json" {
+                println!(
+                    "  {} {} escalation(s) saved for {}",
+                    "PENDING:".yellow().bold(),
+                    remaining_escalations.len(),
+                    "`writ resolve`".cyan()
+                );
+            }
+        } else {
+            // Clean up pending file if all resolved.
+            let pending_path = writ_dir.join("convergence/pending.json");
+            let _ = std::fs::remove_file(&pending_path);
+        }
+
+        if format != "json" && resolved_count > 0 {
+            println!(
+                "  {} {} file(s) auto-resolved above {:.0}% confidence",
+                "SUMMARY:".bold(),
+                resolved_count,
+                min_conf * 100.0
+            );
+        }
+    } else if effective_apply && !report.escalations.is_empty() {
+        // Not auto-resolving — save all escalations for `writ resolve`.
+        let writ_dir = cwd.join(".writ");
+        let pending_dir = writ_dir.join("convergence");
+        std::fs::create_dir_all(&pending_dir)?;
+        let pending_path = pending_dir.join("pending.json");
+        let json = serde_json::to_string_pretty(&report.escalations)?;
+        std::fs::write(&pending_path, json)?;
+    }
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
+// Resolve command
+// -------------------------------------------------------------------
+
+fn cmd_resolve(
+    cwd: &PathBuf,
+    file: Option<String>,
+    accept: Option<String>,
+    all: bool,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let writ_dir = cwd.join(".writ");
+    let pending_path = writ_dir.join("convergence/pending.json");
+
+    let escalations: Vec<writ_core::convergence::PipelineEscalation> = if pending_path.exists() {
+        let data = std::fs::read_to_string(&pending_path)?;
+        serde_json::from_str(&data)?
+    } else {
+        Vec::new()
+    };
+
+    if format == "json" {
+        if all && accept.is_some() {
+            // Resolve all in JSON mode.
+            let accept = accept.as_deref().unwrap();
+            for esc in &escalations {
+                resolve_single(cwd, esc, accept)?;
+            }
+            let _ = std::fs::remove_file(&pending_path);
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "resolved": escalations.len(),
+                    "remaining": 0,
+                    "accept": accept,
+                }))?
+            );
+        } else if let Some(ref file) = file {
+            let accept = accept.as_deref().unwrap_or("best");
+            let esc = escalations
+                .iter()
+                .find(|e| e.file_path == *file)
+                .ok_or_else(|| format!("'{}' is not in the pending escalation list", file))?;
+            resolve_single(cwd, esc, accept)?;
+            let remaining: Vec<_> = escalations
+                .into_iter()
+                .filter(|e| e.file_path != *file)
+                .collect();
+            if remaining.is_empty() {
+                let _ = std::fs::remove_file(&pending_path);
+            } else {
+                let json = serde_json::to_string_pretty(&remaining)?;
+                std::fs::write(&pending_path, json)?;
+            }
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "resolved": file,
+                    "accept": accept,
+                    "remaining": remaining.len(),
+                }))?
+            );
+        } else {
+            println!("{}", serde_json::to_string_pretty(&escalations)?);
+        }
+        return Ok(());
+    }
+
+    // Human-readable output.
+    if escalations.is_empty() {
+        println!(
+            "No pending escalations. Run {} first.",
+            "writ converge-all --apply".cyan()
+        );
+        return Ok(());
+    }
+
+    if all {
+        let accept = accept
+            .as_deref()
+            .ok_or("--all requires --accept (left, right, both, or best)")?;
+        for esc in &escalations {
+            resolve_single(cwd, esc, accept)?;
+            println!("  {} {} (--accept {})", "✓".green(), esc.file_path, accept);
+        }
+        let _ = std::fs::remove_file(&pending_path);
+        println!(
+            "\n{} {} file(s)",
+            "resolved".green().bold(),
+            escalations.len()
+        );
+    } else if let Some(ref file) = file {
+        let accept = accept.as_deref().unwrap_or("best");
+        let esc = escalations
+            .iter()
+            .find(|e| e.file_path == *file)
+            .ok_or_else(|| format!("'{}' is not in the pending escalation list", file))?;
+        resolve_single(cwd, esc, accept)?;
+        let remaining: Vec<_> = escalations
+            .into_iter()
+            .filter(|e| e.file_path != *file)
+            .collect();
+        if remaining.is_empty() {
+            let _ = std::fs::remove_file(&pending_path);
+        } else {
+            let json = serde_json::to_string_pretty(&remaining)?;
+            std::fs::write(&pending_path, json)?;
+        }
+        println!("{} {}", "resolved".green().bold(), file);
+        if !remaining.is_empty() {
+            println!("  {} remaining escalation(s)", remaining.len());
+        }
+    } else {
+        // List pending escalations.
+        println!(
+            "{} pending escalation(s):",
+            escalations.len().to_string().bold()
+        );
+        println!();
+        for esc in &escalations {
+            let conf_info = esc
+                .suggestion_confidence
+                .map(|c| format!(" [confidence: {:.0}%]", c * 100.0))
+                .unwrap_or_default();
+            println!(
+                "  {} {} ({}){}",
+                "✗".red(),
+                esc.file_path.red(),
+                esc.reason,
+                conf_info.dimmed()
+            );
+            println!("    {} {}", "recommended:".dimmed(), esc.recommended_action);
+        }
+        println!();
+        println!("{}:", "Resolve with".bold());
+        println!(
+            "  {} to accept a specific resolution",
+            "writ resolve <file> --accept left|right|both|best".cyan()
+        );
+        println!(
+            "  {} to resolve all at once",
+            "writ resolve --all --accept best".cyan()
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_single(
+    cwd: &PathBuf,
+    esc: &writ_core::convergence::PipelineEscalation,
+    accept: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let content = match accept {
+        "left" => esc
+            .left_content
+            .as_ref()
+            .ok_or("no left content available for this conflict")?
+            .clone(),
+        "right" => esc
+            .right_content
+            .as_ref()
+            .ok_or("no right content available for this conflict")?
+            .clone(),
+        "both" => {
+            let left = esc
+                .left_content
+                .as_ref()
+                .ok_or("no left content available")?;
+            let right = esc
+                .right_content
+                .as_ref()
+                .ok_or("no right content available")?;
+            format!("{}\n{}", left, right)
+        }
+        "best" => esc
+            .suggested_content
+            .as_ref()
+            .ok_or(
+                "no suggestion available for this conflict; use --accept left or --accept right",
+            )?
+            .clone(),
+        other => {
+            return Err(format!(
+                "unknown accept value '{}' (expected left, right, both, best)",
+                other
+            )
+            .into())
+        }
+    };
+
+    let file_path = cwd.join(&esc.file_path);
+    if let Some(parent) = file_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&file_path, content)?;
     Ok(())
 }
 
@@ -3697,14 +4280,14 @@ fn cmd_security_events(
             if events.is_empty() {
                 println!("no security events recorded");
                 if let Some(sev) = severity {
-                    println!("  (filtered by severity: {})", sev);
+                    println!("  {}", format!("(filtered by severity: {})", sev).dimmed());
                 }
                 return Ok(());
             }
 
             println!(
                 "{} security event(s){}:",
-                events.len(),
+                events.len().to_string().bold(),
                 severity
                     .map(|s| format!(" (severity: {})", s))
                     .unwrap_or_default()
@@ -3713,18 +4296,28 @@ fn cmd_security_events(
 
             for event in &events {
                 let sev_label = match event.severity {
-                    writ_core::security::Severity::Info => "INFO",
-                    writ_core::security::Severity::Warning => "WARN",
-                    writ_core::security::Severity::Critical => "CRIT",
+                    writ_core::security::Severity::Info => "INFO".dimmed(),
+                    writ_core::security::Severity::Warning => "WARN".yellow().bold(),
+                    writ_core::security::Severity::Critical => "CRIT".red().bold(),
                 };
                 let agent = event
                     .agent_id
                     .as_deref()
-                    .map(|a| format!(" agent={}", a))
+                    .map(|a| format!(" agent={}", a.cyan()))
                     .unwrap_or_default();
-                let ts = event.timestamp.format("%Y-%m-%d %H:%M:%S UTC");
+                let ts = event
+                    .timestamp
+                    .format("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string()
+                    .dimmed();
 
-                println!("[{}] {} {}{}", sev_label, ts, event.event_type, agent);
+                println!(
+                    "[{}] {} {}{}",
+                    sev_label,
+                    ts,
+                    event.event_type.cyan(),
+                    agent
+                );
                 println!("  {}", event.details);
                 println!();
             }
@@ -3763,22 +4356,35 @@ fn cmd_gc_run(
                 println!("{}", serde_json::to_string_pretty(&plan)?);
             }
             _ => {
-                println!("GC dry run — {}", plan.summary.summary_line);
-                println!();
                 println!(
-                    "  storage: {:.1} MB / {:.1} MB ({:.1}%)",
+                    "{} {}",
+                    "GC dry run".bold(),
+                    format!("— {}", plan.summary.summary_line).dimmed()
+                );
+                println!();
+                let usage_pct = plan.storage.usage_pct();
+                let usage_colored = if usage_pct >= 90.0 {
+                    format!("{:.1}%", usage_pct).red()
+                } else if usage_pct >= 70.0 {
+                    format!("{:.1}%", usage_pct).yellow()
+                } else {
+                    format!("{:.1}%", usage_pct).green()
+                };
+                println!(
+                    "  {} {:.1} MB / {:.1} MB ({})",
+                    "storage:".dimmed(),
                     plan.storage.total_bytes as f64 / 1_048_576.0,
                     plan.storage.budget_bytes as f64 / 1_048_576.0,
-                    plan.storage.usage_pct()
+                    usage_colored
                 );
                 println!();
 
                 if plan.actions.is_empty() {
-                    println!("  nothing to clean");
+                    println!("  {}", "nothing to clean".green());
                 } else {
                     println!(
                         "  {} action(s) planned ({} transition(s), {} deletion(s), {} event(s) to clean):",
-                        plan.summary.total_actions,
+                        plan.summary.total_actions.to_string().bold(),
                         plan.summary.transitions,
                         plan.summary.deletions,
                         plan.summary.events_to_clean
@@ -3792,24 +4398,38 @@ fn cmd_gc_run(
                                 to,
                                 reason,
                             } => {
-                                println!("    transition  {spec_id}: {from} -> {to}");
-                                println!("                {reason}");
+                                println!(
+                                    "    {}  {}: {} -> {}",
+                                    "transition".cyan(),
+                                    spec_id.cyan(),
+                                    from,
+                                    to
+                                );
+                                println!("                {}", reason.dimmed());
                             }
                             writ_core::gc::GcAction::CleanSpec {
                                 spec_id,
                                 lifecycle_state,
                                 reason,
                             } => {
-                                println!("    clean-spec  {spec_id} ({lifecycle_state})");
-                                println!("                {reason}");
+                                println!(
+                                    "    {}  {} ({})",
+                                    "clean-spec".cyan(),
+                                    spec_id.cyan(),
+                                    lifecycle_state
+                                );
+                                println!("                {}", reason.dimmed());
                             }
                             writ_core::gc::GcAction::CleanSecurityEvents {
                                 count,
                                 severity,
                                 reason,
                             } => {
-                                println!("    clean-events  {count} {severity} event(s)");
-                                println!("                  {reason}");
+                                println!(
+                                    "    {}  {count} {severity} event(s)",
+                                    "clean-events".cyan()
+                                );
+                                println!("                  {}", reason.dimmed());
                             }
                             writ_core::gc::GcAction::PruneObjects {
                                 count,
@@ -3817,10 +4437,11 @@ fn cmd_gc_run(
                                 reason,
                             } => {
                                 println!(
-                                    "    prune-objects  {count} object(s), {:.1} MB",
+                                    "    {}  {count} object(s), {:.1} MB",
+                                    "prune-objects".cyan(),
                                     *total_bytes as f64 / 1_048_576.0
                                 );
-                                println!("                   {reason}");
+                                println!("                   {}", reason.dimmed());
                             }
                             writ_core::gc::GcAction::RecompressObjects {
                                 count,
@@ -3828,10 +4449,11 @@ fn cmd_gc_run(
                                 reason,
                             } => {
                                 println!(
-                                    "    recompress     {count} object(s), ~{:.1} MB savings",
+                                    "    {}     {count} object(s), ~{:.1} MB savings",
+                                    "recompress".cyan(),
                                     *estimated_savings_bytes as f64 / 1_048_576.0
                                 );
-                                println!("                   {reason}");
+                                println!("                   {}", reason.dimmed());
                             }
                         }
                     }
@@ -3895,40 +4517,56 @@ fn cmd_gc_run(
             println!("{}", serde_json::to_string_pretty(&result.audit)?);
         }
         _ => {
-            println!("GC complete:");
+            println!("{}:", "GC complete".green().bold());
             println!(
-                "  executed: {} action(s) in {}ms",
-                result.audit.actions_executed, result.audit.duration_ms
+                "  {} {} action(s) in {}ms",
+                "executed:".dimmed(),
+                result.audit.actions_executed.to_string().bold(),
+                result.audit.duration_ms
             );
             if !result.specs_cleaned.is_empty() {
-                println!("  cleaned specs: {}", result.specs_cleaned.join(", "));
+                println!(
+                    "  {} {}",
+                    "cleaned specs:".green(),
+                    result.specs_cleaned.join(", ").cyan()
+                );
             }
             if !result.transitions_applied.is_empty() {
                 for (id, from, to) in &result.transitions_applied {
-                    println!("  transitioned: {id} ({from} -> {to})");
+                    println!(
+                        "  {} {} ({from} -> {to})",
+                        "transitioned:".green(),
+                        id.cyan()
+                    );
                 }
             }
             if result.events_cleaned > 0 {
-                println!("  cleaned events: {}", result.events_cleaned);
+                println!("  {} {}", "cleaned events:".green(), result.events_cleaned);
             }
             if result.objects_pruned > 0 {
                 println!(
-                    "  pruned: {} object(s), {:.1} MB freed",
+                    "  {} {} object(s), {:.1} MB freed",
+                    "pruned:".green(),
                     result.objects_pruned,
                     result.bytes_freed as f64 / 1_048_576.0
                 );
             }
             if result.objects_recompressed > 0 {
                 println!(
-                    "  recompressed: {} object(s), {:.1} MB saved",
+                    "  {} {} object(s), {:.1} MB saved",
+                    "recompressed:".green(),
                     result.objects_recompressed,
                     result.recompression_savings as f64 / 1_048_576.0
                 );
             }
             if result.audit.actions_skipped > 0 {
-                println!("  skipped: {} (safety rules)", result.audit.actions_skipped);
+                println!(
+                    "  {} {} (safety rules)",
+                    "skipped:".yellow(),
+                    result.audit.actions_skipped
+                );
                 for s in &result.audit.skipped_details {
-                    println!("    - {}: {}", s.action, s.reason);
+                    println!("    {} {}: {}", "-".yellow(), s.action, s.reason);
                 }
             }
         }
@@ -3984,48 +4622,58 @@ fn cmd_gc_status(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::
             println!("{}", serde_json::to_string_pretty(&status)?);
         }
         _ => {
-            println!("GC status:");
+            println!("{}:", "GC status".bold());
             println!();
+            let usage_pct = storage.usage_pct();
+            let usage_colored = if usage_pct >= 90.0 {
+                format!("{:.1}%", usage_pct).red()
+            } else if usage_pct >= 70.0 {
+                format!("{:.1}%", usage_pct).yellow()
+            } else {
+                format!("{:.1}%", usage_pct).green()
+            };
             println!(
-                "  storage: {:.1} MB / {:.1} MB ({:.1}%)",
+                "  {} {:.1} MB / {:.1} MB ({})",
+                "storage:".dimmed(),
                 storage.total_bytes as f64 / 1_048_576.0,
                 storage.budget_bytes as f64 / 1_048_576.0,
-                storage.usage_pct()
+                usage_colored
             );
-            println!("  mode: {:?}", config.mode);
+            println!("  {} {:?}", "mode:".dimmed(), config.mode);
             println!();
             println!("  specs ({} total):", specs.len());
-            println!("    active:    {active}");
+            println!("    {}    {}", "active:".green(), active);
             if stale > 0 {
-                println!("    stale:     {stale}");
+                println!("    {}     {}", "stale:".yellow(), stale);
             }
             if completed > 0 {
-                println!("    completed: {completed}");
+                println!("    {} {}", "completed:".dimmed(), completed);
             }
             if cancelled > 0 {
-                println!("    cancelled: {cancelled}");
+                println!("    {} {}", "cancelled:".dimmed(), cancelled);
             }
             if archived > 0 {
-                println!("    archived:  {archived}");
+                println!("    {}  {}", "archived:".dimmed(), archived);
             }
 
             // Show stale warnings.
             let stale_specs = repo.scan_stale_specs(&config)?;
             if !stale_specs.is_empty() {
                 println!();
-                println!("  stale candidates:");
+                println!("  {}:", "stale candidates".yellow());
                 for (id, secs) in &stale_specs {
-                    println!("    {id}: inactive for {}h", secs / 3600);
+                    println!("    {}: inactive for {}h", id.yellow(), secs / 3600);
                 }
             }
 
             if storage.usage_pct() >= config.warning_threshold_pct as f64 {
                 println!();
                 println!(
-                    "  WARNING: storage usage above {}% threshold",
+                    "  {} storage usage above {}% threshold",
+                    "WARNING:".yellow().bold(),
                     config.warning_threshold_pct
                 );
-                println!("  run `writ gc run` to free space");
+                println!("  run {} to free space", "`writ gc run`".cyan());
             }
         }
     }
@@ -4042,62 +4690,82 @@ fn cmd_gc_storage(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error:
             println!("{}", serde_json::to_string_pretty(&storage)?);
         }
         _ => {
-            println!("Storage breakdown:");
+            println!("{}:", "Storage breakdown".bold());
             println!();
             println!(
-                "  total:           {:.1} MB",
+                "  {} {:.1} MB",
+                "total:          ".dimmed(),
                 storage.total_bytes as f64 / 1_048_576.0
             );
             println!(
-                "  seals:           {:.1} MB",
+                "  {} {:.1} MB",
+                "seals:          ".dimmed(),
                 storage.seal_bytes as f64 / 1_048_576.0
             );
             println!(
-                "  working state:   {:.1} MB",
+                "  {} {:.1} MB",
+                "working state:  ".dimmed(),
                 storage.working_state_bytes as f64 / 1_048_576.0
             );
             println!(
-                "  security events: {:.1} MB",
+                "  {} {:.1} MB",
+                "security events:".dimmed(),
                 storage.security_event_bytes as f64 / 1_048_576.0
             );
             println!(
-                "  keys:            {:.1} MB",
+                "  {} {:.1} MB",
+                "keys:           ".dimmed(),
                 storage.key_bytes as f64 / 1_048_576.0
             );
             println!(
-                "  agents:          {:.1} MB",
+                "  {} {:.1} MB",
+                "agents:         ".dimmed(),
                 storage.agent_bytes as f64 / 1_048_576.0
             );
             println!(
-                "  gc metadata:     {:.1} MB",
+                "  {} {:.1} MB",
+                "gc metadata:    ".dimmed(),
                 storage.gc_bytes as f64 / 1_048_576.0
             );
             println!(
-                "  other:           {:.1} MB",
+                "  {} {:.1} MB",
+                "other:          ".dimmed(),
                 storage.other_bytes as f64 / 1_048_576.0
             );
             // Compression stats (if available)
             if let Some(ref cs) = storage.compression {
                 println!();
                 println!(
-                    "  compression: {} compressed, {} raw, {} legacy",
-                    cs.compressed_objects, cs.raw_objects, cs.legacy_objects
+                    "  {} {} compressed, {} raw, {} legacy",
+                    "compression:".dimmed(),
+                    cs.compressed_objects,
+                    cs.raw_objects,
+                    cs.legacy_objects
                 );
                 println!(
-                    "    ratio: {:.1}x ({:.1} MB content in {:.1} MB on disk)",
-                    cs.compression_ratio,
+                    "    ratio: {} ({:.1} MB content in {:.1} MB on disk)",
+                    format!("{:.1}x", cs.compression_ratio).cyan(),
                     cs.total_content_bytes as f64 / 1_048_576.0,
                     cs.total_disk_bytes as f64 / 1_048_576.0
                 );
             }
             println!();
             if storage.budget_bytes == u64::MAX {
-                println!("  budget: unlimited (enterprise)");
+                println!("  {} unlimited (enterprise)", "budget:".dimmed());
             } else {
+                let usage_pct = storage.usage_pct();
+                let usage_colored = if usage_pct >= 90.0 {
+                    format!("{:.1}% used", usage_pct).red()
+                } else if usage_pct >= 70.0 {
+                    format!("{:.1}% used", usage_pct).yellow()
+                } else {
+                    format!("{:.1}% used", usage_pct).green()
+                };
                 println!(
-                    "  budget: {:.1} MB ({:.1}% used)",
+                    "  {} {:.1} MB ({})",
+                    "budget:".dimmed(),
                     storage.budget_bytes as f64 / 1_048_576.0,
-                    storage.usage_pct()
+                    usage_colored
                 );
             }
         }
@@ -4125,14 +4793,19 @@ fn cmd_gc_log(cwd: &PathBuf, limit: usize, format: &str) -> Result<(), Box<dyn s
                 return Ok(());
             }
 
-            println!("{} GC audit record(s):", records.len());
+            println!("{} GC audit record(s):", records.len().to_string().bold());
             println!();
             for record in &records {
-                let ts = record.executed_at.format("%Y-%m-%d %H:%M:%S UTC");
+                let ts = record
+                    .executed_at
+                    .format("%Y-%m-%d %H:%M:%S UTC")
+                    .to_string()
+                    .dimmed();
+                let trigger = format!("{:?}", record.triggered_by).cyan();
                 println!(
-                    "  {} ({:?}) — {}/{} executed, {} skipped, {}ms",
+                    "  {} ({}) — {}/{} executed, {} skipped, {}ms",
                     ts,
-                    record.triggered_by,
+                    trigger,
                     record.actions_executed,
                     record.actions_planned,
                     record.actions_skipped,
@@ -4140,13 +4813,14 @@ fn cmd_gc_log(cwd: &PathBuf, limit: usize, format: &str) -> Result<(), Box<dyn s
                 );
                 if record.space_freed_bytes > 0 {
                     println!(
-                        "    freed: {:.1} MB",
+                        "    {} {:.1} MB",
+                        "freed:".green(),
                         record.space_freed_bytes as f64 / 1_048_576.0
                     );
                 }
                 if !record.skipped_details.is_empty() {
                     for s in &record.skipped_details {
-                        println!("    skipped: {} — {}", s.action, s.reason);
+                        println!("    {} {} — {}", "skipped:".yellow(), s.action, s.reason);
                     }
                 }
             }

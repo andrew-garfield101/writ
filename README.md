@@ -1,18 +1,22 @@
 # writ
 
-**AI native version control for agentic systems.**
+**The first AI native version control system for agentic development.**
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue)](LICENSE)
 [![CI](https://github.com/andrew-garfield101/writ/actions/workflows/ci.yml/badge.svg)](https://github.com/andrew-garfield101/writ/actions/workflows/ci.yml)
 
 
-Writ is a version control system designed from the ground up for LLMs and multi-agent development fleets. Its core primitives are **specs** (not branches), **seals** (not commits), and **convergence** (not merging). It works alongside git, not instead of it.
+AI is advancing fast. Models get updated, tooling shifts, agents make destructive changes, and code that worked yesterday breaks tomorrow. Fully autonomous environments amplify this — when agents have unsupervised write access, bad merges, silent regressions, and lost work aren't edge cases, they're Tuesday.
 
-**One-call context.** A single `writ context` returns everything an agent needs — specs, seals, working state, file contention, integration risk — in structured JSON. No parsing `git log` output. No 4-5 tool calls to build situational awareness.
+Git and git worktrees are a viable workaround for agent isolation. Writ is a purpose-built solution — designed from the data model up for the reality that agentic development is unpredictable, iterative, and evolving as fast as the models themselves.
+
+**One-call context.** Agents waste tokens and compute building situational awareness — `git log`, `git diff`, `git status`, parsing unstructured text, reconstructing project state across multiple tool calls. A single `writ context` returns everything an agent needs — specs, seals, working state, file contention, integration risk — in structured JSON. One call. One structured response. The format agents work best with.
 
 **Semantic convergence.** When multiple agents touch the same files, writ merges *meaning*, not lines. Language-aware analyzers decompose code structurally, compose additive changes automatically, and escalate real conflicts with full context. The core principle: compose, don't choose.
 
 **Cryptographic integrity.** BLAKE3 hash chains and Ed25519 signatures on every seal. Agent identity with trust levels and scope enforcement. Content traceability ensures no line in merged output appears from thin air. Tamper with any checkpoint and the chain breaks.
+
+**Environment agnostic.** Zero-trust environments where every agent action is verified. Fully autonomous systems like [OpenClaw](https://github.com/openclaw) where agents operate with full autonomy. Mixed setups with humans in the loop. VMs, bare metal, containers, CI runners. Writ provides version control for whatever environment agents work in — software development, knowledge work, any iterative task that agents touch.
 
 **Built for any scale.** Deployment profiles from a 500MB Raspberry Pi to unlimited enterprise. Lifecycle management and garbage collection keep repositories clean without ever compromising the immutable seal history.
 
@@ -23,15 +27,13 @@ Writ is a version control system designed from the ground up for LLMs and multi-
 ## Table of Contents
 
 - [Install](#install)
-- [60-Second Workflow](#60-second-workflow)
-- [Why Not Just Git?](#why-not-just-git)
+- [Why Writ](#why-writ)
 - [Context](#context)
 - [Multi-Agent Workflow](#multi-agent-workflow)
 - [Convergence](#convergence)
 - [Going Back](#going-back)
 - [Security](#security)
 - [Lifecycle and Storage](#lifecycle-and-storage)
-- [`writ install`](#writ-install)
 - [Python SDK](#python-sdk)
 - [CLI Reference](#cli-reference)
 - [Architecture](#architecture)
@@ -52,33 +54,39 @@ Or build from source:
 cargo install --path crates/writ-cli
 ```
 
-## 60-Second Workflow
+One command sets up everything:
 
 ```bash
-# Set up writ in any project (works with or without git)
+writ install
+```
+
+That's it. Writ detects your environment and configures sensible defaults automatically. If you're in a git repo, it reads the branch and HEAD. If Claude Code is present (`CLAUDE.md` or `.claude/`), it installs `/writ-seal` and `/writ-context` slash commands. If Codex is detected (`AGENTS.md` or `.codex/`), it adds writ workflow instructions. For any other agent framework, the CLI is available in PATH and the Python SDK works out of the box.
+
+The full round-trip looks like this:
+
+```bash
+# Human checks out a branch, sets up writ
 writ install
 
-# Agents seal checkpoints as they work
+# Agents work — sealing checkpoints as they go
 writ seal -s "added auth module" --agent implementer --spec auth
 writ seal -s "tests passing" --agent tester --spec auth --tests-passed 42 --status complete
 
-# One call gives agents everything they need: specs, seals, state, risk
+# One call gives agents everything they need
 writ context --format json
 
-# When done, commit everything in one shot
+# When done, commit everything back to git in one shot
 writ finish
 
-# Or manually: generate the commit message from the full session history
+# Or generate commit messages and PR descriptions from the full session history
 git commit -m "$(writ summary --format commit)"
-
-# Or a detailed PR description
 gh pr create --body "$(writ summary --format pr)"
 ```
 
-That's it. Human checks out a branch, agents work in writ, human gets a commit with full provenance.
+Every command in this workflow is available to agents by default after `writ install`. No additional configuration. No agent-specific setup scripts. The commands the agents call above — `seal`, `context`, `summary` — are the same ones installed automatically.
 
 ```
- Human world                Agent world                  Human world
+ Human world                    Agent world                       Human world
 ┌──────────┐  writ install  ┌─────────────────┐  writ finish   ┌──────────────┐
 │ git repo │ ──────────────→│ agents work in  │ ─────────────→ │ git commit   │
 │ (branch) │                │ writ: specs,    │                │ with full    │
@@ -86,11 +94,15 @@ That's it. Human checks out a branch, agents work in writ, human gets a commit w
 └──────────┘                └─────────────────┘                └──────────────┘
 ```
 
-## Why Not Just Git?
+## Why Writ
 
-Git's data model was built for humans. Commits carry no structured metadata about which task they serve, which agent made them, or whether tests passed. You can bolt conventions on top, but conventions are things some agents follow and others don't.
+Most multi-agent tooling gives each agent a git worktree and merges via PRs. That handles **isolation** — keeping agents from stepping on each other's files. It doesn't handle **convergence** — bringing their work back together when they inevitably touch the same code.
 
-Writ puts agent native metadata inside the VCS:
+Git worktrees weren't designed for agents. They solve the wrong problem at the wrong layer. The agent still has to shell out to a CLI, parse unstructured text output, reconstruct project state from multiple commands, and hope that merge conflicts get caught before they corrupt the codebase. Every one of those steps burns tokens and compute on work that isn't the agent's actual task.
+
+Orchestration frameworks like OpenClaw, CrewAI, and LangGraph coordinate what agents *do*. But they don't provide version control for what agents *produce*. When a sub-agent in an automated pipeline modifies a file that another sub-agent depends on, there's no structured record of what changed, who changed it, or how to safely merge the results. The orchestrator coordinates tasks. Writ controls the artifacts.
+
+Writ puts agent-native metadata inside the VCS:
 
 | Git | Writ | What Changes |
 |-----|------|-------------|
@@ -102,17 +114,25 @@ Writ puts agent native metadata inside the VCS:
 | (nothing) | **Integration risk** | Automatic risk scoring from divergence, contention, and scope violations |
 | (nothing) | **File contention** | Which files are touched by which agents, sorted by risk |
 | (nothing) | **Session summary** | Auto-generated commit messages and PR descriptions from seal history |
-| `git verify-commit` | `writ verify --chain` | BLAKE3 hash chains + Ed25519 signatures on every seal — tamper-evident by default |
+| `git verify-commit` | `writ verify --chain` | BLAKE3 hash chains + Ed25519 signatures — tamper-evident by default |
+
+### Use Cases
+
+- **Multi-agent software development.** Multiple coding agents working concurrently on overlapping codebases — the core use case writ was designed for
+- **Single-agent workflows.** Even one agent benefits from structured checkpoints, context(), and the git round-trip — `writ install` → work → `writ finish`
+- **Autonomous pipelines.** Sub-agents in orchestration frameworks (OpenClaw, CrewAI, custom systems) producing artifacts that need version control, provenance, and safe convergence
+- **Knowledge work.** Documentation, configuration, data processing — any iterative task where agents modify shared files and need structured history
+- **Human-AI collaboration.** Mixed workflows where humans and agents contribute to the same project, with full transparency into who did what
 
 ## Context
 
-The most expensive thing in an agent's workflow is building situational awareness. With git, that means multiple tool calls — `git log`, `git diff`, reading files — each returning text that needs parsing. With writ:
+The most expensive thing in an agent's workflow is building situational awareness. With git, that means multiple tool calls — `git log`, `git diff`, `git status`, reading files — each returning text that needs parsing and synthesis. Every call costs tokens. Every response needs interpretation. The agent spends compute reconstructing what writ delivers in a single structured response.
 
 ```python
 ctx = repo.context(spec="auth-migration")
 ```
 
-One call. One structured dict. Everything an agent needs:
+One call. One structured dict. The format agents work best with:
 
 - **Spec details** — title, description, status, dependencies, file scope, acceptance criteria
 - **Recent seals** — who did what, when, with which files and verification results
@@ -123,6 +143,8 @@ One call. One structured dict. Everything an agent needs:
 - **Diverged branches** — specs with unmerged work, with convergence recommendations
 - **Scope violations** — seals that touched files outside their spec's declared scope
 - **Session status** — whether all specs are complete, with inline summary
+
+Compare: with git, an agent makes 4-5 tool calls, parses unstructured text from each, and synthesizes its own situational model. With writ, it makes one call and gets structured JSON with everything it needs to start working immediately. That's not an incremental improvement — it's a category difference in how agents bootstrap into a task.
 
 ## Multi-Agent Workflow
 
@@ -154,7 +176,7 @@ Full transparency. No branch archaeology. No parsing commit messages to figure o
 
 The most complex problem in multi-agent development isn't writing code — it's merging it. When five agents work concurrently on overlapping files, traditional line-based merging falls apart. Writ merges *meaning*, not lines.
 
-The convergence engine understands code structurally — it knows the difference between an import, a function definition, and a statement. When two agents both add imports to the same file, writ doesn't see a "conflict" — it sees two additive changes and composes them. When two agents modify the same function body differently, writ knows that's a real conflict and escalates it with full context.
+Writ's convergence engine understands code structurally — it knows the difference between an import, a function definition, and a statement. When two agents both add imports to the same file, writ doesn't see a "conflict" — it sees two additive changes and composes them. When two agents modify the same function body differently, writ knows that's a real conflict and escalates it with full context.
 
 Five deterministic resolution patterns handle the common cases:
 
@@ -168,7 +190,7 @@ Five deterministic resolution patterns handle the common cases:
 
 Every resolution is confidence-scored. High confidence (≥ 0.85) auto-resolves. Low confidence escalates with structured context for human or orchestrator review. Conflicts are structured JSON — not `<<<<` markers — so orchestrator agents can resolve them programmatically.
 
-The resolution pipeline is layered and auditable. Spec-aware resolution uses writ's first-class spec and seal metadata — file scope, acceptance criteria, design notes — to make informed decisions that no other VCS can make. Post-merge verification catches structural damage automatically — duplicate definitions, unbalanced delimiters, content loss, leftover conflict markers — before bad merges reach the working tree. Content traceability ensures every line in merged output traces back to an input.
+The resolution pipeline is layered and auditable. Spec-aware resolution uses writ's first-class spec and seal metadata — file scope, acceptance criteria, design notes — to make informed decisions that no other VCS can make. Post-merge verification catches structural damage automatically — duplicate definitions, unbalanced delimiters, content loss, leftover conflict markers — before bad merges reach the working tree. Content traceability ensures every line in merged output traces back to an input — novel content from bugs or hallucinations is detected and rejected.
 
 Merge ordering is optimized automatically: specs that touch disjoint files merge first, minimizing conflict complexity for the overlapping cases that follow.
 
@@ -201,9 +223,9 @@ writ context --format human
 
 ## Going Back
 
-Something broke. An agent went off the rails. A convergence produced garbage. You need to undo.
+AI models are evolving rapidly. Agents that worked perfectly last week can produce unexpected results after a model update. A convergence might produce garbage. An agent might go off the rails. In fully autonomous environments, these failures can cascade before anyone notices.
 
-Every seal is an immutable snapshot of the entire working directory, and you can restore to any of them:
+Writ is designed for this reality. Every seal is an immutable snapshot of the entire working directory, and you can restore to any of them:
 
 ```bash
 # See the full history — find the seal before things went wrong
@@ -231,15 +253,15 @@ Restoring doesn't delete history. The old seals still exist in the log. `writ lo
 
 ## Security
 
-Writ is built for environments where multiple autonomous agents have write access to the same codebase. That demands security guarantees that traditional VCS was never designed for.
+Writ is built for environments where multiple autonomous agents have write access to the same codebase. That demands security guarantees that traditional VCS was never designed for — whether you're running a zero-trust setup where every agent action is verified, a fully autonomous system where agents operate without human oversight, or anything in between.
 
 **Cryptographic integrity.** Every seal is chained to its predecessor via BLAKE3 hashes — tamper with any checkpoint and the entire chain breaks. Ed25519 digital signatures authenticate who created each seal. `writ verify --chain` validates the full history in one command.
 
-**Agent identity.** Every agent is a registered entity with a trust level, role, and scope constraints. Untrusted or newly introduced agents receive lower convergence confidence caps, limiting their influence on automated merge decisions. Agents can be suspended or revoked without deleting their history.
+**Agent identity.** Every agent is a registered entity with a unique keypair, trust level, role, and scope constraints. Trust levels (full, standard, restricted, untrusted) directly affect convergence behavior — untrusted or newly introduced agents receive lower confidence caps, limiting their influence on automated merge decisions. Agents can be suspended or revoked without deleting their history, and all seals created after a compromise timestamp are automatically flagged for review.
 
 **Scope enforcement.** Specs declare which files they own. When an agent seals changes to files outside its spec's scope, writ flags the violation — in context output, in the audit log, and optionally as a hard rejection. No more agents silently modifying files they shouldn't touch.
 
-**Content traceability.** The no-silent-addition rule: every line in merged output must trace back to an input (base, left, or right). Novel content — whether from a convergence bug or an LLM hallucination — is automatically detected and flagged before it reaches the working tree.
+**Content traceability.** The no-silent-addition rule: every line in merged output must trace back to an input (base, left, or right). Novel content — whether from a convergence bug, a model hallucination, or a compromised agent — is automatically detected and rejected before it reaches the working tree.
 
 **Audit trail.** An append-only security event log records scope violations, signature failures, agent revocations, and convergence anomalies. Events are severity-classified (info, warning, critical) with configurable retention.
 
@@ -250,13 +272,13 @@ writ security events --severity warning    # review security audit log
 
 ## Lifecycle and Storage
 
-As projects grow — more agents, more specs, more seals — storage and state need active management. Writ includes a built-in garbage collection system that keeps repositories clean without ever compromising the immutable seal history.
+AI models update. Tooling shifts. What agents produce today may need to be rolled back tomorrow. A VCS for agentic development needs more than immutable history — it needs active lifecycle management that keeps repositories healthy as projects scale and models evolve.
 
 **Spec lifecycle.** Specs progress through a managed lifecycle: active, stale, completed, cancelled, archived. Stale detection is automatic — `writ context` warns when specs go inactive so nothing falls through the cracks.
 
-**Storage-aware.** Writ tracks storage usage across categories (seals, working state, security events, keys) and alerts when usage approaches configured budgets. Seals are never refused.
+**Storage-aware.** Writ tracks storage usage across categories (seals, working state, security events, keys) and alerts when usage approaches configured budgets. Seals are never refused — immutable history is sacred.
 
-**Safe cleanup.** `writ gc` generates a plan, shows what it will do, and asks before executing. Seals are immutable and never deleted — GC only cleans expired working state, archived specs past retention, and old security events. Every cleanup action is recorded in an audit trail.
+**Safe cleanup.** `writ gc` generates a plan, shows what it will do, and asks before executing. GC only cleans expired working state, archived specs past retention, and old security events. Every cleanup action is recorded in an audit trail.
 
 **Deployment profiles.** Pre-configured storage budgets and retention periods for different environments — from a 500MB Raspberry Pi to unlimited enterprise.
 
@@ -264,43 +286,6 @@ As projects grow — more agents, more specs, more seals — storage and state n
 writ gc status                             # storage breakdown + stale spec warnings
 writ gc run --dry-run                      # preview cleanup plan without executing
 ```
-
-## `writ install`
-
-One command. No config files, no setup wizards, no 12-step onboarding.
-
-```bash
-writ install
-```
-
-What it does (all idempotent — safe to run multiple times):
-
-1. **Init** — creates `.writ/` directory if it doesn't exist
-2. **`.writignore`** — creates a sensible default (`.git/`, `node_modules/`, etc.)
-3. **Git detection** — finds git repo, reads branch name and HEAD commit
-4. **Bridge import** — imports the git working tree as a baseline seal
-5. **Framework hooks** — detects Claude Code, Codex, and installs writ workflow instructions
-6. **File tracking** — reports how many files are now tracked
-
-```
-initialized writ repository in .writ/
-created .writignore
-git: main @ a3f8b2c1
-imported git baseline: 47 file(s), seal d81a5736e16d
-detected ClaudeCode (CLAUDE.md)
-  + .claude/commands/writ-seal.md
-  + .claude/commands/writ-context.md
-  ~ CLAUDE.md
-tracked: 47 file(s)
-```
-
-### Framework Support
-
-| Framework | Detection | What Gets Installed |
-|-----------|-----------|-------------------|
-| **Claude Code** | `CLAUDE.md` or `.claude/` exists | Writ workflow in `CLAUDE.md`, `/writ-seal` and `/writ-context` slash commands |
-| **Codex** | `AGENTS.md` or `.codex/` exists | Writ workflow section in `AGENTS.md` |
-| **Any agent** | Always | `.writignore`, baseline seal, writ CLI available in PATH |
 
 ## Python SDK
 
@@ -377,6 +362,16 @@ writ/
 
 **Test coverage:** 1,350+ Rust tests, 400+ Python tests, 41 YAML scenario tests across unit, integration, and end-to-end layers.
 
+### Framework Support
+
+| Framework | Detection | What Gets Installed |
+|-----------|-----------|-------------------|
+| **Claude Code** | `CLAUDE.md` or `.claude/` exists | Writ workflow in `CLAUDE.md`, `/writ-seal` and `/writ-context` slash commands |
+| **Codex** | `AGENTS.md` or `.codex/` exists | Writ workflow section in `AGENTS.md` |
+| **Any agent** | Always | `.writignore`, baseline seal, writ CLI available in PATH |
+
+We're continuously expanding framework integrations for the most widely used agent tools and models, while maintaining flexible configuration for custom-built agentic systems.
+
 ## Building from Source
 
 ```bash
@@ -394,29 +389,13 @@ pytest tests/
 
 ## Roadmap
 
-### Shipped
-
-- **Round-trip workflow.** `writ install` → agents work → `writ finish` → git commit with full provenance
-- **Convergence engine v2.** Six-phase pipeline with language-aware analyzers for Python, Rust, Go, TypeScript, and JavaScript. Compose-not-choose philosophy. Hardened post-merge verification. Optimized N-agent merge ordering. Full audit trail with per-resolution confidence scoring
-- **Cryptographic seal integrity.** BLAKE3 hash chains + Ed25519 signatures. Dedicated convergence engine keypair. `writ verify --chain` and `writ verify --seal`
-- **Agent identity and trust.** Registration with trust levels, roles, and scope constraints. Suspension and revocation without losing history
-- **Content traceability.** No-silent-addition rule — novel content from bugs or hallucinations detected and rejected
-- **Security event monitoring.** Append-only audit log with severity filtering
-- **Integration risk and file contention.** Automatic risk scoring. Hot file detection sorted by agent count
-- **Spec-scoped context.** Working state, seals, and contention filtered to spec-relevant files
-- **Diverged branch detection.** Per-branch convergence recommendations
-- **Garbage collection.** Spec lifecycle management, storage tracking, deployment profiles, safe cleanup with audit trails. Seals are never deleted
-- **Git bridge.** Import/export with metadata trailers preserving full provenance
-- **Agent framework hooks.** Auto-detection and configuration for Claude Code and Codex
-- **Agent SDK.** `Agent`, `Phase`, `Pipeline` abstractions with auto-summary on completion
-- **Remote sync.** `writ push` / `writ pull` for distributed workflows
-- **CI/CD.** GitHub Actions for automated testing and PyPI publishing
-
-### Ahead
-
-- **Homebrew distribution.** `brew install writ` via tap
+- **LLM-assisted convergence.** Direct LLM API integration for conflict resolution — when deterministic patterns can't resolve a conflict, writ queries an LLM to compose a resolution from the existing code. Composition only — the LLM can select, reorder, and combine from the inputs, never generate novel code. Feature-flagged with full audit trail
+- **Spec-aware resolution.** Convergence Phase 4 uses writ's first-class spec metadata — file scope, acceptance criteria, semantic intent — to resolve ambiguous conflicts that no other VCS has the context to handle
 - **MCP server.** Model Context Protocol integration for IDE-native writ access
-- **Storage compression.** zstd compression on stored objects for reduced disk usage
+- **Homebrew distribution.** `brew install writ` via tap
+- **Storage compression.** zstd compression on stored objects for reduced disk usage on constrained devices
+
+See [CHANGELOG.md](CHANGELOG.md) for shipped features and version history.
 
 ## Contributing
 

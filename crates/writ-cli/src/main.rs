@@ -3220,6 +3220,9 @@ fn cmd_resolve(
     };
 
     if format == "json" {
+        if all && accept.is_none() {
+            return Err("--all requires --accept (e.g. --accept best)".into());
+        }
         if all && accept.is_some() {
             // Resolve all in JSON mode.
             let accept = accept.as_deref().unwrap();

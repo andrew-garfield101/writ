@@ -28,6 +28,7 @@ Issues = "https://github.com/agarfield/writ/issues"
 features = ["pyo3/extension-module"]
 python-source = "python"
 module-name = "writ._native"
+data = "writ.data"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

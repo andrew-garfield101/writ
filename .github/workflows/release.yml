@@ -14,6 +14,7 @@ jobs:
   # ── Build Python wheels for PyPI ──────────────────────────────────────
   build-wheels:
     name: Build wheels (${{ matrix.target }})
+    needs: [build-cli]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -41,6 +42,26 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         uses: docker/setup-qemu-action@v3
 
+      - name: Download CLI binary for this target
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-${{ matrix.target }}
+          path: cli-artifact
+
+      - name: Place CLI in wheel data
+        shell: bash
+        run: |
+          mkdir -p crates/writ-py/writ.data/scripts
+          cd cli-artifact
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z x writ-${{ matrix.target }}.zip
+            cp writ.exe ../crates/writ-py/writ.data/scripts/
+          else
+            tar xzf writ-${{ matrix.target }}.tar.gz
+            cp writ ../crates/writ-py/writ.data/scripts/
+            chmod +x ../crates/writ-py/writ.data/scripts/writ
+          fi
+
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -53,6 +74,7 @@ jobs:
         with:
           name: wheel-${{ matrix.target }}
           path: dist/*.whl
+          if-no-files-found: error
 
   # ── Build sdist ───────────────────────────────────────────────────────
   build-sdist:
@@ -72,6 +94,7 @@ jobs:
         with:
           name: sdist
           path: dist/*.tar.gz
+          if-no-files-found: error
 
   # ── Publish to PyPI ───────────────────────────────────────────────────
   publish-pypi:
@@ -153,6 +176,7 @@ jobs:
         with:
           name: cli-${{ matrix.target }}
           path: writ-${{ matrix.target }}.*
+          if-no-files-found: error
 
   # ── Create GitHub Release ─────────────────────────────────────────────
   github-release:

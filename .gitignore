@@ -29,4 +29,8 @@ book/book/
 tmp/
 
 # Test run results
-testing/ 
+testing/
+
+# Built CLI binaries in wheel data (committed via CI, not locally)
+crates/writ-py/writ.data/scripts/writ
+crates/writ-py/writ.data/scripts/writ.exe

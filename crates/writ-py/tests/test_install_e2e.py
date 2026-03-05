@@ -6,6 +6,7 @@ Python API (writ.Repository.install) and the CLI (writ install --format json).
 
 import json
 import os
+import re
 import subprocess
 import tempfile
 
@@ -341,3 +342,36 @@ class TestInstallThenWork:
         assert export["seals_exported"] >= 1
         assert len(export["exported"]) >= 1
         assert "agent_id" in export["exported"][0]
+
+
+class TestBundledCli:
+    """Verify the writ CLI binary is accessible after pip install."""
+
+    # Set WRIT_WHEEL_INSTALLED=1 in CI after wheel install to hard-fail
+    # instead of silently skipping when the binary isn't on PATH.
+    _require = os.environ.get("WRIT_WHEEL_INSTALLED") == "1"
+
+    def _run_writ_version(self):
+        result = subprocess.run(
+            ["writ", "--version"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            if self._require:
+                pytest.fail("writ CLI not on PATH but WRIT_WHEEL_INSTALLED=1")
+            pytest.skip("writ CLI not on PATH (not installed via wheel)")
+        return result
+
+    def test_cli_on_path(self):
+        """After install, 'writ' should be on PATH."""
+        result = self._run_writ_version()
+        assert re.search(r"writ \d+\.\d+", result.stdout), (
+            f"unexpected --version output: {result.stdout!r}"
+        )
+
+    def test_cli_matches_python_version(self):
+        """CLI and Python package should report same version."""
+        result = self._run_writ_version()
+        cli_version = result.stdout.strip().split()[-1]
+        assert cli_version == writ.__version__

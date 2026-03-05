@@ -352,11 +352,16 @@ class TestBundledCli:
     _require = os.environ.get("WRIT_WHEEL_INSTALLED") == "1"
 
     def _run_writ_version(self):
-        result = subprocess.run(
-            ["writ", "--version"],
-            capture_output=True,
-            text=True,
-        )
+        try:
+            result = subprocess.run(
+                ["writ", "--version"],
+                capture_output=True,
+                text=True,
+            )
+        except FileNotFoundError:
+            if self._require:
+                pytest.fail("writ CLI not on PATH but WRIT_WHEEL_INSTALLED=1")
+            pytest.skip("writ CLI not on PATH (not installed via wheel)")
         if result.returncode != 0:
             if self._require:
                 pytest.fail("writ CLI not on PATH but WRIT_WHEEL_INSTALLED=1")

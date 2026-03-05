@@ -1,13 +1,17 @@
 //! writ CLI — the human (and agent) interface to writ.
 
+mod init;
+
 use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use writ_core::agent::{AgentUpdate, TrustLevel};
+use writ_core::config::{self, GlobalConfig, ProjectConfig};
 use writ_core::context::{ContextFilter, ContextScope};
 use writ_core::diff::LineOp;
+use writ_core::format;
 use writ_core::seal::{AgentIdentity, AgentType, ChangeType, TaskStatus, Verification};
 use writ_core::spec::{Spec, SpecUpdate};
 use writ_core::Repository;
@@ -21,15 +25,68 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize a new writ repository.
+    /// Initialize writ in this project: detect git, import baseline, install hooks.
     Init {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+
         /// Deployment profile for GC configuration.
         /// Values: raspberry-pi, development (default), production, enterprise.
         #[arg(long, default_value = "development")]
         profile: String,
+
+        /// Create a spec during init (convenience shortcut).
+        /// Example: --spec auth --title "Authentication" --description "JWT auth system"
+        #[arg(long)]
+        spec: Option<String>,
+
+        /// Title for the spec created with --spec. Defaults to the spec ID.
+        #[arg(long, requires = "spec")]
+        title: Option<String>,
+
+        /// Description for the spec created with --spec.
+        #[arg(long, requires = "spec")]
+        description: Option<String>,
+
+        /// Accept all defaults without prompting (CI-safe).
+        #[arg(long, short = 'y')]
+        yes: bool,
+
+        /// Create only .writ/ directory, no framework integration files.
+        #[arg(long)]
+        bare: bool,
+
+        /// Skip git integration even if git repo detected.
+        #[arg(long)]
+        no_git: bool,
+
+        /// Skip Claude Code integration.
+        #[arg(long)]
+        no_claude: bool,
+
+        /// Skip Codex / OpenAI integration.
+        #[arg(long)]
+        no_codex: bool,
+
+        /// Skip generic agent instructions.
+        #[arg(long)]
+        no_generic: bool,
+
+        /// Comma-separated list of frameworks to enable: claude,codex,generic.
+        #[arg(long, value_delimiter = ',')]
+        frameworks: Option<Vec<String>>,
+
+        /// Set output format for this project: toon, json, json-compact.
+        #[arg(long = "output-format")]
+        output_fmt: Option<String>,
+
+        /// Set project name (default: auto-detected from manifest or directory name).
+        #[arg(long)]
+        name: Option<String>,
     },
 
-    /// Remove writ from this project (inverse of install).
+    /// Remove writ from this project (inverse of init).
     Uninstall {
         /// Skip confirmation prompt.
         #[arg(long)]
@@ -44,18 +101,22 @@ enum Commands {
         format: String,
     },
 
-    /// One-command setup: init + detect git + import baseline.
+    /// Deprecated: use `writ init` instead.
+    #[command(hide = true)]
     Install {
         /// Output format: "human" (default) or "json".
         #[arg(long, default_value = "human")]
         format: String,
 
-        /// Create a spec during install (convenience shortcut).
-        /// Example: --spec auth --title "Authentication" --description "JWT auth system"
+        /// Deployment profile for GC configuration.
+        #[arg(long, default_value = "development")]
+        profile: String,
+
+        /// Create a spec during install.
         #[arg(long)]
         spec: Option<String>,
 
-        /// Title for the spec created with --spec. Defaults to the spec ID.
+        /// Title for the spec created with --spec.
         #[arg(long, requires = "spec")]
         title: Option<String>,
 
@@ -66,7 +127,7 @@ enum Commands {
 
     /// Show working directory state.
     State {
-        /// Output format: "human" (default from settings), "json", or "brief".
+        /// Output format: "human" (default), "json", "json-compact", or "brief".
         #[arg(long)]
         format: Option<String>,
     },
@@ -129,14 +190,14 @@ enum Commands {
         #[arg(long)]
         diff: bool,
 
-        /// Output format: "human" (default from settings), "json", or "brief".
+        /// Output format: "human" (default), "json", "json-compact", or "brief".
         #[arg(long)]
         format: Option<String>,
     },
 
     /// Show seal history.
     Log {
-        /// Output format: "human" (default from settings), "json", or "brief".
+        /// Output format: "human" (default), "json", "json-compact", or "brief".
         #[arg(long)]
         format: Option<String>,
 
@@ -164,7 +225,7 @@ enum Commands {
         #[arg(long)]
         to: Option<String>,
 
-        /// Output format: "human" (default from settings), "json", or "brief".
+        /// Output format: "human" (default), "json", "json-compact", or "brief".
         #[arg(long)]
         format: Option<String>,
     },
@@ -192,14 +253,14 @@ enum Commands {
         #[arg(long)]
         agent: Option<String>,
 
-        /// Output format: "json" (default), "human", or "brief".
+        /// Output format: "json" (default), "json-compact", "human", or "brief".
         /// Note: context defaults to "json" unlike other commands.
         #[arg(long)]
         format: Option<String>,
     },
 
     /// Human-readable summary of all work done in this writ session.
-    /// Designed for the round-trip: writ install -> agents work -> writ summary -> git commit.
+    /// Designed for the round-trip: writ init -> agents work -> writ summary -> git commit.
     Summary {
         /// Output format: "human" (default from settings), "json", "commit", or "pr".
         /// "commit" outputs a concise one-line commit message.
@@ -242,7 +303,7 @@ enum Commands {
         /// Right spec ID.
         right_spec: String,
 
-        /// Output format: "json" (default), "human", or "brief".
+        /// Output format: "json" (default), "json-compact", "human", or "brief".
         /// Note: converge defaults to "json" unlike other commands.
         #[arg(long)]
         format: Option<String>,
@@ -255,7 +316,7 @@ enum Commands {
     /// Converge ALL diverged branches in sequence (newest-first ordering).
     /// This is the recommended way to merge after multi-agent parallel work.
     ConvergeAll {
-        /// Output format: "json" (default) or "human".
+        /// Output format: "json" (default), "json-compact", or "human".
         /// Note: converge-all defaults to "json" unlike other commands.
         #[arg(long)]
         format: Option<String>,
@@ -768,7 +829,37 @@ fn main() {
     });
 
     let result = match cli.command {
-        Commands::Init { profile } => cmd_init(&cwd, &profile),
+        Commands::Init {
+            format,
+            profile,
+            spec,
+            title,
+            description,
+            yes,
+            bare,
+            no_git,
+            no_claude,
+            no_codex,
+            no_generic,
+            frameworks,
+            output_fmt,
+            name,
+        } => {
+            let opts = init::InitOptions {
+                yes,
+                bare,
+                no_git,
+                no_claude,
+                no_codex,
+                no_generic,
+                frameworks,
+                format: output_fmt,
+                name,
+                profile: profile.clone(),
+                output_format: format.clone(),
+            };
+            cmd_init(&cwd, &format, &profile, spec, title, description, opts)
+        }
         Commands::Uninstall {
             force,
             keep_writignore,
@@ -776,10 +867,23 @@ fn main() {
         } => cmd_uninstall(&cwd, force, keep_writignore, &format),
         Commands::Install {
             format,
+            profile,
             spec,
             title,
             description,
-        } => cmd_install(&cwd, &format, spec, title, description),
+        } => {
+            eprintln!(
+                "{} `writ install` is deprecated — use `writ init` instead",
+                "notice:".yellow().bold()
+            );
+            let opts = init::InitOptions {
+                yes: true, // deprecated path: non-interactive for backward compat
+                profile: profile.clone(),
+                output_format: format.clone(),
+                ..Default::default()
+            };
+            cmd_init(&cwd, &format, &profile, spec, title, description, opts)
+        }
         Commands::State { format } => {
             let format = resolve_format(format.as_deref(), &cwd, "human");
             cmd_state(&cwd, &format)
@@ -1031,16 +1135,60 @@ fn main() {
 // Shared CLI helpers
 // ---------------------------------------------------------------------------
 
-/// Resolve the effective output format. If the user explicitly passed a value,
-/// use it. Otherwise check settings, then fall back to the given default.
+/// Resolve the effective output format using the full config resolution chain:
+/// CLI flag > WRIT_FORMAT env var > project config > global config > default.
 fn resolve_format(explicit: Option<&str>, cwd: &PathBuf, fallback: &str) -> String {
     if let Some(f) = explicit {
         return f.to_string();
     }
+
+    // Check WRIT_FORMAT environment variable
+    if let Ok(env_fmt) = std::env::var("WRIT_FORMAT") {
+        if !env_fmt.is_empty() {
+            if format::is_valid_format(&env_fmt)
+                || matches!(env_fmt.as_str(), "human" | "brief" | "commit" | "pr")
+            {
+                return env_fmt;
+            }
+            eprintln!(
+                "warning: WRIT_FORMAT='{}' is not a recognized format, ignoring",
+                env_fmt
+            );
+        }
+    }
+
+    // Load project config (from .writ/config.toml or migrated settings.json)
+    let project = Repository::open(cwd)
+        .ok()
+        .and_then(|r| ProjectConfig::load(r.writ_dir()).ok())
+        .unwrap_or_default();
+
+    // Load global config (~/.writ/config)
+    let global = GlobalConfig::load().unwrap_or_default();
+
+    config::resolve_output_format(None, &project, &global, fallback)
+}
+
+/// Resolve the project name from config, falling back to directory name.
+fn resolve_project_name(cwd: &PathBuf) -> Option<String> {
     Repository::open(cwd)
         .ok()
-        .and_then(|r| r.settings().default_format.clone())
-        .unwrap_or_else(|| fallback.to_string())
+        .and_then(|r| {
+            ProjectConfig::load(r.writ_dir())
+                .ok()
+                .and_then(|c| c.project.and_then(|p| p.name))
+        })
+        .or_else(|| {
+            cwd.file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.to_string())
+        })
+}
+
+/// Create a formatter by name, injecting project context for TOON headers.
+fn make_formatter(name: &str, cwd: &PathBuf) -> Option<Box<dyn format::OutputFormatter>> {
+    let project_name = resolve_project_name(cwd);
+    format::formatter_for_project(name, project_name.as_deref())
 }
 
 /// Resolve the effective agent ID for seals.
@@ -1070,7 +1218,7 @@ fn error_hint(err: &dyn std::error::Error) -> Option<String> {
     let msg = err.to_string();
 
     if msg.contains("not a writ repository") {
-        return Some("run `writ init` or `writ install` to create one".into());
+        return Some("run `writ init` to create one".into());
     }
     if msg.contains(".writ/ already exists") {
         return Some(
@@ -1098,7 +1246,7 @@ fn error_hint(err: &dyn std::error::Error) -> Option<String> {
         );
     }
     if msg.contains("no git repository found") {
-        return Some("run `git init` first, then `writ install`".into());
+        return Some("run `git init` first, then `writ init`".into());
     }
     if msg.contains("unresolved conflicts") {
         return Some(
@@ -1154,56 +1302,65 @@ fn color_risk_level(level: &str) -> colored::ColoredString {
     }
 }
 
-fn cmd_init(cwd: &PathBuf, profile: &str) -> Result<(), Box<dyn std::error::Error>> {
-    Repository::init(cwd)?;
+fn cmd_init(
+    cwd: &PathBuf,
+    format: &str,
+    profile: &str,
+    spec_id: Option<String>,
+    spec_title: Option<String>,
+    spec_description: Option<String>,
+    opts: init::InitOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Phase 1+2: Interactive flow collects user preferences via prompts.
+    let plan = init::plan_init(&opts)?;
+
+    // Execute: create .writ/, import baseline.
+    let result = Repository::init_project(cwd)?;
 
     // Save GC config from the selected profile.
     let gc_config = writ_core::gc::GcConfig::from_profile(profile)?;
     gc_config.save(&cwd.join(".writ"))?;
 
-    println!("initialized writ repository in .writ/");
-    println!("  gc profile: {profile}");
-    Ok(())
-}
+    // Save the project config from the interactive flow.
+    plan.project_config.save(&cwd.join(".writ"))?;
 
-fn cmd_install(
-    cwd: &PathBuf,
-    format: &str,
-    spec_id: Option<String>,
-    spec_title: Option<String>,
-    spec_description: Option<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let result = Repository::install(cwd)?;
+    // Install framework hooks based on user selections (not just auto-detection).
+    // LE-7: Collect and display hook errors instead of silently discarding them.
+    if !opts.bare {
+        let mut hook_warnings: Vec<String> = Vec::new();
+        if plan.enable_claude {
+            if let Err(e) = writ_core::hooks::hook_claude_code(cwd) {
+                hook_warnings.push(format!("Claude Code hook: {}", e));
+            }
+        }
+        if plan.enable_codex {
+            if let Err(e) = writ_core::hooks::hook_codex(cwd) {
+                hook_warnings.push(format!("Codex hook: {}", e));
+            }
+        }
+        if plan.enable_generic {
+            if let Err(e) = writ_core::hooks::hook_generic(cwd) {
+                hook_warnings.push(format!("Generic hook: {}", e));
+            }
+        }
+        if let Err(e) = writ_core::hooks::append_gitignore(cwd) {
+            hook_warnings.push(format!(".gitignore: {}", e));
+        }
+        for warning in &hook_warnings {
+            eprintln!("{} {}", "warning:".yellow().bold(), warning);
+        }
+    }
 
     match format {
         "json" => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         _ => {
+            println!();
             if result.initialized {
-                println!("initialized writ repository in .writ/");
+                println!("{} Initialized .writ/", "✓".green());
             } else {
-                println!("writ repository already exists");
-            }
-
-            if result.writignore_created {
-                println!("created .writignore");
-            }
-
-            if result.git_detected {
-                let branch = result.git_branch.as_deref().unwrap_or("(detached)");
-                let head = result.git_head_short.as_deref().unwrap_or("unknown");
-                println!("git: {} @ {}", branch, head);
-
-                if let Some(true) = result.git_dirty {
-                    let count = result.git_dirty_count.unwrap_or(0);
-                    eprintln!(
-                        "warning: git working tree has {} uncommitted change(s)",
-                        count
-                    );
-                }
-            } else {
-                println!("no git repository detected");
+                println!("{} Reinitialized .writ/ (seals preserved)", "✓".green());
             }
 
             if result.git_imported {
@@ -1213,47 +1370,58 @@ fn cmd_install(
                     .map(|s| &s[..12.min(s.len())])
                     .unwrap_or("?");
                 let files = result.imported_files.unwrap_or(0);
+                let branch = result.git_branch.as_deref().unwrap_or("(detached)");
+                let head = result.git_head_short.as_deref().unwrap_or("unknown");
 
                 if result.reimported {
                     println!(
-                        "re-imported git baseline: {} file(s), seal {}",
-                        files, seal_short
+                        "{} Re-imported git baseline ({} @ {}, {} files, seal {})",
+                        "✓".green(),
+                        branch,
+                        head,
+                        files,
+                        seal_short
                     );
                 } else {
                     println!(
-                        "imported git baseline: {} file(s), seal {}",
-                        files, seal_short
+                        "{} Imported git baseline ({} @ {}, {} files, seal {})",
+                        "✓".green(),
+                        branch,
+                        head,
+                        files,
+                        seal_short
                     );
                 }
             } else if result.already_imported {
-                println!("git baseline already synced");
-            } else if let Some(ref reason) = result.import_skipped_reason {
-                println!("import skipped: {}", reason);
+                println!("{} Git baseline already synced", "✓".green());
             }
+
+            if plan.enable_claude {
+                println!("{} Claude Code integration configured", "✓".green());
+            }
+            if plan.enable_codex {
+                println!("{} Codex / OpenAI integration configured", "✓".green());
+            }
+            if plan.enable_generic {
+                println!("{} Generic agent instructions created", "✓".green());
+            }
+
+            if result.writignore_created {
+                println!("{} Created .writignore", "✓".green());
+            }
+
+            let output_fmt = plan.project_config.output_format().unwrap_or("json");
+            println!("{} Output format: {}", "✓".green(), output_fmt);
 
             if let Some(ref err) = result.import_error {
-                eprintln!("import error: {}", err);
+                eprintln!("{} Import error: {}", "✗".red(), err);
             }
 
-            println!("tracked: {} file(s)", result.tracked_files);
-
-            let detected: Vec<_> = result
-                .frameworks_detected
-                .iter()
-                .filter(|f| f.detected)
-                .collect();
-            for f in &detected {
-                println!("detected {:?} ({})", f.framework, f.indicators.join(", "));
-            }
-
-            for hook in &result.hooks_installed {
-                for f in &hook.files_created {
-                    println!("  + {f}");
-                }
-                for f in &hook.files_updated {
-                    println!("  ~ {f}");
-                }
-            }
+            println!();
+            println!(
+                "{}",
+                "Ready. Agents in this directory will use writ automatically.".bold()
+            );
         }
     }
 
@@ -1265,14 +1433,6 @@ fn cmd_install(
         repo.add_spec(&Spec::new(id.clone(), title.to_string(), desc.to_string()))?;
         if format != "json" {
             println!("spec: created '{}' ({})", id, title);
-        }
-    }
-
-    if format != "json" {
-        println!();
-        println!("ready. next steps:");
-        for op in &result.available_operations {
-            println!("  {}", op);
         }
     }
 
@@ -1366,7 +1526,7 @@ fn cmd_uninstall(
 
             println!();
             println!("writ has been removed. your source files and git history are untouched.");
-            println!("to reinstall: writ install");
+            println!("to reinitialize: writ init");
         }
     }
 
@@ -1380,6 +1540,9 @@ fn cmd_state(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Erro
     match format {
         "json" => {
             println!("{}", serde_json::to_string_pretty(&state)?);
+        }
+        "json-compact" => {
+            println!("{}", serde_json::to_string(&state)?);
         }
         "brief" => {
             println!("{}", state.brief());
@@ -1605,8 +1768,10 @@ fn cmd_log(
     }
 
     match format {
-        "json" => {
-            println!("{}", serde_json::to_string_pretty(&seals)?);
+        fmt @ ("json" | "json-compact") => {
+            if let Some(formatter) = make_formatter(fmt, cwd) {
+                println!("{}", formatter.format_seal_log(&seals)?);
+            }
         }
         "brief" => {
             for seal in &seals {
@@ -1718,6 +1883,9 @@ fn cmd_diff(
     match format {
         "json" => {
             println!("{}", serde_json::to_string_pretty(&diff_output)?);
+        }
+        "json-compact" => {
+            println!("{}", serde_json::to_string(&diff_output)?);
         }
         "brief" => {
             if diff_output.files.is_empty() {
@@ -1997,8 +2165,13 @@ fn cmd_context(
 
             print_diverged_branch_warnings(&repo);
         }
-        _ => {
-            println!("{}", serde_json::to_string_pretty(&ctx)?);
+        other => {
+            if let Some(formatter) = make_formatter(other, cwd) {
+                println!("{}", formatter.format_context(&ctx)?);
+            } else {
+                // Fall back to pretty JSON for unknown formats (backward compat)
+                println!("{}", serde_json::to_string_pretty(&ctx)?);
+            }
         }
     }
 
@@ -2300,14 +2473,21 @@ fn cmd_show(
     let seal = repo.get_seal(seal_id)?;
 
     match format {
-        "json" => {
+        "json" | "json-compact" => {
+            let compact = format == "json-compact";
             if show_diff {
                 let diff = repo.diff_seal(seal_id)?;
                 let combined = serde_json::json!({
                     "seal": seal,
                     "diff": diff,
                 });
-                println!("{}", serde_json::to_string_pretty(&combined)?);
+                if compact {
+                    println!("{}", serde_json::to_string(&combined)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&combined)?);
+                }
+            } else if compact {
+                println!("{}", serde_json::to_string(&seal)?);
             } else {
                 println!("{}", serde_json::to_string_pretty(&seal)?);
             }
@@ -2560,8 +2740,10 @@ fn cmd_spec_status(
         specs.retain(|s| s.lifecycle_state == target);
     }
 
-    if format == "json" {
-        println!("{}", serde_json::to_string_pretty(&specs)?);
+    if format == "json" || format == "json-compact" {
+        if let Some(formatter) = make_formatter(format, cwd) {
+            println!("{}", formatter.format_spec_list(&specs)?);
+        }
         return Ok(());
     }
 
@@ -2619,6 +2801,9 @@ fn cmd_converge(
     match format {
         "json" => {
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        "json-compact" => {
+            println!("{}", serde_json::to_string(&report)?);
         }
         "brief" => {
             let status = if report.is_clean {
@@ -2802,7 +2987,7 @@ fn cmd_converge_all(
     // Dry run: run without apply, then show the report.
     let effective_apply = apply && !dry_run;
 
-    let spinner = if format != "json" {
+    let spinner = if format != "json" && format != "json-compact" {
         Some(make_spinner("converging branches..."))
     } else {
         None
@@ -2817,6 +3002,7 @@ fn cmd_converge_all(
     if report.merges.is_empty() {
         match format {
             "json" => println!("{}", serde_json::to_string_pretty(&report)?),
+            "json-compact" => println!("{}", serde_json::to_string(&report)?),
             _ => println!("No diverged branches — nothing to converge."),
         }
         return Ok(());
@@ -2825,6 +3011,9 @@ fn cmd_converge_all(
     match format {
         "json" => {
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        "json-compact" => {
+            println!("{}", serde_json::to_string(&report)?);
         }
         _ => {
             println!(

@@ -8,12 +8,12 @@ Two agents work in parallel on different specs. Both touch some of the same file
 
 ## Setup
 
-Start with a project that has writ installed:
+Start with a project that has writ initialized:
 
 ```bash
 mkdir demo && cd demo
 git init && echo "# Demo" > README.md && git add . && git commit -m "init"
-writ install
+writ init
 ```
 
 Create two specs:

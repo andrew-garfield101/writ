@@ -25,7 +25,7 @@ Set during initialization with `writ init --profile <name>`:
 
 ## .writignore
 
-Same syntax as `.gitignore`. Created automatically by `writ install` with sensible defaults:
+Same syntax as `.gitignore`. Created automatically by `writ init` with sensible defaults:
 
 ```
 .git/

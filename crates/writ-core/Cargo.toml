@@ -21,6 +21,10 @@ walkdir = "2"
 chrono = { version = "0.4", features = ["serde"] }
 fs2 = "0.4"
 zstd = "0.13"
+toml = "0.8"
+toon-format = { version = "0.4", default-features = false }
+hostname = "0.4"
+dirs = "5"
 git2 = { version = "0.19", optional = true }
 
 [dev-dependencies]

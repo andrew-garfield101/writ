@@ -13,7 +13,7 @@ Navigate to your project and run:
 
 ```bash
 cd my-project
-writ install
+writ init
 ```
 
 Output:

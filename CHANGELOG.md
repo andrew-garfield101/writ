@@ -109,10 +109,12 @@ Initial public release. AI native version control for agentic systems.
 - Post-convergence quality reports with per file decisions and quality scoring
 - Structured JSON conflict reports
 
-**Install and Workflow**
-- `writ install`: one command setup with init, .writignore, git detection, bridge import, framework hooks
-- `writ install --spec`: optional spec creation during install
-- Agent framework auto detection for Claude Code and Codex
+**Init and Workflow**
+- `writ init`: guided interactive setup with environment scanning, git detection, agent framework integration, and output format selection
+- `writ init --yes`: non-interactive mode for CI and scripting
+- `writ init --spec`: optional spec creation during init
+- Agent framework auto detection and configuration for Claude Code, Codex, and generic agents
+- `writ install` retained as deprecated alias (prints notice, calls `writ init`)
 
 **Summary and Round Trip**
 - `writ summary --format commit|pr|human|json`

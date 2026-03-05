@@ -6,7 +6,7 @@
 
 ### "No writ repository found"
 
-You're not inside a writ project. Run `writ install` to set one up, or navigate to a directory that has a `.writ/` folder.
+You're not inside a writ project. Run `writ init` to set one up, or navigate to a directory that has a `.writ/` folder.
 
 ### "Seal chain verification failed"
 

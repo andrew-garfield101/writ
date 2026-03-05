@@ -4,19 +4,30 @@ Complete reference for all writ commands.
 
 ## Core Commands
 
-### `writ install`
+### `writ init`
 
-One-command setup: initializes writ, detects git, imports baseline, installs framework hooks.
+Guided setup: initializes writ, scans environment, detects git, imports baseline, configures agent frameworks, sets output format preferences.
 
 ```bash
-writ install [OPTIONS]
+writ init [OPTIONS]
 
 Options:
-  --format <FORMAT>            Output format: "human" (default) or "json"
-  --spec <SPEC>                Create a spec during install
+  --yes / -y                   Accept all defaults, no prompts (CI-safe)
+  --bare                       Create only .writ/ directory, no framework integration
+  --no-git                     Skip git integration even if git repo detected
+  --no-claude                  Skip Claude Code integration
+  --no-codex                   Skip Codex / OpenAI integration
+  --no-generic                 Skip generic agent instructions
+  --frameworks <LIST>          Comma-separated: claude,codex,generic
+  --format <FORMAT>            Set output format: toon, json, json-compact
+  --name <PROJECT>             Set project name (default: directory name)
+  --profile <PROFILE>          Deployment profile (storage budgets, retention)
+  --spec <SPEC>                Create a spec during init
   --title <TITLE>              Title for the spec (used with --spec)
   --description <DESCRIPTION>  Description for the spec (used with --spec)
 ```
+
+> **Note:** `writ install` is a deprecated alias for `writ init`. It prints a deprecation notice and calls `writ init`.
 
 ### `writ uninstall`
 

@@ -7,11 +7,14 @@
 pub mod agent;
 #[cfg(feature = "bridge")]
 pub mod bridge;
+pub mod config;
 pub mod context;
 pub mod convergence;
 pub mod crypto;
 pub mod diff;
+pub mod env_scan;
 pub mod error;
+pub mod format;
 pub mod fsutil;
 pub mod gc;
 pub mod hash;

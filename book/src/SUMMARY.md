@@ -13,6 +13,7 @@
 - [Seals vs Commits](concepts/seals-vs-commits.md)
 - [Specs and Agents](concepts/specs-and-agents.md)
 - [Convergence](concepts/convergence.md)
+- [Output Formats](concepts/output-formats.md)
 - [Security Model](concepts/security-model.md)
 
 # Guides

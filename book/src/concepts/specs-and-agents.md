@@ -18,7 +18,7 @@ writ spec add --id auth --title "Authentication System" \
 Or during install:
 
 ```bash
-writ install --spec auth --title "Authentication System"
+writ init --spec auth --title "Authentication System"
 ```
 
 ### What a Spec Contains

@@ -201,7 +201,7 @@ impl Repository {
     /// Idempotent: safe to run multiple times. Re-imports only when git HEAD
     /// moves. Reports git state, framework detection, and tracked file count.
     #[cfg(feature = "bridge")]
-    pub fn install(root: &Path) -> WritResult<InstallResult> {
+    pub fn init_project(root: &Path) -> WritResult<InitResult> {
         let repo_root = fs::canonicalize(root)
             .unwrap_or_else(|_| root.to_path_buf())
             .to_string_lossy()
@@ -218,9 +218,9 @@ impl Repository {
         // Step 2: Create .writignore if needed
         let writignore_created = crate::ignore::create_writignore(root)?;
 
-        // Step 3: Detect frameworks and install hooks
+        // Step 3: Detect frameworks (read-only — actual hook installation is
+        // handled by the CLI based on user flags like --no-claude, --bare, etc.)
         let frameworks_detected = crate::hooks::detect_frameworks(root);
-        let hooks_installed = crate::hooks::install_hooks(root)?;
 
         // Step 4: Detect git and query state
         let git_state = query_git_state(root);
@@ -312,7 +312,7 @@ impl Repository {
             "writ diff".to_string(),
         ];
 
-        Ok(InstallResult {
+        Ok(InitResult {
             initialized,
             git_detected,
             git_imported,
@@ -331,7 +331,7 @@ impl Repository {
             tracked_files,
             available_operations,
             frameworks_detected,
-            hooks_installed,
+            hooks_installed: Vec::new(),
         })
     }
 
@@ -6162,9 +6162,9 @@ impl Repository {
     }
 }
 
-/// Result of `writ install`.
+/// Result of `writ init`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct InstallResult {
+pub struct InitResult {
     pub initialized: bool,
     pub git_detected: bool,
     pub git_imported: bool,
@@ -7037,7 +7037,7 @@ pub struct RestoreResult {
 }
 
 /// Human-readable summary of all work done in this writ session.
-/// Designed for the round-trip workflow: writ install -> agents work -> writ summary -> git commit.
+/// Designed for the round-trip workflow: writ init -> agents work -> writ summary -> git commit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SummaryOutput {
     /// High-level one-liner suitable for a git commit message subject line.
@@ -18547,7 +18547,7 @@ mod install_tests {
     #[test]
     fn test_install_fresh_no_git() {
         let dir = tempdir().unwrap();
-        let result = Repository::install(dir.path()).unwrap();
+        let result = Repository::init_project(dir.path()).unwrap();
         assert!(result.initialized);
         assert!(!result.git_detected);
         assert!(!result.git_imported);
@@ -18558,11 +18558,11 @@ mod install_tests {
     #[test]
     fn test_install_idempotent_no_git() {
         let dir = tempdir().unwrap();
-        let first = Repository::install(dir.path()).unwrap();
+        let first = Repository::init_project(dir.path()).unwrap();
         assert!(first.initialized);
         assert!(first.writignore_created);
 
-        let second = Repository::install(dir.path()).unwrap();
+        let second = Repository::init_project(dir.path()).unwrap();
         assert!(!second.initialized);
         assert!(!second.writignore_created);
     }
@@ -18570,14 +18570,14 @@ mod install_tests {
     #[test]
     fn test_install_has_repo_root() {
         let dir = tempdir().unwrap();
-        let result = Repository::install(dir.path()).unwrap();
+        let result = Repository::init_project(dir.path()).unwrap();
         assert!(!result.repo_root.is_empty());
     }
 
     #[test]
     fn test_install_has_available_operations() {
         let dir = tempdir().unwrap();
-        let result = Repository::install(dir.path()).unwrap();
+        let result = Repository::init_project(dir.path()).unwrap();
         assert!(!result.available_operations.is_empty());
         assert!(result
             .available_operations
@@ -18588,7 +18588,7 @@ mod install_tests {
     #[test]
     fn test_install_creates_writignore() {
         let dir = tempdir().unwrap();
-        Repository::install(dir.path()).unwrap();
+        Repository::init_project(dir.path()).unwrap();
         assert!(dir.path().join(".writignore").exists());
     }
 
@@ -18596,7 +18596,7 @@ mod install_tests {
     fn test_install_preserves_existing_writignore() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join(".writignore"), "my_custom_rules\n").unwrap();
-        let result = Repository::install(dir.path()).unwrap();
+        let result = Repository::init_project(dir.path()).unwrap();
         assert!(!result.writignore_created);
         let content = fs::read_to_string(dir.path().join(".writignore")).unwrap();
         assert_eq!(content, "my_custom_rules\n");
@@ -18606,7 +18606,7 @@ mod install_tests {
     fn test_install_writignore_imports_gitignore() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join(".gitignore"), "build\n*.log\n").unwrap();
-        let result = Repository::install(dir.path()).unwrap();
+        let result = Repository::init_project(dir.path()).unwrap();
         assert!(result.writignore_created);
         let content = fs::read_to_string(dir.path().join(".writignore")).unwrap();
         assert!(content.contains("build"));
@@ -18617,21 +18617,21 @@ mod install_tests {
     fn test_install_detects_claude_code() {
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("CLAUDE.md"), "# Project").unwrap();
-        let result = Repository::install(dir.path()).unwrap();
+        let result = Repository::init_project(dir.path()).unwrap();
         assert!(result.frameworks_detected.iter().any(|f| f.detected));
     }
 
     #[test]
     fn test_install_no_frameworks() {
         let dir = tempdir().unwrap();
-        let result = Repository::install(dir.path()).unwrap();
+        let result = Repository::init_project(dir.path()).unwrap();
         assert!(result.frameworks_detected.iter().all(|f| !f.detected));
     }
 
     #[test]
     fn test_install_result_serializable() {
         let dir = tempdir().unwrap();
-        let result = Repository::install(dir.path()).unwrap();
+        let result = Repository::init_project(dir.path()).unwrap();
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("initialized"));
         assert!(json.contains("repo_root"));
@@ -18664,7 +18664,7 @@ mod install_tests {
     fn test_install_with_git() {
         let dir = tempdir().unwrap();
         setup_git_repo(dir.path());
-        let result = Repository::install(dir.path()).unwrap();
+        let result = Repository::init_project(dir.path()).unwrap();
         assert!(result.git_detected);
         assert!(result.git_imported);
         assert!(result.imported_files.unwrap() > 0);
@@ -18678,11 +18678,11 @@ mod install_tests {
         let dir = tempdir().unwrap();
         setup_git_repo(dir.path());
 
-        let first = Repository::install(dir.path()).unwrap();
+        let first = Repository::init_project(dir.path()).unwrap();
         assert!(first.git_imported);
         assert!(!first.already_imported);
 
-        let second = Repository::install(dir.path()).unwrap();
+        let second = Repository::init_project(dir.path()).unwrap();
         assert!(!second.git_imported);
         assert!(second.already_imported);
         assert!(second
@@ -18697,7 +18697,7 @@ mod install_tests {
         let dir = tempdir().unwrap();
         setup_git_repo(dir.path());
 
-        let first = Repository::install(dir.path()).unwrap();
+        let first = Repository::init_project(dir.path()).unwrap();
         assert!(first.git_imported);
 
         // Make a new git commit
@@ -18714,7 +18714,7 @@ mod install_tests {
             .commit(Some("HEAD"), &sig, &sig, "second commit", &tree, &[&head])
             .unwrap();
 
-        let second = Repository::install(dir.path()).unwrap();
+        let second = Repository::init_project(dir.path()).unwrap();
         assert!(second.git_imported);
         assert!(second.reimported);
         assert_ne!(first.imported_seal_id, second.imported_seal_id);
@@ -18728,7 +18728,7 @@ mod install_tests {
         // Modify a tracked file without committing
         fs::write(dir.path().join("main.py"), "print('modified')").unwrap();
 
-        let result = Repository::install(dir.path()).unwrap();
+        let result = Repository::init_project(dir.path()).unwrap();
         assert_eq!(result.git_dirty, Some(true));
         assert!(result.git_dirty_count.unwrap() >= 1);
     }

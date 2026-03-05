@@ -85,9 +85,49 @@ fn parse_spec_status(s: &str) -> PyResult<writ_core::spec::SpecStatus> {
 // Serde → Python dict helper
 // ---------------------------------------------------------------------------
 
-fn to_pydict<T: serde::Serialize>(py: Python, value: &T) -> PyResult<PyObject> {
+fn to_pydict<T: serde::Serialize + ?Sized>(py: Python, value: &T) -> PyResult<PyObject> {
     let obj = pythonize::pythonize(py, value).map_err(|e| WritError::new_err(e.to_string()))?;
     Ok(obj.unbind())
+}
+
+/// Format seals as a string using the given formatter, or return a Python dict.
+fn format_seals(py: Python, seals: &[writ_core::seal::Seal], format: &str) -> PyResult<PyObject> {
+    match format {
+        "dict" => to_pydict(py, seals),
+        "json" | "json-compact" | "toon" => {
+            let formatter = writ_core::format::formatter_for(format)
+                .ok_or_else(|| WritError::new_err(format!("unknown format: '{format}'")))?;
+            let output = formatter
+                .format_seal_log(seals)
+                .map_err(|e| WritError::new_err(e.to_string()))?;
+            Ok(pyo3::types::PyString::new(py, &output).into_any().unbind())
+        }
+        other => Err(WritError::new_err(format!(
+            "unknown format: '{other}' (expected 'dict', 'json', 'json-compact', or 'toon')"
+        ))),
+    }
+}
+
+/// Format specs as a string using the given formatter, or return a Python dict.
+fn format_specs(
+    py: Python,
+    specs: &[writ_core::spec::Spec],
+    format: &str,
+) -> PyResult<PyObject> {
+    match format {
+        "dict" => to_pydict(py, specs),
+        "json" | "json-compact" | "toon" => {
+            let formatter = writ_core::format::formatter_for(format)
+                .ok_or_else(|| WritError::new_err(format!("unknown format: '{format}'")))?;
+            let output = formatter
+                .format_spec_list(specs)
+                .map_err(|e| WritError::new_err(e.to_string()))?;
+            Ok(pyo3::types::PyString::new(py, &output).into_any().unbind())
+        }
+        other => Err(WritError::new_err(format!(
+            "unknown format: '{other}' (expected 'dict', 'json', 'json-compact', or 'toon')"
+        ))),
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -176,7 +216,7 @@ impl PyRepository {
     #[staticmethod]
     fn install(py: Python, path: &str) -> PyResult<PyObject> {
         let p = PathBuf::from(path);
-        let result = writ_core::Repository::install(&p).map_err(writ_err)?;
+        let result = writ_core::Repository::init_project(&p).map_err(writ_err)?;
         to_pydict(py, &result)
     }
 
@@ -320,34 +360,49 @@ impl PyRepository {
     }
 
     /// Get seal history (newest first).
-    #[pyo3(signature = (limit=None))]
-    fn log(&self, py: Python, limit: Option<usize>) -> PyResult<PyObject> {
+    ///
+    /// `format` controls the return type: "dict" (default), "json",
+    /// "json-compact", or "toon".
+    #[pyo3(signature = (limit=None, format="dict"))]
+    fn log(&self, py: Python, limit: Option<usize>, format: &str) -> PyResult<PyObject> {
         let mut seals = self.inner.log().map_err(writ_err)?;
         if let Some(n) = limit {
             seals.truncate(n);
         }
-        to_pydict(py, &seals)
+        format_seals(py, &seals, format)
     }
 
     /// Get the seal chain for a specific spec, walking from its tip.
-    #[pyo3(signature = (spec_id, limit=None))]
-    fn spec_log(&self, py: Python, spec_id: &str, limit: Option<usize>) -> PyResult<PyObject> {
+    ///
+    /// `format` controls the return type: "dict" (default), "json",
+    /// "json-compact", or "toon".
+    #[pyo3(signature = (spec_id, limit=None, format="dict"))]
+    fn spec_log(
+        &self,
+        py: Python,
+        spec_id: &str,
+        limit: Option<usize>,
+        format: &str,
+    ) -> PyResult<PyObject> {
         let mut seals = self.inner.spec_log(spec_id).map_err(writ_err)?;
         if let Some(n) = limit {
             seals.truncate(n);
         }
-        to_pydict(py, &seals)
+        format_seals(py, &seals, format)
     }
 
     /// Unified log across ALL heads (global + spec branches), deduped, newest-first.
     /// Shows seals from diverged branches that `log()` would miss.
-    #[pyo3(signature = (limit=None))]
-    fn log_all(&self, py: Python, limit: Option<usize>) -> PyResult<PyObject> {
+    ///
+    /// `format` controls the return type: "dict" (default), "json",
+    /// "json-compact", or "toon".
+    #[pyo3(signature = (limit=None, format="dict"))]
+    fn log_all(&self, py: Python, limit: Option<usize>, format: &str) -> PyResult<PyObject> {
         let mut seals = self.inner.log_all().map_err(writ_err)?;
         if let Some(n) = limit {
             seals.truncate(n);
         }
-        to_pydict(py, &seals)
+        format_seals(py, &seals, format)
     }
 
     /// Get diverged branch information for multi-agent convergence.
@@ -385,7 +440,13 @@ impl PyRepository {
     /// - `status`: "in-progress", "complete", or "blocked"
     /// - `agent`: agent ID string (filters seal history)
     /// - `for_agent`: agent ID string (scopes entire context to agent's world)
-    #[pyo3(signature = (spec=None, seal_limit=10, status=None, agent=None, for_agent=None))]
+    ///
+    /// `format` controls the return type:
+    /// - `"dict"` (default): returns a parsed Python dict
+    /// - `"json"`: returns a pretty-printed JSON string
+    /// - `"json-compact"`: returns a minified JSON string
+    /// - `"toon"`: returns a TOON string (~40% fewer tokens than JSON)
+    #[pyo3(signature = (spec=None, seal_limit=10, status=None, agent=None, for_agent=None, format="dict"))]
     fn context(
         &self,
         py: Python,
@@ -394,6 +455,7 @@ impl PyRepository {
         status: Option<String>,
         agent: Option<String>,
         for_agent: Option<String>,
+        format: &str,
     ) -> PyResult<PyObject> {
         let scope = if let Some(id) = spec {
             ContextScope::Spec(id)
@@ -421,7 +483,21 @@ impl PyRepository {
             .inner
             .context(scope, seal_limit, &filter)
             .map_err(writ_err)?;
-        to_pydict(py, &ctx)
+
+        match format {
+            "dict" => to_pydict(py, &ctx),
+            "json" | "json-compact" | "toon" => {
+                let formatter = writ_core::format::formatter_for(format)
+                    .ok_or_else(|| WritError::new_err(format!("unknown format: '{format}'")))?;
+                let output = formatter
+                    .format_context(&ctx)
+                    .map_err(|e| WritError::new_err(e.to_string()))?;
+                Ok(pyo3::types::PyString::new(py, &output).into_any().unbind())
+            }
+            other => Err(WritError::new_err(format!(
+                "unknown format: '{other}' (expected 'dict', 'json', 'json-compact', or 'toon')"
+            ))),
+        }
     }
 
     /// Load a seal by full or short ID.
@@ -500,9 +576,13 @@ impl PyRepository {
     }
 
     /// List all specs.
-    fn list_specs(&self, py: Python) -> PyResult<PyObject> {
+    ///
+    /// `format` controls the return type: "dict" (default), "json",
+    /// "json-compact", or "toon".
+    #[pyo3(signature = (format="dict"))]
+    fn list_specs(&self, py: Python, format: &str) -> PyResult<PyObject> {
         let specs = self.inner.list_specs().map_err(writ_err)?;
-        to_pydict(py, &specs)
+        format_specs(py, &specs, format)
     }
 
     /// Analyze convergence between two specs (three-way merge).

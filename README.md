@@ -62,16 +62,16 @@ cargo install --path crates/writ-cli
 One command sets up everything:
 
 ```bash
-writ install
+writ init
 ```
 
-That's it. Writ detects your environment and configures sensible defaults automatically. If you're in a git repo, it reads the branch and HEAD. If Claude Code is present (`CLAUDE.md` or `.claude/`), it installs `/writ-seal` and `/writ-context` slash commands. If Codex is detected (`AGENTS.md` or `.codex/`), it adds writ workflow instructions. For any other agent framework, the CLI is available in PATH and the Python SDK works out of the box.
+That's it. Writ detects your environment and configures sensible defaults automatically. If you're in a git repo, it reads the branch and HEAD. If Claude Code is present (`CLAUDE.md` or `.claude/`), it creates `/writ-seal` and `/writ-context` slash commands. If Codex is detected (`AGENTS.md` or `.codex/`), it adds writ workflow instructions. For any other agent framework, the CLI is available in PATH and the Python SDK works out of the box.
 
 The full round-trip looks like this:
 
 ```bash
 # Human checks out a branch, sets up writ
-writ install
+writ init
 
 # Agents work — sealing checkpoints as they go
 writ seal -s "added auth module" --agent implementer --spec auth
@@ -88,11 +88,11 @@ git commit -m "$(writ summary --format commit)"
 gh pr create --body "$(writ summary --format pr)"
 ```
 
-Every command in this workflow is available to agents by default after `writ install`. No additional configuration. No agent-specific setup scripts. The commands the agents call above — `seal`, `context`, `summary` — are the same ones installed automatically.
+Every command in this workflow is available to agents by default after `writ init`. No additional configuration. No agent-specific setup scripts. The commands the agents call above — `seal`, `context`, `summary` — are the same ones installed automatically.
 
 ```
  Human world                    Agent world                       Human world
-┌──────────┐  writ install  ┌─────────────────┐  writ finish   ┌──────────────┐
+┌──────────┐  writ init     ┌─────────────────┐  writ finish   ┌──────────────┐
 │ git repo │ ──────────────→│ agents work in  │ ─────────────→ │ git commit   │
 │ (branch) │                │ writ: specs,    │                │ with full    │
 │          │                │ seals, context  │                │ provenance   │
@@ -124,7 +124,7 @@ Writ puts agent-native metadata inside the VCS:
 ### Use Cases
 
 - **Multi-agent software development.** Multiple coding agents working concurrently on overlapping codebases — the core use case writ was designed for
-- **Single-agent workflows.** Even one agent benefits from structured checkpoints, context(), and the git round-trip — `writ install` → work → `writ finish`
+- **Single-agent workflows.** Even one agent benefits from structured checkpoints, context(), and the git round-trip — `writ init` → work → `writ finish`
 - **Autonomous pipelines.** Sub-agents in orchestration frameworks (OpenClaw, CrewAI, custom systems) producing artifacts that need version control, provenance, and safe convergence
 - **Knowledge work.** Documentation, configuration, data processing — any iterative task where agents modify shared files and need structured history
 - **Human-AI collaboration.** Mixed workflows where humans and agents contribute to the same project, with full transparency into who did what
@@ -321,8 +321,9 @@ with Agent("implementer", spec_id="auth") as agent:
 ## CLI Reference
 
 ```
-writ install                          # one-command setup (init + git detect + bridge import + hooks)
-writ install --profile production     # setup with a deployment profile (storage budgets, retention)
+writ init                             # guided setup (git detect + bridge import + framework integration)
+writ init --yes                       # non-interactive setup (CI-safe, accept all defaults)
+writ init --profile production        # setup with a deployment profile (storage budgets, retention)
 writ uninstall [--force]              # clean removal of writ from the project
 writ seal -s "..." --agent ID         # create a structured checkpoint
 writ context [--spec ID] [--format]   # structured context dump (json, human, brief)

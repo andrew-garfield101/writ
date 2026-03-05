@@ -22,11 +22,11 @@ Writ replaces that workflow with structured, single call access to everything an
 
 ## Where Writ Fits
 
-Writ sits alongside git, not instead of it. A human checks out a branch, runs `writ install`, and agents work in writ — sealing checkpoints, checking context, converging changes. When they're done, `writ finish` commits everything back to git with full provenance. Git handles what it's good at: storage, distribution, collaboration history. Writ handles what it was never designed for: agent native workflows at scale.
+Writ sits alongside git, not instead of it. A human checks out a branch, runs `writ init`, and agents work in writ — sealing checkpoints, checking context, converging changes. When they're done, `writ finish` commits everything back to git with full provenance. Git handles what it's good at: storage, distribution, collaboration history. Writ handles what it was never designed for: agent native workflows at scale.
 
 ```
  Human world                    Agent world                       Human world
-┌──────────┐  writ install  ┌─────────────────┐  writ finish   ┌──────────────┐
+┌──────────┐  writ init     ┌─────────────────┐  writ finish   ┌──────────────┐
 │ git repo │ ──────────────→│ agents work in  │ ─────────────→ │ git commit   │
 │ (branch) │                │ writ: specs,    │                │ with full    │
 │          │                │ seals, context  │                │ provenance   │
@@ -51,7 +51,7 @@ The single agent with git world is today. The fleet of fifty agents world is nex
 
 ```bash
 # Set up writ in any project
-writ install
+writ init
 
 # Agents seal checkpoints as they work
 writ seal -s "added auth module" --agent implementer --spec auth

@@ -136,7 +136,8 @@ class TestScenario3DirtyWorkingTree:
 
         r = _writ_cli("install", cwd=str(tmp_path))
         assert r.returncode == 0
-        assert "uncommitted change" in r.stderr
+        # After init redesign, dirty warning is in stdout (scan results), not stderr
+        assert "uncommitted change" in r.stdout
 
 
 class TestScenario4JsonOutput:
@@ -217,6 +218,9 @@ class TestScenario6ClaudeCodeDetection:
         )
         assert claude_detected, f"Claude Code not detected: {detected}"
 
+        # Hook installation is now separate from init_project (BRI-B1 fix)
+        writ.install_hooks(str(tmp_path))
+
         claude_md = (tmp_path / "CLAUDE.md").read_text()
         assert "## Writ" in claude_md
         assert "seal" in claude_md.lower()
@@ -230,10 +234,11 @@ class TestScenario6ClaudeCodeDetection:
             f.write("# My Project\n")
 
         writ.Repository.install(str(tmp_path))
-        result2 = writ.Repository.install(str(tmp_path))
+        writ.install_hooks(str(tmp_path))
 
-        hooks = result2.get("hooks_installed", [])
-        for hook in hooks:
+        # Second install_hooks should be a no-op
+        hooks2 = writ.install_hooks(str(tmp_path))
+        for hook in hooks2:
             assert hook["files_created"] == []
             assert hook["files_updated"] == []
 

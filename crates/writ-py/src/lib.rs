@@ -109,11 +109,7 @@ fn format_seals(py: Python, seals: &[writ_core::seal::Seal], format: &str) -> Py
 }
 
 /// Format specs as a string using the given formatter, or return a Python dict.
-fn format_specs(
-    py: Python,
-    specs: &[writ_core::spec::Spec],
-    format: &str,
-) -> PyResult<PyObject> {
+fn format_specs(py: Python, specs: &[writ_core::spec::Spec], format: &str) -> PyResult<PyObject> {
     match format {
         "dict" => to_pydict(py, specs),
         "json" | "json-compact" | "toon" => {

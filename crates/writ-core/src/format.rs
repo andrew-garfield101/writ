@@ -596,13 +596,13 @@ mod tests {
     // Assertions enforce minimum savings thresholds so regressions are caught.
     // -----------------------------------------------------------------------
 
-    use crate::context::{
-        ContextOutput, IntegrationRisk, SealSummary, WorkingStateSummary,
-    };
+    use crate::context::{ContextOutput, IntegrationRisk, SealSummary, WorkingStateSummary};
 
     /// Build N realistic seals with file changes and summaries.
     fn make_benchmark_seals(n: usize) -> Vec<crate::seal::Seal> {
-        use crate::seal::{AgentIdentity, AgentType, ChangeType, FileChange, TaskStatus, Verification};
+        use crate::seal::{
+            AgentIdentity, AgentType, ChangeType, FileChange, TaskStatus, Verification,
+        };
         (0..n)
             .map(|i| {
                 let agent_id = match i % 3 {
@@ -762,7 +762,9 @@ mod tests {
     {
         let json_size = format_fn(&JsonFormatter).unwrap().len();
         let compact_size = format_fn(&JsonCompactFormatter).unwrap().len();
-        let toon_size = format_fn(&ToonFormatter::with_project("benchmark")).unwrap().len();
+        let toon_size = format_fn(&ToonFormatter::with_project("benchmark"))
+            .unwrap()
+            .len();
         (json_size, compact_size, toon_size)
     }
 
@@ -802,7 +804,9 @@ mod tests {
                 make_test_spec(
                     &format!("spec-{i}"),
                     &format!("Feature {i}: implementation task with details"),
-                    &format!("Acceptance criteria for spec {i} covering edge cases and integration"),
+                    &format!(
+                        "Acceptance criteria for spec {i} covering edge cases and integration"
+                    ),
                 )
             })
             .collect();
@@ -874,9 +878,7 @@ mod tests {
         eprintln!("╔══════════════════════════════════════════════════════════╗");
         eprintln!("║          F.14 Token Efficiency Benchmark Report         ║");
         eprintln!("╠══════════════════════════════════════════════════════════╣");
-        eprintln!(
-            "║ Data Type      │ JSON    │ Compact │ TOON    │ Savings  ║"
-        );
+        eprintln!("║ Data Type      │ JSON    │ Compact │ TOON    │ Savings  ║");
         eprintln!("╠════════════════╪═════════╪═════════╪═════════╪══════════╣");
         eprintln!(
             "║ Seal log (20)  │ {:>6}B │ {:>6}B │ {:>6}B │ {:>5.1}%   ║",

@@ -65,7 +65,7 @@ One command sets up everything:
 writ init
 ```
 
-That's it. Writ detects your environment and configures sensible defaults automatically. If you're in a git repo, it reads the branch and HEAD. If Claude Code is present (`CLAUDE.md` or `.claude/`), it creates `/writ-seal` and `/writ-context` slash commands. If Codex is detected (`AGENTS.md` or `.codex/`), it adds writ workflow instructions. For any other agent framework, the CLI is available in PATH and the Python SDK works out of the box.
+That's it. Writ detects your environment and configures sensible defaults automatically. If you're in a git repo, it reads the branch and HEAD. If Claude Code is present (`CLAUDE.md` or `.claude/`), it creates `/writ-seal` and `/writ-context` slash commands. If Codex is detected (`AGENTS.md` or `.codex/`), it adds writ workflow instructions. For any other agent framework, the CLI is available in PATH and the Python SDK works out of the box. See the [quickstart guide](https://andrew-garfield101.github.io/writ/getting-started/quickstart.html) for a full walkthrough.
 
 The full round-trip looks like this:
 
@@ -75,12 +75,18 @@ writ init
 
 # Agents work — sealing checkpoints as they go
 writ seal -s "added auth module" --agent implementer --spec auth
-writ seal -s "tests passing" --agent tester --spec auth --tests-passed 42 --status complete
+writ seal -s "tests passing" --agent tester --spec auth --tests-passed 42
+
+# Agent marks its task complete
+writ spec done auth
 
 # One call gives agents everything they need
-writ context --format json
+writ context --format toon              # token-optimized for LLM agents
 
-# When done, commit everything back to git in one shot
+# Human checks in on progress from anywhere
+writ status
+
+# When ready, promote completed work to git
 writ finish
 
 # Or generate commit messages and PR descriptions from the full session history
@@ -88,14 +94,14 @@ git commit -m "$(writ summary --format commit)"
 gh pr create --body "$(writ summary --format pr)"
 ```
 
-Every command in this workflow is available to agents by default after `writ init`. No additional configuration. No agent-specific setup scripts. The commands the agents call above — `seal`, `context`, `summary` — are the same ones installed automatically.
+Every command in this workflow is available to agents by default after `writ init`. No additional configuration. No agent-specific setup scripts. Agents seal checkpoints and mark tasks complete. The user checks in with `writ status` and promotes completed work to git with `writ finish`. Three commands for the user. The agents handle the rest.
 
 ```
  Human world                    Agent world                       Human world
 ┌──────────┐  writ init     ┌─────────────────┐  writ finish   ┌──────────────┐
-│ git repo │ ──────────────→│ agents work in  │ ─────────────→ │ git commit   │
-│ (branch) │                │ writ: specs,    │                │ with full    │
-│          │                │ seals, context  │                │ provenance   │
+│ git repo │ ──────────────→│ agents work:    │ ─────────────→ │ git commit   │
+│ (branch) │                │ seal, spec done │  writ status   │ with full    │
+│          │                │ context, log    │◀──────────────│ provenance   │
 └──────────┘                └─────────────────┘                └──────────────┘
 ```
 
@@ -120,6 +126,8 @@ Writ puts agent-native metadata inside the VCS:
 | (nothing) | **File contention** | Which files are touched by which agents, sorted by risk |
 | (nothing) | **Session summary** | Auto-generated commit messages and PR descriptions from seal history |
 | `git verify-commit` | `writ verify --chain` | BLAKE3 hash chains + Ed25519 signatures — tamper-evident by default |
+| (nothing) | `writ status` | Fleet overview — agent activity, spec progress, commit readiness |
+| (nothing) | `writ spec done` | Agent marks task complete with final seal — user finishes to git |
 
 ### Use Cases
 
@@ -151,6 +159,29 @@ One call. One structured dict. The format agents work best with:
 
 Compare: with git, an agent makes 4-5 tool calls, parses unstructured text from each, and synthesizes its own situational model. With writ, it makes one call and gets structured JSON with everything it needs to start working immediately. That's not an incremental improvement — it's a category difference in how agents bootstrap into a task.
 
+### Output Formats
+
+By default, `writ context` returns JSON. For LLM agents, TOON (Token Oriented Object Notation) delivers the same structured data in significantly fewer tokens. Field names declared once, rows streamed as values, no braces, no repeated keys:
+
+```
+seals[5]{id,summary,agent,timestamp,spec}:
+  seal-0041,Implement phase 3 pattern matching,cc,2026-03-04T10:00:00Z,S-041
+  seal-0042,Add import deduplication,amis,2026-03-04T10:15:00Z,S-039
+  seal-0043,Scale test scenarios,bri,2026-03-04T10:30:00Z,S-045
+```
+
+Benchmarks on representative project data (payload size, TOON vs JSON):
+
+| Data | JSON | TOON | Reduction |
+|------|------|------|-----------|
+| Seal log (20 seals) | 20,650 B | 13,733 B | **33%** |
+| Full context (5 specs, 10 seals, 40 files) | 8,182 B | 6,507 B | **20%** |
+| Spec list (15 specs) | 5,912 B | 5,297 B | **10%** |
+
+Token savings are typically higher — JSON structural characters (braces, brackets, quotes, colons) each consume individual tokens that TOON eliminates entirely. These savings compound. Five agents calling context ten times per session means hundreds of redundant key tokens per call eliminated. At fleet scale, that's compute budget recovered for actual reasoning.
+
+Format preference is configurable globally (`~/.writ/config`), per project (`.writ/config.toml`), or per call (`--format`). See the [output formats guide](https://andrew-garfield101.github.io/writ/concepts/output-formats.html) for the full reference.
+
 ## Multi-Agent Workflow
 
 Three agents, different specs, working concurrently. Sealing is serialized via advisory file locks, so agents queue safely.
@@ -169,10 +200,16 @@ repo.seal(summary="42 tests passing", agent_id="test-bot", spec_id="test-suite",
 The human checks in:
 
 ```bash
-$ writ spec status
-  > auth-migration       InProgress  (3 seal(s))
-  v payment-refactor     Complete    (5 seal(s))
-    db-optimization      Pending     (0 seal(s))
+$ writ status
+
+  Active    2 agents    2 specs in progress
+  Done      1 agent     1 spec completed (not committed)
+
+  S-002  payments             pay-dev     5 seals    Complete
+  S-001  auth-migration       auth-dev    3 seals    working
+  S-003  test-suite           test-bot    1 seal     working
+
+  1 spec complete · run `writ finish` when ready
 ```
 
 Full transparency. No branch archaeology. No parsing commit messages to figure out which agent did what.
@@ -180,6 +217,8 @@ Full transparency. No branch archaeology. No parsing commit messages to figure o
 ## Convergence
 
 The most complex problem in multi-agent development isn't writing code — it's merging it. When five agents work concurrently on overlapping files, traditional line-based merging falls apart. Writ merges *meaning*, not lines.
+
+Git worktrees give agents isolation. They don't give agents convergence. When five diverged branches need to become one codebase, line based merge sees conflicts everywhere. Writ's structural understanding means most of those "conflicts" auto resolve without human intervention.
 
 Writ's convergence engine understands code structurally — it knows the difference between an import, a function definition, and a statement. When two agents both add imports to the same file, writ doesn't see a "conflict" — it sees two additive changes and composes them. When two agents modify the same function body differently, writ knows that's a real conflict and escalates it with full context.
 
@@ -197,7 +236,7 @@ Every resolution is confidence-scored. High confidence (≥ 0.85) auto-resolves.
 
 The resolution pipeline is layered and auditable. Spec-aware resolution uses writ's first-class spec and seal metadata — file scope, acceptance criteria, design notes — to make informed decisions that no other VCS can make. Post-merge verification catches structural damage automatically — duplicate definitions, unbalanced delimiters, content loss, leftover conflict markers — before bad merges reach the working tree. Content traceability ensures every line in merged output traces back to an input — novel content from bugs or hallucinations is detected and rejected.
 
-Merge ordering is optimized automatically: specs that touch disjoint files merge first, minimizing conflict complexity for the overlapping cases that follow.
+Merge ordering is optimized automatically: specs that touch disjoint files merge first, minimizing conflict complexity for the overlapping cases that follow. See the [convergence deep dive](https://andrew-garfield101.github.io/writ/concepts/convergence.html) for the full six phase pipeline.
 
 ```bash
 # Merge ALL diverged branches at once — escalate what can't be auto-resolved
@@ -275,6 +314,8 @@ writ verify --chain                        # validate full seal chain integrity
 writ security events --severity warning    # review security audit log
 ```
 
+See the [security model](https://andrew-garfield101.github.io/writ/concepts/security-model.html) for the full trust framework, scope enforcement rules, and audit system.
+
 ## Lifecycle and Storage
 
 AI models update. Tooling shifts. What agents produce today may need to be rolled back tomorrow. A VCS for agentic development needs more than immutable history — it needs active lifecycle management that keeps repositories healthy as projects scale and models evolve.
@@ -286,6 +327,8 @@ AI models update. Tooling shifts. What agents produce today may need to be rolle
 **Safe cleanup.** `writ gc` generates a plan, shows what it will do, and asks before executing. GC only cleans expired working state, archived specs past retention, and old security events. Every cleanup action is recorded in an audit trail.
 
 **Deployment profiles.** Pre-configured storage budgets and retention periods for different environments — from a 500MB Raspberry Pi to unlimited enterprise.
+
+**Workflow modes.** Three modes that scale from solo developer to enterprise fleet. `user` mode (default): you run `writ finish` manually. `propose` mode: an orchestrator groups and proposes commits, you review and accept. `auto` mode: fully autonomous commit pipeline with configurable safety rails — test verification, max specs per commit, branch targeting. Configure globally or per project. See the [configuration reference](https://andrew-garfield101.github.io/writ/reference/configuration.html) for details.
 
 ```bash
 writ gc status                             # storage breakdown + stale spec warnings
@@ -326,12 +369,13 @@ writ init --yes                       # non-interactive setup (CI-safe, accept a
 writ init --profile production        # setup with a deployment profile (storage budgets, retention)
 writ uninstall [--force]              # clean removal of writ from the project
 writ seal -s "..." --agent ID         # create a structured checkpoint
-writ context [--spec ID] [--format]   # structured context dump (json, human, brief)
+writ context [--spec ID] [--format]   # structured context dump (json, toon, human, brief)
+writ status [--watch] [--completed]   # fleet overview: agents, specs, progress
 writ log [--all] [--spec ID]          # seal history (--all includes diverged branches)
 writ summary --format commit          # one-line commit message with full provenance
 writ summary --format pr              # full PR description with spec/agent breakdown
-writ finish                           # one-command: summary → git add → git commit
-writ finish --full                    # same, but with PR-style commit body
+writ finish [--strategy per-spec]      # promote completed specs → git commit(s)
+writ finish --yes                     # accept defaults, no prompts (same as current behavior)
 writ finish --dry-run                 # preview without committing
 writ converge LEFT RIGHT [--apply]    # two-spec convergence
 writ converge-all --apply --strategy  # merge all diverged branches (escalate, manual, orchestrator)
@@ -340,12 +384,14 @@ writ verify --seal SEAL_ID            # verify a specific seal's hash and signat
 writ security events [--severity]     # security audit log with filtering
 writ spec add --id ID --title "..."   # register a spec
 writ spec status [--state active]     # show specs, optionally filtered by lifecycle state
+writ spec done ID [-s "..."]          # mark spec complete (creates final seal)
 writ spec cancel ID                   # cancel a spec (lifecycle transition)
+writ reopen --spec ID                 # reopen completed spec for continued work
 writ gc status                        # storage breakdown + stale spec warnings
 writ gc run [--dry-run] [--yes]       # generate and execute cleanup plan
 writ gc storage                       # detailed storage usage by category
 writ state                            # working directory changes
-writ diff                             # content-level diff
+writ diff [--spec ID] [--stat]        # spec-aware diff with filtering
 writ show SEAL_ID [--diff]            # inspect a seal
 writ restore SEAL_ID                  # restore to a seal's state
 writ bridge import                    # import git state as baseline
@@ -399,7 +445,6 @@ pytest tests/
 - **Spec-aware resolution.** Convergence Phase 4 uses writ's first-class spec metadata — file scope, acceptance criteria, semantic intent — to resolve ambiguous conflicts that no other VCS has the context to handle
 - **MCP server.** Model Context Protocol integration for IDE-native writ access
 - **Homebrew distribution.** `brew install writ` via tap
-- **Storage compression.** zstd compression on stored objects for reduced disk usage on constrained devices
 
 See [CHANGELOG.md](CHANGELOG.md) for shipped features and version history.
 
@@ -411,7 +456,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, test commands, and
 
 AGPL-3.0-only. See [LICENSE](LICENSE) for details.
 
-For commercial licensing inquiries, contact the project maintainer.
+For commercial licensing inquiries, contact the project owner.
 
 ---
 

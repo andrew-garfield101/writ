@@ -41,21 +41,21 @@ files[20]{path,hash,modified,agent,spec}:
 
 Field names declared once in the header. Row count declared explicitly. No braces, no repeated keys, no quotes unless a value contains a delimiter. The LLM receives identical information in significantly fewer tokens.
 
-## Token Savings
+## Benchmarks
 
-<!-- TODO: Replace with real benchmark numbers from F.14 when available -->
+Real measurements from writ's benchmark suite (F.14), comparing payload size across all three formats on representative project data:
 
-Preliminary estimates for a representative context response (20 files, 10 seals, 5 specs, 3 agents):
+| Data Type | JSON | JSON Compact | TOON | TOON vs JSON |
+|-----------|------|-------------|------|-------------|
+| Seal log (20 seals) | 20,650 B | 14,869 B | 13,733 B | **33% smaller** |
+| Full context (5 specs, 10 seals, 40 files) | 8,182 B | 6,252 B | 6,507 B | **20% smaller** |
+| Spec list (15 specs) | 5,912 B | 4,831 B | 5,297 B | **10% smaller** |
 
-| Format | Relative Size |
-|--------|--------------|
-| JSON (pretty) | Baseline |
-| JSON Compact | ~35-40% smaller than pretty JSON |
-| TOON | ~55-65% smaller than pretty JSON |
+Seal logs show the most dramatic savings because they're highly tabular — each seal repeats the same fields (id, summary, agent, timestamp, spec). TOON's header once format eliminates all that redundancy. Full context is a mix of nested and tabular data, so savings are more modest but still substantial.
 
-These numbers compound. Five agents making 10 context calls per session means TOON saves thousands of tokens per session. At fleet scale (50+ agents), that translates directly to measurable cost reduction and reduced context window pressure — agents can work on larger projects before hitting limits.
+Token savings are typically higher than byte savings. JSON structural characters — `{`, `}`, `[`, `]`, `"`, `:` — each consume individual tokens in most tokenizers. TOON eliminates these entirely, so the token reduction exceeds the byte reduction.
 
-Exact benchmark numbers with real token counts will be published here once the format implementation is complete.
+These savings compound. Five agents making 10 context calls per session means hundreds of redundant key tokens per call eliminated. At fleet scale (50+ agents), that translates directly to measurable cost reduction and reduced context window pressure — agents can work on larger projects before hitting limits.
 
 ## Choosing a Format
 
@@ -124,7 +124,7 @@ writ context                            # uses TOON without --format flag
 | `writ context` | Primary use case for TOON. Full project state. |
 | `writ log` | Seal history. Highly tabular — ideal for TOON. |
 | `writ spec status` | Active specs and their state. |
-| `writ status` | Working directory overview. |
+| `writ status` | Fleet overview: agents, specs, progress. |
 | `writ show` | Single seal detail. |
 
 ## Python SDK

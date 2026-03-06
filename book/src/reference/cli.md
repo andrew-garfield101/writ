@@ -75,8 +75,28 @@ Options:
   --seal-limit <N>           Maximum recent seals to include [default: 10]
   --status <STATUS>          Filter seals by status
   --agent <AGENT>            Filter seals by agent ID
-  --format <FORMAT>          Output: json (default), human, brief
+  --format <FORMAT>          Output: json, toon, human, brief
 ```
+
+### `writ status`
+
+High level project overview. Agent activity, spec progress, commit readiness. Complements `writ state` (low level working directory state) with a fleet aware, progress oriented view.
+
+```bash
+writ status [OPTIONS]
+
+Options:
+  --completed              Show all completed specs in detail
+  --active                 Show all in-progress specs in detail
+  --agent <AGENT>          Filter to a single agent's work
+  --spec <SPEC>            Detail view of one spec
+  --watch                  Live-updating view (refreshes every 5s)
+  --interval <SECONDS>     Refresh interval for --watch [default: 5]
+  --proposals              Show pending commit proposals (propose mode)
+  --format <FORMAT>        Output: json, toon, json-compact
+```
+
+The default view adapts automatically to project scale — expanding details for small projects, collapsing to summaries for large fleets. Use filter flags to drill down.
 
 ### `writ log`
 
@@ -106,10 +126,20 @@ Options:
 
 ### `writ diff`
 
-Show content level diff of working directory changes.
+Show content level diff of working directory changes. Enhanced with spec and agent aware filtering.
 
 ```bash
-writ diff
+writ diff [OPTIONS]
+
+Options:
+  --completed              Diff across completed specs (default)
+  --spec <SPEC>            Diff for a single spec
+  --agent <AGENT>          Diff for a single agent's work
+  --all                    Include in-progress specs
+  --file <PATH>            Diff for a single file
+  --stat                   Summary only (files and line counts)
+  --full                   Full unified diff output
+  --format <FORMAT>        Output format for machine consumption
 ```
 
 ### `writ state`
@@ -149,14 +179,32 @@ Formats:
 
 ### `writ finish`
 
-One-command round trip: summary, git add, git commit.
+Promote completed specs to git commits. Interactive spec selection, commit strategy options, and auto generated messages from seal history.
 
 ```bash
 writ finish [OPTIONS]
 
 Options:
-  --full       Include PR-style body in commit message
-  --dry-run    Preview without committing
+  --yes, -y                Accept defaults, no prompts (matches existing behavior)
+  --full                   Per-spec commits with interactive review
+  --strategy <STRATEGY>    Commit strategy: single (default), per-spec, grouped
+  --message, -m <MSG>      Commit message (skips message prompt)
+  --specs <LIST>           Comma-separated spec IDs to include
+  --all                    Include all completed specs (no selection prompt)
+  --dry-run                Preview what would be committed without doing it
+
+  # Propose mode (workflow.commit_mode = "propose")
+  --propose                Create a commit proposal (does not commit)
+  --accept <N>             Accept proposal number N
+  --accept-all             Accept all pending proposals
+  --reject <N>             Reject proposal number N
+  --review <N>             Review proposal number N in detail
+  --proposals              List pending proposals
+
+  # Auto mode (workflow.commit_mode = "auto")
+  --auto                   Commit immediately without approval
+  --verify                 Run verification command before committing
+  --no-verify              Skip verification command
 ```
 
 ## Convergence Commands
@@ -211,9 +259,22 @@ Options:
   --state <STATE>   Filter: active, stale, completed, cancelled, archived
 ```
 
+### `writ spec done`
+
+Mark a spec as completed. Creates a final seal, transitions the spec from active to completed, and prints hints for the user.
+
+```bash
+writ spec done <ID> [OPTIONS]
+
+Options:
+  -s, --summary <MSG>    Completion summary (used in commit message by writ finish)
+```
+
+If the agent has exactly one active spec, the ID can be omitted: `writ spec done`.
+
 ### `writ spec complete`
 
-Mark a spec as completed.
+Mark a spec as completed (same as `writ spec done` without the final seal creation).
 
 ```bash
 writ spec complete <ID>
@@ -225,6 +286,14 @@ Cancel a spec.
 
 ```bash
 writ spec cancel <ID>
+```
+
+### `writ reopen`
+
+Reopen a completed spec for continued work. Sets the spec back to active. Seal history is preserved.
+
+```bash
+writ reopen --spec <ID>
 ```
 
 ## Security Commands

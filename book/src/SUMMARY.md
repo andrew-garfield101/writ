@@ -19,6 +19,7 @@
 # Guides
 
 - [Multi Agent Workflow](guides/multi-agent-workflow.md)
+- [Workflow Modes](guides/workflow-modes.md)
 - [Git Integration](guides/git-integration.md)
 - [Suggested Uses](guides/suggested-uses.md)
 - [CI/CD Integration](guides/ci-cd.md)

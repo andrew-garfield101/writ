@@ -21,6 +21,28 @@ pub enum SpecStatus {
     Blocked,
 }
 
+/// Git commit promotion state for the round-trip workflow.
+///
+/// Tracks whether completed spec work has been committed to git
+/// and pushed to a remote. Separate from `SpecStatus` (work status)
+/// and `LifecycleState` (GC status).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CommitState {
+    /// Work not yet committed to git.
+    Uncommitted,
+    /// Committed to local git repository.
+    Committed,
+    /// Pushed to remote.
+    Pushed,
+}
+
+impl Default for CommitState {
+    fn default() -> Self {
+        CommitState::Uncommitted
+    }
+}
+
 /// GC lifecycle state (separate from user-facing status).
 ///
 /// Added as an additive field — existing repos without this field
@@ -85,6 +107,21 @@ pub struct Spec {
     /// Used by GC stale detection. Defaults to `created_at` for existing specs.
     #[serde(default = "Utc::now")]
     pub last_activity: DateTime<Utc>,
+    /// Summary provided when spec was completed via `writ spec done`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_summary: Option<String>,
+    /// Git promotion state — tracks commit/push progress.
+    #[serde(default)]
+    pub commit_state: CommitState,
+    /// When the spec was marked complete.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<DateTime<Utc>>,
+    /// Git commit hash once committed via `writ finish`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_hash: Option<String>,
+    /// When the spec was committed to git.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed_at: Option<DateTime<Utc>>,
 }
 
 impl std::str::FromStr for SpecStatus {
@@ -137,7 +174,43 @@ impl Spec {
             tech_stack: Vec::new(),
             lifecycle_state: LifecycleState::Active,
             last_activity: now,
+            completion_summary: None,
+            commit_state: CommitState::Uncommitted,
+            completed_at: None,
+            commit_hash: None,
+            committed_at: None,
         }
+    }
+
+    /// Returns true if this spec is complete and not yet committed to git.
+    pub fn is_committable(&self) -> bool {
+        self.status == SpecStatus::Complete && self.commit_state == CommitState::Uncommitted
+    }
+
+    /// Record that this spec's work was committed to git.
+    pub fn mark_committed(&mut self, hash: String) {
+        let now = Utc::now();
+        self.commit_state = CommitState::Committed;
+        self.commit_hash = Some(hash);
+        self.committed_at = Some(now);
+        self.updated_at = now;
+    }
+
+    /// Mark this spec as pushed to remote.
+    pub fn mark_pushed(&mut self) {
+        self.commit_state = CommitState::Pushed;
+        self.updated_at = Utc::now();
+    }
+
+    /// Reopen a completed spec for further work.
+    /// Clears commit state but preserves completion_summary for history.
+    pub fn reopen(&mut self) {
+        self.status = SpecStatus::InProgress;
+        self.commit_state = CommitState::Uncommitted;
+        self.completed_at = None;
+        self.commit_hash = None;
+        self.committed_at = None;
+        self.updated_at = Utc::now();
     }
 }
 
@@ -193,6 +266,141 @@ mod tests {
         let json = serde_json::to_string(&spec).unwrap();
         let recovered: Spec = serde_json::from_str(&json).unwrap();
         assert_eq!(recovered.lifecycle_state, LifecycleState::Active);
+    }
+
+    #[test]
+    fn test_commit_state_default_is_uncommitted() {
+        assert_eq!(CommitState::default(), CommitState::Uncommitted);
+    }
+
+    #[test]
+    fn test_commit_state_serde_values() {
+        assert_eq!(
+            serde_json::to_string(&CommitState::Uncommitted).unwrap(),
+            "\"uncommitted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CommitState::Committed).unwrap(),
+            "\"committed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CommitState::Pushed).unwrap(),
+            "\"pushed\""
+        );
+    }
+
+    #[test]
+    fn test_new_spec_has_uncommitted_state() {
+        let spec = Spec::new("test".into(), "Test".into(), "desc".into());
+        assert_eq!(spec.commit_state, CommitState::Uncommitted);
+        assert!(spec.completion_summary.is_none());
+        assert!(spec.completed_at.is_none());
+        assert!(spec.commit_hash.is_none());
+        assert!(spec.committed_at.is_none());
+    }
+
+    #[test]
+    fn test_is_committable_complete_and_uncommitted() {
+        let mut spec = Spec::new("test".into(), "Test".into(), "desc".into());
+        spec.status = SpecStatus::Complete;
+        assert!(spec.is_committable());
+    }
+
+    #[test]
+    fn test_is_committable_false_when_not_complete() {
+        let spec = Spec::new("test".into(), "Test".into(), "desc".into());
+        assert!(!spec.is_committable()); // Pending
+    }
+
+    #[test]
+    fn test_is_committable_false_when_already_committed() {
+        let mut spec = Spec::new("test".into(), "Test".into(), "desc".into());
+        spec.status = SpecStatus::Complete;
+        spec.mark_committed("abc123".into());
+        assert!(!spec.is_committable());
+    }
+
+    #[test]
+    fn test_mark_committed() {
+        let mut spec = Spec::new("test".into(), "Test".into(), "desc".into());
+        spec.status = SpecStatus::Complete;
+        spec.mark_committed("abc123def".into());
+
+        assert_eq!(spec.commit_state, CommitState::Committed);
+        assert_eq!(spec.commit_hash.as_deref(), Some("abc123def"));
+        assert!(spec.committed_at.is_some());
+    }
+
+    #[test]
+    fn test_mark_pushed() {
+        let mut spec = Spec::new("test".into(), "Test".into(), "desc".into());
+        spec.status = SpecStatus::Complete;
+        spec.mark_committed("abc123".into());
+        spec.mark_pushed();
+
+        assert_eq!(spec.commit_state, CommitState::Pushed);
+    }
+
+    #[test]
+    fn test_reopen_clears_commit_state() {
+        let mut spec = Spec::new("test".into(), "Test".into(), "desc".into());
+        spec.status = SpecStatus::Complete;
+        spec.completion_summary = Some("All done".into());
+        spec.completed_at = Some(Utc::now());
+        spec.mark_committed("abc123".into());
+
+        spec.reopen();
+
+        assert_eq!(spec.status, SpecStatus::InProgress);
+        assert_eq!(spec.commit_state, CommitState::Uncommitted);
+        assert!(spec.completed_at.is_none());
+        assert!(spec.commit_hash.is_none());
+        assert!(spec.committed_at.is_none());
+        // Summary preserved for history
+        assert_eq!(spec.completion_summary.as_deref(), Some("All done"));
+    }
+
+    #[test]
+    fn test_backward_compat_missing_commit_fields() {
+        // Old spec JSON without any of the new round-trip fields
+        let json = r#"{
+            "id": "old-spec",
+            "title": "Old Spec",
+            "description": "from before round-trip sprint",
+            "status": "complete",
+            "depends_on": [],
+            "file_scope": [],
+            "created_at": "2026-02-20T00:00:00Z",
+            "updated_at": "2026-02-20T00:00:00Z",
+            "sealed_by": []
+        }"#;
+        let spec: Spec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.commit_state, CommitState::Uncommitted);
+        assert!(spec.completion_summary.is_none());
+        assert!(spec.completed_at.is_none());
+        assert!(spec.commit_hash.is_none());
+        assert!(spec.committed_at.is_none());
+    }
+
+    #[test]
+    fn test_roundtrip_with_commit_fields() {
+        let mut spec = Spec::new("rt".into(), "Round Trip".into(), "test".into());
+        spec.status = SpecStatus::Complete;
+        spec.completion_summary = Some("Implemented feature X".into());
+        spec.completed_at = Some(Utc::now());
+        spec.mark_committed("deadbeef".into());
+
+        let json = serde_json::to_string(&spec).unwrap();
+        let recovered: Spec = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(recovered.commit_state, CommitState::Committed);
+        assert_eq!(
+            recovered.completion_summary.as_deref(),
+            Some("Implemented feature X")
+        );
+        assert_eq!(recovered.commit_hash.as_deref(), Some("deadbeef"));
+        assert!(recovered.completed_at.is_some());
+        assert!(recovered.committed_at.is_some());
     }
 
     #[test]

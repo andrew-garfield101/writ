@@ -8,9 +8,11 @@
 //! Format resolution chain: CLI flag > project config > global config > default.
 
 use crate::context::ContextOutput;
+use crate::diff::DiffOutput;
 use crate::error::{WritError, WritResult};
 use crate::seal::Seal;
 use crate::spec::Spec;
+use crate::status::StatusOutput;
 
 /// Trait for output formatters. Each formatter converts writ data structures
 /// into a string representation suitable for CLI output or SDK consumption.
@@ -26,6 +28,12 @@ pub trait OutputFormatter: Send + Sync {
 
     /// Format a list of specs (e.g., `writ spec list` output).
     fn format_spec_list(&self, specs: &[Spec]) -> WritResult<String>;
+
+    /// Format a diff output (e.g., `writ diff` output).
+    fn format_diff(&self, diff: &DiffOutput) -> WritResult<String>;
+
+    /// Format a status output (e.g., `writ status --format` output).
+    fn format_status(&self, status: &StatusOutput) -> WritResult<String>;
 }
 
 /// All known format names.
@@ -60,6 +68,14 @@ impl OutputFormatter for JsonFormatter {
     fn format_spec_list(&self, specs: &[Spec]) -> WritResult<String> {
         Ok(serde_json::to_string_pretty(specs)?)
     }
+
+    fn format_diff(&self, diff: &DiffOutput) -> WritResult<String> {
+        Ok(serde_json::to_string_pretty(diff)?)
+    }
+
+    fn format_status(&self, status: &StatusOutput) -> WritResult<String> {
+        Ok(serde_json::to_string_pretty(status)?)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +101,14 @@ impl OutputFormatter for JsonCompactFormatter {
 
     fn format_spec_list(&self, specs: &[Spec]) -> WritResult<String> {
         Ok(serde_json::to_string(specs)?)
+    }
+
+    fn format_diff(&self, diff: &DiffOutput) -> WritResult<String> {
+        Ok(serde_json::to_string(diff)?)
+    }
+
+    fn format_status(&self, status: &StatusOutput) -> WritResult<String> {
+        Ok(serde_json::to_string(status)?)
     }
 }
 
@@ -157,6 +181,16 @@ impl OutputFormatter for ToonFormatter {
     fn format_spec_list(&self, specs: &[Spec]) -> WritResult<String> {
         let val = serde_json::to_value(specs)?;
         self.encode_with_header(&val, "spec-list")
+    }
+
+    fn format_diff(&self, diff: &DiffOutput) -> WritResult<String> {
+        let val = serde_json::to_value(diff)?;
+        self.encode_with_header(&val, "diff")
+    }
+
+    fn format_status(&self, status: &StatusOutput) -> WritResult<String> {
+        let val = serde_json::to_value(status)?;
+        self.encode_with_header(&val, "status")
     }
 }
 

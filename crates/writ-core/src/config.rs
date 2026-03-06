@@ -35,6 +35,10 @@ pub struct GlobalConfig {
     /// Output format preferences.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputConfig>,
+
+    /// Workflow settings (commit mode, strategy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowConfig>,
 }
 
 /// User identity section.
@@ -96,6 +100,14 @@ pub struct ProjectConfig {
     /// Security settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub security: Option<SecurityConfig>,
+
+    /// Workflow settings (commit mode, strategy, stale timeout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<WorkflowConfig>,
+
+    /// Auto-mode configuration (project-level only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<AutoModeConfig>,
 }
 
 /// Project metadata section.
@@ -151,6 +163,85 @@ pub struct SecurityConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Workflow config
+// ---------------------------------------------------------------------------
+
+/// Workflow settings — how completed specs become git commits.
+///
+/// Configurable at both global and project level.
+/// Valid `commit_mode` values: `"user"`, `"propose"`, `"auto"`.
+/// Valid `commit_strategy` values: `"single"`, `"per-spec"`, `"grouped"`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkflowConfig {
+    /// Commit mode: "user" (manual), "propose" (orchestrator proposes), "auto" (autonomous).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_mode: Option<String>,
+
+    /// Default commit strategy: "single", "per-spec", or "grouped".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_strategy: Option<String>,
+
+    /// Stale spec timeout in seconds. Specs with no seal activity past this
+    /// threshold are flagged as stale. 0 disables stale detection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_timeout: Option<u64>,
+}
+
+/// Auto-mode configuration — safety rails for fully autonomous commits.
+///
+/// Only valid at the project level (not global).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutoModeConfig {
+    /// Shell command that must exit 0 before auto-commit proceeds.
+    /// Leave empty or None to skip verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_command: Option<String>,
+
+    /// Maximum number of specs per commit in auto mode. Overflow batches
+    /// into additional commits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_specs_per_commit: Option<u32>,
+
+    /// Target branch for auto commits (e.g. "writ/auto"). Strongly
+    /// recommended to NOT be main/master.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+
+    /// Notification method: "log" (writ events), "stdout", or "none".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify: Option<String>,
+
+    /// Optional webhook URL for external notification on auto-commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webhook_url: Option<String>,
+}
+
+/// Valid commit modes.
+const VALID_COMMIT_MODES: &[&str] = &["user", "propose", "auto"];
+
+/// Valid commit strategies.
+const VALID_COMMIT_STRATEGIES: &[&str] = &["single", "per-spec", "grouped"];
+
+/// Default commit mode.
+const DEFAULT_COMMIT_MODE: &str = "user";
+
+/// Default commit strategy.
+const DEFAULT_COMMIT_STRATEGY: &str = "single";
+
+/// Default stale timeout in seconds (1 hour).
+const DEFAULT_STALE_TIMEOUT: u64 = 3600;
+
+/// Check whether a string is a valid commit mode.
+pub fn is_valid_commit_mode(s: &str) -> bool {
+    VALID_COMMIT_MODES.contains(&s)
+}
+
+/// Check whether a string is a valid commit strategy.
+pub fn is_valid_commit_strategy(s: &str) -> bool {
+    VALID_COMMIT_STRATEGIES.contains(&s)
+}
+
+// ---------------------------------------------------------------------------
 // Global config load/save
 // ---------------------------------------------------------------------------
 
@@ -188,6 +279,21 @@ impl GlobalConfig {
     pub fn output_format(&self) -> Option<&str> {
         self.output.as_ref()?.format.as_deref()
     }
+
+    /// Get the configured commit mode, if set.
+    pub fn commit_mode(&self) -> Option<&str> {
+        self.workflow.as_ref()?.commit_mode.as_deref()
+    }
+
+    /// Get the configured commit strategy, if set.
+    pub fn commit_strategy(&self) -> Option<&str> {
+        self.workflow.as_ref()?.commit_strategy.as_deref()
+    }
+
+    /// Get the configured stale timeout, if set.
+    pub fn stale_timeout(&self) -> Option<u64> {
+        self.workflow.as_ref()?.stale_timeout
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,9 +330,29 @@ impl ProjectConfig {
         Ok(())
     }
 
+    /// Get the project name, if set.
+    pub fn project_name(&self) -> Option<&str> {
+        self.project.as_ref()?.name.as_deref()
+    }
+
     /// Get the preferred output format, if set.
     pub fn output_format(&self) -> Option<&str> {
         self.output.as_ref()?.format.as_deref()
+    }
+
+    /// Get the configured commit mode, if set.
+    pub fn commit_mode(&self) -> Option<&str> {
+        self.workflow.as_ref()?.commit_mode.as_deref()
+    }
+
+    /// Get the configured commit strategy, if set.
+    pub fn commit_strategy(&self) -> Option<&str> {
+        self.workflow.as_ref()?.commit_strategy.as_deref()
+    }
+
+    /// Get the configured stale timeout, if set.
+    pub fn stale_timeout(&self) -> Option<u64> {
+        self.workflow.as_ref()?.stale_timeout
     }
 
     /// Migrate values from `.writ/settings.json` into a new ProjectConfig.
@@ -290,6 +416,71 @@ pub fn resolve_output_format(
 }
 
 // ---------------------------------------------------------------------------
+// Workflow resolution chain (W.19)
+// ---------------------------------------------------------------------------
+
+/// Resolve the commit mode using the priority chain:
+/// CLI flag > project config > global config > default ("user").
+///
+/// Returns an error if the resolved value is not a valid mode.
+pub fn resolve_commit_mode(
+    cli_flag: Option<&str>,
+    project: &ProjectConfig,
+    global: &GlobalConfig,
+) -> WritResult<String> {
+    let resolved = cli_flag
+        .map(|s| s.to_string())
+        .or_else(|| project.commit_mode().map(|s| s.to_string()))
+        .or_else(|| global.commit_mode().map(|s| s.to_string()))
+        .unwrap_or_else(|| DEFAULT_COMMIT_MODE.to_string());
+
+    if !is_valid_commit_mode(&resolved) {
+        return Err(WritError::Other(format!(
+            "invalid commit mode '{}' — expected one of: {}",
+            resolved,
+            VALID_COMMIT_MODES.join(", ")
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Resolve the commit strategy using the priority chain:
+/// CLI flag > project config > global config > default ("single").
+///
+/// Returns an error if the resolved value is not a valid strategy.
+pub fn resolve_commit_strategy(
+    cli_flag: Option<&str>,
+    project: &ProjectConfig,
+    global: &GlobalConfig,
+) -> WritResult<String> {
+    let resolved = cli_flag
+        .map(|s| s.to_string())
+        .or_else(|| project.commit_strategy().map(|s| s.to_string()))
+        .or_else(|| global.commit_strategy().map(|s| s.to_string()))
+        .unwrap_or_else(|| DEFAULT_COMMIT_STRATEGY.to_string());
+
+    if !is_valid_commit_strategy(&resolved) {
+        return Err(WritError::Other(format!(
+            "invalid commit strategy '{}' — expected one of: {}",
+            resolved,
+            VALID_COMMIT_STRATEGIES.join(", ")
+        )));
+    }
+    Ok(resolved)
+}
+
+/// Resolve the stale spec timeout using the priority chain:
+/// project config > global config > default (3600s).
+///
+/// No CLI flag for this — it's a config-only setting.
+pub fn resolve_stale_timeout(project: &ProjectConfig, global: &GlobalConfig) -> u64 {
+    project
+        .stale_timeout()
+        .or_else(|| global.stale_timeout())
+        .unwrap_or(DEFAULT_STALE_TIMEOUT)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -323,6 +514,7 @@ mod tests {
             output: Some(OutputConfig {
                 format: Some("toon".into()),
             }),
+            workflow: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: GlobalConfig = toml::from_str(&toml_str).unwrap();
@@ -385,6 +577,8 @@ mod tests {
             security: Some(SecurityConfig {
                 scope_enforcement: true,
             }),
+            workflow: None,
+            auto: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: ProjectConfig = toml::from_str(&toml_str).unwrap();
@@ -692,6 +886,319 @@ cursor = true
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         // scope_enforcement defaults to false via #[serde(default)]
         assert_eq!(config.security.as_ref().unwrap().scope_enforcement, false);
+    }
+
+    // -- W.18: WorkflowConfig tests --
+
+    #[test]
+    fn test_workflow_config_defaults() {
+        let wf = WorkflowConfig::default();
+        assert!(wf.commit_mode.is_none());
+        assert!(wf.commit_strategy.is_none());
+        assert!(wf.stale_timeout.is_none());
+    }
+
+    #[test]
+    fn test_workflow_config_roundtrip_toml() {
+        let toml_str = r#"
+[workflow]
+commit_mode = "propose"
+commit_strategy = "per-spec"
+stale_timeout = 7200
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let wf = config.workflow.as_ref().unwrap();
+        assert_eq!(wf.commit_mode.as_deref(), Some("propose"));
+        assert_eq!(wf.commit_strategy.as_deref(), Some("per-spec"));
+        assert_eq!(wf.stale_timeout, Some(7200));
+
+        // Re-serialize and parse again
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let reparsed: ProjectConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.commit_mode(), Some("propose"));
+        assert_eq!(reparsed.commit_strategy(), Some("per-spec"));
+        assert_eq!(reparsed.stale_timeout(), Some(7200));
+    }
+
+    #[test]
+    fn test_workflow_config_partial_fields() {
+        // Only commit_mode set — others should be None
+        let toml_str = r#"
+[workflow]
+commit_mode = "auto"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.commit_mode(), Some("auto"));
+        assert!(config.commit_strategy().is_none());
+        assert!(config.stale_timeout().is_none());
+    }
+
+    #[test]
+    fn test_workflow_config_stale_timeout_zero_disables() {
+        let toml_str = r#"
+[workflow]
+stale_timeout = 0
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.stale_timeout(), Some(0));
+    }
+
+    #[test]
+    fn test_auto_mode_config_roundtrip_toml() {
+        let toml_str = r#"
+[auto]
+verify_command = "cargo test --quiet"
+max_specs_per_commit = 10
+branch = "writ/auto"
+notify = "stdout"
+webhook_url = "https://example.com/hook"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let auto = config.auto.as_ref().unwrap();
+        assert_eq!(auto.verify_command.as_deref(), Some("cargo test --quiet"));
+        assert_eq!(auto.max_specs_per_commit, Some(10));
+        assert_eq!(auto.branch.as_deref(), Some("writ/auto"));
+        assert_eq!(auto.notify.as_deref(), Some("stdout"));
+        assert_eq!(
+            auto.webhook_url.as_deref(),
+            Some("https://example.com/hook")
+        );
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let reparsed: ProjectConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            reparsed.auto.as_ref().unwrap().max_specs_per_commit,
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn test_auto_mode_config_defaults() {
+        let auto = AutoModeConfig::default();
+        assert!(auto.verify_command.is_none());
+        assert!(auto.max_specs_per_commit.is_none());
+        assert!(auto.branch.is_none());
+        assert!(auto.notify.is_none());
+        assert!(auto.webhook_url.is_none());
+    }
+
+    #[test]
+    fn test_global_config_workflow_section() {
+        let toml_str = r#"
+[workflow]
+commit_mode = "user"
+commit_strategy = "single"
+stale_timeout = 1800
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.commit_mode(), Some("user"));
+        assert_eq!(config.commit_strategy(), Some("single"));
+        assert_eq!(config.stale_timeout(), Some(1800));
+    }
+
+    #[test]
+    fn test_global_config_no_auto_section() {
+        // GlobalConfig does not have auto — auto is project-level only
+        let toml_str = r#"
+[workflow]
+commit_mode = "propose"
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.commit_mode(), Some("propose"));
+    }
+
+    #[test]
+    fn test_workflow_config_save_and_load() {
+        let dir = TempDir::new().unwrap();
+        let config = ProjectConfig {
+            workflow: Some(WorkflowConfig {
+                commit_mode: Some("auto".into()),
+                commit_strategy: Some("grouped".into()),
+                stale_timeout: Some(0),
+            }),
+            auto: Some(AutoModeConfig {
+                verify_command: Some("make test".into()),
+                max_specs_per_commit: Some(5),
+                branch: Some("writ/ci".into()),
+                notify: Some("log".into()),
+                webhook_url: None,
+            }),
+            ..Default::default()
+        };
+        config.save(dir.path()).unwrap();
+
+        let loaded = ProjectConfig::load(dir.path()).unwrap();
+        assert_eq!(loaded.commit_mode(), Some("auto"));
+        assert_eq!(loaded.commit_strategy(), Some("grouped"));
+        assert_eq!(loaded.stale_timeout(), Some(0));
+        let auto = loaded.auto.as_ref().unwrap();
+        assert_eq!(auto.verify_command.as_deref(), Some("make test"));
+        assert_eq!(auto.max_specs_per_commit, Some(5));
+        assert_eq!(auto.branch.as_deref(), Some("writ/ci"));
+    }
+
+    // -- W.19: Resolution chain tests --
+
+    #[test]
+    fn test_resolve_commit_mode_cli_wins() {
+        let project = ProjectConfig {
+            workflow: Some(WorkflowConfig {
+                commit_mode: Some("propose".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            workflow: Some(WorkflowConfig {
+                commit_mode: Some("auto".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_commit_mode(Some("user"), &project, &global).unwrap(),
+            "user"
+        );
+    }
+
+    #[test]
+    fn test_resolve_commit_mode_project_over_global() {
+        let project = ProjectConfig {
+            workflow: Some(WorkflowConfig {
+                commit_mode: Some("propose".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            workflow: Some(WorkflowConfig {
+                commit_mode: Some("auto".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_commit_mode(None, &project, &global).unwrap(),
+            "propose"
+        );
+    }
+
+    #[test]
+    fn test_resolve_commit_mode_falls_to_default() {
+        let project = ProjectConfig::default();
+        let global = GlobalConfig::default();
+        assert_eq!(
+            resolve_commit_mode(None, &project, &global).unwrap(),
+            "user"
+        );
+    }
+
+    #[test]
+    fn test_resolve_commit_mode_rejects_invalid() {
+        let project = ProjectConfig::default();
+        let global = GlobalConfig::default();
+        let result = resolve_commit_mode(Some("yolo"), &project, &global);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("invalid commit mode"));
+        assert!(err.contains("yolo"));
+    }
+
+    #[test]
+    fn test_resolve_commit_strategy_cli_wins() {
+        let project = ProjectConfig {
+            workflow: Some(WorkflowConfig {
+                commit_strategy: Some("grouped".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let global = GlobalConfig::default();
+        assert_eq!(
+            resolve_commit_strategy(Some("per-spec"), &project, &global).unwrap(),
+            "per-spec"
+        );
+    }
+
+    #[test]
+    fn test_resolve_commit_strategy_falls_to_default() {
+        let project = ProjectConfig::default();
+        let global = GlobalConfig::default();
+        assert_eq!(
+            resolve_commit_strategy(None, &project, &global).unwrap(),
+            "single"
+        );
+    }
+
+    #[test]
+    fn test_resolve_commit_strategy_rejects_invalid() {
+        let project = ProjectConfig {
+            workflow: Some(WorkflowConfig {
+                commit_strategy: Some("chaos".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let global = GlobalConfig::default();
+        let result = resolve_commit_strategy(None, &project, &global);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_stale_timeout_project_over_global() {
+        let project = ProjectConfig {
+            workflow: Some(WorkflowConfig {
+                stale_timeout: Some(600),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            workflow: Some(WorkflowConfig {
+                stale_timeout: Some(7200),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(resolve_stale_timeout(&project, &global), 600);
+    }
+
+    #[test]
+    fn test_resolve_stale_timeout_falls_to_default() {
+        let project = ProjectConfig::default();
+        let global = GlobalConfig::default();
+        assert_eq!(resolve_stale_timeout(&project, &global), 3600);
+    }
+
+    #[test]
+    fn test_resolve_stale_timeout_zero_from_project() {
+        let project = ProjectConfig {
+            workflow: Some(WorkflowConfig {
+                stale_timeout: Some(0),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let global = GlobalConfig::default();
+        assert_eq!(resolve_stale_timeout(&project, &global), 0);
+    }
+
+    #[test]
+    fn test_valid_commit_modes() {
+        assert!(is_valid_commit_mode("user"));
+        assert!(is_valid_commit_mode("propose"));
+        assert!(is_valid_commit_mode("auto"));
+        assert!(!is_valid_commit_mode("manual"));
+        assert!(!is_valid_commit_mode(""));
+    }
+
+    #[test]
+    fn test_valid_commit_strategies() {
+        assert!(is_valid_commit_strategy("single"));
+        assert!(is_valid_commit_strategy("per-spec"));
+        assert!(is_valid_commit_strategy("grouped"));
+        assert!(!is_valid_commit_strategy("atomic"));
+        assert!(!is_valid_commit_strategy(""));
     }
 
     #[test]

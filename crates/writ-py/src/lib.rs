@@ -108,6 +108,46 @@ fn format_seals(py: Python, seals: &[writ_core::seal::Seal], format: &str) -> Py
     }
 }
 
+/// Format a diff output as a string using the given formatter, or return a Python dict.
+fn format_diff(py: Python, diff: &writ_core::diff::DiffOutput, format: &str) -> PyResult<PyObject> {
+    match format {
+        "dict" => to_pydict(py, diff),
+        "json" | "json-compact" | "toon" => {
+            let formatter = writ_core::format::formatter_for(format)
+                .ok_or_else(|| WritError::new_err(format!("unknown format: '{format}'")))?;
+            let output = formatter
+                .format_diff(diff)
+                .map_err(|e| WritError::new_err(e.to_string()))?;
+            Ok(pyo3::types::PyString::new(py, &output).into_any().unbind())
+        }
+        other => Err(WritError::new_err(format!(
+            "unknown format: '{other}' (expected 'dict', 'json', 'json-compact', or 'toon')"
+        ))),
+    }
+}
+
+/// Format a status output as a string using the given formatter, or return a Python dict.
+fn format_status(
+    py: Python,
+    status: &writ_core::status::StatusOutput,
+    format: &str,
+) -> PyResult<PyObject> {
+    match format {
+        "dict" => to_pydict(py, status),
+        "json" | "json-compact" | "toon" => {
+            let formatter = writ_core::format::formatter_for(format)
+                .ok_or_else(|| WritError::new_err(format!("unknown format: '{format}'")))?;
+            let output = formatter
+                .format_status(status)
+                .map_err(|e| WritError::new_err(e.to_string()))?;
+            Ok(pyo3::types::PyString::new(py, &output).into_any().unbind())
+        }
+        other => Err(WritError::new_err(format!(
+            "unknown format: '{other}' (expected 'dict', 'json', 'json-compact', or 'toon')"
+        ))),
+    }
+}
+
 /// Format specs as a string using the given formatter, or return a Python dict.
 fn format_specs(py: Python, specs: &[writ_core::spec::Spec], format: &str) -> PyResult<PyObject> {
     match format {
@@ -412,22 +452,78 @@ impl PyRepository {
         self.inner.spec_head(spec_id).map_err(writ_err)
     }
 
-    /// Diff working tree against HEAD.
-    fn diff(&self, py: Python) -> PyResult<PyObject> {
-        let diff = self.inner.diff().map_err(writ_err)?;
-        to_pydict(py, &diff)
+    /// Get high-level project status: agent activity, spec progress,
+    /// commit readiness. Complements `state()` (low-level plumbing)
+    /// with fleet-aware, progress-oriented porcelain.
+    ///
+    /// `format` controls the return type: "dict" (default), "json",
+    /// "json-compact", or "toon".
+    #[pyo3(signature = (format="dict"))]
+    fn status(&self, py: Python, format: &str) -> PyResult<PyObject> {
+        let status = self.inner.status().map_err(writ_err)?;
+        format_status(py, &status, format)
+    }
+
+    /// Diff working tree against HEAD with optional filtering.
+    ///
+    /// Filtering parameters (all optional):
+    /// - `spec`: Filter to files changed by a specific spec ID.
+    /// - `agent`: Filter to files changed by a specific agent ID.
+    /// - `completed`: Only show changes from completed specs.
+    /// - `include_all`: When combined with `completed`, also include in-progress specs.
+    /// - `file`: Filter to a single file path.
+    ///
+    /// `format` controls the return type: "dict" (default), "json",
+    /// "json-compact", or "toon".
+    #[pyo3(signature = (spec=None, agent=None, completed=false, include_all=false, file=None, format="dict"))]
+    fn diff(
+        &self,
+        py: Python,
+        spec: Option<&str>,
+        agent: Option<&str>,
+        completed: bool,
+        include_all: bool,
+        file: Option<&str>,
+        format: &str,
+    ) -> PyResult<PyObject> {
+        let mut diff = self.inner.diff().map_err(writ_err)?;
+
+        let has_filter = spec.is_some() || agent.is_some() || completed || file.is_some();
+        if has_filter {
+            let allowed = self.collect_filtered_paths(spec, agent, completed, include_all, file)?;
+            diff.files.retain(|f| allowed.contains(&f.path));
+            diff.files_changed = diff.files.len();
+            diff.total_additions = diff.files.iter().map(|f| f.additions).sum();
+            diff.total_deletions = diff.files.iter().map(|f| f.deletions).sum();
+        }
+
+        format_diff(py, &diff, format)
     }
 
     /// Diff between two seals (supports short ID prefixes).
-    fn diff_seals(&self, py: Python, from_id: &str, to_id: &str) -> PyResult<PyObject> {
+    ///
+    /// `format` controls the return type: "dict" (default), "json",
+    /// "json-compact", or "toon".
+    #[pyo3(signature = (from_id, to_id, format="dict"))]
+    fn diff_seals(
+        &self,
+        py: Python,
+        from_id: &str,
+        to_id: &str,
+        format: &str,
+    ) -> PyResult<PyObject> {
         let diff = self.inner.diff_seals(from_id, to_id).map_err(writ_err)?;
-        to_pydict(py, &diff)
+        format_diff(py, &diff, format)
     }
 
     /// Diff a single seal vs its parent (or vs empty for first seal).
-    fn diff_seal(&self, py: Python, seal_id: &str) -> PyResult<PyObject> {
+    ///
+    /// `format` controls the return type: "dict" (default), "json",
+    /// "json-compact", or "toon".
+    #[pyo3(signature = (seal_id, format="dict"))]
+    fn diff_seal(&self, py: Python, seal_id: &str, format: &str) -> PyResult<PyObject> {
         let diff = self.inner.diff_seal(seal_id).map_err(writ_err)?;
-        to_pydict(py, &diff)
+        format_diff(py, &diff, format)
     }
 
     /// Get structured context for LLM consumption.
@@ -913,6 +1009,346 @@ impl PyRepository {
     fn complete_spec(&self, spec_id: &str) -> PyResult<()> {
         self.inner.complete_spec(spec_id).map_err(writ_err)?;
         Ok(())
+    }
+
+    /// Commit completed spec work to git (programmatic `writ finish`).
+    ///
+    /// Parameters:
+    /// - `strategy`: "single" (default) or "per-spec"
+    /// - `message`: Optional commit message override. If None, auto-generates from spec summaries.
+    /// - `dry_run`: If True, returns what would be committed without actually committing.
+    /// - `specs`: Optional list of spec IDs to finish. If None, finishes all committable specs.
+    ///
+    /// Returns a dict with `commits` (list of {hash, message, specs}), `strategy`, `dry_run`.
+    #[pyo3(signature = (strategy="single", message=None, dry_run=false, specs=None))]
+    fn finish(
+        &self,
+        py: Python,
+        strategy: &str,
+        message: Option<String>,
+        dry_run: bool,
+        specs: Option<Vec<String>>,
+    ) -> PyResult<PyObject> {
+        use serde::Serialize;
+        use writ_core::git_ops::{Git2Ops, GitOps};
+
+        #[derive(Serialize)]
+        struct FinishCommit {
+            hash: String,
+            message: String,
+            specs: Vec<String>,
+        }
+
+        #[derive(Serialize)]
+        struct FinishResult {
+            commits: Vec<FinishCommit>,
+            strategy: String,
+            dry_run: bool,
+            specs_finished: usize,
+        }
+
+        // Validate strategy
+        if strategy != "single" && strategy != "per-spec" {
+            return Err(WritError::new_err(format!(
+                "unknown strategy: '{}' (expected 'single' or 'per-spec')",
+                strategy
+            )));
+        }
+
+        let all_specs = self.inner.list_specs().map_err(writ_err)?;
+        let committable: Vec<_> = all_specs
+            .iter()
+            .filter(|s| {
+                if !s.is_committable() {
+                    return false;
+                }
+                match &specs {
+                    Some(ids) => ids.iter().any(|id| id == &s.id),
+                    None => true,
+                }
+            })
+            .collect();
+
+        if committable.is_empty() {
+            let result = FinishResult {
+                commits: Vec::new(),
+                strategy: strategy.to_string(),
+                dry_run,
+                specs_finished: 0,
+            };
+            return to_pydict(py, &result);
+        }
+
+        if dry_run {
+            // Return what would be committed without doing it
+            let spec_ids: Vec<String> = committable.iter().map(|s| s.id.clone()).collect();
+            let msg = message.unwrap_or_else(|| {
+                committable
+                    .iter()
+                    .map(|s| {
+                        s.completion_summary
+                            .as_deref()
+                            .unwrap_or(&s.title)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            });
+            let commits = match strategy {
+                "per-spec" => committable
+                    .iter()
+                    .map(|s| FinishCommit {
+                        hash: "(dry-run)".to_string(),
+                        message: format!(
+                            "{}: {}",
+                            s.id,
+                            s.completion_summary.as_deref().unwrap_or(&s.title)
+                        ),
+                        specs: vec![s.id.clone()],
+                    })
+                    .collect(),
+                _ => vec![FinishCommit {
+                    hash: "(dry-run)".to_string(),
+                    message: msg,
+                    specs: spec_ids,
+                }],
+            };
+            let result = FinishResult {
+                specs_finished: committable.len(),
+                commits,
+                strategy: strategy.to_string(),
+                dry_run: true,
+            };
+            return to_pydict(py, &result);
+        }
+
+        // Open git repo
+        let root = self.inner.root();
+        let git = Git2Ops::open(root).map_err(|e| WritError::new_err(e.to_string()))?;
+
+        let mut commits = Vec::new();
+
+        match strategy {
+            "per-spec" => {
+                let mut sorted: Vec<_> = committable.clone();
+                sorted.sort_by_key(|s| s.completed_at);
+
+                for s in &sorted {
+                    // Stage files in this spec's scope if available, otherwise stage all
+                    if !s.file_scope.is_empty() {
+                        let paths: Vec<&str> = s.file_scope.iter().map(|p| p.as_str()).collect();
+                        git.stage_files(&paths).map_err(|e| WritError::new_err(e.to_string()))?;
+                    } else {
+                        git.stage_all().map_err(|e| WritError::new_err(e.to_string()))?;
+                    }
+
+                    if !git.has_staged_changes().map_err(|e| WritError::new_err(e.to_string()))? {
+                        continue;
+                    }
+
+                    let msg = format!(
+                        "{}: {}",
+                        s.id,
+                        s.completion_summary.as_deref().unwrap_or(&s.title)
+                    );
+                    let hash = git.commit(&msg).map_err(|e| WritError::new_err(e.to_string()))?;
+                    let _ = self.inner.mark_spec_committed(&s.id, &hash);
+                    commits.push(FinishCommit {
+                        hash,
+                        message: msg,
+                        specs: vec![s.id.clone()],
+                    });
+                }
+            }
+            _ => {
+                // Single commit strategy
+                git.stage_all().map_err(|e| WritError::new_err(e.to_string()))?;
+
+                if !git.has_staged_changes().map_err(|e| WritError::new_err(e.to_string()))? {
+                    let result = FinishResult {
+                        commits: Vec::new(),
+                        strategy: strategy.to_string(),
+                        dry_run: false,
+                        specs_finished: 0,
+                    };
+                    return to_pydict(py, &result);
+                }
+
+                let spec_ids: Vec<String> = committable.iter().map(|s| s.id.clone()).collect();
+                let msg = message.unwrap_or_else(|| {
+                    let summary = self.inner.summary().ok();
+                    summary
+                        .map(|s| s.headline)
+                        .unwrap_or_else(|| "writ: commit completed specs".to_string())
+                });
+
+                let hash = git.commit(&msg).map_err(|e| WritError::new_err(e.to_string()))?;
+                for s in &committable {
+                    let _ = self.inner.mark_spec_committed(&s.id, &hash);
+                }
+                commits.push(FinishCommit {
+                    hash,
+                    message: msg,
+                    specs: spec_ids,
+                });
+            }
+        }
+
+        let specs_finished = commits.iter().map(|c| c.specs.len()).sum();
+        let result = FinishResult {
+            commits,
+            strategy: strategy.to_string(),
+            dry_run: false,
+            specs_finished,
+        };
+        to_pydict(py, &result)
+    }
+
+    /// Mark a spec as done: sets status to Complete, stores the optional
+    /// completion summary, and records the completion timestamp.
+    ///
+    /// This is the Python binding for `writ spec done <id>`.
+    /// Returns the updated spec as a dict.
+    #[pyo3(signature = (spec_id, summary=None))]
+    fn spec_done(
+        &self,
+        py: Python,
+        spec_id: &str,
+        summary: Option<String>,
+    ) -> PyResult<PyObject> {
+        let spec = self.inner.mark_spec_done(spec_id, summary).map_err(writ_err)?;
+        to_pydict(py, &spec)
+    }
+
+    /// Reopen a completed spec, returning it to active/in-progress state.
+    ///
+    /// Only uncommitted completed specs can be reopened. The seal chain is
+    /// preserved — a new or existing agent can pick up the spec and continue.
+    fn reopen_spec(&self, spec_id: &str) -> PyResult<()> {
+        self.inner.reopen_spec(spec_id).map_err(writ_err)?;
+        Ok(())
+    }
+
+    // -- Propose mode (W.31) --
+
+    /// Create a commit proposal for review (propose mode).
+    ///
+    /// Parameters:
+    /// - `spec_ids`: List of spec IDs to include in the proposal.
+    /// - `message`: Proposed commit message.
+    /// - `proposed_by`: Who created this proposal (agent ID or orchestrator name).
+    /// - `strategy`: Commit strategy ("single" or "per-spec").
+    ///
+    /// Any pending proposals with overlapping specs are automatically superseded.
+    /// Returns the proposal as a dict.
+    #[pyo3(signature = (spec_ids, message, proposed_by="cli", strategy="single"))]
+    fn propose(
+        &self,
+        py: Python,
+        spec_ids: Vec<String>,
+        message: String,
+        proposed_by: &str,
+        strategy: &str,
+    ) -> PyResult<PyObject> {
+        let proposal = self
+            .inner
+            .create_proposal(spec_ids, message, proposed_by.to_string(), strategy.to_string())
+            .map_err(writ_err)?;
+        to_pydict(py, &proposal)
+    }
+
+    /// List all proposals, sorted by creation time (newest first).
+    /// Returns a list of proposal dicts.
+    fn list_proposals(&self, py: Python) -> PyResult<PyObject> {
+        let proposals = self.inner.list_proposals().map_err(writ_err)?;
+        to_pydict(py, &proposals)
+    }
+
+    /// Accept a pending proposal: marks it accepted.
+    /// The actual git commit should be done via `finish()` or externally.
+    /// Returns the updated proposal as a dict.
+    fn accept_proposal(&self, py: Python, proposal_id: &str) -> PyResult<PyObject> {
+        let proposal = self.inner.accept_proposal(proposal_id).map_err(writ_err)?;
+        to_pydict(py, &proposal)
+    }
+
+    /// Reject a pending proposal. Specs remain completed for future proposals.
+    /// Returns the updated proposal as a dict.
+    fn reject_proposal(&self, py: Python, proposal_id: &str) -> PyResult<PyObject> {
+        let proposal = self.inner.reject_proposal(proposal_id).map_err(writ_err)?;
+        to_pydict(py, &proposal)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers for PyRepository
+// ---------------------------------------------------------------------------
+
+impl PyRepository {
+    /// Collect file paths matching filter criteria (mirrors CLI's collect_filtered_paths).
+    fn collect_filtered_paths(
+        &self,
+        spec: Option<&str>,
+        agent: Option<&str>,
+        completed: bool,
+        include_all: bool,
+        file: Option<&str>,
+    ) -> PyResult<std::collections::HashSet<String>> {
+        use std::collections::HashSet;
+
+        // Single file filter — just that path.
+        if let Some(path) = file {
+            let mut set = HashSet::new();
+            set.insert(path.to_string());
+            return Ok(set);
+        }
+
+        let mut paths = HashSet::new();
+
+        if let Some(spec_id) = spec {
+            if let Ok(seals) = self.inner.spec_log(spec_id) {
+                for seal in &seals {
+                    for change in &seal.changes {
+                        paths.insert(change.path.clone());
+                    }
+                }
+            }
+            return Ok(paths);
+        }
+
+        if agent.is_some() || completed {
+            let seals = self.inner.log_all().map_err(writ_err)?;
+
+            let completed_specs: HashSet<String> = if completed && !include_all {
+                self.inner
+                    .list_specs()
+                    .map_err(writ_err)?
+                    .iter()
+                    .filter(|s| s.status == writ_core::spec::SpecStatus::Complete)
+                    .map(|s| s.id.clone())
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+
+            for seal in &seals {
+                if let Some(agent_name) = agent {
+                    if seal.agent.id != agent_name {
+                        continue;
+                    }
+                }
+                if completed && !include_all {
+                    match &seal.spec_id {
+                        Some(sid) if completed_specs.contains(sid) => {}
+                        _ => continue,
+                    }
+                }
+                for change in &seal.changes {
+                    paths.insert(change.path.clone());
+                }
+            }
+        }
+
+        Ok(paths)
     }
 }
 

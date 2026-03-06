@@ -579,86 +579,37 @@ fn writ_claude_md_section() -> String {
     r#"## Writ Version Control
 
 This project uses writ for version control alongside git.
-All agents must use writ commands for checkpointing and context retrieval.
 
-### Required Workflow
-1. At session start, run `writ context` to get structured project state
-2. Before starting work, create or claim a spec: `writ spec add --id <spec-id> --title "<task description>"`
-3. Checkpoint work regularly: `writ seal -s "<summary>" --spec <spec-id>`
-4. When task is complete: `writ finish --spec <spec-id>`
+### Recommended Workflow
+1. Run `writ context` to get structured project state
+2. Create or claim a spec: `writ spec add --id <id> --title "<description>"`
+3. Work on your task, checkpointing regularly: `writ seal -s "<summary>"`
+4. When your task is complete: `writ spec done <id>`
 
 ### Context Retrieval
 - `writ context` returns project state in token-optimized TOON format by default
-- TOON uses ~40% fewer tokens than JSON with identical information
-- For standard JSON output: `writ context --format json`
+- For standard JSON: `writ context --format json`
 
 ### Available Commands
-- `writ context` — structured project state (files, specs, recent activity)
-- `writ context --spec <id>` — context scoped to a specific task
-- `writ seal -s "<summary>"` — create a checkpoint of current work
-- `writ spec add --id <spec-id> --title "<description>"` — create a new task spec
-- `writ spec list` — view active specs
-- `writ finish --spec <id>` — mark task complete, finalize seal chain
-- `writ status` — current writ state overview
+- `writ context` — structured project state (files, specs, activity)
+- `writ seal -s "<summary>"` — checkpoint your work
+- `writ spec add --id <id> --title "<description>"` — create a task spec
+- `writ spec status` — view active specs
+- `writ spec done <id>` — mark your task complete
+- `writ status` — project overview (agents, specs, progress)
+- `writ diff` — preview file changes
 - `writ log` — recent seal history
 
 ### Slash Commands
 - `/writ-seal` — interactive seal creation
 - `/writ-context` — get project context
 
-### Rules
-- Do NOT use `git add` / `git commit` directly for checkpointing
-- Writ manages the seal chain; git is used only for final push to remote
-- Always include meaningful summaries in seals for other agents' context
-- Use --status in-progress for intermediate work (this is the default)
-- Use --status complete only when the spec is fully done — this automatically marks the spec as complete
-- Include test results when available (--tests-passed N --tests-failed M)
-- Use `writ log --all` to see seals from all branches (including diverged ones)
-- Seal results include `hints` array and `file_scope_warning` — check these after each seal
-
-### Rollback and recovery
-
-If something goes wrong — tests fail, work goes sideways, convergence produces bad output:
-
-```bash
-writ log --all                        # find the last known-good seal
-writ show SEAL_ID --diff              # inspect it to confirm
-writ restore SEAL_ID                  # rewind working directory to that seal's state
-writ seal -s "rolled back to SEAL_ID" --agent your-id  # seal the rollback
-```
-
-Every seal is an immutable snapshot. Restoring doesn't delete history — all previous seals
-remain in the log. Use restore as a safety net when your changes cause regressions.
-
-### Convergence (multi-agent)
-
-When multiple agents work in parallel, their seals may diverge. Check for this:
-- `writ context` shows `convergence_recommended: true` and `integration_risk` level
-- `writ converge-all --dry-run` previews what will be merged
-- `writ converge-all --apply` merges all diverged branches
-- After convergence, seal the result: `writ seal -s "converged N branches" --agent convergence-bot`
-
-Fallback strategies: `escalate` (default), `manual`, `orchestrator`.
-
-For two-branch convergence: `writ converge <left-spec> <right-spec> --apply`
-
-### Integration risk
-
-Context includes an `integration_risk` field with level (low/medium/high), score (0-100), and factors.
-Check this before starting work on shared files. High risk means multiple diverged branches
-and files touched by many agents — converge before further work.
-
-### Human round-trip (git integration)
-
-When you're done, the human developer commits your work to git:
-
-```bash
-writ finish                                               # one-command: summary + git add + git commit
-writ finish --full                                        # same, with PR-style commit body
-writ finish --dry-run                                     # preview without committing
-git commit -m "$(writ summary --format commit)"           # manual: one-line commit message
-gh pr create --body "$(writ summary --format pr)"         # manual: full PR description
-```
+### Guidelines
+- Checkpoint with `writ seal` after each meaningful unit of work
+- Always run `writ spec done` when your task is complete
+- Include meaningful summaries in seals so other agents understand your work
+- Do NOT run `git add`, `git commit`, or `git push` — the user manages the git round-trip via `writ finish`
+- Do NOT run `writ finish` — this is the git integration command managed by the user or orchestrator
 "#.to_string()
 }
 
@@ -669,54 +620,24 @@ This project uses writ (AI-native version control) for checkpointing and coordin
 
 ### Workflow
 1. Run `writ context` at the start of every task to understand project state
-2. Checkpoint with `writ seal -s "<summary>"` after meaningful progress
-3. Create specs for tasks: `writ spec add --id <spec-id> --title "<description>"`
-4. Complete tasks with `writ finish --spec <spec-id>`
+2. Create specs for tasks: `writ spec add --id <id> --title "<description>"`
+3. Checkpoint with `writ seal -s "<summary>"` after meaningful progress
+4. Complete tasks with `writ spec done <id>`
 
 ### Context Retrieval
 - `writ context` returns project state in token-optimized TOON format (~40% fewer tokens)
 - For standard JSON: `writ context --format json`
 
 ### Key Commands
-- `writ context` — get structured project state
+- `writ context` — structured project state
 - `writ seal -s "<summary>"` — checkpoint work
-- `writ spec add / list / finish` — task management
-- `writ status` — overview
-- `writ log` — recent history
+- `writ spec add / status / done` — task management
+- `writ status` — project overview
+- `writ log` — seal history
 
-### Guidelines
-- Do not use git commit directly for work-in-progress. Use writ seal.
-- Use `--status complete` only on your final seal for a spec — this automatically marks the spec as complete
-- Include verification data (--tests-passed, --tests-failed)
-- Use `writ log --all` to see unified history across all branches
-
-### Rollback and recovery
-
-If tests fail or work goes wrong, restore to a previous seal:
-
-```bash
-writ log --all                        # find the last known-good seal
-writ restore SEAL_ID                  # rewind working directory to that state
-writ seal -s "rolled back" --agent your-id  # seal the rollback
-```
-
-Every seal is immutable — restoring doesn't delete history.
-
-### Convergence (multi-agent)
-
-- Check `integration_risk` field in context for divergence risk assessment
-- `writ converge-all --dry-run` to preview, `--apply` to execute
-- Fallback strategies: `escalate` (default), `manual`, `orchestrator`
-- After convergence, seal: `writ seal -s "converged" --agent convergence-bot`
-
-### Human round-trip
-
-```bash
-writ finish                                               # one-command: summary + git add + git commit
-git commit -m "$(writ summary --format commit)"           # manual: one-line commit message
-gh pr create --body "$(writ summary --format pr)"         # manual: full PR description
-```
-"#.to_string()
+Do not run `git commit` or `writ finish` — the user manages the git round-trip.
+"#
+    .to_string()
 }
 
 const CLAUDE_SEAL_COMMAND: &str = r#"Seal the current work as a writ checkpoint.
@@ -724,12 +645,11 @@ const CLAUDE_SEAL_COMMAND: &str = r#"Seal the current work as a writ checkpoint.
 Run this command to create a structured checkpoint:
 
 ```bash
-writ seal -s "$ARGUMENTS" --agent claude-code --status in-progress
+writ seal -s "$ARGUMENTS" --agent claude-code --spec your-spec-id
 ```
 
-To link to a spec, add `--spec your-spec-id`.
 To include test results, add `--tests-passed N --tests-failed M`.
-To mark a spec complete, use `--status complete` instead.
+When your task is fully complete, run `writ spec done <spec-id>` instead.
 "#;
 
 const CLAUDE_CONTEXT_COMMAND: &str = r#"Show the current writ context for this project.
@@ -768,11 +688,24 @@ This project uses writ for version control. The `writ` CLI is available in PATH.
 ## Workflow
 
 1. Run `writ context` at the start of every task to understand project state
-2. Create or claim a spec: `writ spec add --id <spec-id> --title "<task description>"`
+2. Create or claim a spec: `writ spec add --id <id> --title "<description>"`
 3. Do your work in small increments
 4. Run `writ seal -s "<summary>" --agent <your-id> --spec <spec-id>` after each meaningful chunk
 5. Check `writ context` periodically to see what other agents have done
-6. When task is complete: `writ finish --spec <spec-id>`
+6. When task is complete: `writ spec done <id>`
+
+## Spec Lifecycle
+
+Specs move through a defined lifecycle:
+
+    active → completed → committed
+
+- **active**: Work in progress. Seals are being created.
+- **completed**: `writ spec done` was run. Work is done but not in git yet.
+- **committed**: The user ran `writ finish` to promote the work to a git commit.
+
+The user controls when completed work becomes a git commit via `writ finish`.
+Agents should never run `writ finish` or `git commit`.
 
 ## Token-Efficient Context
 
@@ -793,27 +726,30 @@ Available formats:
 - `writ context` — structured project state
 - `writ context --spec <id>` — context scoped to a specific task
 - `writ seal -s "<summary>" --agent <id>` — checkpoint work
-- `writ spec add --id <spec-id> --title "<description>"` — create a new task spec
-- `writ spec list` — view active specs
-- `writ finish --spec <id>` — mark task complete, finalize seal chain
-- `writ status` — current writ state overview
+- `writ spec add --id <id> --title "<description>"` — create a task spec
+- `writ spec status` — view active specs
+- `writ spec done <id>` — mark your task complete (creates final seal)
+- `writ status` — project overview (agents, specs, progress)
+- `writ diff` — preview file changes
 - `writ log` — recent seal history
 - `writ restore <seal-id>` — roll back to a previous seal
 
 ## Rules
 
-- Do not use `git add` / `git commit` directly for checkpointing. Use `writ seal`.
-- Use `--status complete` only when the spec is fully done.
-- Always include meaningful summaries in seals for other agents' context.
+- Checkpoint with `writ seal` after each meaningful unit of work
+- Always run `writ spec done` when your task is complete
+- Include meaningful summaries in seals for other agents' context
 - Include test results when available: `--tests-passed N --tests-failed M`
+- Do NOT run `git add`, `git commit`, or `git push` — the user manages git via `writ finish`
+- Do NOT run `writ finish` — this is the git integration command managed by the user or orchestrator
 
 ## Integration Examples
 
 ### System Prompt Snippet
 Add to your agent's system prompt:
 "This project uses writ for version control. Run `writ context` at the start
-of each task. Checkpoint work with `writ seal -s '<summary>'`. Do not use
-git commit directly."
+of each task. Checkpoint work with `writ seal -s '<summary>'`. Mark tasks
+complete with `writ spec done <id>`. Do not run git commit or writ finish."
 
 ### Tool Definition (for function-calling agents)
 ```json
@@ -823,6 +759,17 @@ git commit directly."
   "parameters": {
     "summary": { "type": "string", "description": "What was accomplished" },
     "spec_id": { "type": "string", "description": "Spec to link this seal to" }
+  }
+}
+```
+
+```json
+{
+  "name": "writ_spec_done",
+  "description": "Mark a task spec as complete (creates final seal)",
+  "parameters": {
+    "spec_id": { "type": "string", "description": "ID of the spec to complete" },
+    "summary": { "type": "string", "description": "Optional completion summary" }
   }
 }
 ```
@@ -1059,60 +1006,69 @@ mod tests {
     // --- Template content tests ---
 
     #[test]
-    fn test_claude_md_section_has_restore_guidance() {
+    fn test_claude_md_section_has_spec_done_workflow() {
         let section = writ_claude_md_section();
-        assert!(section.contains("writ restore"), "missing restore command");
         assert!(
-            section.contains("Rollback and recovery"),
-            "missing rollback section"
+            section.contains("writ spec done"),
+            "missing writ spec done in workflow"
         );
-        assert!(section.contains("immutable"), "missing immutability note");
+        assert!(
+            section.contains("Recommended Workflow"),
+            "missing recommended workflow heading"
+        );
     }
 
     #[test]
     fn test_claude_md_section_has_round_trip_commands() {
         let section = writ_claude_md_section();
         assert!(
-            section.contains("git commit -m \"$(writ summary --format commit)\""),
-            "missing correct git commit command"
+            section.contains("writ status"),
+            "missing writ status command"
         );
-        assert!(section.contains("gh pr create"), "missing gh pr command");
-    }
-
-    #[test]
-    fn test_claude_md_section_has_convergence_strategies() {
-        let section = writ_claude_md_section();
-        assert!(section.contains("manual"), "missing manual strategy");
-        assert!(section.contains("escalate"), "missing escalate strategy");
+        assert!(section.contains("writ diff"), "missing writ diff command");
         assert!(
-            section.contains("orchestrator"),
-            "missing orchestrator strategy"
+            section.contains("writ spec done <id>"),
+            "missing writ spec done command"
         );
     }
 
     #[test]
-    fn test_claude_md_section_has_writ_finish() {
+    fn test_claude_md_section_prohibits_git_and_finish() {
+        let section = writ_claude_md_section();
+        assert!(
+            section.contains("Do NOT run `git add`, `git commit`, or `git push`"),
+            "missing git prohibition"
+        );
+        assert!(
+            section.contains("Do NOT run `writ finish`"),
+            "missing writ finish prohibition"
+        );
+    }
+
+    #[test]
+    fn test_claude_md_section_has_writ_finish_prohibition() {
         let section = writ_claude_md_section();
         assert!(
             section.contains("writ finish"),
-            "missing writ finish command"
+            "missing writ finish reference"
         );
+        // The template should tell agents NOT to run writ finish
         assert!(
-            section.contains("writ finish --full"),
-            "missing writ finish --full"
-        );
-        assert!(
-            section.contains("writ finish --dry-run"),
-            "missing writ finish --dry-run"
+            section.contains("Do NOT run `writ finish`"),
+            "agents should be told not to run writ finish"
         );
     }
 
     #[test]
-    fn test_claude_md_section_documents_auto_promotion() {
+    fn test_claude_md_section_has_guidelines_section() {
         let section = writ_claude_md_section();
         assert!(
-            section.contains("automatically marks the spec as complete"),
-            "missing auto-promotion note"
+            section.contains("### Guidelines"),
+            "missing guidelines heading"
+        );
+        assert!(
+            section.contains("writ seal"),
+            "missing seal checkpoint guideline"
         );
     }
 
@@ -1140,36 +1096,47 @@ mod tests {
     }
 
     #[test]
-    fn test_agents_md_section_has_restore_guidance() {
+    fn test_agents_md_section_has_spec_done_workflow() {
         let section = writ_agents_md_section();
-        assert!(section.contains("writ restore"), "missing restore command");
-        assert!(section.contains("immutable"), "missing immutability note");
+        assert!(
+            section.contains("writ spec done"),
+            "missing writ spec done in workflow"
+        );
     }
 
     #[test]
     fn test_agents_md_section_has_round_trip_commands() {
         let section = writ_agents_md_section();
         assert!(
-            section.contains("git commit -m \"$(writ summary --format commit)\""),
-            "missing correct git commit command"
+            section.contains("writ status"),
+            "missing writ status command"
+        );
+        assert!(
+            section.contains("spec add / status / done"),
+            "missing spec task management shorthand"
         );
     }
 
     #[test]
-    fn test_agents_md_section_has_writ_finish() {
+    fn test_agents_md_section_prohibits_git_and_finish() {
         let section = writ_agents_md_section();
         assert!(
-            section.contains("writ finish"),
-            "missing writ finish command"
+            section.contains("Do not run `git commit` or `writ finish`"),
+            "missing git/finish prohibition"
         );
     }
 
     #[test]
-    fn test_agents_md_section_documents_auto_promotion() {
+    fn test_agents_md_section_is_focused() {
         let section = writ_agents_md_section();
+        // Round-trip templates are streamlined — no convergence/rollback/human round-trip
         assert!(
-            section.contains("automatically marks the spec as complete"),
-            "missing auto-promotion note"
+            !section.contains("Convergence"),
+            "agents template should not include convergence details"
+        );
+        assert!(
+            !section.contains("Rollback"),
+            "agents template should not include rollback details"
         );
     }
 
@@ -1472,14 +1439,14 @@ mod tests {
     // --- Slash command content tests ---
 
     #[test]
-    fn test_seal_command_has_spec_and_status_docs() {
+    fn test_seal_command_has_spec_and_done_docs() {
         assert!(
             CLAUDE_SEAL_COMMAND.contains("--spec"),
             "missing spec flag doc"
         );
         assert!(
-            CLAUDE_SEAL_COMMAND.contains("--status complete"),
-            "missing status complete doc"
+            CLAUDE_SEAL_COMMAND.contains("writ spec done"),
+            "missing spec done reference"
         );
     }
 

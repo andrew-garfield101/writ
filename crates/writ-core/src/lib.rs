@@ -16,6 +16,8 @@ pub mod env_scan;
 pub mod error;
 pub mod format;
 pub mod fsutil;
+#[cfg(feature = "bridge")]
+pub mod git_ops;
 pub mod gc;
 pub mod hash;
 pub mod hooks;
@@ -24,6 +26,7 @@ pub mod index;
 pub mod keystore;
 pub mod lock;
 pub mod object;
+pub mod proposal;
 pub mod remote;
 pub mod repo;
 pub mod seal;
@@ -31,6 +34,7 @@ pub mod security;
 pub mod settings;
 pub mod spec;
 pub mod state;
+pub mod status;
 
 pub use error::{WritError, WritResult};
 pub use repo::Repository;

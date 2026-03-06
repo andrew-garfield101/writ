@@ -11,7 +11,7 @@ use dialoguer::{Confirm, Input, Select};
 
 use writ_core::config::{
     FrameworksConfig, GitConfig, GlobalConfig, InitDefaultValues, InitDefaults, OutputConfig,
-    ProjectConfig, ProjectMeta, SecurityConfig, UserConfig,
+    ProjectConfig, ProjectMeta, SecurityConfig, UserConfig, WorkflowConfig,
 };
 use writ_core::env_scan::{detect_user_name, EnvironmentScan};
 
@@ -95,6 +95,11 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
             output: Some(OutputConfig {
                 format: Some("toon".into()),
             }),
+            workflow: Some(WorkflowConfig {
+                commit_mode: Some("user".into()),
+                commit_strategy: None,
+                stale_timeout: None,
+            }),
         };
         if let Err(e) = config.save() {
             eprintln!("warning: could not save global config: {}", e);
@@ -148,6 +153,29 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
         chosen_format
     );
 
+    // W.23: Workflow mode selection
+    println!();
+    let mode_options = &["user", "propose", "auto"];
+    let mode_descriptions = &[
+        "You run `writ finish` manually (recommended)",
+        "Orchestrator proposes, you approve",
+        "Fully autonomous (CI/pipelines)",
+    ];
+    println!("Default workflow mode (how completed work becomes git commits):");
+    for (i, (opt, desc)) in mode_options.iter().zip(mode_descriptions).enumerate() {
+        println!("  ({}) {:<10} {}", i + 1, opt, desc);
+    }
+
+    let mode_idx = Select::new()
+        .with_prompt("Choose")
+        .items(mode_options)
+        .default(0)
+        .interact()
+        .unwrap_or(0);
+    let chosen_mode = mode_options[mode_idx].to_string();
+
+    println!("  {} Workflow: {} mode", "→".green(), chosen_mode);
+
     let config = GlobalConfig {
         user: Some(UserConfig { name: Some(name) }),
         init: Some(InitDefaults {
@@ -157,6 +185,11 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
         }),
         output: Some(OutputConfig {
             format: Some(chosen_format),
+        }),
+        workflow: Some(WorkflowConfig {
+            commit_mode: Some(chosen_mode),
+            commit_strategy: None,
+            stale_timeout: None,
         }),
     };
 
@@ -235,6 +268,9 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
     // Output format (I.9)
     let output_format = resolve_output_format(&global_config, opts);
 
+    // W.24: Workflow mode (per-project override)
+    let workflow_mode = resolve_workflow_mode(&global_config, opts);
+
     // Project name
     let project_name = opts
         .name
@@ -267,6 +303,12 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
         security: Some(SecurityConfig {
             scope_enforcement: true,
         }),
+        workflow: Some(WorkflowConfig {
+            commit_mode: Some(workflow_mode),
+            commit_strategy: None,
+            stale_timeout: None,
+        }),
+        auto: None,
     };
 
     // Summary and confirmation (I.10)
@@ -642,6 +684,77 @@ fn resolve_output_format(global: &GlobalConfig, opts: &InitOptions) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// W.24: Workflow mode prompt (per-project override)
+// ---------------------------------------------------------------------------
+
+fn resolve_workflow_mode(global: &GlobalConfig, opts: &InitOptions) -> String {
+    if opts.yes {
+        // Use global config or default to "user".
+        return global.commit_mode().unwrap_or("user").to_string();
+    }
+
+    let global_mode = global.commit_mode();
+
+    if let Some(mode) = global_mode {
+        // Global mode exists — offer to override.
+        println!();
+        println!(
+            "{}",
+            "── Workflow Mode ───────────────────────────────────".dimmed()
+        );
+        println!(
+            "How should completed work become git commits? {} (from global config)",
+            mode.bold()
+        );
+
+        let input: String = Input::new()
+            .with_prompt("Override for this project? [enter to keep / type mode name]")
+            .default(String::new())
+            .allow_empty(true)
+            .interact_text()
+            .unwrap_or_default();
+
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            mode.to_string()
+        } else if writ_core::config::is_valid_commit_mode(trimmed) {
+            trimmed.to_string()
+        } else {
+            eprintln!("Unknown mode '{}', keeping '{}'", trimmed, mode);
+            mode.to_string()
+        }
+    } else {
+        // No global mode — show full selection.
+        println!();
+        println!(
+            "{}",
+            "── Workflow Mode ───────────────────────────────────".dimmed()
+        );
+        println!("How should completed work become git commits?");
+
+        let options = &[
+            "user      You run `writ finish` manually (recommended)",
+            "propose   Orchestrator proposes, you approve",
+            "auto      Fully autonomous (CI/pipelines)",
+        ];
+
+        let choice = Select::new()
+            .with_prompt("Choose")
+            .items(options)
+            .default(0)
+            .interact()
+            .unwrap_or(0);
+
+        match choice {
+            0 => "user".into(),
+            1 => "propose".into(),
+            2 => "auto".into(),
+            _ => "user".into(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // I.10: Summary display and confirmation
 // ---------------------------------------------------------------------------
 
@@ -700,5 +813,15 @@ fn display_summary(
     let format = config.output_format().unwrap_or("json");
     println!();
     println!("Output format: {} (token-optimized)", format.bold());
+
+    // W.25: Show workflow mode in summary.
+    let mode = config.commit_mode().unwrap_or("user");
+    let mode_desc = match mode {
+        "user" => "run `writ finish` to promote completed work to git",
+        "propose" => "orchestrator proposes, you approve",
+        "auto" => "fully autonomous commits",
+        _ => "",
+    };
+    println!("Workflow: {} mode ({})", mode.bold(), mode_desc);
     println!();
 }

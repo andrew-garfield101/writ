@@ -228,6 +228,38 @@ enum Commands {
         /// Output format: "human" (default), "json", "json-compact", or "brief".
         #[arg(long)]
         format: Option<String>,
+
+        /// Filter diff to files changed by a specific spec.
+        #[arg(long)]
+        spec: Option<String>,
+
+        /// Filter diff to files changed by a specific agent.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Only show changes from completed specs.
+        #[arg(long)]
+        completed: bool,
+
+        /// Include in-progress specs (used with --completed to show all).
+        #[arg(long)]
+        all: bool,
+
+        /// Show diff for a single file only.
+        #[arg(long)]
+        file: Option<String>,
+
+        /// Summary only: file names and line counts, no diff content.
+        #[arg(long)]
+        stat: bool,
+
+        /// Show only file names that changed (no line counts, no diff content).
+        #[arg(long)]
+        name_only: bool,
+
+        /// Show changes from completed specs not yet committed to git.
+        #[arg(long)]
+        cached: bool,
     },
 
     /// Dump structured context for LLM consumption.
@@ -269,8 +301,40 @@ enum Commands {
         format: Option<String>,
     },
 
-    /// One-command round-trip: generate summary, git add, git commit.
-    /// Equivalent to: git add . && git commit -m "$(writ summary --format commit)"
+    /// Fleet-aware project status: agent activity, spec progress, commit readiness.
+    /// High-level porcelain view — complements `writ state` (low-level plumbing).
+    Status {
+        /// Show all completed specs in detail.
+        #[arg(long)]
+        completed: bool,
+
+        /// Show all in-progress specs in detail.
+        #[arg(long)]
+        active: bool,
+
+        /// Filter by agent name.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Detail view of one spec.
+        #[arg(long)]
+        spec: Option<String>,
+
+        /// Live-updating view (refresh every 5 seconds by default).
+        #[arg(long)]
+        watch: bool,
+
+        /// Refresh interval in seconds for --watch mode.
+        #[arg(long, default_value = "5")]
+        interval: u64,
+
+        /// Output format: "human" (default), "json", "json-compact", "toon".
+        #[arg(long)]
+        format: Option<String>,
+    },
+
+    /// Commit completed spec work to git.
+    /// Shows completed specs, generates commit message(s), and creates git commit(s).
     Finish {
         /// Use the full PR-style description as the commit body instead of a one-liner.
         #[arg(long)]
@@ -279,6 +343,34 @@ enum Commands {
         /// Dry run: show what would be committed without actually committing.
         #[arg(long)]
         dry_run: bool,
+
+        /// Skip confirmation prompts (for scripts and auto mode).
+        #[arg(long, short)]
+        yes: bool,
+
+        /// Commit strategy: single (default), per-spec, grouped.
+        #[arg(long, default_value = "single")]
+        strategy: String,
+
+        /// Create a proposal instead of committing directly (propose mode).
+        #[arg(long)]
+        propose: bool,
+
+        /// List pending proposals.
+        #[arg(long)]
+        proposals: bool,
+
+        /// Accept a pending proposal by ID (e.g. prop-20260306-143000).
+        #[arg(long)]
+        accept: Option<String>,
+
+        /// Reject a pending proposal by ID.
+        #[arg(long)]
+        reject: Option<String>,
+
+        /// Auto mode: commit immediately without prompts, using project auto config.
+        #[arg(long)]
+        auto: bool,
     },
 
     /// Restore working directory to a specific seal's state.
@@ -584,6 +676,22 @@ enum SpecCommands {
         id: String,
     },
 
+    /// Mark a spec as done — all work is complete.
+    /// Creates a final seal and transitions the spec to complete status.
+    /// If only one active spec exists, the ID is auto-detected.
+    Done {
+        /// Spec ID to complete (auto-detected if only one active spec).
+        id: Option<String>,
+
+        /// Completion summary describing what was accomplished.
+        #[arg(short, long)]
+        summary: Option<String>,
+
+        /// Agent ID for the final seal.
+        #[arg(long)]
+        agent: Option<String>,
+    },
+
     /// Complete a spec's lifecycle (transitions to Completed).
     /// Requires the spec's user-facing status to already be 'complete'.
     Complete {
@@ -629,6 +737,13 @@ enum SpecCommands {
         /// Output format: "human" (default) or "json".
         #[arg(long, default_value = "human")]
         format: String,
+    },
+
+    /// Reopen a completed spec, returning it to active state.
+    /// Seal history is preserved. Any agent can claim the spec.
+    Reopen {
+        /// Spec ID to reopen.
+        id: String,
     },
 }
 
@@ -934,9 +1049,21 @@ fn main() {
             let format = resolve_format(format.as_deref(), &cwd, "human");
             cmd_log(&cwd, &format, limit, spec, all)
         }
-        Commands::Diff { from, to, format } => {
+        Commands::Diff {
+            from,
+            to,
+            format,
+            spec,
+            agent,
+            completed,
+            all,
+            file,
+            stat,
+            name_only,
+            cached,
+        } => {
             let format = resolve_format(format.as_deref(), &cwd, "human");
-            cmd_diff(&cwd, from, to, &format)
+            cmd_diff(&cwd, from, to, &format, spec, agent, completed, all, file, stat, name_only, cached)
         }
         Commands::Context {
             spec,
@@ -953,7 +1080,45 @@ fn main() {
             let format = resolve_format(format.as_deref(), &cwd, "human");
             cmd_summary(&cwd, &format)
         }
-        Commands::Finish { full, dry_run } => cmd_finish(&cwd, full, dry_run),
+        Commands::Status {
+            completed,
+            active,
+            agent,
+            spec,
+            watch,
+            interval,
+            format,
+        } => {
+            let format = resolve_format(format.as_deref(), &cwd, "human");
+            cmd_status(
+                &cwd, completed, active, agent, spec, watch, interval, &format,
+            )
+        }
+        Commands::Finish {
+            full,
+            dry_run,
+            yes,
+            strategy,
+            propose,
+            proposals,
+            accept,
+            reject,
+            auto,
+        } => {
+            if proposals {
+                cmd_finish_proposals(&cwd)
+            } else if let Some(id) = accept {
+                cmd_finish_accept(&cwd, &id, &strategy)
+            } else if let Some(id) = reject {
+                cmd_finish_reject(&cwd, &id)
+            } else if propose {
+                cmd_finish_propose(&cwd, full, &strategy)
+            } else if auto {
+                cmd_finish_auto(&cwd, &strategy)
+            } else {
+                cmd_finish(&cwd, full, dry_run, yes, &strategy)
+            }
+        }
         Commands::Restore {
             seal_id,
             force,
@@ -1003,6 +1168,11 @@ fn main() {
                 cmd_spec_status(&cwd, state.as_deref(), &format)
             }
             SpecCommands::Cancel { id } => cmd_spec_cancel(&cwd, &id),
+            SpecCommands::Done {
+                id,
+                summary,
+                agent,
+            } => cmd_spec_done(&cwd, id.as_deref(), summary, agent.as_deref()),
             SpecCommands::Complete { id } => cmd_spec_complete(&cwd, &id),
             SpecCommands::Show { id } => cmd_spec_show(&cwd, &id),
             SpecCommands::Update {
@@ -1025,6 +1195,7 @@ fn main() {
                 tech_stack,
                 &format,
             ),
+            SpecCommands::Reopen { id } => cmd_spec_reopen(&cwd, &id),
         },
         Commands::Bridge { action } => match action {
             BridgeCommands::Import {
@@ -1412,6 +1583,21 @@ fn cmd_init(
 
             let output_fmt = plan.project_config.output_format().unwrap_or("json");
             println!("{} Output format: {}", "✓".green(), output_fmt);
+
+            // W.25: Show workflow mode in init output.
+            let commit_mode = plan.project_config.commit_mode().unwrap_or("user");
+            let mode_desc = match commit_mode {
+                "user" => "run `writ finish` to promote completed work to git",
+                "propose" => "orchestrator proposes, you approve",
+                "auto" => "fully autonomous commits",
+                _ => "",
+            };
+            println!(
+                "{} Workflow: {} mode ({})",
+                "✓".green(),
+                commit_mode,
+                mode_desc
+            );
 
             if let Some(ref err) = result.import_error {
                 eprintln!("{} Import error: {}", "✗".red(), err);
@@ -1869,34 +2055,89 @@ fn cmd_diff(
     from: Option<String>,
     to: Option<String>,
     format: &str,
+    spec_filter: Option<String>,
+    agent_filter: Option<String>,
+    completed: bool,
+    all: bool,
+    file_filter: Option<String>,
+    stat: bool,
+    name_only: bool,
+    cached: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
 
-    let diff_output = match (from, to) {
-        (Some(f), Some(t)) => repo.diff_seals(&f, &t)?,
+    let mut diff_output = match (&from, &to) {
+        (Some(f), Some(t)) => repo.diff_seals(f, t)?,
         (None, None) => repo.diff()?,
         _ => {
             return Err("must provide both --from and --to, or neither".into());
         }
     };
 
-    match format {
+    // --cached: filter to files from completed-but-uncommitted specs.
+    // This shows what `writ finish` would commit.
+    let effective_completed = completed || cached;
+
+    // Build a set of allowed file paths based on filtering flags.
+    let has_filter = spec_filter.is_some()
+        || agent_filter.is_some()
+        || effective_completed
+        || file_filter.is_some();
+
+    if has_filter {
+        let allowed_paths: std::collections::HashSet<String> = if let Some(ref path) = file_filter {
+            // Single file filter — just that path.
+            std::iter::once(path.clone()).collect()
+        } else {
+            // Collect file paths from seals matching the filter criteria.
+            collect_filtered_paths(&repo, spec_filter.as_deref(), agent_filter.as_deref(), effective_completed, all)?
+        };
+
+        diff_output.files.retain(|f| allowed_paths.contains(&f.path));
+
+        // Recompute totals after filtering.
+        diff_output.files_changed = diff_output.files.len();
+        diff_output.total_additions = diff_output.files.iter().map(|f| f.additions).sum();
+        diff_output.total_deletions = diff_output.files.iter().map(|f| f.deletions).sum();
+
+        // Update description with filter info.
+        if let Some(ref id) = spec_filter {
+            diff_output.description = format!("{} (spec: {})", diff_output.description, id);
+        }
+        if let Some(ref name) = agent_filter {
+            diff_output.description = format!("{} (agent: {})", diff_output.description, name);
+        }
+    }
+
+    // Use name-only or stat mode if requested.
+    let effective_format = if name_only {
+        "name-only"
+    } else if stat {
+        "stat"
+    } else {
+        format
+    };
+
+    match effective_format {
         "json" => {
             println!("{}", serde_json::to_string_pretty(&diff_output)?);
         }
         "json-compact" => {
             println!("{}", serde_json::to_string(&diff_output)?);
         }
-        "brief" => {
+        "name-only" => {
             if diff_output.files.is_empty() {
                 println!("no changes");
             } else {
-                println!(
-                    "{} file(s) changed, {} addition(s), {} deletion(s)",
-                    diff_output.files_changed,
-                    diff_output.total_additions,
-                    diff_output.total_deletions,
-                );
+                for f in &diff_output.files {
+                    println!("{}", f.path);
+                }
+            }
+        }
+        "stat" | "brief" => {
+            if diff_output.files.is_empty() {
+                println!("no changes");
+            } else {
                 for f in &diff_output.files {
                     let marker = match f.change_type {
                         ChangeType::Added => "+",
@@ -1905,6 +2146,12 @@ fn cmd_diff(
                     };
                     println!("  {marker} {} (+{}, -{})", f.path, f.additions, f.deletions);
                 }
+                println!(
+                    "\n{} file(s) changed, {} addition(s), {} deletion(s)",
+                    diff_output.files_changed,
+                    diff_output.total_additions,
+                    diff_output.total_deletions,
+                );
             }
         }
         _ => {
@@ -1953,6 +2200,71 @@ fn cmd_diff(
     }
 
     Ok(())
+}
+
+/// Collect file paths from seals matching the given filter criteria.
+/// Used by cmd_diff to filter diff output by spec, agent, or completion status.
+fn collect_filtered_paths(
+    repo: &Repository,
+    spec_filter: Option<&str>,
+    agent_filter: Option<&str>,
+    completed_only: bool,
+    include_all: bool,
+) -> Result<std::collections::HashSet<String>, Box<dyn std::error::Error>> {
+    use writ_core::spec::SpecStatus;
+
+    let mut paths = std::collections::HashSet::new();
+
+    if let Some(spec_id) = spec_filter {
+        // Get all seals for this specific spec.
+        if let Ok(seals) = repo.spec_log(spec_id) {
+            for seal in &seals {
+                for change in &seal.changes {
+                    paths.insert(change.path.clone());
+                }
+            }
+        }
+        return Ok(paths);
+    }
+
+    if agent_filter.is_some() || completed_only {
+        // Get all seals across all branches.
+        let seals = repo.log_all()?;
+
+        // Build set of completed spec IDs for filtering.
+        let completed_specs: std::collections::HashSet<String> = if completed_only && !include_all {
+            repo.list_specs()?
+                .iter()
+                .filter(|s| s.status == SpecStatus::Complete)
+                .map(|s| s.id.clone())
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        for seal in &seals {
+            // Agent filter: skip seals from other agents.
+            if let Some(agent_name) = agent_filter {
+                if seal.agent.id != agent_name {
+                    continue;
+                }
+            }
+
+            // Completed filter: skip seals not linked to completed specs.
+            if completed_only && !include_all {
+                match &seal.spec_id {
+                    Some(sid) if completed_specs.contains(sid) => {}
+                    _ => continue,
+                }
+            }
+
+            for change in &seal.changes {
+                paths.insert(change.path.clone());
+            }
+        }
+    }
+
+    Ok(paths)
 }
 
 fn cmd_context(
@@ -2313,23 +2625,868 @@ fn cmd_summary(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-fn cmd_finish(cwd: &PathBuf, full: bool, dry_run: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
-    let summary = repo.summary()?;
+fn cmd_status(
+    cwd: &PathBuf,
+    show_completed: bool,
+    show_active: bool,
+    filter_agent: Option<String>,
+    filter_spec: Option<String>,
+    watch: bool,
+    interval: u64,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // W.2: Watch mode — live-updating terminal view.
+    if watch && format == "human" {
+        return cmd_status_watch(
+            cwd,
+            show_completed,
+            show_active,
+            filter_agent,
+            filter_spec,
+            interval,
+        );
+    }
 
+    let repo = Repository::open(cwd)?;
+    let status = repo.status()?;
+
+    // Machine-readable output (W.3).
+    match format {
+        "json" | "json-compact" | "toon" => {
+            if let Some(formatter) = make_formatter(format, cwd) {
+                println!("{}", formatter.format_status(&status)?);
+            } else {
+                // Fallback to pretty JSON if unknown format somehow.
+                println!("{}", serde_json::to_string_pretty(&status)?);
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    // Human-readable display with adaptive scaling.
+    use writ_core::status::SpecBrief;
+
+    // Apply filters.
+    let filter_briefs = |briefs: &[SpecBrief]| -> Vec<SpecBrief> {
+        briefs
+            .iter()
+            .filter(|b| {
+                if let Some(ref agent) = filter_agent {
+                    if b.agent != *agent {
+                        return false;
+                    }
+                }
+                if let Some(ref spec) = filter_spec {
+                    if b.id != *spec {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect()
+    };
+
+    let completed = filter_briefs(&status.specs_completed);
+    let in_progress = filter_briefs(&status.specs_in_progress);
+    let stale = filter_briefs(&status.stale_specs);
+
+    let total_specs = completed.len() + in_progress.len();
+
+    // Header.
+    let now = chrono::Local::now();
+    println!();
+    println!(
+        "{}",
+        format!(
+            "── writ status ── {} ── {} ────────────",
+            status.project_name,
+            now.format("%-I:%M %p")
+        )
+        .dimmed()
+    );
+    println!();
+
+    // Agent summary.
+    if status.agents.total > 0 {
+        if status.agents.active > 0 {
+            println!(
+                "  {}  {:>3} agent{}   {} spec{} in progress",
+                "Active".green().bold(),
+                status.agents.active,
+                if status.agents.active == 1 { "" } else { "s" },
+                in_progress.len(),
+                if in_progress.len() == 1 { "" } else { "s" }
+            );
+        }
+        if status.agents.done > 0 {
+            println!(
+                "  {}    {:>3} agent{}   {} spec{} completed (not committed)",
+                "Done".cyan().bold(),
+                status.agents.done,
+                if status.agents.done == 1 { "" } else { "s" },
+                completed.len(),
+                if completed.len() == 1 { "" } else { "s" }
+            );
+        }
+        if status.agents.idle > 0 {
+            println!(
+                "  {}    {:>3} agent{}",
+                "Idle".dimmed().bold(),
+                status.agents.idle,
+                if status.agents.idle == 1 { "" } else { "s" }
+            );
+        }
+    } else {
+        println!("  No agent activity yet.");
+    }
+
+    // Adaptive scaling for spec display.
+    let show_all_completed = show_completed || total_specs <= 15;
+    let show_all_active = show_active || total_specs <= 5;
+    let max_completed = if show_all_completed {
+        completed.len()
+    } else if total_specs <= 50 {
+        5
+    } else {
+        0
+    };
+    let max_active = if show_all_active {
+        in_progress.len()
+    } else {
+        0
+    };
+
+    // Completed specs.
+    if !completed.is_empty() {
+        println!();
+        println!(
+            "{}",
+            "── Completed (ready to finish) ─────────────────────".dimmed()
+        );
+        for brief in completed.iter().take(max_completed) {
+            print_spec_brief(brief);
+        }
+        if max_completed < completed.len() {
+            println!(
+                "  {} more completed spec{} (use --completed to see all)",
+                completed.len() - max_completed,
+                if completed.len() - max_completed == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        }
+
+        println!();
+        println!(
+            "  {} spec{} complete · {} file{} changed · run {} when ready",
+            completed.len(),
+            if completed.len() == 1 { "" } else { "s" },
+            status.total_files_changed,
+            if status.total_files_changed == 1 {
+                ""
+            } else {
+                "s"
+            },
+            "`writ finish`".bold()
+        );
+    }
+
+    // In-progress specs.
+    if !in_progress.is_empty() {
+        println!();
+        println!(
+            "{}",
+            "── In Progress ─────────────────────────────────────".dimmed()
+        );
+        if max_active > 0 {
+            for brief in in_progress.iter().take(max_active) {
+                print_spec_brief(brief);
+            }
+            if max_active < in_progress.len() {
+                println!(
+                    "  ... {} more (use --active to see all)",
+                    in_progress.len() - max_active
+                );
+            }
+        }
+        println!(
+            "  {} spec{} across {} agent{}",
+            in_progress.len(),
+            if in_progress.len() == 1 { "" } else { "s" },
+            status.agents.active,
+            if status.agents.active == 1 { "" } else { "s" }
+        );
+    }
+
+    // Stale specs.
+    if !stale.is_empty() {
+        println!();
+        println!(
+            "{}",
+            "── Stale ───────────────────────────────────────────".dimmed()
+        );
+        for brief in &stale {
+            let age = chrono::Utc::now()
+                .signed_duration_since(brief.last_activity)
+                .num_minutes();
+            let age_str = if age >= 60 {
+                format!("last seal {}h ago", age / 60)
+            } else {
+                format!("last seal {}m ago", age)
+            };
+            println!(
+                "  {} {}  {:<30} {:<8} {}",
+                "⚠".yellow(),
+                brief.id,
+                brief.title,
+                brief.agent,
+                age_str.dimmed()
+            );
+        }
+    }
+
+    // Empty state.
+    if completed.is_empty() && in_progress.is_empty() {
+        println!();
+        println!(
+            "  No specs yet. Create one with {}.",
+            "`writ spec add`".bold()
+        );
+    }
+
+    println!();
+
+    Ok(())
+}
+
+/// W.2: Watch mode — live-updating terminal view with keyboard shortcuts.
+fn cmd_status_watch(
+    cwd: &PathBuf,
+    show_completed: bool,
+    show_active: bool,
+    filter_agent: Option<String>,
+    filter_spec: Option<String>,
+    interval: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crossterm::{
+        event::{self, Event, KeyCode, KeyEvent},
+        terminal::{self, ClearType},
+    };
+    use std::io::Write;
+    use std::time::Duration;
+
+    terminal::enable_raw_mode()?;
+
+    let result = (|| -> Result<Option<&str>, Box<dyn std::error::Error>> {
+        loop {
+            // Clear screen and move cursor to top.
+            let mut stdout = std::io::stdout();
+            crossterm::execute!(
+                stdout,
+                terminal::Clear(ClearType::All),
+                crossterm::cursor::MoveTo(0, 0)
+            )?;
+
+            // Render status.
+            let repo = Repository::open(cwd)?;
+            let status = repo.status()?;
+
+            let now = chrono::Local::now();
+            println!(
+                "{}",
+                format!(
+                    "── writ status ── {} ── LIVE ({}s) ── {} ────────────",
+                    status.project_name,
+                    interval,
+                    now.format("%-I:%M:%S %p")
+                )
+                .dimmed()
+            );
+            println!();
+
+            // Agent summary.
+            if status.agents.total > 0 {
+                if status.agents.active > 0 {
+                    println!(
+                        "  {}  {:>3} agent{}   {} spec{} in progress",
+                        "Active".green().bold(),
+                        status.agents.active,
+                        if status.agents.active == 1 { "" } else { "s" },
+                        status.specs_in_progress.len(),
+                        if status.specs_in_progress.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    );
+                }
+                if status.agents.done > 0 {
+                    println!(
+                        "  {}    {:>3} agent{}   {} spec{} completed",
+                        "Done".cyan().bold(),
+                        status.agents.done,
+                        if status.agents.done == 1 { "" } else { "s" },
+                        status.specs_completed.len(),
+                        if status.specs_completed.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    );
+                }
+            } else {
+                println!("  No agent activity yet.");
+            }
+
+            // Completed specs.
+            let completed: Vec<_> = status
+                .specs_completed
+                .iter()
+                .filter(|b| {
+                    filter_agent.as_ref().map_or(true, |a| b.agent == *a)
+                        && filter_spec.as_ref().map_or(true, |s| b.id == *s)
+                })
+                .collect();
+
+            if !completed.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    "── Completed ───────────────────────────────────────".dimmed()
+                );
+                let max = if show_completed {
+                    completed.len()
+                } else {
+                    5.min(completed.len())
+                };
+                for brief in completed.iter().take(max) {
+                    print_spec_brief(brief);
+                }
+                if max < completed.len() {
+                    println!("  ... {} more", completed.len() - max);
+                }
+            }
+
+            // In-progress specs.
+            let active: Vec<_> = status
+                .specs_in_progress
+                .iter()
+                .filter(|b| {
+                    filter_agent.as_ref().map_or(true, |a| b.agent == *a)
+                        && filter_spec.as_ref().map_or(true, |s| b.id == *s)
+                })
+                .collect();
+
+            if !active.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    "── In Progress ─────────────────────────────────────".dimmed()
+                );
+                let max = if show_active {
+                    active.len()
+                } else {
+                    5.min(active.len())
+                };
+                for brief in active.iter().take(max) {
+                    print_spec_brief(brief);
+                }
+                if max < active.len() {
+                    println!("  ... {} more", active.len() - max);
+                }
+            }
+
+            // Stale.
+            if !status.stale_specs.is_empty() {
+                println!();
+                println!(
+                    "{}",
+                    "── Stale ───────────────────────────────────────────".dimmed()
+                );
+                for brief in &status.stale_specs {
+                    println!(
+                        "  {} {}  {}  (possibly stale)",
+                        "⚠".yellow(),
+                        brief.id,
+                        brief.title
+                    );
+                }
+            }
+
+            println!();
+            println!("  {}", "Press q to quit · f to finish · d to diff".dimmed());
+            stdout.flush()?;
+
+            // Poll for keyboard input until interval expires.
+            let poll_timeout = Duration::from_secs(interval);
+            if event::poll(poll_timeout)? {
+                if let Event::Key(KeyEvent { code, .. }) = event::read()? {
+                    match code {
+                        KeyCode::Char('q') | KeyCode::Esc => return Ok(None),
+                        KeyCode::Char('f') => return Ok(Some("finish")),
+                        KeyCode::Char('d') => return Ok(Some("diff")),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    })();
+
+    terminal::disable_raw_mode()?;
+
+    // Handle post-watch command dispatch.
+    match result {
+        Ok(Some("finish")) => {
+            println!();
+            cmd_finish(cwd, false, false, false, "single")?;
+        }
+        Ok(Some("diff")) => {
+            println!();
+            let format = resolve_format(None, cwd, "human");
+            cmd_diff(cwd, None, None, &format, None, None, false, false, None, false, false, false)?;
+        }
+        Ok(_) => {} // quit
+        Err(e) => return Err(e),
+    }
+
+    Ok(())
+}
+
+/// Print a single SpecBrief line for status display.
+fn print_spec_brief(brief: &writ_core::status::SpecBrief) {
+    let age = chrono::Utc::now()
+        .signed_duration_since(brief.last_activity)
+        .num_minutes();
+    let age_str = if age < 1 {
+        "just now".to_string()
+    } else if age < 60 {
+        format!("{}m ago", age)
+    } else {
+        format!("{}h ago", age / 60)
+    };
+
+    println!(
+        "  {}  {:<30} {:<8} {} seal{}   {}",
+        brief.id,
+        brief.title,
+        brief.agent,
+        brief.seal_count,
+        if brief.seal_count == 1 { " " } else { "s" },
+        age_str.dimmed()
+    );
+}
+
+fn cmd_finish(
+    cwd: &PathBuf,
+    full: bool,
+    dry_run: bool,
+    yes: bool,
+    strategy: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+    use writ_core::git_ops::{Git2Ops, GitOps};
+
+    let repo = Repository::open(cwd)?;
+
+    // Gather completed specs for display
+    let specs = repo.list_specs()?;
+    let committable: Vec<_> = specs.iter().filter(|s| s.is_committable()).collect();
+    let in_progress: Vec<_> = specs
+        .iter()
+        .filter(|s| {
+            matches!(
+                s.status,
+                writ_core::spec::SpecStatus::InProgress | writ_core::spec::SpecStatus::Pending
+            )
+        })
+        .collect();
+
+    if committable.is_empty() {
+        // Fall back to legacy behavior: commit whatever is in the working tree
+        let summary = repo.summary()?;
+        if summary.files_to_stage.is_empty() {
+            println!("Nothing to commit — no completed specs and no changes.");
+            println!();
+            println!(
+                "  {} Use `writ spec done <id>` to mark a spec as complete.",
+                "→".dimmed()
+            );
+            println!(
+                "  {} Use `writ status` to see current progress.",
+                "→".dimmed()
+            );
+            return Ok(());
+        }
+
+        // Legacy path: commit all changes with summary message
+        let commit_message = if full {
+            summary.commit_message.clone()
+        } else {
+            let files = summary.files_changed.len();
+            format!("{} ({} files)", summary.headline, files)
+        };
+
+        return finish_legacy(cwd, &commit_message, &summary.files_to_stage, dry_run, full);
+    }
+
+    // Show what we're about to commit
+    println!();
+    println!("{}", "Completed specs ready to commit:".bold());
+    for s in &committable {
+        let summary_hint = s
+            .completion_summary
+            .as_deref()
+            .unwrap_or("(no summary)");
+        println!(
+            "  {} {} — {}",
+            "✓".green(),
+            s.id.cyan(),
+            summary_hint
+        );
+    }
+
+    if !in_progress.is_empty() {
+        println!();
+        println!("{}", "In-progress specs (not included):".dimmed());
+        for s in &in_progress {
+            println!("  {} {}", "·".dimmed(), s.id.dimmed());
+        }
+    }
+
+    // Generate commit message
+    let summary = repo.summary()?;
     let commit_message = if full {
         summary.commit_message.clone()
     } else {
-        let files = summary.files_changed.len();
-        if summary.convergence_recommended {
-            format!(
-                "{} ({} files, {} diverged)",
-                summary.headline, files, summary.diverged_branch_count
-            )
-        } else {
-            format!("{} ({} files)", summary.headline, files)
+        // Build a message from completed spec summaries
+        let mut msg = summary.headline.clone();
+        if committable.len() > 1 {
+            msg = format!("{} ({} specs)", msg, committable.len());
         }
+        msg
     };
+
+    println!();
+    println!("{}:", "Commit message".bold());
+    println!("  {}", commit_message.lines().next().unwrap_or(""));
+    if full {
+        for line in commit_message.lines().skip(1) {
+            println!("  {}", line);
+        }
+    }
+    println!("Strategy: {}", strategy);
+
+    if dry_run {
+        println!();
+        println!("{}", "DRY RUN — no changes made.".yellow().bold());
+        println!();
+        println!(
+            "Files that would be staged ({}):",
+            summary.files_to_stage.len()
+        );
+        for f in &summary.files_to_stage {
+            println!("  {f}");
+        }
+        return Ok(());
+    }
+
+    // Confirm unless --yes
+    if !yes {
+        print!("\nProceed? [Y/n] ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        let input = input.trim().to_lowercase();
+        if input == "n" || input == "no" {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    // Open git repo via GitOps
+    let git = Git2Ops::open(cwd)?;
+
+    match strategy {
+        "single" => {
+            // Single commit: stage all, commit once, mark all specs
+            git.stage_all()?;
+
+            if !git.has_staged_changes()? {
+                println!("Nothing to commit — working tree clean.");
+                return Ok(());
+            }
+
+            let hash = git.commit(&commit_message)?;
+            let short_hash = &hash[..std::cmp::min(8, hash.len())];
+
+            // Mark all committable specs
+            for s in &committable {
+                let _ = repo.mark_spec_committed(&s.id, &hash);
+            }
+
+            println!();
+            println!(
+                "  {} Committed {} — {}",
+                "✓".green().bold(),
+                short_hash.cyan(),
+                commit_message.lines().next().unwrap_or("")
+            );
+            println!(
+                "  {} {} spec(s) marked as committed.",
+                "✓".green().bold(),
+                committable.len()
+            );
+        }
+        "per-spec" => {
+            // Per-spec commits: sort by completed_at, one commit per spec.
+            // Uses file_scope for isolation when available; falls back to
+            // stage_all for the first spec if no file_scope is set.
+            let mut sorted: Vec<_> = committable.clone();
+            sorted.sort_by_key(|s| s.completed_at);
+
+            let mut staged_all = false;
+            for s in &sorted {
+                if !s.file_scope.is_empty() {
+                    // Stage only this spec's files
+                    let paths: Vec<&str> =
+                        s.file_scope.iter().map(|p| p.as_str()).collect();
+                    git.stage_files(&paths)?;
+                } else if !staged_all {
+                    // No file_scope — stage everything on the first pass
+                    git.stage_all()?;
+                    staged_all = true;
+                }
+
+                if !git.has_staged_changes()? {
+                    continue;
+                }
+
+                let msg = s
+                    .completion_summary
+                    .as_deref()
+                    .unwrap_or(&s.title);
+                let spec_msg = format!("{}: {}", s.id, msg);
+
+                let hash = git.commit(&spec_msg)?;
+                let short = &hash[..std::cmp::min(8, hash.len())];
+                let _ = repo.mark_spec_committed(&s.id, &hash);
+
+                println!(
+                    "  {} {} — {} ({})",
+                    "✓".green(),
+                    short.cyan(),
+                    s.id,
+                    msg
+                );
+            }
+        }
+        "grouped" => {
+            // Grouped commits: auto-detect logical groupings by directory prefix.
+            // Specs sharing a common directory prefix are committed together.
+            let groups = compute_spec_groups(&committable);
+
+            if groups.len() == 1 {
+                println!(
+                    "  {} All specs share the same area — committing as single group.",
+                    "→".dimmed()
+                );
+            } else {
+                println!(
+                    "  {} {} groups detected by directory prefix:",
+                    "→".dimmed(),
+                    groups.len()
+                );
+                for (i, group) in groups.iter().enumerate() {
+                    let spec_ids: Vec<&str> =
+                        group.specs.iter().map(|s| s.id.as_str()).collect();
+                    println!(
+                        "    Group {}: \"{}\" ({})",
+                        i + 1,
+                        group.label,
+                        spec_ids.join(", ")
+                    );
+                }
+                println!();
+            }
+
+            for group in &groups {
+                // Collect all files from specs in this group
+                let files: Vec<&str> = group
+                    .specs
+                    .iter()
+                    .flat_map(|s| s.file_scope.iter().map(|f| f.as_str()))
+                    .collect();
+
+                if !files.is_empty() {
+                    git.stage_files(&files)?;
+                } else {
+                    // No file_scope on any spec in the group — stage all
+                    git.stage_all()?;
+                }
+
+                if !git.has_staged_changes()? {
+                    continue;
+                }
+
+                // Build commit message from group specs
+                let summaries: Vec<String> = group
+                    .specs
+                    .iter()
+                    .map(|s| {
+                        let msg = s
+                            .completion_summary
+                            .as_deref()
+                            .unwrap_or(&s.title);
+                        format!("{}: {}", s.id, msg)
+                    })
+                    .collect();
+                let group_msg = if summaries.len() == 1 {
+                    summaries[0].clone()
+                } else {
+                    format!("{}\n\n{}", group.label, summaries.join("\n"))
+                };
+
+                let hash = git.commit(&group_msg)?;
+                let short = &hash[..std::cmp::min(8, hash.len())];
+
+                for s in &group.specs {
+                    let _ = repo.mark_spec_committed(&s.id, &hash);
+                }
+
+                let spec_ids: Vec<&str> =
+                    group.specs.iter().map(|s| s.id.as_str()).collect();
+                println!(
+                    "  {} {} — {} ({})",
+                    "✓".green(),
+                    short.cyan(),
+                    group.label,
+                    spec_ids.join(", ")
+                );
+            }
+        }
+        other => {
+            eprintln!(
+                "error: unknown strategy '{}'. Use: single, per-spec, grouped",
+                other
+            );
+            std::process::exit(1);
+        }
+    }
+
+    println!();
+    println!(
+        "  {} Run `git push` when ready.",
+        "→".dimmed()
+    );
+
+    Ok(())
+}
+
+/// A group of specs sharing a common directory prefix for grouped commit strategy.
+struct SpecGroup<'a> {
+    /// Human-readable label for this group (the common directory prefix or fallback).
+    label: String,
+    /// Specs in this group.
+    specs: Vec<&'a writ_core::spec::Spec>,
+}
+
+/// Compute logical groupings of specs by common directory prefix of their file_scope.
+///
+/// Algorithm:
+/// 1. For each spec, compute the common directory prefix of its changed files.
+/// 2. Group specs sharing the same prefix.
+/// 3. Specs with empty file_scope go into a "misc" catch-all group.
+fn compute_spec_groups<'a>(specs: &[&'a writ_core::spec::Spec]) -> Vec<SpecGroup<'a>> {
+    use std::collections::BTreeMap;
+
+    let mut prefix_groups: BTreeMap<String, Vec<&'a writ_core::spec::Spec>> = BTreeMap::new();
+
+    for spec in specs {
+        let prefix = common_directory_prefix(&spec.file_scope);
+        prefix_groups.entry(prefix).or_default().push(spec);
+    }
+
+    prefix_groups
+        .into_iter()
+        .map(|(prefix, group_specs)| {
+            let label = if prefix.is_empty() {
+                "misc".to_string()
+            } else {
+                prefix
+            };
+            SpecGroup {
+                label,
+                specs: group_specs,
+            }
+        })
+        .collect()
+}
+
+/// Compute the common directory prefix for a list of file paths.
+///
+/// Examples:
+/// - `["src/storage/zstd.rs", "src/storage/compress.rs"]` → `"src/storage/"`
+/// - `["src/a.rs", "tests/b.rs"]` → `""` (no common prefix beyond root)
+/// - `["crates/writ-py/src/lib.rs"]` → `"crates/writ-py/src/"`
+/// - `[]` → `""`
+fn common_directory_prefix(paths: &[String]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+
+    // Extract directory portions of each path
+    let dirs: Vec<&str> = paths
+        .iter()
+        .map(|p| {
+            match p.rfind('/') {
+                Some(i) => &p[..=i], // include trailing slash
+                None => "",           // file in root
+            }
+        })
+        .collect();
+
+    if dirs.is_empty() {
+        return String::new();
+    }
+
+    // Find common prefix across all directory strings
+    let first = dirs[0];
+    let mut common_len = first.len();
+
+    for dir in &dirs[1..] {
+        common_len = first
+            .chars()
+            .zip(dir.chars())
+            .take(common_len)
+            .take_while(|(a, b)| a == b)
+            .count();
+        if common_len == 0 {
+            return String::new();
+        }
+    }
+
+    let prefix = &first[..common_len];
+
+    // Trim to last '/' boundary so we don't split mid-directory
+    match prefix.rfind('/') {
+        Some(i) => prefix[..=i].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Legacy finish path: no spec awareness, just stage and commit.
+fn finish_legacy(
+    cwd: &PathBuf,
+    commit_message: &str,
+    files_to_stage: &[String],
+    dry_run: bool,
+    full: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
 
     if dry_run {
         println!("DRY RUN — would execute:");
@@ -2347,65 +3504,370 @@ fn cmd_finish(cwd: &PathBuf, full: bool, dry_run: bool) -> Result<(), Box<dyn st
             println!("──────────────────────────────────────────────────────────────");
         }
         println!();
-        println!(
-            "Files that would be staged ({}):",
-            summary.files_to_stage.len()
-        );
-        for f in &summary.files_to_stage {
+        println!("Files that would be staged ({}):", files_to_stage.len());
+        for f in files_to_stage {
             println!("  {f}");
         }
         return Ok(());
     }
 
-    // Verify git is available.
-    let git_check = std::process::Command::new("git")
-        .arg("rev-parse")
-        .arg("--is-inside-work-tree")
-        .current_dir(cwd)
-        .output();
+    // Use GitOps for the actual commit
+    use writ_core::git_ops::{Git2Ops, GitOps};
+    let git = Git2Ops::open(cwd)?;
+    git.stage_all()?;
 
-    match git_check {
-        Ok(output) if output.status.success() => {}
-        _ => {
-            eprintln!("error: not inside a git repository. `writ finish` requires git.");
-            eprintln!("hint: use `writ summary --format commit` to get the message manually.");
+    if !git.has_staged_changes()? {
+        println!("Nothing to commit — working tree clean.");
+        return Ok(());
+    }
+
+    let hash = git.commit(commit_message)?;
+    let short = &hash[..std::cmp::min(8, hash.len())];
+
+    println!(
+        "  {} Committed {} — {}",
+        "✓".green().bold(),
+        short.cyan(),
+        commit_message.lines().next().unwrap_or("")
+    );
+
+    Ok(())
+}
+
+/// Create a proposal instead of committing directly.
+fn cmd_finish_propose(
+    cwd: &PathBuf,
+    full: bool,
+    strategy: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let repo = Repository::open(cwd)?;
+    let specs = repo.list_specs()?;
+    let committable: Vec<_> = specs.iter().filter(|s| s.is_committable()).collect();
+
+    if committable.is_empty() {
+        eprintln!("No completed specs to propose.");
+        eprintln!("  {} Use `writ spec done <id>` first.", "→".dimmed());
+        std::process::exit(1);
+    }
+
+    // Generate commit message
+    let summary = repo.summary()?;
+    let message = if full {
+        summary.commit_message.clone()
+    } else {
+        let mut msg = summary.headline.clone();
+        if committable.len() > 1 {
+            msg = format!("{} ({} specs)", msg, committable.len());
+        }
+        msg
+    };
+
+    let spec_ids: Vec<String> = committable.iter().map(|s| s.id.clone()).collect();
+    let proposal = repo.create_proposal(
+        spec_ids,
+        message,
+        "cli".into(),
+        strategy.into(),
+    )?;
+
+    println!();
+    println!(
+        "  {} Proposal {} created.",
+        "✓".green().bold(),
+        proposal.id.cyan()
+    );
+    println!("  Specs: {}", proposal.spec_ids.join(", "));
+    println!("  Message: {}", proposal.message.lines().next().unwrap_or(""));
+    println!();
+    println!(
+        "  {} Review: `writ finish --proposals`",
+        "→".dimmed()
+    );
+    println!(
+        "  {} Accept: `writ finish --accept {}`",
+        "→".dimmed(),
+        proposal.id
+    );
+
+    Ok(())
+}
+
+/// List pending proposals.
+fn cmd_finish_proposals(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let repo = Repository::open(cwd)?;
+    let proposals = repo.list_proposals()?;
+    let pending: Vec<_> = proposals.iter().filter(|p| p.is_pending()).collect();
+
+    if pending.is_empty() {
+        println!("No pending proposals.");
+        println!(
+            "  {} Use `writ finish --propose` to create one.",
+            "→".dimmed()
+        );
+        return Ok(());
+    }
+
+    println!();
+    println!("{}", "Pending proposals:".bold());
+    for p in &pending {
+        println!();
+        println!("  {} {}", "ID:".dimmed(), p.id.cyan());
+        println!("  {} {}", "Specs:".dimmed(), p.spec_ids.join(", "));
+        println!(
+            "  {} {}",
+            "Message:".dimmed(),
+            p.message.lines().next().unwrap_or("")
+        );
+        println!(
+            "  {} {} ({})",
+            "By:".dimmed(),
+            p.proposed_by,
+            p.created_at.format("%Y-%m-%d %H:%M")
+        );
+    }
+    println!();
+    println!(
+        "  {} Accept: `writ finish --accept <id>`",
+        "→".dimmed()
+    );
+    println!(
+        "  {} Reject: `writ finish --reject <id>`",
+        "→".dimmed()
+    );
+
+    Ok(())
+}
+
+/// Accept a proposal: commit and mark accepted.
+fn cmd_finish_accept(
+    cwd: &PathBuf,
+    proposal_id: &str,
+    strategy: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+    use writ_core::git_ops::{Git2Ops, GitOps};
+
+    let repo = Repository::open(cwd)?;
+    let proposal = repo.accept_proposal(proposal_id)?;
+
+    // Execute the commit
+    let git = Git2Ops::open(cwd)?;
+    git.stage_all()?;
+
+    if !git.has_staged_changes()? {
+        println!("Nothing to commit — working tree clean.");
+        return Ok(());
+    }
+
+    let hash = git.commit(&proposal.message)?;
+    let short = &hash[..std::cmp::min(8, hash.len())];
+
+    // Update proposal with actual hash
+    let _ = repo.update_proposal_hash(proposal_id, &hash);
+
+    // Mark specs as committed
+    for spec_id in &proposal.spec_ids {
+        let _ = repo.mark_spec_committed(spec_id, &hash);
+    }
+
+    println!();
+    println!(
+        "  {} Proposal {} accepted.",
+        "✓".green().bold(),
+        proposal_id.cyan()
+    );
+    println!(
+        "  {} Committed {} — {}",
+        "✓".green().bold(),
+        short.cyan(),
+        proposal.message.lines().next().unwrap_or("")
+    );
+    println!(
+        "  {} {} spec(s) marked as committed.",
+        "✓".green().bold(),
+        proposal.spec_ids.len()
+    );
+    println!();
+    println!(
+        "  {} Run `git push` when ready.",
+        "→".dimmed()
+    );
+
+    Ok(())
+}
+
+/// Reject a proposal.
+fn cmd_finish_reject(
+    cwd: &PathBuf,
+    proposal_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let repo = Repository::open(cwd)?;
+    let proposal = repo.reject_proposal(proposal_id)?;
+
+    println!();
+    println!(
+        "  {} Proposal {} rejected.",
+        "✗".red().bold(),
+        proposal_id.cyan()
+    );
+    println!("  Specs remain completed — create a new proposal when ready.");
+
+    Ok(())
+}
+
+/// Auto mode: commit without prompts, with safety rails from project config.
+fn cmd_finish_auto(
+    cwd: &PathBuf,
+    strategy: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+    use writ_core::config::ProjectConfig;
+    use writ_core::git_ops::{Git2Ops, GitOps};
+
+    let repo = Repository::open(cwd)?;
+
+    // Load auto config
+    let project_config = ProjectConfig::load(repo.writ_dir()).unwrap_or_default();
+    let auto_config = project_config.auto.clone().unwrap_or_default();
+
+    // Safety: warn if targeting main/master
+    let git = Git2Ops::open(cwd)?;
+    if let Some(ref target_branch) = auto_config.branch {
+        if target_branch == "main" || target_branch == "master" {
+            eprintln!(
+                "{}",
+                "WARNING: auto mode targeting main/master branch. This is not recommended."
+                    .yellow()
+                    .bold()
+            );
+        }
+        // Checkout target branch
+        git.checkout_or_create_branch(target_branch)?;
+    } else {
+        // No branch configured — check current branch
+        if let Ok(Some(ref branch)) = git.current_branch() {
+            if branch == "main" || branch == "master" {
+                eprintln!(
+                    "{}",
+                    "WARNING: auto mode on main/master. Set [auto] branch in config.toml."
+                        .yellow()
+                        .bold()
+                );
+            }
+        }
+    }
+
+    // Safety: run verify command if configured
+    if let Some(ref cmd) = auto_config.verify_command {
+        eprintln!("Running verify command: {}", cmd);
+        let output = std::process::Command::new("sh")
+            .args(["-c", cmd])
+            .current_dir(cwd)
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "{}",
+                "Auto-commit BLOCKED: verify command failed.".red().bold()
+            );
+            eprintln!("  Command: {}", cmd);
+            eprintln!("  Exit code: {}", output.status);
+            if !stderr.is_empty() {
+                eprintln!("  stderr: {}", stderr.trim());
+            }
             std::process::exit(1);
         }
+        eprintln!("  {} Verify command passed.", "✓".green());
     }
 
-    // git add .
-    let add = std::process::Command::new("git")
-        .args(["add", "."])
-        .current_dir(cwd)
-        .output()?;
+    // Gather completed specs
+    let specs = repo.list_specs()?;
+    let committable: Vec<_> = specs.iter().filter(|s| s.is_committable()).collect();
 
-    if !add.status.success() {
-        let stderr = String::from_utf8_lossy(&add.stderr);
-        eprintln!("error: git add failed: {stderr}");
-        std::process::exit(1);
+    if committable.is_empty() {
+        eprintln!("Auto mode: no completed specs to commit.");
+        std::process::exit(0);
     }
 
-    // git commit -m "<message>"
-    let commit = std::process::Command::new("git")
-        .args(["commit", "-m", &commit_message])
-        .current_dir(cwd)
-        .output()?;
+    // Apply max_specs_per_commit batching
+    let max_per_commit = auto_config.max_specs_per_commit.unwrap_or(u32::MAX) as usize;
+    let batches: Vec<Vec<_>> = committable
+        .chunks(max_per_commit)
+        .map(|chunk| chunk.to_vec())
+        .collect();
 
-    if !commit.status.success() {
-        let stderr = String::from_utf8_lossy(&commit.stderr);
-        if stderr.contains("nothing to commit") {
-            println!("nothing to commit — working tree clean");
-            return Ok(());
+    let summary = repo.summary()?;
+    let mut total_committed = 0;
+
+    for (i, batch) in batches.iter().enumerate() {
+        git.stage_all()?;
+        if !git.has_staged_changes()? {
+            continue;
         }
-        eprintln!("error: git commit failed: {stderr}");
-        std::process::exit(1);
+
+        // Generate message for this batch
+        let message = if batches.len() == 1 {
+            summary.headline.clone()
+        } else {
+            format!(
+                "{} (batch {}/{})",
+                summary.headline,
+                i + 1,
+                batches.len()
+            )
+        };
+
+        let hash = git.commit(&message)?;
+        let short = &hash[..std::cmp::min(8, hash.len())];
+
+        // Mark specs committed
+        for s in batch {
+            let _ = repo.mark_spec_committed(&s.id, &hash);
+        }
+
+        total_committed += batch.len();
+        eprintln!(
+            "  {} {} — {} ({} specs)",
+            "✓".green(),
+            short,
+            message.lines().next().unwrap_or(""),
+            batch.len()
+        );
+
+        // Log as security event (audit trail)
+        let logger = writ_core::security::SecurityEventLogger::new(repo.writ_dir());
+        let event = writ_core::security::SecurityEvent {
+            timestamp: chrono::Utc::now(),
+            severity: writ_core::security::Severity::Info,
+            event_type: "auto_commit".to_string(),
+            agent_id: None,
+            details: format!("Auto-committed {} specs: {}", batch.len(), hash),
+        };
+        let _ = logger.emit_event(&event);
     }
 
-    let stdout = String::from_utf8_lossy(&commit.stdout);
-    println!("{}", stdout.trim());
-    println!();
-    println!("committed with message:");
-    println!("  {}", commit_message.lines().next().unwrap_or(""));
+    // Notification
+    let notify = auto_config.notify.as_deref().unwrap_or("log");
+    match notify {
+        "stdout" => {
+            println!(
+                "AUTO: committed {} spec(s) in {} batch(es).",
+                total_committed,
+                batches.len()
+            );
+        }
+        "none" => {}
+        _ => {
+            // "log" is default — already logged via security events above
+        }
+    }
 
     Ok(())
 }
@@ -2774,6 +4236,117 @@ fn cmd_spec_status(
     Ok(())
 }
 
+fn cmd_spec_done(
+    cwd: &PathBuf,
+    id: Option<&str>,
+    summary: Option<String>,
+    agent: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let repo = Repository::open(cwd)?;
+
+    // Auto-detect spec ID if not provided
+    let spec_id = match id {
+        Some(id) => id.to_string(),
+        None => {
+            let specs = repo.list_specs()?;
+            let active: Vec<_> = specs
+                .iter()
+                .filter(|s| {
+                    matches!(
+                        s.status,
+                        writ_core::spec::SpecStatus::InProgress
+                            | writ_core::spec::SpecStatus::Pending
+                    )
+                })
+                .collect();
+
+            match active.len() {
+                0 => {
+                    eprintln!("error: no active specs to complete.");
+                    eprintln!("hint: use `writ spec add` to create a spec first.");
+                    std::process::exit(1);
+                }
+                1 => {
+                    let id = active[0].id.clone();
+                    println!(
+                        "Auto-detected active spec: {} \"{}\"",
+                        id, active[0].title
+                    );
+                    id
+                }
+                n => {
+                    eprintln!(
+                        "error: {} active specs found. Please specify which one:",
+                        n
+                    );
+                    for s in &active {
+                        eprintln!("  writ spec done {} -s \"summary\"", s.id);
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
+    // Create final seal
+    let agent_id = agent.unwrap_or("human");
+    let seal_summary = summary
+        .as_deref()
+        .unwrap_or("Spec completed")
+        .to_string();
+
+    let seal_agent = AgentIdentity {
+        id: agent_id.to_string(),
+        agent_type: if agent_id == "human" {
+            AgentType::Human
+        } else {
+            AgentType::Agent
+        },
+    };
+    let verification = Verification {
+        tests_passed: None,
+        tests_failed: None,
+        linted: false,
+    };
+    let _seal = repo.seal(
+        seal_agent,
+        seal_summary,
+        Some(spec_id.clone()),
+        TaskStatus::Complete,
+        verification,
+        false,
+    )?;
+
+    // Mark spec as done
+    let spec = repo.mark_spec_done(&spec_id, summary)?;
+
+    let seal_count = repo.spec_log(&spec_id).map(|l| l.len()).unwrap_or(0);
+
+    println!();
+    println!(
+        "  {} Spec \"{}\" marked as done.",
+        "✓".green().bold(),
+        spec.title
+    );
+    if let Some(ref s) = spec.completion_summary {
+        println!("  Summary: {}", s);
+    }
+    println!("  Seals: {}", seal_count);
+    println!();
+    println!(
+        "  {} Run `writ status` to see all completed specs.",
+        "→".dimmed()
+    );
+    println!(
+        "  {} Run `writ finish` to commit completed work to git.",
+        "→".dimmed()
+    );
+
+    Ok(())
+}
+
 fn cmd_spec_cancel(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
     repo.cancel_spec(id)?;
@@ -2785,6 +4358,28 @@ fn cmd_spec_complete(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::
     let repo = Repository::open(cwd)?;
     repo.complete_spec(id)?;
     println!("spec '{}' lifecycle completed", id);
+    Ok(())
+}
+
+fn cmd_spec_reopen(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+
+    // Load spec for display info before reopening.
+    let spec = repo.load_spec(id)?;
+    let title = spec.title.clone();
+    let seal_count = repo.spec_log(id).map(|l| l.len()).unwrap_or(0);
+
+    repo.reopen_spec(id)?;
+
+    println!("Spec {} \"{}\" reopened.", id, title);
+    println!("Status: completed → active");
+    println!("Any agent can now claim and continue this spec.");
+    println!();
+    println!(
+        "Previous work preserved in seal chain ({} seals).",
+        seal_count
+    );
+
     Ok(())
 }
 
@@ -5185,4 +6780,167 @@ fn cmd_config_unset(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- common_directory_prefix tests --
+
+    #[test]
+    fn test_common_prefix_same_directory() {
+        let paths = vec![
+            "src/storage/zstd.rs".to_string(),
+            "src/storage/compress.rs".to_string(),
+            "src/storage/object_store.rs".to_string(),
+        ];
+        assert_eq!(common_directory_prefix(&paths), "src/storage/");
+    }
+
+    #[test]
+    fn test_common_prefix_no_overlap() {
+        let paths = vec!["src/a.rs".to_string(), "tests/b.rs".to_string()];
+        assert_eq!(common_directory_prefix(&paths), "");
+    }
+
+    #[test]
+    fn test_common_prefix_single_file() {
+        let paths = vec!["crates/writ-py/src/lib.rs".to_string()];
+        assert_eq!(common_directory_prefix(&paths), "crates/writ-py/src/");
+    }
+
+    #[test]
+    fn test_common_prefix_empty_list() {
+        let paths: Vec<String> = vec![];
+        assert_eq!(common_directory_prefix(&paths), "");
+    }
+
+    #[test]
+    fn test_common_prefix_root_files() {
+        let paths = vec!["Cargo.toml".to_string(), "README.md".to_string()];
+        assert_eq!(common_directory_prefix(&paths), "");
+    }
+
+    #[test]
+    fn test_common_prefix_partial_directory_match() {
+        // "src/convergence/" and "src/config/" share "src/" not "src/con"
+        let paths = vec![
+            "src/convergence/phase3.rs".to_string(),
+            "src/config/settings.rs".to_string(),
+        ];
+        assert_eq!(common_directory_prefix(&paths), "src/");
+    }
+
+    #[test]
+    fn test_common_prefix_nested_match() {
+        let paths = vec![
+            "crates/writ-core/src/repo.rs".to_string(),
+            "crates/writ-core/src/spec.rs".to_string(),
+            "crates/writ-core/src/config.rs".to_string(),
+        ];
+        assert_eq!(common_directory_prefix(&paths), "crates/writ-core/src/");
+    }
+
+    #[test]
+    fn test_common_prefix_mixed_depth() {
+        let paths = vec![
+            "crates/writ-py/src/lib.rs".to_string(),
+            "crates/writ-py/tests/test_api.py".to_string(),
+        ];
+        assert_eq!(common_directory_prefix(&paths), "crates/writ-py/");
+    }
+
+    // -- compute_spec_groups tests --
+
+    fn make_test_spec(id: &str, files: Vec<&str>) -> writ_core::spec::Spec {
+        writ_core::spec::Spec {
+            id: id.to_string(),
+            title: format!("Test spec {}", id),
+            description: String::new(),
+            status: writ_core::spec::SpecStatus::Complete,
+            depends_on: vec![],
+            file_scope: files.into_iter().map(|f| f.to_string()).collect(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            sealed_by: vec![],
+            acceptance_criteria: vec![],
+            design_notes: vec![],
+            tech_stack: vec![],
+            lifecycle_state: writ_core::spec::LifecycleState::Active,
+            last_activity: chrono::Utc::now(),
+            completion_summary: None,
+            commit_state: writ_core::spec::CommitState::Uncommitted,
+            completed_at: None,
+            commit_hash: None,
+            committed_at: None,
+        }
+    }
+
+    #[test]
+    fn test_group_specs_by_directory() {
+        let s1 = make_test_spec("S-001", vec!["src/storage/zstd.rs", "src/storage/compress.rs"]);
+        let s2 = make_test_spec("S-002", vec!["src/storage/object_store.rs"]);
+        let s3 = make_test_spec("S-003", vec!["crates/writ-py/src/lib.rs"]);
+
+        let specs: Vec<&writ_core::spec::Spec> = vec![&s1, &s2, &s3];
+        let groups = compute_spec_groups(&specs);
+
+        assert_eq!(groups.len(), 2);
+        // BTreeMap sorts by key, so "crates/writ-py/src/" comes before "src/storage/"
+        assert_eq!(groups[0].label, "crates/writ-py/src/");
+        assert_eq!(groups[0].specs.len(), 1);
+        assert_eq!(groups[1].label, "src/storage/");
+        assert_eq!(groups[1].specs.len(), 2);
+    }
+
+    #[test]
+    fn test_group_specs_all_same_area() {
+        let s1 = make_test_spec("S-001", vec!["src/repo.rs"]);
+        let s2 = make_test_spec("S-002", vec!["src/config.rs"]);
+
+        let specs: Vec<&writ_core::spec::Spec> = vec![&s1, &s2];
+        let groups = compute_spec_groups(&specs);
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "src/");
+        assert_eq!(groups[0].specs.len(), 2);
+    }
+
+    #[test]
+    fn test_group_specs_empty_file_scope_goes_to_misc() {
+        let s1 = make_test_spec("S-001", vec!["src/repo.rs"]);
+        let s2 = make_test_spec("S-002", vec![]);
+
+        let specs: Vec<&writ_core::spec::Spec> = vec![&s1, &s2];
+        let groups = compute_spec_groups(&specs);
+
+        assert_eq!(groups.len(), 2);
+        // "" sorts before "src/" in BTreeMap
+        assert_eq!(groups[0].label, "misc");
+        assert_eq!(groups[0].specs.len(), 1);
+        assert_eq!(groups[0].specs[0].id, "S-002");
+    }
+
+    #[test]
+    fn test_group_specs_cross_directory_spec_gets_own_group() {
+        // A spec touching files across directories gets grouped by the
+        // common prefix of its own files
+        let s1 = make_test_spec("S-001", vec!["src/a.rs", "tests/b.rs"]);
+        let s2 = make_test_spec("S-002", vec!["src/c.rs", "src/d.rs"]);
+
+        let specs: Vec<&writ_core::spec::Spec> = vec![&s1, &s2];
+        let groups = compute_spec_groups(&specs);
+
+        assert_eq!(groups.len(), 2);
+        // S-001 has no common prefix → "misc"
+        assert_eq!(groups[0].label, "misc");
+        assert_eq!(groups[0].specs[0].id, "S-001");
+        assert_eq!(groups[1].label, "src/");
+        assert_eq!(groups[1].specs[0].id, "S-002");
+    }
 }

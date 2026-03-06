@@ -1477,6 +1477,11 @@ mod tests {
             tech_stack: Vec::new(),
             lifecycle_state: lifecycle,
             last_activity: ts,
+            completion_summary: None,
+            commit_state: crate::spec::CommitState::Uncommitted,
+            completed_at: None,
+            commit_hash: None,
+            committed_at: None,
         }
     }
 

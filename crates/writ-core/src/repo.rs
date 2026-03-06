@@ -1042,6 +1042,152 @@ impl Repository {
         Ok(specs)
     }
 
+    /// Generate a high-level project status for the round-trip workflow.
+    ///
+    /// Returns agent activity, spec progress, commit readiness, and stale
+    /// spec warnings. Used by `writ status` (porcelain) as opposed to
+    /// `writ state` (plumbing).
+    pub fn status(&self) -> WritResult<crate::status::StatusOutput> {
+        use crate::spec::{CommitState, SpecStatus};
+        use crate::status::{AgentSummary, SpecBrief, StatusOutput};
+        use std::collections::{HashMap, HashSet};
+
+        let specs = self.list_specs()?;
+        let now = chrono::Utc::now();
+
+        // Load project config for commit_mode and project name.
+        let project_config = crate::config::ProjectConfig::load(&self.writ_dir).unwrap_or_default();
+        let global_config = crate::config::GlobalConfig::load().unwrap_or_default();
+        let project_name = project_config
+            .project_name()
+            .unwrap_or("unknown")
+            .to_string();
+        let commit_mode = crate::config::resolve_commit_mode(None, &project_config, &global_config)
+            .unwrap_or_else(|_| "user".into());
+
+        // Stale timeout from workflow config.
+        let stale_timeout = project_config
+            .stale_timeout()
+            .or_else(|| global_config.stale_timeout())
+            .unwrap_or(3600);
+
+        // Build SpecBrief for each spec, bucketed by state.
+        let mut in_progress = Vec::new();
+        let mut completed = Vec::new();
+        let mut committed = Vec::new();
+        let mut stale = Vec::new();
+
+        // Track agents by state for AgentSummary.
+        let mut agents_active: HashSet<String> = HashSet::new();
+        let mut agents_done: HashSet<String> = HashSet::new();
+        let mut all_agents: HashSet<String> = HashSet::new();
+        let mut total_files_changed: usize = 0;
+
+        // For agent detection, we need the most recent seal per spec.
+        // Build a map: spec_id -> (agent_id, seal_count, files_changed_set).
+        let mut spec_seal_info: HashMap<String, (String, usize, HashSet<String>)> = HashMap::new();
+        let all_seals = self.log()?;
+        for seal in &all_seals {
+            if let Some(ref spec_id) = seal.spec_id {
+                let entry = spec_seal_info
+                    .entry(spec_id.clone())
+                    .or_insert_with(|| (seal.agent.id.clone(), 0, HashSet::new()));
+                entry.1 += 1;
+                for change in &seal.changes {
+                    entry.2.insert(change.path.clone());
+                }
+                // Most recent seal's agent wins (seals are newest-first from log()).
+                // First entry is already the most recent, so don't overwrite.
+            }
+        }
+
+        for spec in &specs {
+            let (agent, seal_count, files) = spec_seal_info
+                .get(&spec.id)
+                .map(|(a, c, f)| (a.clone(), *c, f.len()))
+                .unwrap_or_else(|| ("unknown".into(), 0, 0));
+
+            all_agents.insert(agent.clone());
+
+            let brief = SpecBrief {
+                id: spec.id.clone(),
+                title: spec.title.clone(),
+                agent: agent.clone(),
+                seal_count,
+                files_changed: files,
+                last_activity: spec.last_activity,
+                status: format!("{:?}", spec.status)
+                    .to_lowercase()
+                    .replace("inprogress", "in-progress"),
+                completion_summary: spec.completion_summary.clone(),
+            };
+
+            match spec.status {
+                SpecStatus::Complete => match spec.commit_state {
+                    CommitState::Committed | CommitState::Pushed => {
+                        agents_done.insert(agent.clone());
+                        committed.push(brief);
+                    }
+                    CommitState::Uncommitted => {
+                        agents_done.insert(agent.clone());
+                        total_files_changed += files;
+                        completed.push(brief);
+                    }
+                },
+                SpecStatus::InProgress | SpecStatus::Pending => {
+                    // Check for staleness.
+                    if stale_timeout > 0 {
+                        let age = now
+                            .signed_duration_since(spec.last_activity)
+                            .num_seconds()
+                            .max(0) as u64;
+                        if age >= stale_timeout && seal_count > 0 {
+                            stale.push(brief.clone());
+                        }
+                    }
+                    agents_active.insert(agent.clone());
+                    in_progress.push(brief);
+                }
+                SpecStatus::Blocked => {
+                    in_progress.push(brief);
+                }
+            }
+        }
+
+        // Agents who are "done" but also have active specs are "active".
+        for agent in &agents_active {
+            agents_done.remove(agent);
+        }
+
+        // Idle = agents with no active specs AND no completed specs
+        // (they appeared in seals but all their specs are committed or cancelled).
+        let idle_count = all_agents
+            .iter()
+            .filter(|a| !agents_active.contains(*a) && !agents_done.contains(*a))
+            .count();
+
+        // Sort completed by last_activity descending (most recent first).
+        completed.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+        in_progress.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+
+        Ok(StatusOutput {
+            project_name,
+            timestamp: now,
+            agents: AgentSummary {
+                active: agents_active.len(),
+                done: agents_done.len(),
+                idle: idle_count,
+                total: all_agents.len(),
+            },
+            specs_in_progress: in_progress,
+            specs_completed: completed,
+            specs_committed: committed,
+            total_files_changed,
+            stale_specs: stale,
+            commit_mode,
+        })
+    }
+
     /// Load a spec by ID.
     pub fn load_spec(&self, id: &str) -> WritResult<Spec> {
         let path = self.writ_dir.join("specs").join(format!("{id}.json"));
@@ -1082,6 +1228,7 @@ impl Repository {
                 | (LifecycleState::Active, LifecycleState::Completed)
                 | (LifecycleState::Stale, LifecycleState::Active)
                 | (LifecycleState::Stale, LifecycleState::Cancelled)
+                | (LifecycleState::Completed, LifecycleState::Active)
                 | (LifecycleState::Completed, LifecycleState::Archived)
                 | (LifecycleState::Cancelled, LifecycleState::Archived)
         );
@@ -1143,6 +1290,48 @@ impl Repository {
         }
     }
 
+    /// Reopen a completed spec, returning it to active/in-progress state.
+    ///
+    /// Only specs with status `Complete` and commit_state `Uncommitted` can be
+    /// reopened. Committed or pushed specs cannot be reopened — the git history
+    /// is already written.
+    ///
+    /// The seal chain is preserved. A new or existing agent can pick up
+    /// the spec and continue working.
+    pub fn reopen_spec(&self, spec_id: &str) -> WritResult<()> {
+        use crate::spec::{CommitState, LifecycleState, SpecStatus};
+
+        let mut spec = self.load_spec(spec_id)?;
+
+        // Only completed specs can be reopened.
+        if spec.status != SpecStatus::Complete {
+            return Err(WritError::InvalidLifecycleTransition(format!(
+                "spec '{}': can only reopen completed specs (current status: {:?})",
+                spec_id, spec.status
+            )));
+        }
+
+        // Reject if already committed to git.
+        if matches!(
+            spec.commit_state,
+            CommitState::Committed | CommitState::Pushed
+        ) {
+            return Err(WritError::InvalidLifecycleTransition(format!(
+                "spec '{}': cannot reopen a committed spec (commit_state: {:?})",
+                spec_id, spec.commit_state
+            )));
+        }
+
+        // Reopen the spec (resets status, clears completion/commit data).
+        spec.reopen();
+
+        // Transition lifecycle back to Active.
+        spec.lifecycle_state = LifecycleState::Active;
+
+        self.save_spec(&spec)?;
+        Ok(())
+    }
+
     /// Scan for stale specs (Active specs past the stale timeout).
     ///
     /// Returns `(spec_id, seconds_since_last_activity)` for each stale
@@ -1174,6 +1363,11 @@ impl Repository {
     pub fn storage_report(&self) -> WritResult<crate::gc::StorageReport> {
         let config = crate::gc::GcConfig::load(&self.writ_dir)?;
         crate::gc::StorageReport::scan(&self.writ_dir, config.budget_bytes)
+    }
+
+    /// Get the repository root path (the directory containing `.writ/`).
+    pub fn root(&self) -> &std::path::Path {
+        &self.root
     }
 
     /// Get the path to the `.writ/` directory.
@@ -2587,6 +2781,170 @@ impl Repository {
         }
 
         Ok(spec)
+    }
+
+    /// Mark a spec as done: transitions to Complete with optional summary.
+    /// This is the round-trip workflow entry point (distinct from GC's
+    /// `complete_spec` which transitions lifecycle_state).
+    pub fn mark_spec_done(&self, spec_id: &str, summary: Option<String>) -> WritResult<Spec> {
+        let mut spec = self.load_spec(spec_id)?;
+
+        if matches!(spec.status, crate::spec::SpecStatus::Complete) {
+            return Err(WritError::Other(format!(
+                "spec '{}' is already complete",
+                spec_id
+            )));
+        }
+
+        let now = chrono::Utc::now();
+        spec.status = crate::spec::SpecStatus::Complete;
+        spec.completion_summary = summary;
+        spec.completed_at = Some(now);
+        spec.updated_at = now;
+        self.save_spec(&spec)?;
+        Ok(spec)
+    }
+
+    /// Record that a spec's work was committed to git.
+    pub fn mark_spec_committed(&self, spec_id: &str, git_hash: &str) -> WritResult<Spec> {
+        let mut spec = self.load_spec(spec_id)?;
+
+        if !matches!(spec.status, crate::spec::SpecStatus::Complete) {
+            return Err(WritError::Other(format!(
+                "spec '{}' is not complete, cannot mark as committed",
+                spec_id
+            )));
+        }
+
+        spec.mark_committed(git_hash.to_string());
+        self.save_spec(&spec)?;
+        Ok(spec)
+    }
+
+    // ── Proposal CRUD ──────────────────────────────────────────────────
+
+    /// Directory where proposals are stored.
+    fn proposals_dir(&self) -> std::path::PathBuf {
+        self.writ_dir.join("proposals")
+    }
+
+    /// Create a new proposal. Supersedes any pending proposals with overlapping specs.
+    pub fn create_proposal(
+        &self,
+        spec_ids: Vec<String>,
+        message: String,
+        proposed_by: String,
+        strategy: String,
+    ) -> WritResult<crate::proposal::Proposal> {
+        let dir = self.proposals_dir();
+        std::fs::create_dir_all(&dir)?;
+
+        let mut proposal =
+            crate::proposal::Proposal::new(spec_ids.clone(), message, proposed_by, strategy);
+
+        // Supersede any pending proposals with overlapping specs
+        let existing = self.list_proposals()?;
+        for mut old in existing {
+            if old.is_pending() && old.overlaps_with(&spec_ids) {
+                old.supersede(&proposal.id);
+                self.save_proposal(&old)?;
+            }
+        }
+
+        self.save_proposal(&proposal)?;
+        Ok(proposal)
+    }
+
+    /// List all proposals, sorted by creation time (newest first).
+    pub fn list_proposals(&self) -> WritResult<Vec<crate::proposal::Proposal>> {
+        let dir = self.proposals_dir();
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut proposals = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().map_or(false, |e| e == "json") {
+                let data = std::fs::read_to_string(&path)?;
+                if let Ok(p) = serde_json::from_str::<crate::proposal::Proposal>(&data) {
+                    proposals.push(p);
+                }
+            }
+        }
+
+        proposals.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(proposals)
+    }
+
+    /// Accept a proposal: execute its commit and mark it accepted.
+    /// Returns the commit hash.
+    pub fn accept_proposal(&self, proposal_id: &str) -> WritResult<crate::proposal::Proposal> {
+        let mut proposal = self.load_proposal(proposal_id)?;
+
+        if !proposal.is_pending() {
+            return Err(WritError::Other(format!(
+                "proposal '{}' is not pending (status: {:?})",
+                proposal_id, proposal.status
+            )));
+        }
+
+        // The actual git commit is done by the CLI (it has GitOps).
+        // We just mark the proposal as accepted — the CLI passes the hash back.
+        // For now, mark accepted without a hash; CLI calls update_proposal_hash().
+        proposal.accept(String::new());
+        self.save_proposal(&proposal)?;
+        Ok(proposal)
+    }
+
+    /// Update an accepted proposal with the actual commit hash.
+    pub fn update_proposal_hash(
+        &self,
+        proposal_id: &str,
+        hash: &str,
+    ) -> WritResult<()> {
+        let mut proposal = self.load_proposal(proposal_id)?;
+        proposal.commit_hash = Some(hash.to_string());
+        self.save_proposal(&proposal)?;
+        Ok(())
+    }
+
+    /// Reject a proposal. Specs remain in completed state for future proposals.
+    pub fn reject_proposal(&self, proposal_id: &str) -> WritResult<crate::proposal::Proposal> {
+        let mut proposal = self.load_proposal(proposal_id)?;
+
+        if !proposal.is_pending() {
+            return Err(WritError::Other(format!(
+                "proposal '{}' is not pending (status: {:?})",
+                proposal_id, proposal.status
+            )));
+        }
+
+        proposal.reject();
+        self.save_proposal(&proposal)?;
+        Ok(proposal)
+    }
+
+    /// Load a single proposal by ID.
+    pub fn load_proposal(&self, id: &str) -> WritResult<crate::proposal::Proposal> {
+        let path = self.proposals_dir().join(format!("{}.json", id));
+        if !path.exists() {
+            return Err(WritError::Other(format!("proposal '{}' not found", id)));
+        }
+        let data = std::fs::read_to_string(&path)?;
+        serde_json::from_str(&data)
+            .map_err(|e| WritError::Other(format!("failed to parse proposal: {e}")))
+    }
+
+    /// Save a proposal to disk.
+    fn save_proposal(&self, proposal: &crate::proposal::Proposal) -> WritResult<()> {
+        let dir = self.proposals_dir();
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.json", proposal.id));
+        let data = serde_json::to_string_pretty(proposal)?;
+        std::fs::write(path, data)?;
+        Ok(())
     }
 
     /// Promote a spec's status to match a seal's task status.
@@ -5764,6 +6122,17 @@ impl Repository {
             tech_stack,
             lifecycle_state: existing.lifecycle_state.clone(),
             last_activity: std::cmp::max(incoming.last_activity, existing.last_activity),
+            completion_summary: existing
+                .completion_summary
+                .clone()
+                .or(incoming.completion_summary.clone()),
+            commit_state: existing.commit_state.clone(),
+            completed_at: existing.completed_at.or(incoming.completed_at),
+            commit_hash: existing
+                .commit_hash
+                .clone()
+                .or(incoming.commit_hash.clone()),
+            committed_at: existing.committed_at.or(incoming.committed_at),
         }
     }
 
@@ -7376,7 +7745,8 @@ mod tests {
     // --- Invalid transitions (Gap 2: corruption/illegal state handling) ---
 
     #[test]
-    fn test_lifecycle_rejects_completed_to_active() {
+    fn test_lifecycle_allows_completed_to_active() {
+        // Completed → Active is a valid transition (used by writ reopen).
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         let spec = Spec::new("s1".to_string(), "T".to_string(), "".to_string());
@@ -7384,13 +7754,11 @@ mod tests {
 
         repo.transition_spec_lifecycle("s1", LifecycleState::Completed)
             .unwrap();
-        let err = repo
-            .transition_spec_lifecycle("s1", LifecycleState::Active)
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("not a legal transition"),
-            "expected IllegalTransition error, got: {err}"
-        );
+        repo.transition_spec_lifecycle("s1", LifecycleState::Active)
+            .unwrap();
+
+        let reopened = repo.load_spec("s1").unwrap();
+        assert_eq!(reopened.lifecycle_state, LifecycleState::Active);
     }
 
     #[test]
@@ -10860,6 +11228,11 @@ mod verify_all_chains_tests {
             updated_at: chrono::Utc::now(),
             lifecycle_state: crate::spec::LifecycleState::Active,
             last_activity: chrono::Utc::now(),
+            completion_summary: None,
+            commit_state: crate::spec::CommitState::Uncommitted,
+            completed_at: None,
+            commit_hash: None,
+            committed_at: None,
         };
         repo.add_spec(&spec).unwrap();
 
@@ -10917,6 +11290,11 @@ mod verify_all_chains_tests {
                 updated_at: chrono::Utc::now(),
                 lifecycle_state: crate::spec::LifecycleState::Active,
                 last_activity: chrono::Utc::now(),
+                completion_summary: None,
+                commit_state: crate::spec::CommitState::Uncommitted,
+                completed_at: None,
+                commit_hash: None,
+                committed_at: None,
             };
             repo.add_spec(&spec).unwrap();
         }
@@ -13446,6 +13824,11 @@ mod remote_tests {
             tech_stack: vec![],
             lifecycle_state: crate::spec::LifecycleState::Active,
             last_activity: now,
+            completion_summary: None,
+            commit_state: crate::spec::CommitState::Uncommitted,
+            completed_at: None,
+            commit_hash: None,
+            committed_at: None,
         };
 
         let spec_in_progress = crate::spec::Spec {
@@ -24703,7 +25086,8 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn test_illegal_transition_completed_to_active() {
+    fn test_transition_completed_to_active_allowed() {
+        // Completed → Active is now a valid transition (supports writ reopen).
         let (_dir, repo) = setup_repo();
         create_spec(&repo, "my-spec");
 
@@ -24711,7 +25095,10 @@ mod lifecycle_tests {
             .unwrap();
 
         let result = repo.transition_spec_lifecycle("my-spec", LifecycleState::Active);
-        assert!(result.is_err());
+        assert!(result.is_ok());
+
+        let spec = repo.load_spec("my-spec").unwrap();
+        assert_eq!(spec.lifecycle_state, LifecycleState::Active);
     }
 
     #[test]

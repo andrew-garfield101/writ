@@ -87,6 +87,22 @@ enum Commands {
     },
 
     /// Remove writ from this project (inverse of init).
+    Uninit {
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        force: bool,
+
+        /// Keep the .writignore file.
+        #[arg(long)]
+        keep_writignore: bool,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Deprecated: use `writ uninit` instead.
+    #[command(hide = true)]
     Uninstall {
         /// Skip confirmation prompt.
         #[arg(long)]
@@ -986,11 +1002,22 @@ fn main() {
             };
             cmd_init(&cwd, &format, &profile, spec, title, description, opts)
         }
+        Commands::Uninit {
+            force,
+            keep_writignore,
+            format,
+        } => cmd_uninit(&cwd, force, keep_writignore, &format),
         Commands::Uninstall {
             force,
             keep_writignore,
             format,
-        } => cmd_uninstall(&cwd, force, keep_writignore, &format),
+        } => {
+            eprintln!(
+                "{} `writ uninstall` is deprecated — use `writ uninit` instead",
+                "notice:".yellow().bold()
+            );
+            cmd_uninit(&cwd, force, keep_writignore, &format)
+        }
         Commands::Install {
             format,
             profile,
@@ -1405,7 +1432,7 @@ fn error_hint(err: &dyn std::error::Error) -> Option<String> {
     }
     if msg.contains(".writ/ already exists") {
         return Some(
-            "this directory already has writ initialized — use `writ uninstall` first to start fresh"
+            "this directory already has writ initialized — use `writ uninit` first to start fresh"
                 .into(),
         );
     }
@@ -1581,6 +1608,10 @@ fn cmd_init(
 
             if plan.enable_claude {
                 println!("{} Claude Code integration configured", "✓".green());
+                println!(
+                    "  {} Agent permissions: Bash(writ *) in .claude/settings.json",
+                    "→".green()
+                );
             }
             if plan.enable_codex {
                 println!("{} Codex / OpenAI integration configured", "✓".green());
@@ -1637,7 +1668,7 @@ fn cmd_init(
     Ok(())
 }
 
-fn cmd_uninstall(
+fn cmd_uninit(
     cwd: &PathBuf,
     force: bool,
     keep_writignore: bool,
@@ -1688,7 +1719,7 @@ fn cmd_uninstall(
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
         if !input.trim().eq_ignore_ascii_case("y") {
-            eprintln!("uninstall cancelled");
+            eprintln!("uninit cancelled");
             return Ok(());
         }
     }

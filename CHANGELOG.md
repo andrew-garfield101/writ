@@ -84,6 +84,11 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Troubleshooting guide
 - CONTRIBUTING.md with development setup and contribution guidelines
 
+**CLI Naming**
+- `writ uninit` replaces `writ uninstall` for removing writ from a project. `writ uninstall` remains as a hidden deprecated alias that prints a notice and delegates to `uninit`.
+- `--keep-writignore` flag preserves `.writignore` during uninit
+- `--format json` support for machine readable uninit output
+
 ### Changed
 
 - Linear diff fallback for large files (10k+ lines) uses O(n) algorithm instead of O(n^2) LCS

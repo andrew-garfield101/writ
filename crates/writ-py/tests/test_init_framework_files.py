@@ -71,7 +71,7 @@ def append_writ_section(existing_content: Optional[str], writ_section: str) -> s
 def remove_writ_section(content: str) -> str:
     """Remove writ section between markers, preserving surrounding content.
 
-    Used by writ uninstall.
+    Used by writ uninit.
     """
     if BEGIN_MARKER not in content or END_MARKER not in content:
         return content

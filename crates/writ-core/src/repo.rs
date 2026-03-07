@@ -6615,7 +6615,7 @@ pub struct InitResult {
     pub hooks_installed: Vec<crate::hooks::HookResult>,
 }
 
-/// Result of `writ uninstall`.
+/// Result of `writ uninit` (inverse of `writ init`).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UninstallResult {
     /// Whether .writ/ was removed.

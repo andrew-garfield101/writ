@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::WritResult;
 use crate::fsutil::atomic_write;
 
+/// The permission entry writ adds to Claude Code's settings.json.
+const WRIT_PERMISSION: &str = "Bash(writ *)";
+
 /// HTML comment markers for writ-managed sections in framework files.
 /// Used for idempotent append-in-place and surgical removal on uninstall.
 const MARKER_BEGIN: &str = "<!-- BEGIN WRIT CONFIGURATION — managed by writ init -->";
@@ -81,6 +84,103 @@ fn detect_codex(root: &Path) -> FrameworkDetection {
     }
 }
 
+/// Ensure `Bash(writ *)` is in `.claude/settings.json` so agents can run writ commands.
+///
+/// Creates the file if it doesn't exist. Merges the permission into existing
+/// settings, preserving all other configuration.
+fn ensure_claude_permissions(root: &Path) -> WritResult<Option<String>> {
+    let claude_dir = root.join(".claude");
+    if !claude_dir.exists() {
+        fs::create_dir_all(&claude_dir)?;
+    }
+
+    let settings_path = claude_dir.join("settings.json");
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    // Navigate to permissions.allow, creating the structure if needed.
+    let permissions = settings
+        .as_object_mut()
+        .unwrap()
+        .entry("permissions")
+        .or_insert_with(|| serde_json::json!({}));
+    let allow = permissions
+        .as_object_mut()
+        .unwrap()
+        .entry("allow")
+        .or_insert_with(|| serde_json::json!([]));
+
+    let allow_arr = allow.as_array_mut().unwrap();
+
+    // Check if already present.
+    let already_has = allow_arr
+        .iter()
+        .any(|v| v.as_str() == Some(WRIT_PERMISSION));
+
+    if already_has {
+        return Ok(None);
+    }
+
+    allow_arr.push(serde_json::Value::String(WRIT_PERMISSION.to_string()));
+
+    let json = serde_json::to_string_pretty(&settings)
+        .map_err(|e| crate::error::WritError::Other(format!("JSON serialize: {}", e)))?;
+    atomic_write(&settings_path, format!("{}\n", json).as_bytes())?;
+
+    if settings_path.exists() {
+        // File existed before, we updated it
+        Ok(Some(".claude/settings.json".to_string()))
+    } else {
+        Ok(Some(".claude/settings.json".to_string()))
+    }
+}
+
+/// Remove `Bash(writ *)` from `.claude/settings.json` during uninstall.
+///
+/// Leaves the file in place even if the allow list becomes empty — we don't
+/// delete the user's settings file.
+fn remove_claude_permissions(root: &Path) -> WritResult<Option<String>> {
+    let settings_path = root.join(".claude").join("settings.json");
+    if !settings_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&settings_path)?;
+    let mut settings: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Ok(None), // Don't touch malformed files
+    };
+
+    let removed = if let Some(permissions) = settings.get_mut("permissions") {
+        if let Some(allow) = permissions.get_mut("allow") {
+            if let Some(arr) = allow.as_array_mut() {
+                let before = arr.len();
+                arr.retain(|v| v.as_str() != Some(WRIT_PERMISSION));
+                arr.len() < before
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if removed {
+        let json = serde_json::to_string_pretty(&settings)
+            .map_err(|e| crate::error::WritError::Other(format!("JSON serialize: {}", e)))?;
+        atomic_write(&settings_path, format!("{}\n", json).as_bytes())?;
+        Ok(Some(".claude/settings.json".to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Generate writ integration hooks for Claude Code.
 pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
     let mut created = Vec::new();
@@ -135,6 +235,22 @@ pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
     if !context_cmd.exists() {
         atomic_write(&context_cmd, CLAUDE_CONTEXT_COMMAND.as_bytes())?;
         created.push(".claude/commands/writ-context.md".to_string());
+    }
+
+    // Ensure Bash(writ *) permission in .claude/settings.json.
+    match ensure_claude_permissions(root) {
+        Ok(Some(path)) => {
+            if root.join(".claude").join("settings.json").metadata().is_ok() {
+                // File existed before or was just created — either way it's been set up.
+                updated.push(path);
+            } else {
+                created.push(path);
+            }
+        }
+        Ok(None) => {} // Already had the permission
+        Err(e) => {
+            eprintln!("warning: could not configure Claude Code permissions: {}", e);
+        }
     }
 
     Ok(HookResult {
@@ -324,6 +440,17 @@ pub fn unhook_claude_code(root: &Path) -> WritResult<UninstallHookResult> {
     // Clean up empty commands dir (only if we emptied it).
     if commands_dir.exists() && is_dir_empty(&commands_dir) {
         let _ = fs::remove_dir(&commands_dir);
+    }
+
+    // Remove Bash(writ *) permission from .claude/settings.json.
+    match remove_claude_permissions(root) {
+        Ok(Some(path)) => {
+            updated.push(path);
+        }
+        Ok(None) => {} // Permission wasn't there or file doesn't exist
+        Err(e) => {
+            eprintln!("warning: could not remove Claude Code permissions: {}", e);
+        }
     }
 
     Ok(UninstallHookResult {
@@ -610,6 +737,7 @@ This project uses writ for version control alongside git.
 - Include meaningful summaries in seals so other agents understand your work
 - Do NOT run `git add`, `git commit`, or `git push` — the user manages the git round-trip via `writ finish`
 - Do NOT run `writ finish` — this is the git integration command managed by the user or orchestrator
+- `writ restore <seal-id>` overwrites working directory files — use only when you need to revert to a known-good state
 "#.to_string()
 }
 
@@ -636,6 +764,7 @@ This project uses writ (AI-native version control) for checkpointing and coordin
 - `writ log` — seal history
 
 Do not run `git commit` or `writ finish` — the user manages the git round-trip.
+`writ restore <seal-id>` overwrites working directory files — use only when reverting to a known-good state.
 "#
     .to_string()
 }
@@ -732,7 +861,7 @@ Available formats:
 - `writ status` — project overview (agents, specs, progress)
 - `writ diff` — preview file changes
 - `writ log` — recent seal history
-- `writ restore <seal-id>` — roll back to a previous seal
+- `writ restore <seal-id>` — roll back to a previous seal (overwrites working directory files)
 
 ## Rules
 
@@ -1540,5 +1669,166 @@ mod tests {
         let content = "## Writ Version Control\n\nNew-style heading content.\n";
         let cleaned = remove_writ_section(content);
         assert!(cleaned.trim().is_empty());
+    }
+
+    // --- Claude Code permissions tests ---
+
+    #[test]
+    fn test_ensure_claude_permissions_creates_settings() {
+        let dir = tempdir().unwrap();
+        let result = ensure_claude_permissions(dir.path()).unwrap();
+        assert!(result.is_some());
+
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = parsed["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.iter().any(|v| v.as_str() == Some("Bash(writ *)")));
+    }
+
+    #[test]
+    fn test_ensure_claude_permissions_merges_existing() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(
+            dir.path().join(".claude").join("settings.json"),
+            r#"{"permissions": {"allow": ["Bash(git *)"]}, "other": true}"#,
+        )
+        .unwrap();
+
+        ensure_claude_permissions(dir.path()).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = parsed["permissions"]["allow"].as_array().unwrap();
+        // Both permissions should be present.
+        assert!(allow.iter().any(|v| v.as_str() == Some("Bash(git *)")));
+        assert!(allow.iter().any(|v| v.as_str() == Some("Bash(writ *)")));
+        // Other fields preserved.
+        assert_eq!(parsed["other"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn test_ensure_claude_permissions_idempotent() {
+        let dir = tempdir().unwrap();
+        ensure_claude_permissions(dir.path()).unwrap();
+        let result = ensure_claude_permissions(dir.path()).unwrap();
+        assert!(result.is_none(), "second call should be a no-op");
+
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = parsed["permissions"]["allow"].as_array().unwrap();
+        // Should only have one entry, not duplicated.
+        let count = allow
+            .iter()
+            .filter(|v| v.as_str() == Some("Bash(writ *)"))
+            .count();
+        assert_eq!(count, 1, "permission should not be duplicated");
+    }
+
+    #[test]
+    fn test_remove_claude_permissions_removes_entry() {
+        let dir = tempdir().unwrap();
+        ensure_claude_permissions(dir.path()).unwrap();
+        let result = remove_claude_permissions(dir.path()).unwrap();
+        assert!(result.is_some());
+
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = parsed["permissions"]["allow"].as_array().unwrap();
+        assert!(!allow.iter().any(|v| v.as_str() == Some("Bash(writ *)")));
+    }
+
+    #[test]
+    fn test_remove_claude_permissions_preserves_other() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(
+            dir.path().join(".claude").join("settings.json"),
+            r#"{"permissions": {"allow": ["Bash(git *)", "Bash(writ *)"]}}"#,
+        )
+        .unwrap();
+
+        remove_claude_permissions(dir.path()).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = parsed["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.iter().any(|v| v.as_str() == Some("Bash(git *)")));
+        assert!(!allow.iter().any(|v| v.as_str() == Some("Bash(writ *)")));
+    }
+
+    #[test]
+    fn test_remove_claude_permissions_noop_when_missing() {
+        let dir = tempdir().unwrap();
+        let result = remove_claude_permissions(dir.path()).unwrap();
+        assert!(result.is_none(), "no file → no-op");
+    }
+
+    #[test]
+    fn test_hook_claude_code_adds_permissions() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        let settings_path = dir.path().join(".claude").join("settings.json");
+        assert!(settings_path.exists(), "settings.json should be created");
+
+        let content = fs::read_to_string(&settings_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let allow = parsed["permissions"]["allow"].as_array().unwrap();
+        assert!(allow.iter().any(|v| v.as_str() == Some("Bash(writ *)")));
+    }
+
+    #[test]
+    fn test_unhook_claude_code_removes_permissions() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        // Verify permission exists.
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        assert!(content.contains("Bash(writ *)"));
+
+        unhook_claude_code(dir.path()).unwrap();
+
+        // Permission should be removed.
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        assert!(!content.contains("Bash(writ *)"));
+    }
+
+    #[test]
+    fn test_claude_md_has_restore_warning() {
+        let section = writ_claude_md_section();
+        assert!(
+            section.contains("writ restore"),
+            "CLAUDE.md template should warn about writ restore"
+        );
+        assert!(
+            section.contains("overwrites working directory"),
+            "should explain restore is destructive"
+        );
+    }
+
+    #[test]
+    fn test_agents_md_has_restore_warning() {
+        let section = writ_agents_md_section();
+        assert!(
+            section.contains("writ restore"),
+            "AGENTS.md template should mention writ restore"
+        );
+    }
+
+    #[test]
+    fn test_agent_instructions_has_restore_warning() {
+        let content = agent_instructions_content();
+        assert!(
+            content.contains("overwrites working directory"),
+            "agent instructions should warn about restore"
+        );
     }
 }

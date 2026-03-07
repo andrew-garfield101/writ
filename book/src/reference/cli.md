@@ -27,14 +27,14 @@ Options:
   --description <DESCRIPTION>  Description for the spec (used with --spec)
 ```
 
-> **Note:** `writ install` is a deprecated alias for `writ init`. It prints a deprecation notice and calls `writ init`.
+> **Note:** `writ install` and `writ uninstall` are deprecated aliases for `writ init` and `writ uninit` respectively. They print a deprecation notice and call the new command.
 
-### `writ uninstall`
+### `writ uninit`
 
 Remove writ from the project. Deletes `.writ/` directory and framework hooks.
 
 ```bash
-writ uninstall [OPTIONS]
+writ uninit [OPTIONS]
 
 Options:
   --force             Skip confirmation prompt

@@ -2,14 +2,14 @@
 
 Tests the actual writ.install_hooks() and writ.detect_frameworks() Python
 bindings, as well as CLI integration for `writ init --yes`, `writ install`
-(deprecated alias), and `writ uninstall`.
+(deprecated alias), and `writ uninit`.
 
 T.8:  CLAUDE.md creation/append with markers via install_hooks()
 T.9:  CLAUDE.md marker-based update on reinit via install_hooks()
 T.10: Idempotent .gitignore modification via install_hooks()
 T.11: `writ init --yes` non-interactive CLI mode
 T.12: `writ install` deprecated alias
-T.13: `writ uninstall` integration
+T.13: `writ uninit` integration
 """
 
 import json
@@ -427,13 +427,13 @@ class TestDeprecatedInstallAlias:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# T.13: `writ uninstall` integration
+# T.13: `writ uninit` integration
 # ═══════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.skipif(WRIT_BIN is None, reason="writ binary not found")
 class TestUninstallIntegration:
-    """T.13: `writ uninstall --force` removes writ hooks cleanly."""
+    """T.13: `writ uninit --force` removes writ hooks cleanly."""
 
     def test_uninstall_removes_writ_dir(self, tmp_path: Path):
         """Full lifecycle: init → uninstall removes .writ/."""

@@ -975,9 +975,8 @@ mod tests {
     {
         let json_tokens = count_tokens(&format_fn(&JsonFormatter).unwrap());
         let compact_tokens = count_tokens(&format_fn(&JsonCompactFormatter).unwrap());
-        let toon_tokens = count_tokens(
-            &format_fn(&ToonFormatter::with_project("benchmark")).unwrap(),
-        );
+        let toon_tokens =
+            count_tokens(&format_fn(&ToonFormatter::with_project("benchmark")).unwrap());
         (json_tokens, compact_tokens, toon_tokens)
     }
 
@@ -993,13 +992,8 @@ mod tests {
         eprintln!("--- Seal Log (20 seals) — TOKEN COUNTS ---");
         eprintln!("  JSON:    {:>5} tokens  ({json_bytes:>6} bytes)", json_tok);
         eprintln!("  Compact: {:>5} tokens", compact_tok);
-        eprintln!(
-            "  TOON:    {:>5} tokens  ({toon_bytes:>6} bytes)",
-            toon_tok
-        );
-        eprintln!(
-            "  Token savings: {token_savings:.1}% (vs byte savings: {byte_savings:.1}%)"
-        );
+        eprintln!("  TOON:    {:>5} tokens  ({toon_bytes:>6} bytes)", toon_tok);
+        eprintln!("  Token savings: {token_savings:.1}% (vs byte savings: {byte_savings:.1}%)");
 
         // TOON must save more tokens than bytes (JSON structural chars are
         // individual tokens but few bytes each)
@@ -1035,13 +1029,8 @@ mod tests {
         eprintln!("--- Spec List (15 specs) — TOKEN COUNTS ---");
         eprintln!("  JSON:    {:>5} tokens  ({json_bytes:>6} bytes)", json_tok);
         eprintln!("  Compact: {:>5} tokens", compact_tok);
-        eprintln!(
-            "  TOON:    {:>5} tokens  ({toon_bytes:>6} bytes)",
-            toon_tok
-        );
-        eprintln!(
-            "  Token savings: {token_savings:.1}% (vs byte savings: {byte_savings:.1}%)"
-        );
+        eprintln!("  TOON:    {:>5} tokens  ({toon_bytes:>6} bytes)", toon_tok);
+        eprintln!("  Token savings: {token_savings:.1}% (vs byte savings: {byte_savings:.1}%)");
 
         assert!(
             toon_tok < json_tok,
@@ -1061,13 +1050,8 @@ mod tests {
         eprintln!("--- Full Context (5 specs, 10 seals, 40 files) — TOKEN COUNTS ---");
         eprintln!("  JSON:    {:>5} tokens  ({json_bytes:>6} bytes)", json_tok);
         eprintln!("  Compact: {:>5} tokens", compact_tok);
-        eprintln!(
-            "  TOON:    {:>5} tokens  ({toon_bytes:>6} bytes)",
-            toon_tok
-        );
-        eprintln!(
-            "  Token savings: {token_savings:.1}% (vs byte savings: {byte_savings:.1}%)"
-        );
+        eprintln!("  TOON:    {:>5} tokens  ({toon_bytes:>6} bytes)", toon_tok);
+        eprintln!("  Token savings: {token_savings:.1}% (vs byte savings: {byte_savings:.1}%)");
 
         assert!(
             toon_tok < json_tok,
@@ -1102,37 +1086,57 @@ mod tests {
         let ctx_bytes = measure_sizes(|f| f.format_context(&ctx));
 
         eprintln!();
-        eprintln!("╔══════════════════════════════════════════════════════════════════════════════╗");
-        eprintln!("║              F.14b Token Efficiency Benchmark Report (cl100k_base)          ║");
-        eprintln!("╠══════════════════════════════════════════════════════════════════════════════╣");
+        eprintln!(
+            "╔══════════════════════════════════════════════════════════════════════════════╗"
+        );
+        eprintln!(
+            "║              F.14b Token Efficiency Benchmark Report (cl100k_base)          ║"
+        );
+        eprintln!(
+            "╠══════════════════════════════════════════════════════════════════════════════╣"
+        );
         eprintln!("║ Data Type      │ JSON     │ Compact  │ TOON     │ Token Δ  │ Byte Δ  │ Gap ║");
         eprintln!("╠════════════════╪══════════╪══════════╪══════════╪══════════╪═════════╪═════╣");
         eprintln!(
             "║ Seal log (20)  │ {:>5} tok│ {:>5} tok│ {:>5} tok│ {:>5.1}%  │ {:>5.1}%  │{:>4.1}%║",
-            seal_tok.0, seal_tok.1, seal_tok.2,
+            seal_tok.0,
+            seal_tok.1,
+            seal_tok.2,
             savings_pct(seal_tok.0, seal_tok.2),
             savings_pct(seal_bytes.0, seal_bytes.2),
             savings_pct(seal_tok.0, seal_tok.2) - savings_pct(seal_bytes.0, seal_bytes.2),
         );
         eprintln!(
             "║ Spec list (15) │ {:>5} tok│ {:>5} tok│ {:>5} tok│ {:>5.1}%  │ {:>5.1}%  │{:>4.1}%║",
-            spec_tok.0, spec_tok.1, spec_tok.2,
+            spec_tok.0,
+            spec_tok.1,
+            spec_tok.2,
             savings_pct(spec_tok.0, spec_tok.2),
             savings_pct(spec_bytes.0, spec_bytes.2),
             savings_pct(spec_tok.0, spec_tok.2) - savings_pct(spec_bytes.0, spec_bytes.2),
         );
         eprintln!(
             "║ Full ctx (5/10)│ {:>5} tok│ {:>5} tok│ {:>5} tok│ {:>5.1}%  │ {:>5.1}%  │{:>4.1}%║",
-            ctx_tok.0, ctx_tok.1, ctx_tok.2,
+            ctx_tok.0,
+            ctx_tok.1,
+            ctx_tok.2,
             savings_pct(ctx_tok.0, ctx_tok.2),
             savings_pct(ctx_bytes.0, ctx_bytes.2),
             savings_pct(ctx_tok.0, ctx_tok.2) - savings_pct(ctx_bytes.0, ctx_bytes.2),
         );
-        eprintln!("╠══════════════════════════════════════════════════════════════════════════════╣");
-        eprintln!("║ Gap = how much MORE tokens are saved vs bytes (structural char overhead)    ║");
+        eprintln!(
+            "╠══════════════════════════════════════════════════════════════════════════════╣"
+        );
+        eprintln!(
+            "║ Gap = how much MORE tokens are saved vs bytes (structural char overhead)    ║"
+        );
         eprintln!("║ Tokenizer: cl100k_base (GPT-4 / Claude-approximate)                        ║");
-        eprintln!("║ NOTE: dev-dependency only — tiktoken does NOT ship with writ                ║");
-        eprintln!("╚══════════════════════════════════════════════════════════════════════════════╝");
+        eprintln!(
+            "║ NOTE: dev-dependency only — tiktoken does NOT ship with writ                ║"
+        );
+        eprintln!(
+            "╚══════════════════════════════════════════════════════════════════════════════╝"
+        );
         eprintln!();
 
         // Token savings should be >= byte savings for all data types
@@ -1167,7 +1171,9 @@ mod tests {
         out.push_str("Your branch is up to date with 'origin/feature/auth'.\n\n");
         out.push_str("Changes not staged for commit:\n");
         out.push_str("  (use \"git add <file>...\" to update what will be committed)\n");
-        out.push_str("  (use \"git restore <file>...\" to discard changes in working directory)\n\n");
+        out.push_str(
+            "  (use \"git restore <file>...\" to discard changes in working directory)\n\n",
+        );
         for i in 0..5 {
             out.push_str(&format!("\tmodified:   src/module_{i}/main.rs\n"));
         }
@@ -1233,8 +1239,7 @@ mod tests {
         ];
         for (path, ins, del) in &files {
             let total = ins + del;
-            let bar: String = "+".repeat((*ins).min(40))
-                + &"-".repeat((*del).min(40));
+            let bar: String = "+".repeat((*ins).min(40)) + &"-".repeat((*del).min(40));
             out.push_str(&format!(
                 " {:<40} | {:>4} {}\n",
                 path,
@@ -1328,18 +1333,34 @@ mod tests {
         let toon_vs_git = savings_pct(git_tokens, writ_toon_tokens);
 
         eprintln!();
-        eprintln!("╔══════════════════════════════════════════════════════════════════════════════╗");
-        eprintln!("║        F.14c — Git Baseline vs Writ Context (token comparison)              ║");
-        eprintln!("╠══════════════════════════════════════════════════════════════════════════════╣");
-        eprintln!("║                                                                              ║");
-        eprintln!("║  WITHOUT WRIT (raw git commands):                                            ║");
-        eprintln!("║    git status + git log + git diff --stat + git branch + AGENTS.md           ║");
+        eprintln!(
+            "╔══════════════════════════════════════════════════════════════════════════════╗"
+        );
+        eprintln!(
+            "║        F.14c — Git Baseline vs Writ Context (token comparison)              ║"
+        );
+        eprintln!(
+            "╠══════════════════════════════════════════════════════════════════════════════╣"
+        );
+        eprintln!(
+            "║                                                                              ║"
+        );
+        eprintln!(
+            "║  WITHOUT WRIT (raw git commands):                                            ║"
+        );
+        eprintln!(
+            "║    git status + git log + git diff --stat + git branch + AGENTS.md           ║"
+        );
         eprintln!(
             "║    = {:>5} tokens ({:>6} bytes)  [{} tool calls]                              ║",
             git_tokens, git_bytes, 5
         );
-        eprintln!("║                                                                              ║");
-        eprintln!("║  WITH WRIT (single writ context call):                                       ║");
+        eprintln!(
+            "║                                                                              ║"
+        );
+        eprintln!(
+            "║  WITH WRIT (single writ context call):                                       ║"
+        );
         eprintln!(
             "║    JSON:  {:>5} tokens ({:>6} bytes)  {:>+6.1}% vs git                        ║",
             writ_json_tokens,
@@ -1352,17 +1373,39 @@ mod tests {
             writ_toon.len(),
             -toon_vs_git
         );
-        eprintln!("║                                                                              ║");
-        eprintln!("║  PLUS writ context includes (not available via git):                          ║");
-        eprintln!("║    • Spec progress with status tracking                                      ║");
-        eprintln!("║    • Agent activity and attribution                                          ║");
-        eprintln!("║    • Integration risk scoring                                                ║");
-        eprintln!("║    • Convergence state and recommendations                                   ║");
-        eprintln!("║    • File contention detection                                               ║");
-        eprintln!("║    • Seal chain integrity verification                                       ║");
-        eprintln!("║                                                                              ║");
-        eprintln!("╠══════════════════════════════════════════════════════════════════════════════╣");
-        eprintln!("║  Fleet scaling (5 agents, 3 context reads each):                             ║");
+        eprintln!(
+            "║                                                                              ║"
+        );
+        eprintln!(
+            "║  PLUS writ context includes (not available via git):                          ║"
+        );
+        eprintln!(
+            "║    • Spec progress with status tracking                                      ║"
+        );
+        eprintln!(
+            "║    • Agent activity and attribution                                          ║"
+        );
+        eprintln!(
+            "║    • Integration risk scoring                                                ║"
+        );
+        eprintln!(
+            "║    • Convergence state and recommendations                                   ║"
+        );
+        eprintln!(
+            "║    • File contention detection                                               ║"
+        );
+        eprintln!(
+            "║    • Seal chain integrity verification                                       ║"
+        );
+        eprintln!(
+            "║                                                                              ║"
+        );
+        eprintln!(
+            "╠══════════════════════════════════════════════════════════════════════════════╣"
+        );
+        eprintln!(
+            "║  Fleet scaling (5 agents, 3 context reads each):                             ║"
+        );
 
         let reads = 15usize; // 5 agents × 3 reads per task
         let git_fleet = git_tokens * reads;
@@ -1392,11 +1435,21 @@ mod tests {
             "║    cost per capability: ~{:.0} tokens each (specs, risk, agents, etc)        ║",
             info_per_token
         );
-        eprintln!("║                                                                              ║");
-        eprintln!("║  NOTE: git approach also requires the agent to PARSE unstructured            ║");
-        eprintln!("║  text and synthesize state — writ delivers it pre-structured.                ║");
-        eprintln!("║  The real cost difference is larger than tokens alone suggest.                ║");
-        eprintln!("╚══════════════════════════════════════════════════════════════════════════════╝");
+        eprintln!(
+            "║                                                                              ║"
+        );
+        eprintln!(
+            "║  NOTE: git approach also requires the agent to PARSE unstructured            ║"
+        );
+        eprintln!(
+            "║  text and synthesize state — writ delivers it pre-structured.                ║"
+        );
+        eprintln!(
+            "║  The real cost difference is larger than tokens alone suggest.                ║"
+        );
+        eprintln!(
+            "╚══════════════════════════════════════════════════════════════════════════════╝"
+        );
         eprintln!();
 
         // Writ TOON should be competitive with raw git output in token count
@@ -1467,9 +1520,7 @@ mod tests {
             writ_toon_tokens, writ_capabilities
         );
         eprintln!("║                                                                    ║");
-        eprintln!(
-            "║  Tokens per capability:                                               ║"
-        );
+        eprintln!("║  Tokens per capability:                                               ║");
         eprintln!(
             "║    git:  {:.0} tokens/capability                                       ║",
             git_per_cap
@@ -1499,13 +1550,7 @@ mod tests {
             let writ_calls = total_reads; // 1 writ command per read
             eprintln!(
                 "║ {:>3}    │ {:>3}   │ {:>8} tok │ {:>8} tok │ {:>3} vs {:>3} ({:>5}) ║",
-                agents,
-                total_reads,
-                git_total,
-                writ_total,
-                git_calls,
-                writ_calls,
-                label,
+                agents, total_reads, git_total, writ_total, git_calls, writ_calls, label,
             );
         }
 
@@ -1561,11 +1606,13 @@ mod tests {
         };
 
         let empty_toon = ToonFormatter::with_project("benchmark")
-            .format_context(&empty_ctx).unwrap();
+            .format_context(&empty_ctx)
+            .unwrap();
         let empty_tokens = bpe.encode_with_special_tokens(&empty_toon).len();
 
         let full_toon = ToonFormatter::with_project("benchmark")
-            .format_context(&ctx).unwrap();
+            .format_context(&ctx)
+            .unwrap();
         let full_tokens = bpe.encode_with_special_tokens(&full_toon).len();
 
         // Build partial contexts to measure each section's cost
@@ -1573,14 +1620,16 @@ mod tests {
         ctx_specs_only.all_specs = ctx.all_specs.clone();
         let specs_tokens = count_tokens(
             &ToonFormatter::with_project("benchmark")
-                .format_context(&ctx_specs_only).unwrap()
+                .format_context(&ctx_specs_only)
+                .unwrap(),
         ) - empty_tokens;
 
         let mut ctx_seals_only = empty_ctx.clone();
         ctx_seals_only.recent_seals = ctx.recent_seals.clone();
         let seals_tokens = count_tokens(
             &ToonFormatter::with_project("benchmark")
-                .format_context(&ctx_seals_only).unwrap()
+                .format_context(&ctx_seals_only)
+                .unwrap(),
         ) - empty_tokens;
 
         let mut ctx_files_only = empty_ctx.clone();
@@ -1588,46 +1637,89 @@ mod tests {
         ctx_files_only.tracked_files = ctx.tracked_files;
         let files_tokens = count_tokens(
             &ToonFormatter::with_project("benchmark")
-                .format_context(&ctx_files_only).unwrap()
+                .format_context(&ctx_files_only)
+                .unwrap(),
         ) - empty_tokens;
 
         let mut ctx_working_only = empty_ctx.clone();
         ctx_working_only.working_state = ctx.working_state.clone();
         let working_tokens = count_tokens(
             &ToonFormatter::with_project("benchmark")
-                .format_context(&ctx_working_only).unwrap()
+                .format_context(&ctx_working_only)
+                .unwrap(),
         ) - empty_tokens;
 
         let mut ctx_risk_only = empty_ctx.clone();
         ctx_risk_only.integration_risk = ctx.integration_risk.clone();
         let risk_tokens = count_tokens(
             &ToonFormatter::with_project("benchmark")
-                .format_context(&ctx_risk_only).unwrap()
+                .format_context(&ctx_risk_only)
+                .unwrap(),
         ) - empty_tokens;
 
         let mut ctx_ops_only = empty_ctx.clone();
         ctx_ops_only.available_operations = ctx.available_operations.clone();
         let ops_tokens = count_tokens(
             &ToonFormatter::with_project("benchmark")
-                .format_context(&ctx_ops_only).unwrap()
+                .format_context(&ctx_ops_only)
+                .unwrap(),
         ) - empty_tokens;
 
         let overhead = full_tokens as isize
-            - (empty_tokens + specs_tokens + seals_tokens + files_tokens
-                + working_tokens + risk_tokens + ops_tokens) as isize;
+            - (empty_tokens
+                + specs_tokens
+                + seals_tokens
+                + files_tokens
+                + working_tokens
+                + risk_tokens
+                + ops_tokens) as isize;
 
         eprintln!();
         eprintln!("  ┌─── Token Breakdown by Section ───────────────────┐");
-        eprintln!("  │ Empty shell (boilerplate):    {:>5} tokens ({:>4.1}%) │", empty_tokens, (empty_tokens as f64 / full_tokens as f64) * 100.0);
-        eprintln!("  │ Specs (5 specs):              {:>5} tokens ({:>4.1}%) │", specs_tokens, (specs_tokens as f64 / full_tokens as f64) * 100.0);
-        eprintln!("  │ Seals (10 recent):            {:>5} tokens ({:>4.1}%) │", seals_tokens, (seals_tokens as f64 / full_tokens as f64) * 100.0);
-        eprintln!("  │ File scope (40 files):        {:>5} tokens ({:>4.1}%) │", files_tokens, (files_tokens as f64 / full_tokens as f64) * 100.0);
-        eprintln!("  │ Working state:                {:>5} tokens ({:>4.1}%) │", working_tokens, (working_tokens as f64 / full_tokens as f64) * 100.0);
-        eprintln!("  │ Integration risk:             {:>5} tokens ({:>4.1}%) │", risk_tokens, (risk_tokens as f64 / full_tokens as f64) * 100.0);
-        eprintln!("  │ Available operations:         {:>5} tokens ({:>4.1}%) │", ops_tokens, (ops_tokens as f64 / full_tokens as f64) * 100.0);
-        eprintln!("  │ Cross-section overhead:       {:>5} tokens         │", overhead);
+        eprintln!(
+            "  │ Empty shell (boilerplate):    {:>5} tokens ({:>4.1}%) │",
+            empty_tokens,
+            (empty_tokens as f64 / full_tokens as f64) * 100.0
+        );
+        eprintln!(
+            "  │ Specs (5 specs):              {:>5} tokens ({:>4.1}%) │",
+            specs_tokens,
+            (specs_tokens as f64 / full_tokens as f64) * 100.0
+        );
+        eprintln!(
+            "  │ Seals (10 recent):            {:>5} tokens ({:>4.1}%) │",
+            seals_tokens,
+            (seals_tokens as f64 / full_tokens as f64) * 100.0
+        );
+        eprintln!(
+            "  │ File scope (40 files):        {:>5} tokens ({:>4.1}%) │",
+            files_tokens,
+            (files_tokens as f64 / full_tokens as f64) * 100.0
+        );
+        eprintln!(
+            "  │ Working state:                {:>5} tokens ({:>4.1}%) │",
+            working_tokens,
+            (working_tokens as f64 / full_tokens as f64) * 100.0
+        );
+        eprintln!(
+            "  │ Integration risk:             {:>5} tokens ({:>4.1}%) │",
+            risk_tokens,
+            (risk_tokens as f64 / full_tokens as f64) * 100.0
+        );
+        eprintln!(
+            "  │ Available operations:         {:>5} tokens ({:>4.1}%) │",
+            ops_tokens,
+            (ops_tokens as f64 / full_tokens as f64) * 100.0
+        );
+        eprintln!(
+            "  │ Cross-section overhead:       {:>5} tokens         │",
+            overhead
+        );
         eprintln!("  │─────────────────────────────────────────────────│");
-        eprintln!("  │ TOTAL:                        {:>5} tokens        │", full_tokens);
+        eprintln!(
+            "  │ TOTAL:                        {:>5} tokens        │",
+            full_tokens
+        );
         eprintln!("  └─────────────────────────────────────────────────┘");
         eprintln!();
 
@@ -1637,8 +1729,8 @@ mod tests {
         assert!(
             writ_per_cap < git_per_cap * 1.5,
             "writ per-capability cost ({:.0}) shouldn't be >1.5x git ({:.0})",
-            writ_per_cap, git_per_cap
+            writ_per_cap,
+            git_per_cap
         );
     }
-
 }

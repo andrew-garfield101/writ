@@ -16,9 +16,9 @@ pub mod env_scan;
 pub mod error;
 pub mod format;
 pub mod fsutil;
+pub mod gc;
 #[cfg(feature = "bridge")]
 pub mod git_ops;
-pub mod gc;
 pub mod hash;
 pub mod hooks;
 pub mod ignore;

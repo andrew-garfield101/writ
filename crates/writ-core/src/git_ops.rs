@@ -48,18 +48,16 @@ mod git2_impl {
         /// Open a git repository at the given path.
         pub fn open(root: &Path) -> WritResult<Self> {
             // Verify it's a valid git repo
-            Repository::open(root).map_err(|e| {
-                WritError::Other(format!("not a git repository: {e}"))
-            })?;
+            Repository::open(root)
+                .map_err(|e| WritError::Other(format!("not a git repository: {e}")))?;
             Ok(Self {
                 root: root.to_path_buf(),
             })
         }
 
         fn repo(&self) -> WritResult<Repository> {
-            Repository::open(&self.root).map_err(|e| {
-                WritError::Other(format!("failed to open git repository: {e}"))
-            })
+            Repository::open(&self.root)
+                .map_err(|e| WritError::Other(format!("failed to open git repository: {e}")))
         }
 
         fn default_signature(repo: &Repository) -> WritResult<Signature<'static>> {
@@ -74,9 +72,9 @@ mod git2_impl {
     impl GitOps for Git2Ops {
         fn stage_files(&self, paths: &[&str]) -> WritResult<usize> {
             let repo = self.repo()?;
-            let mut index = repo.index().map_err(|e| {
-                WritError::Other(format!("failed to read git index: {e}"))
-            })?;
+            let mut index = repo
+                .index()
+                .map_err(|e| WritError::Other(format!("failed to read git index: {e}")))?;
 
             let mut count = 0;
             for path in paths {
@@ -89,73 +87,71 @@ mod git2_impl {
                 }
             }
 
-            index.write().map_err(|e| {
-                WritError::Other(format!("failed to write git index: {e}"))
-            })?;
+            index
+                .write()
+                .map_err(|e| WritError::Other(format!("failed to write git index: {e}")))?;
             Ok(count)
         }
 
         fn stage_all(&self) -> WritResult<usize> {
             let repo = self.repo()?;
-            let mut index = repo.index().map_err(|e| {
-                WritError::Other(format!("failed to read git index: {e}"))
-            })?;
+            let mut index = repo
+                .index()
+                .map_err(|e| WritError::Other(format!("failed to read git index: {e}")))?;
 
             // Count entries before
             let before = index.len();
 
             index
                 .add_all(["*"].iter(), IndexAddOption::DEFAULT, None)
-                .map_err(|e| {
-                    WritError::Other(format!("failed to stage all files: {e}"))
-                })?;
+                .map_err(|e| WritError::Other(format!("failed to stage all files: {e}")))?;
 
             // Remove deleted files from index
-            index
-                .update_all(["*"].iter(), None)
-                .map_err(|e| {
-                    WritError::Other(format!("failed to update index for deletions: {e}"))
-                })?;
-
-            index.write().map_err(|e| {
-                WritError::Other(format!("failed to write git index: {e}"))
+            index.update_all(["*"].iter(), None).map_err(|e| {
+                WritError::Other(format!("failed to update index for deletions: {e}"))
             })?;
+
+            index
+                .write()
+                .map_err(|e| WritError::Other(format!("failed to write git index: {e}")))?;
 
             let after = index.len();
             // Return approximate count (may differ from actual staged changes)
-            Ok(if after >= before { after - before } else { before - after })
+            Ok(if after >= before {
+                after - before
+            } else {
+                before - after
+            })
         }
 
         fn commit(&self, message: &str) -> WritResult<String> {
             let repo = self.repo()?;
             let sig = Self::default_signature(&repo)?;
-            let mut index = repo.index().map_err(|e| {
-                WritError::Other(format!("failed to read git index: {e}"))
-            })?;
+            let mut index = repo
+                .index()
+                .map_err(|e| WritError::Other(format!("failed to read git index: {e}")))?;
 
-            let tree_oid = index.write_tree().map_err(|e| {
-                WritError::Other(format!("failed to write tree: {e}"))
-            })?;
-            let tree = repo.find_tree(tree_oid).map_err(|e| {
-                WritError::Other(format!("failed to find tree: {e}"))
-            })?;
+            let tree_oid = index
+                .write_tree()
+                .map_err(|e| WritError::Other(format!("failed to write tree: {e}")))?;
+            let tree = repo
+                .find_tree(tree_oid)
+                .map_err(|e| WritError::Other(format!("failed to find tree: {e}")))?;
 
             // Get parent commit (HEAD), if any
             let parent = match repo.head() {
-                Ok(head) => Some(head.peel_to_commit().map_err(|e| {
-                    WritError::Other(format!("failed to resolve HEAD: {e}"))
-                })?),
+                Ok(head) => Some(
+                    head.peel_to_commit()
+                        .map_err(|e| WritError::Other(format!("failed to resolve HEAD: {e}")))?,
+                ),
                 Err(_) => None, // Initial commit
             };
 
-            let parents: Vec<&git2::Commit> =
-                parent.as_ref().map(|p| vec![p]).unwrap_or_default();
+            let parents: Vec<&git2::Commit> = parent.as_ref().map(|p| vec![p]).unwrap_or_default();
 
             let oid = repo
                 .commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
-                .map_err(|e| {
-                    WritError::Other(format!("failed to create commit: {e}"))
-                })?;
+                .map_err(|e| WritError::Other(format!("failed to create commit: {e}")))?;
 
             Ok(oid.to_string())
         }
@@ -181,42 +177,39 @@ mod git2_impl {
             match repo.find_branch(name, git2::BranchType::Local) {
                 Ok(branch) => {
                     // Checkout existing branch
-                    let refname = branch.get().name().ok_or_else(|| {
-                        WritError::Other("branch ref has no name".into())
-                    })?;
+                    let refname = branch
+                        .get()
+                        .name()
+                        .ok_or_else(|| WritError::Other("branch ref has no name".into()))?;
                     repo.set_head(refname).map_err(|e| {
                         WritError::Other(format!("failed to set HEAD to {}: {e}", name))
                     })?;
-                    repo.checkout_head(Some(
-                        git2::build::CheckoutBuilder::new().force(),
-                    ))
-                    .map_err(|e| {
-                        WritError::Other(format!("failed to checkout {}: {e}", name))
-                    })?;
+                    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+                        .map_err(|e| {
+                            WritError::Other(format!("failed to checkout {}: {e}", name))
+                        })?;
                 }
                 Err(_) => {
                     // Create new branch from HEAD
-                    let head = repo.head().map_err(|e| {
-                        WritError::Other(format!("no HEAD to branch from: {e}"))
-                    })?;
-                    let commit = head.peel_to_commit().map_err(|e| {
-                        WritError::Other(format!("HEAD is not a commit: {e}"))
-                    })?;
+                    let head = repo
+                        .head()
+                        .map_err(|e| WritError::Other(format!("no HEAD to branch from: {e}")))?;
+                    let commit = head
+                        .peel_to_commit()
+                        .map_err(|e| WritError::Other(format!("HEAD is not a commit: {e}")))?;
                     let branch = repo.branch(name, &commit, false).map_err(|e| {
                         WritError::Other(format!("failed to create branch '{}': {e}", name))
                     })?;
-                    let refname = branch.get().name().ok_or_else(|| {
-                        WritError::Other("new branch ref has no name".into())
-                    })?;
-                    repo.set_head(refname).map_err(|e| {
-                        WritError::Other(format!("failed to set HEAD: {e}"))
-                    })?;
-                    repo.checkout_head(Some(
-                        git2::build::CheckoutBuilder::new().force(),
-                    ))
-                    .map_err(|e| {
-                        WritError::Other(format!("failed to checkout new branch: {e}"))
-                    })?;
+                    let refname = branch
+                        .get()
+                        .name()
+                        .ok_or_else(|| WritError::Other("new branch ref has no name".into()))?;
+                    repo.set_head(refname)
+                        .map_err(|e| WritError::Other(format!("failed to set HEAD: {e}")))?;
+                    repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force()))
+                        .map_err(|e| {
+                            WritError::Other(format!("failed to checkout new branch: {e}"))
+                        })?;
                 }
             }
 
@@ -226,17 +219,16 @@ mod git2_impl {
         fn has_staged_changes(&self) -> WritResult<bool> {
             let repo = self.repo()?;
             let head_tree = match repo.head() {
-                Ok(head) => Some(head.peel_to_tree().map_err(|e| {
-                    WritError::Other(format!("failed to get HEAD tree: {e}"))
-                })?),
+                Ok(head) => Some(
+                    head.peel_to_tree()
+                        .map_err(|e| WritError::Other(format!("failed to get HEAD tree: {e}")))?,
+                ),
                 Err(_) => None, // No commits — any staged content counts
             };
 
             let diff = repo
                 .diff_tree_to_index(head_tree.as_ref(), None, None)
-                .map_err(|e| {
-                    WritError::Other(format!("failed to diff index: {e}"))
-                })?;
+                .map_err(|e| WritError::Other(format!("failed to diff index: {e}")))?;
 
             Ok(diff.deltas().len() > 0)
         }
@@ -357,25 +349,16 @@ mod tests {
 
         // Create a new branch
         ops.checkout_or_create_branch("feature-x").unwrap();
-        assert_eq!(
-            ops.current_branch().unwrap().as_deref(),
-            Some("feature-x")
-        );
+        assert_eq!(ops.current_branch().unwrap().as_deref(), Some("feature-x"));
 
         // Switch back (assuming default was "master" or "main")
         // Create it explicitly first
         ops.checkout_or_create_branch("test-main").unwrap();
-        assert_eq!(
-            ops.current_branch().unwrap().as_deref(),
-            Some("test-main")
-        );
+        assert_eq!(ops.current_branch().unwrap().as_deref(), Some("test-main"));
 
         // Switch to existing branch
         ops.checkout_or_create_branch("feature-x").unwrap();
-        assert_eq!(
-            ops.current_branch().unwrap().as_deref(),
-            Some("feature-x")
-        );
+        assert_eq!(ops.current_branch().unwrap().as_deref(), Some("feature-x"));
     }
 
     #[test]

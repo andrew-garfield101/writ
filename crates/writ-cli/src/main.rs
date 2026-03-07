@@ -1074,7 +1074,9 @@ fn main() {
             cached,
         } => {
             let format = resolve_format(format.as_deref(), &cwd, "human");
-            cmd_diff(&cwd, from, to, &format, spec, agent, completed, all, file, stat, name_only, cached)
+            cmd_diff(
+                &cwd, from, to, &format, spec, agent, completed, all, file, stat, name_only, cached,
+            )
         }
         Commands::Context {
             spec,
@@ -1179,11 +1181,9 @@ fn main() {
                 cmd_spec_status(&cwd, state.as_deref(), &format)
             }
             SpecCommands::Cancel { id } => cmd_spec_cancel(&cwd, &id),
-            SpecCommands::Done {
-                id,
-                summary,
-                agent,
-            } => cmd_spec_done(&cwd, id.as_deref(), summary, agent.as_deref()),
+            SpecCommands::Done { id, summary, agent } => {
+                cmd_spec_done(&cwd, id.as_deref(), summary, agent.as_deref())
+            }
             SpecCommands::Complete { id } => cmd_spec_complete(&cwd, &id),
             SpecCommands::Show { id } => cmd_spec_show(&cwd, &id),
             SpecCommands::Update {
@@ -2102,10 +2102,18 @@ fn cmd_diff(
             std::iter::once(path.clone()).collect()
         } else {
             // Collect file paths from seals matching the filter criteria.
-            collect_filtered_paths(&repo, spec_filter.as_deref(), agent_filter.as_deref(), effective_completed, all)?
+            collect_filtered_paths(
+                &repo,
+                spec_filter.as_deref(),
+                agent_filter.as_deref(),
+                effective_completed,
+                all,
+            )?
         };
 
-        diff_output.files.retain(|f| allowed_paths.contains(&f.path));
+        diff_output
+            .files
+            .retain(|f| allowed_paths.contains(&f.path));
 
         // Recompute totals after filtering.
         diff_output.files_changed = diff_output.files.len();
@@ -3059,7 +3067,9 @@ fn cmd_status_watch(
         Ok(Some("diff")) => {
             println!();
             let format = resolve_format(None, cwd, "human");
-            cmd_diff(cwd, None, None, &format, None, None, false, false, None, false, false, false)?;
+            cmd_diff(
+                cwd, None, None, &format, None, None, false, false, None, false, false, false,
+            )?;
         }
         Ok(_) => {} // quit
         Err(e) => return Err(e),
@@ -3149,16 +3159,8 @@ fn cmd_finish(
     println!();
     println!("{}", "Completed specs ready to commit:".bold());
     for s in &committable {
-        let summary_hint = s
-            .completion_summary
-            .as_deref()
-            .unwrap_or("(no summary)");
-        println!(
-            "  {} {} — {}",
-            "✓".green(),
-            s.id.cyan(),
-            summary_hint
-        );
+        let summary_hint = s.completion_summary.as_deref().unwrap_or("(no summary)");
+        println!("  {} {} — {}", "✓".green(), s.id.cyan(), summary_hint);
     }
 
     if !in_progress.is_empty() {
@@ -3264,8 +3266,7 @@ fn cmd_finish(
             for s in &sorted {
                 if !s.file_scope.is_empty() {
                     // Stage only this spec's files
-                    let paths: Vec<&str> =
-                        s.file_scope.iter().map(|p| p.as_str()).collect();
+                    let paths: Vec<&str> = s.file_scope.iter().map(|p| p.as_str()).collect();
                     git.stage_files(&paths)?;
                 } else if !staged_all {
                     // No file_scope — stage everything on the first pass
@@ -3277,23 +3278,14 @@ fn cmd_finish(
                     continue;
                 }
 
-                let msg = s
-                    .completion_summary
-                    .as_deref()
-                    .unwrap_or(&s.title);
+                let msg = s.completion_summary.as_deref().unwrap_or(&s.title);
                 let spec_msg = format!("{}: {}", s.id, msg);
 
                 let hash = git.commit(&spec_msg)?;
                 let short = &hash[..std::cmp::min(8, hash.len())];
                 let _ = repo.mark_spec_committed(&s.id, &hash);
 
-                println!(
-                    "  {} {} — {} ({})",
-                    "✓".green(),
-                    short.cyan(),
-                    s.id,
-                    msg
-                );
+                println!("  {} {} — {} ({})", "✓".green(), short.cyan(), s.id, msg);
             }
         }
         "grouped" => {
@@ -3313,8 +3305,7 @@ fn cmd_finish(
                     groups.len()
                 );
                 for (i, group) in groups.iter().enumerate() {
-                    let spec_ids: Vec<&str> =
-                        group.specs.iter().map(|s| s.id.as_str()).collect();
+                    let spec_ids: Vec<&str> = group.specs.iter().map(|s| s.id.as_str()).collect();
                     println!(
                         "    Group {}: \"{}\" ({})",
                         i + 1,
@@ -3349,10 +3340,7 @@ fn cmd_finish(
                     .specs
                     .iter()
                     .map(|s| {
-                        let msg = s
-                            .completion_summary
-                            .as_deref()
-                            .unwrap_or(&s.title);
+                        let msg = s.completion_summary.as_deref().unwrap_or(&s.title);
                         format!("{}: {}", s.id, msg)
                     })
                     .collect();
@@ -3369,8 +3357,7 @@ fn cmd_finish(
                     let _ = repo.mark_spec_committed(&s.id, &hash);
                 }
 
-                let spec_ids: Vec<&str> =
-                    group.specs.iter().map(|s| s.id.as_str()).collect();
+                let spec_ids: Vec<&str> = group.specs.iter().map(|s| s.id.as_str()).collect();
                 println!(
                     "  {} {} — {} ({})",
                     "✓".green(),
@@ -3390,10 +3377,7 @@ fn cmd_finish(
     }
 
     println!();
-    println!(
-        "  {} Run `git push` when ready.",
-        "→".dimmed()
-    );
+    println!("  {} Run `git push` when ready.", "→".dimmed());
 
     Ok(())
 }
@@ -3456,7 +3440,7 @@ fn common_directory_prefix(paths: &[String]) -> String {
         .map(|p| {
             match p.rfind('/') {
                 Some(i) => &p[..=i], // include trailing slash
-                None => "",           // file in root
+                None => "",          // file in root
             }
         })
         .collect();
@@ -3577,12 +3561,7 @@ fn cmd_finish_propose(
     };
 
     let spec_ids: Vec<String> = committable.iter().map(|s| s.id.clone()).collect();
-    let proposal = repo.create_proposal(
-        spec_ids,
-        message,
-        "cli".into(),
-        strategy.into(),
-    )?;
+    let proposal = repo.create_proposal(spec_ids, message, "cli".into(), strategy.into())?;
 
     println!();
     println!(
@@ -3591,12 +3570,12 @@ fn cmd_finish_propose(
         proposal.id.cyan()
     );
     println!("  Specs: {}", proposal.spec_ids.join(", "));
-    println!("  Message: {}", proposal.message.lines().next().unwrap_or(""));
-    println!();
     println!(
-        "  {} Review: `writ finish --proposals`",
-        "→".dimmed()
+        "  Message: {}",
+        proposal.message.lines().next().unwrap_or("")
     );
+    println!();
+    println!("  {} Review: `writ finish --proposals`", "→".dimmed());
     println!(
         "  {} Accept: `writ finish --accept {}`",
         "→".dimmed(),
@@ -3642,14 +3621,8 @@ fn cmd_finish_proposals(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>>
         );
     }
     println!();
-    println!(
-        "  {} Accept: `writ finish --accept <id>`",
-        "→".dimmed()
-    );
-    println!(
-        "  {} Reject: `writ finish --reject <id>`",
-        "→".dimmed()
-    );
+    println!("  {} Accept: `writ finish --accept <id>`", "→".dimmed());
+    println!("  {} Reject: `writ finish --reject <id>`", "→".dimmed());
 
     Ok(())
 }
@@ -3704,19 +3677,13 @@ fn cmd_finish_accept(
         proposal.spec_ids.len()
     );
     println!();
-    println!(
-        "  {} Run `git push` when ready.",
-        "→".dimmed()
-    );
+    println!("  {} Run `git push` when ready.", "→".dimmed());
 
     Ok(())
 }
 
 /// Reject a proposal.
-fn cmd_finish_reject(
-    cwd: &PathBuf,
-    proposal_id: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_finish_reject(cwd: &PathBuf, proposal_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
     let repo = Repository::open(cwd)?;
@@ -3734,10 +3701,7 @@ fn cmd_finish_reject(
 }
 
 /// Auto mode: commit without prompts, with safety rails from project config.
-fn cmd_finish_auto(
-    cwd: &PathBuf,
-    strategy: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_finish_auto(cwd: &PathBuf, strategy: &str) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
     use writ_core::config::ProjectConfig;
     use writ_core::git_ops::{Git2Ops, GitOps};
@@ -3828,12 +3792,7 @@ fn cmd_finish_auto(
         let message = if batches.len() == 1 {
             summary.headline.clone()
         } else {
-            format!(
-                "{} (batch {}/{})",
-                summary.headline,
-                i + 1,
-                batches.len()
-            )
+            format!("{} (batch {}/{})", summary.headline, i + 1, batches.len())
         };
 
         let hash = git.commit(&message)?;
@@ -4282,17 +4241,11 @@ fn cmd_spec_done(
                 }
                 1 => {
                     let id = active[0].id.clone();
-                    println!(
-                        "Auto-detected active spec: {} \"{}\"",
-                        id, active[0].title
-                    );
+                    println!("Auto-detected active spec: {} \"{}\"", id, active[0].title);
                     id
                 }
                 n => {
-                    eprintln!(
-                        "error: {} active specs found. Please specify which one:",
-                        n
-                    );
+                    eprintln!("error: {} active specs found. Please specify which one:", n);
                     for s in &active {
                         eprintln!("  writ spec done {} -s \"summary\"", s.id);
                     }
@@ -4304,10 +4257,7 @@ fn cmd_spec_done(
 
     // Create final seal
     let agent_id = agent.unwrap_or("human");
-    let seal_summary = summary
-        .as_deref()
-        .unwrap_or("Spec completed")
-        .to_string();
+    let seal_summary = summary.as_deref().unwrap_or("Spec completed").to_string();
 
     let seal_agent = AgentIdentity {
         id: agent_id.to_string(),
@@ -6798,11 +6748,7 @@ fn cmd_config_unset(
 // Doctor
 // ---------------------------------------------------------------------------
 
-fn cmd_doctor(
-    cwd: &PathBuf,
-    json: bool,
-    fix: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_doctor(cwd: &PathBuf, json: bool, fix: bool) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open(cwd)?;
     let report = writ_core::migrate::DoctorReport::run(repo.writ_dir());
 
@@ -6834,8 +6780,16 @@ fn cmd_doctor(
     println!(
         "  {} passed, {} failed, {} warnings",
         report.passed.to_string().green(),
-        if report.failed > 0 { failed_str.red().to_string() } else { failed_str },
-        if report.warnings > 0 { warn_str.yellow().to_string() } else { warn_str },
+        if report.failed > 0 {
+            failed_str.red().to_string()
+        } else {
+            failed_str
+        },
+        if report.warnings > 0 {
+            warn_str.yellow().to_string()
+        } else {
+            warn_str
+        },
     );
 
     if !report.is_healthy() {
@@ -6946,7 +6900,10 @@ mod tests {
 
     #[test]
     fn test_group_specs_by_directory() {
-        let s1 = make_test_spec("S-001", vec!["src/storage/zstd.rs", "src/storage/compress.rs"]);
+        let s1 = make_test_spec(
+            "S-001",
+            vec!["src/storage/zstd.rs", "src/storage/compress.rs"],
+        );
         let s2 = make_test_spec("S-002", vec!["src/storage/object_store.rs"]);
         let s3 = make_test_spec("S-003", vec!["crates/writ-py/src/lib.rs"]);
 

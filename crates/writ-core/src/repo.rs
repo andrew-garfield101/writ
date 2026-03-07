@@ -178,8 +178,7 @@ impl Repository {
             }
 
             // Update last_opened_by stamp.
-            let mut v = crate::migrate::RepoVersion::load(&writ_dir)?
-                .unwrap_or_default();
+            let mut v = crate::migrate::RepoVersion::load(&writ_dir)?.unwrap_or_default();
             v.last_opened_by = env!("CARGO_PKG_VERSION").to_string();
             v.last_opened_at = Some(chrono::Utc::now());
             v.save(&writ_dir)?;
@@ -2934,11 +2933,7 @@ impl Repository {
     }
 
     /// Update an accepted proposal with the actual commit hash.
-    pub fn update_proposal_hash(
-        &self,
-        proposal_id: &str,
-        hash: &str,
-    ) -> WritResult<()> {
+    pub fn update_proposal_hash(&self, proposal_id: &str, hash: &str) -> WritResult<()> {
         let mut proposal = self.load_proposal(proposal_id)?;
         proposal.commit_hash = Some(hash.to_string());
         self.save_proposal(&proposal)?;

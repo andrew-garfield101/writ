@@ -112,8 +112,7 @@ pub fn migrate(writ_dir: &Path, from_version: u32, to_version: u32) -> WritResul
 
         // Update version file after each successful step so partial
         // migrations leave the repo at the last good version.
-        let mut version = RepoVersion::load(writ_dir)?
-            .unwrap_or_else(RepoVersion::new);
+        let mut version = RepoVersion::load(writ_dir)?.unwrap_or_else(RepoVersion::new);
         version.schema_version = step;
         version.last_opened_by = env!("CARGO_PKG_VERSION").to_string();
         version.last_opened_at = Some(Utc::now());
@@ -129,8 +128,15 @@ pub fn migrate(writ_dir: &Path, from_version: u32, to_version: u32) -> WritResul
 fn migrate_v0_to_v1(writ_dir: &Path) -> WritResult<()> {
     // Ensure all expected directories exist (some were added post-launch).
     let dirs = [
-        "objects", "seals", "specs", "heads", "keys", "agents",
-        "proposals", "security", "security/events",
+        "objects",
+        "seals",
+        "specs",
+        "heads",
+        "keys",
+        "agents",
+        "proposals",
+        "security",
+        "security/events",
     ];
     for dir in &dirs {
         let p = writ_dir.join(dir);
@@ -217,9 +223,18 @@ impl DoctorReport {
         // 8. Seal files (sample)
         checks.push(check_seals(writ_dir));
 
-        let passed = checks.iter().filter(|c| c.status == CheckStatus::Pass).count();
-        let failed = checks.iter().filter(|c| c.status == CheckStatus::Fail).count();
-        let warnings = checks.iter().filter(|c| c.status == CheckStatus::Warning).count();
+        let passed = checks
+            .iter()
+            .filter(|c| c.status == CheckStatus::Pass)
+            .count();
+        let failed = checks
+            .iter()
+            .filter(|c| c.status == CheckStatus::Fail)
+            .count();
+        let warnings = checks
+            .iter()
+            .filter(|c| c.status == CheckStatus::Warning)
+            .count();
 
         DoctorReport {
             checks,
@@ -631,10 +646,15 @@ mod tests {
         RepoVersion::new().save(&writ_dir).unwrap();
 
         let report = DoctorReport::run(&writ_dir);
-        assert!(report.is_healthy(), "failures: {:?}",
-            report.checks.iter()
+        assert!(
+            report.is_healthy(),
+            "failures: {:?}",
+            report
+                .checks
+                .iter()
                 .filter(|c| c.status == CheckStatus::Fail)
-                .collect::<Vec<_>>());
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -648,7 +668,11 @@ mod tests {
 
         let report = DoctorReport::run(&writ_dir);
         assert!(!report.is_healthy());
-        let dir_check = report.checks.iter().find(|c| c.name == "directories").unwrap();
+        let dir_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "directories")
+            .unwrap();
         assert_eq!(dir_check.status, CheckStatus::Fail);
         assert!(dir_check.message.contains("objects"));
     }
@@ -673,7 +697,11 @@ mod tests {
         // No version.toml written
 
         let report = DoctorReport::run(&writ_dir);
-        let ver = report.checks.iter().find(|c| c.name == "version_file").unwrap();
+        let ver = report
+            .checks
+            .iter()
+            .find(|c| c.name == "version_file")
+            .unwrap();
         assert_eq!(ver.status, CheckStatus::Warning);
     }
 
@@ -939,7 +967,11 @@ mod tests {
         fs::remove_file(writ_dir.join("keys").join(".master")).unwrap();
 
         let report = DoctorReport::run(&writ_dir);
-        let key = report.checks.iter().find(|c| c.name == "master_key").unwrap();
+        let key = report
+            .checks
+            .iter()
+            .find(|c| c.name == "master_key")
+            .unwrap();
         assert_eq!(key.status, CheckStatus::Fail);
         assert!(key.message.contains(".master"));
     }
@@ -950,11 +982,7 @@ mod tests {
         let writ_dir = make_minimal_writ_dir(&tmp);
         RepoVersion::new().save(&writ_dir).unwrap();
 
-        fs::write(
-            writ_dir.join("seals").join("bad-seal.json"),
-            "not a seal",
-        )
-        .unwrap();
+        fs::write(writ_dir.join("seals").join("bad-seal.json"), "not a seal").unwrap();
 
         let report = DoctorReport::run(&writ_dir);
         let seal_check = report.checks.iter().find(|c| c.name == "seals").unwrap();
@@ -1020,11 +1048,7 @@ mod tests {
 
         let report = DoctorReport::run(&writ_dir);
         // Sprint spec says 8 checks
-        assert_eq!(
-            report.checks.len(),
-            8,
-            "doctor should run exactly 8 checks"
-        );
+        assert_eq!(report.checks.len(), 8, "doctor should run exactly 8 checks");
         assert_eq!(
             report.passed + report.failed + report.warnings,
             8,

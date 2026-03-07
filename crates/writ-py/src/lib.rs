@@ -1085,11 +1085,7 @@ impl PyRepository {
             let msg = message.unwrap_or_else(|| {
                 committable
                     .iter()
-                    .map(|s| {
-                        s.completion_summary
-                            .as_deref()
-                            .unwrap_or(&s.title)
-                    })
+                    .map(|s| s.completion_summary.as_deref().unwrap_or(&s.title))
                     .collect::<Vec<_>>()
                     .join("; ")
             });
@@ -1136,12 +1132,17 @@ impl PyRepository {
                     // Stage files in this spec's scope if available, otherwise stage all
                     if !s.file_scope.is_empty() {
                         let paths: Vec<&str> = s.file_scope.iter().map(|p| p.as_str()).collect();
-                        git.stage_files(&paths).map_err(|e| WritError::new_err(e.to_string()))?;
+                        git.stage_files(&paths)
+                            .map_err(|e| WritError::new_err(e.to_string()))?;
                     } else {
-                        git.stage_all().map_err(|e| WritError::new_err(e.to_string()))?;
+                        git.stage_all()
+                            .map_err(|e| WritError::new_err(e.to_string()))?;
                     }
 
-                    if !git.has_staged_changes().map_err(|e| WritError::new_err(e.to_string()))? {
+                    if !git
+                        .has_staged_changes()
+                        .map_err(|e| WritError::new_err(e.to_string()))?
+                    {
                         continue;
                     }
 
@@ -1150,7 +1151,9 @@ impl PyRepository {
                         s.id,
                         s.completion_summary.as_deref().unwrap_or(&s.title)
                     );
-                    let hash = git.commit(&msg).map_err(|e| WritError::new_err(e.to_string()))?;
+                    let hash = git
+                        .commit(&msg)
+                        .map_err(|e| WritError::new_err(e.to_string()))?;
                     let _ = self.inner.mark_spec_committed(&s.id, &hash);
                     commits.push(FinishCommit {
                         hash,
@@ -1161,9 +1164,13 @@ impl PyRepository {
             }
             _ => {
                 // Single commit strategy
-                git.stage_all().map_err(|e| WritError::new_err(e.to_string()))?;
+                git.stage_all()
+                    .map_err(|e| WritError::new_err(e.to_string()))?;
 
-                if !git.has_staged_changes().map_err(|e| WritError::new_err(e.to_string()))? {
+                if !git
+                    .has_staged_changes()
+                    .map_err(|e| WritError::new_err(e.to_string()))?
+                {
                     let result = FinishResult {
                         commits: Vec::new(),
                         strategy: strategy.to_string(),
@@ -1181,7 +1188,9 @@ impl PyRepository {
                         .unwrap_or_else(|| "writ: commit completed specs".to_string())
                 });
 
-                let hash = git.commit(&msg).map_err(|e| WritError::new_err(e.to_string()))?;
+                let hash = git
+                    .commit(&msg)
+                    .map_err(|e| WritError::new_err(e.to_string()))?;
                 for s in &committable {
                     let _ = self.inner.mark_spec_committed(&s.id, &hash);
                 }
@@ -1209,13 +1218,11 @@ impl PyRepository {
     /// This is the Python binding for `writ spec done <id>`.
     /// Returns the updated spec as a dict.
     #[pyo3(signature = (spec_id, summary=None))]
-    fn spec_done(
-        &self,
-        py: Python,
-        spec_id: &str,
-        summary: Option<String>,
-    ) -> PyResult<PyObject> {
-        let spec = self.inner.mark_spec_done(spec_id, summary).map_err(writ_err)?;
+    fn spec_done(&self, py: Python, spec_id: &str, summary: Option<String>) -> PyResult<PyObject> {
+        let spec = self
+            .inner
+            .mark_spec_done(spec_id, summary)
+            .map_err(writ_err)?;
         to_pydict(py, &spec)
     }
 
@@ -1251,7 +1258,12 @@ impl PyRepository {
     ) -> PyResult<PyObject> {
         let proposal = self
             .inner
-            .create_proposal(spec_ids, message, proposed_by.to_string(), strategy.to_string())
+            .create_proposal(
+                spec_ids,
+                message,
+                proposed_by.to_string(),
+                strategy.to_string(),
+            )
             .map_err(writ_err)?;
         to_pydict(py, &proposal)
     }
@@ -1327,8 +1339,7 @@ impl PyRepository {
     ///   last_opened_at: str or None
     fn version_info(&self, py: Python) -> PyResult<PyObject> {
         let writ_dir = self.inner.writ_dir();
-        let version = writ_core::migrate::RepoVersion::load(writ_dir)
-            .map_err(writ_err)?;
+        let version = writ_core::migrate::RepoVersion::load(writ_dir).map_err(writ_err)?;
         match version {
             Some(v) => to_pydict(py, &v),
             None => {

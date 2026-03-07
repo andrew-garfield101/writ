@@ -118,7 +118,8 @@ class TestInstallHooksClaudeMd:
 
         seal_content = seal_cmd.read_text()
         assert "--spec" in seal_content
-        assert "--status" in seal_content
+        # Slash command now uses "writ spec done" instead of "--status"
+        assert "spec done" in seal_content or "--status" in seal_content
 
     def test_install_hooks_claudemd_new_file(self, tmp_path: Path):
         """install_hooks() on fresh dir (no CLAUDE.md) — no crash but also

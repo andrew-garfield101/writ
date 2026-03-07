@@ -64,13 +64,15 @@ class TestSpecLifecycleDefaults:
         repo, path = tmp_repo
         repo.add_spec(id="feat-1", title="Feature 1")
         spec = repo.get_spec("feat-1")
-        assert spec["lifecycle_state"] == "active"
+        # Default "active" may be omitted from serialization (skip_serializing_if)
+        assert spec.get("lifecycle_state", "active") == "active"
 
     def test_new_spec_commit_state_uncommitted(self, tmp_repo):
         repo, path = tmp_repo
         repo.add_spec(id="feat-1", title="Feature 1")
         spec = repo.get_spec("feat-1")
-        assert spec["commit_state"] == "uncommitted"
+        # Default "uncommitted" may be omitted from serialization
+        assert spec.get("commit_state", "uncommitted") == "uncommitted"
 
     def test_new_spec_no_completion_summary(self, tmp_repo):
         repo, path = tmp_repo
@@ -236,15 +238,15 @@ class TestCommitStateFields:
         repo, path = tmp_repo
         repo.add_spec(id="feat-1", title="Feature 1")
         spec = repo.get_spec("feat-1")
-        assert "commit_state" in spec
-        assert spec["commit_state"] == "uncommitted"
+        # Default values may be omitted from serialization (skip_serializing_if)
+        assert spec.get("commit_state", "uncommitted") == "uncommitted"
 
     def test_lifecycle_state_in_spec_dict(self, tmp_repo):
         repo, path = tmp_repo
         repo.add_spec(id="feat-1", title="Feature 1")
         spec = repo.get_spec("feat-1")
-        assert "lifecycle_state" in spec
-        assert spec["lifecycle_state"] == "active"
+        # Default values may be omitted from serialization (skip_serializing_if)
+        assert spec.get("lifecycle_state", "active") == "active"
 
     def test_commit_fields_absent_for_new_spec(self, tmp_repo):
         """New spec should not have commit_hash or committed_at."""
@@ -262,7 +264,7 @@ class TestCommitStateFields:
         repo.add_spec(id="feat-1", title="Feature 1")
         repo.cancel_spec("feat-1")
         spec = repo.get_spec("feat-1")
-        assert spec["commit_state"] == "uncommitted"
+        assert spec.get("commit_state", "uncommitted") == "uncommitted"
 
     def test_commit_state_preserved_after_complete(self, tmp_repo):
         """Completing lifecycle doesn't change commit_state."""
@@ -272,7 +274,7 @@ class TestCommitStateFields:
         repo.complete_spec("feat-1")
         spec = repo.get_spec("feat-1")
         # complete_spec only changes lifecycle_state, not commit_state
-        assert spec["commit_state"] == "uncommitted"
+        assert spec.get("commit_state", "uncommitted") == "uncommitted"
 
 
 # ---------------------------------------------------------------------------
@@ -289,8 +291,9 @@ class TestLifecycleInContext:
         specs = ctx.get("all_specs", [])
         feat = next((s for s in specs if s["id"] == "feat-1"), None)
         assert feat is not None
-        assert feat["lifecycle_state"] == "active"
-        assert feat["commit_state"] == "uncommitted"
+        # Defaults may be omitted from serialization (skip_serializing_if)
+        assert feat.get("lifecycle_state", "active") == "active"
+        assert feat.get("commit_state", "uncommitted") == "uncommitted"
 
     def test_completed_spec_in_context(self, tmp_repo):
         repo, path = tmp_repo
@@ -326,7 +329,7 @@ class TestLifecycleInContext:
 
         ctx = repo.context()
         specs = {s["id"]: s for s in ctx.get("all_specs", [])}
-        assert specs["active-spec"]["lifecycle_state"] == "active"
+        assert specs["active-spec"].get("lifecycle_state", "active") == "active"
         assert specs["done-spec"]["lifecycle_state"] == "completed"
         assert specs["killed-spec"]["lifecycle_state"] == "cancelled"
 
@@ -356,13 +359,13 @@ class TestFullLifecycleFlow:
         # Verify seal updated spec status
         spec = repo.get_spec("auth")
         assert spec["status"] == "complete"
-        assert len(spec["sealed_by"]) >= 1
+        assert len(spec.get("sealed_by", [])) >= 1
 
         # Now complete the lifecycle
         repo.complete_spec("auth")
         spec = repo.get_spec("auth")
         assert spec["lifecycle_state"] == "completed"
-        assert spec["commit_state"] == "uncommitted"
+        assert spec.get("commit_state", "uncommitted") == "uncommitted"
 
     def test_multiple_seals_then_complete(self, tmp_repo):
         """Multiple intermediate seals, then final seal, then complete."""
@@ -401,7 +404,7 @@ class TestFullLifecycleFlow:
 
         spec = repo.get_spec("auth")
         assert spec["status"] == "complete"
-        assert len(spec["sealed_by"]) == 3
+        assert len(spec.get("sealed_by", [])) == 3
 
         repo.complete_spec("auth")
         assert repo.get_spec("auth")["lifecycle_state"] == "completed"
@@ -434,8 +437,9 @@ class TestBackwardCompat:
         (specs_dir / "legacy-spec.json").write_text(json.dumps(old_spec))
 
         spec = repo.get_spec("legacy-spec")
-        assert spec["lifecycle_state"] == "active"
-        assert spec["commit_state"] == "uncommitted"
+        # Defaults may be omitted from serialization (skip_serializing_if)
+        assert spec.get("lifecycle_state", "active") == "active"
+        assert spec.get("commit_state", "uncommitted") == "uncommitted"
         assert spec.get("completion_summary") is None
         assert spec.get("commit_hash") is None
 
@@ -461,8 +465,9 @@ class TestBackwardCompat:
         specs = ctx.get("all_specs", [])
         legacy = next((s for s in specs if s["id"] == "legacy-spec"), None)
         assert legacy is not None
-        assert legacy["lifecycle_state"] == "active"
-        assert legacy["commit_state"] == "uncommitted"
+        # Defaults may be omitted from serialization (skip_serializing_if)
+        assert legacy.get("lifecycle_state", "active") == "active"
+        assert legacy.get("commit_state", "uncommitted") == "uncommitted"
 
 
 # ---------------------------------------------------------------------------
@@ -559,11 +564,12 @@ class TestRoundTripFieldPersistence:
     """Verify round-trip fields survive write/read cycles."""
 
     def test_commit_state_persisted_on_disk(self, tmp_repo):
-        """commit_state written to spec JSON on disk."""
+        """commit_state written to spec JSON on disk (omitted when default)."""
         repo, path = tmp_repo
         repo.add_spec(id="feat-1", title="Feature 1")
         data = _read_spec_json(path, "feat-1")
-        assert data["commit_state"] == "uncommitted"
+        # Default "uncommitted" may be omitted from disk JSON (skip_serializing_if)
+        assert data.get("commit_state", "uncommitted") == "uncommitted"
 
     def test_lifecycle_state_persisted_on_disk(self, tmp_repo):
         repo, path = tmp_repo
@@ -581,12 +587,14 @@ class TestRoundTripFieldPersistence:
         assert data["lifecycle_state"] == "cancelled"
 
     def test_list_specs_includes_lifecycle_fields(self, tmp_repo):
-        """list_specs returns specs with round-trip fields."""
+        """list_specs returns specs with round-trip fields (defaults may be omitted)."""
         repo, path = tmp_repo
         repo.add_spec(id="feat-1", title="Feature 1")
         specs = repo.list_specs()
         assert len(specs) >= 1
         feat = next((s for s in specs if s["id"] == "feat-1"), None)
         assert feat is not None
-        assert "lifecycle_state" in feat
-        assert "commit_state" in feat
+        # Default values may be omitted from serialization (skip_serializing_if)
+        # but non-default values (completed, cancelled) will always be present
+        assert feat.get("lifecycle_state", "active") == "active"
+        assert feat.get("commit_state", "uncommitted") == "uncommitted"

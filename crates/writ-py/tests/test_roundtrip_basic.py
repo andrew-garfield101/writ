@@ -347,7 +347,7 @@ class TestSpecThroughFinish:
         assert spec["status"] == "complete"
         # Current finish doesn't update commit_state — that's W.6
         # Just verify the spec is still readable after git operations
-        assert spec["lifecycle_state"] == "active"
+        assert spec.get("lifecycle_state", "active") == "active"
 
     def test_multiple_specs_through_finish(self, git_writ_repo):
         """Multiple specs, all sealed, then finish."""

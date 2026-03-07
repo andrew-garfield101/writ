@@ -157,23 +157,27 @@ impl Repository {
         }
 
         // --- Schema version check & auto-migration ---
-        let current_schema = crate::migrate::CURRENT_SCHEMA_VERSION;
-        let repo_version = crate::migrate::RepoVersion::load(&writ_dir)?;
-        let schema = repo_version.as_ref().map(|v| v.schema_version).unwrap_or(0);
-
-        if schema > current_schema {
-            return Err(WritError::Other(format!(
-                "this repo uses schema version {schema}, but this binary only supports up to \
-                 {current_schema} — please update writ"
-            )));
-        }
-
-        if schema < current_schema {
-            crate::migrate::migrate(&writ_dir, schema, current_schema)?;
-        }
-
-        // Update last_opened_by stamp.
+        // Acquire lock during migration + version stamp to prevent races when
+        // multiple processes/threads open the same repo concurrently.
         {
+            let _lock = RepoLock::acquire(&writ_dir, Self::LOCK_TIMEOUT)?;
+
+            let current_schema = crate::migrate::CURRENT_SCHEMA_VERSION;
+            let repo_version = crate::migrate::RepoVersion::load(&writ_dir)?;
+            let schema = repo_version.as_ref().map(|v| v.schema_version).unwrap_or(0);
+
+            if schema > current_schema {
+                return Err(WritError::Other(format!(
+                    "this repo uses schema version {schema}, but this binary only supports up to \
+                     {current_schema} — please update writ"
+                )));
+            }
+
+            if schema < current_schema {
+                crate::migrate::migrate(&writ_dir, schema, current_schema)?;
+            }
+
+            // Update last_opened_by stamp.
             let mut v = crate::migrate::RepoVersion::load(&writ_dir)?
                 .unwrap_or_default();
             v.last_opened_by = env!("CARGO_PKG_VERSION").to_string();

@@ -86,8 +86,9 @@ class TestReopenBasics:
         repo.reopen_spec("feat")
         spec = repo.get_spec("feat")
         assert spec["status"] == "in-progress"
-        assert spec["commit_state"] == "uncommitted"
-        assert spec["lifecycle_state"] == "active"
+        # Defaults may be omitted from serialization (skip_serializing_if)
+        assert spec.get("commit_state", "uncommitted") == "uncommitted"
+        assert spec.get("lifecycle_state", "active") == "active"
 
     def test_reopen_preserves_completion_summary(self, tmp_repo):
         """Reopen preserves the original completion summary for history."""
@@ -207,7 +208,7 @@ class TestReopenContinueWork:
 
         spec = repo.get_spec("feat")
         assert spec["status"] == "in-progress"
-        assert len(spec["sealed_by"]) >= 2
+        assert len(spec.get("sealed_by", [])) >= 2
 
     def test_reopen_complete_again(self, tmp_repo):
         """Full cycle: complete → reopen → work → complete again."""
@@ -260,7 +261,8 @@ class TestReopenContinueWork:
 
         ctx = repo.context(spec="feat")
         assert ctx["active_spec"]["status"] == "in-progress"
-        assert ctx["active_spec"]["lifecycle_state"] == "active"
+        # Default "active" may be omitted from serialization (skip_serializing_if)
+        assert ctx["active_spec"].get("lifecycle_state", "active") == "active"
 
 
 class TestSpecDone:

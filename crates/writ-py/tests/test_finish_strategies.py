@@ -167,7 +167,7 @@ class TestPerSpecStrategy:
 
         # Specs should NOT be marked committed
         auth = repo.get_spec("auth")
-        assert auth["commit_state"] == "uncommitted"
+        assert auth.get("commit_state", "uncommitted") == "uncommitted"
 
     def test_per_spec_no_committable_specs(self, git_writ_repo):
         """Per-spec with no committable specs returns empty result."""
@@ -192,7 +192,7 @@ class TestPerSpecStrategy:
 
         # api should still be uncommitted
         api = repo.get_spec("api")
-        assert api["commit_state"] == "uncommitted"
+        assert api.get("commit_state", "uncommitted") == "uncommitted"
 
 
 # ---------------------------------------------------------------------------

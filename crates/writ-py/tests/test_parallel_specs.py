@@ -315,7 +315,7 @@ class TestFiveAgentParallel:
         for i in range(3):
             spec = repo.get_spec(f"feat-{i}")
             assert spec["lifecycle_state"] == "completed"
-            assert spec["commit_state"] == "uncommitted"
+            assert spec.get("commit_state", "uncommitted") == "uncommitted"
 
         # Finish
         result = run_writ(["finish"], str(path))

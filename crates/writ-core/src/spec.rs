@@ -68,6 +68,18 @@ impl Default for LifecycleState {
     }
 }
 
+impl LifecycleState {
+    fn is_default(&self) -> bool {
+        matches!(self, LifecycleState::Active)
+    }
+}
+
+impl CommitState {
+    fn is_default(&self) -> bool {
+        matches!(self, CommitState::Uncommitted)
+    }
+}
+
 /// A requirement specification tracked by writ.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -81,14 +93,17 @@ pub struct Spec {
     /// Current status.
     pub status: SpecStatus,
     /// IDs of specs this one depends on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
     /// Files expected to be affected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_scope: Vec<String>,
     /// When the spec was created.
     pub created_at: DateTime<Utc>,
     /// When the spec was last updated.
     pub updated_at: DateTime<Utc>,
     /// IDs of seals linked to this spec.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sealed_by: Vec<String>,
     /// Testable conditions for spec completion.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -101,7 +116,7 @@ pub struct Spec {
     pub tech_stack: Vec<String>,
     /// GC lifecycle state — separate from user-facing `status`.
     /// Defaults to `Active` for backward compatibility with existing repos.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "LifecycleState::is_default")]
     pub lifecycle_state: LifecycleState,
     /// Timestamp of last meaningful activity (seal referencing this spec).
     /// Used by GC stale detection. Defaults to `created_at` for existing specs.
@@ -111,7 +126,7 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_summary: Option<String>,
     /// Git promotion state — tracks commit/push progress.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "CommitState::is_default")]
     pub commit_state: CommitState,
     /// When the spec was marked complete.
     #[serde(default, skip_serializing_if = "Option::is_none")]

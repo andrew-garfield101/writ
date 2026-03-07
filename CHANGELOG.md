@@ -62,6 +62,19 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Layer 4: YAML scenario runner with timing support. 41 scenarios: 23 convergence, 7 negative, 7 scale, 2 security, 2 e2e. Scale scenarios up to 100 agents.
 - Layer 5: Live agent test run framework. TR22: 3 agents, 20 checks, scripted and live modes.
 
+**Upgrade and Migration**
+- Schema versioning: `.writ/version.toml` tracks on-disk format version separately from binary version
+- Auto-migration on open: repos created before versioning (schema v0) are silently migrated to v1
+- Migration runner: sequential, idempotent, with backup before each migration step
+- `writ doctor`: read only health check command with 8 checks (version file, schema, directories, index, config, master key, specs, seals)
+- `writ doctor --json` for machine readable output
+- Clear error when opening a repo created by a newer version of writ
+- v0 to v1 migration: creates version.toml, ensures all expected directories, creates HEAD if missing, migrates legacy settings.json to config.toml
+
+**Packaging**
+- `pip install writ-vcs` now bundles the `writ` CLI binary via PEP 427 `.data/scripts/`
+- Single package install puts both Python API and CLI on PATH
+
 **Documentation Site**
 - mdbook based documentation site (`book/` directory)
 - Introduction, installation, quickstart, and first convergence walkthrough
@@ -77,6 +90,12 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `repo.rs` refactored: convergence engine extracted into `convergence/` module (~10K LOC)
 - Convergence conflict reports use structured JSON instead of `<<<<<<<` markers
 - Test directories restructured for Layer 1-5 framework
+
+### Optimized
+
+- Context output reduced by 26% (2,283 to 1,685 tokens). Empty spec fields, default enum values, and redundant seal paths are now omitted. Writ delivers 2.5x more information than equivalent git commands at 25% better token efficiency per capability.
+- Adaptive context output: empty sections (integration risk, scope violations, diverged branches) are omitted entirely when they carry no information. Output scales with complexity, not a fixed schema.
+- Token benchmarks added to CI (F.14b, F.14c): tiktoken cl100k_base verification of all format efficiency claims. Anthropic API script for ground truth Claude token counts.
 
 ---
 

@@ -82,7 +82,7 @@ Set your default format globally:
 ```bash
 # During first writ init, you'll be prompted:
 # Default output format for agent context:
-#   (1) toon          Token-Oriented Object Notation (~33% fewer tokens)
+#   (1) toon          Token Oriented Object Notation (optimized for LLM agents)
 #   (2) json          Standard JSON (maximum compatibility)
 #   (3) json-compact  Minified JSON
 ```

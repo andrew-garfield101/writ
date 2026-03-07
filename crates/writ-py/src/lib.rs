@@ -1277,6 +1277,72 @@ impl PyRepository {
         let proposal = self.inner.reject_proposal(proposal_id).map_err(writ_err)?;
         to_pydict(py, &proposal)
     }
+
+    // -----------------------------------------------------------------------
+    // Upgrade & migration bindings (UPG.12)
+    // -----------------------------------------------------------------------
+
+    /// Run health checks on the repository. Returns a dict with:
+    ///   checks: list of {name, status, message}
+    ///   passed: int
+    ///   failed: int
+    ///   warnings: int
+    ///   is_healthy: bool
+    fn doctor(&self, py: Python) -> PyResult<PyObject> {
+        let writ_dir = self.inner.writ_dir();
+        let report = writ_core::migrate::DoctorReport::run(writ_dir);
+        let dict = pyo3::types::PyDict::new(py);
+        let checks: Vec<_> = report
+            .checks
+            .iter()
+            .map(|c| {
+                let d = pyo3::types::PyDict::new(py);
+                d.set_item("name", &c.name).unwrap();
+                d.set_item(
+                    "status",
+                    match c.status {
+                        writ_core::migrate::CheckStatus::Pass => "pass",
+                        writ_core::migrate::CheckStatus::Fail => "fail",
+                        writ_core::migrate::CheckStatus::Warning => "warning",
+                    },
+                )
+                .unwrap();
+                d.set_item("message", &c.message).unwrap();
+                d.to_object(py)
+            })
+            .collect();
+        dict.set_item("checks", checks)?;
+        dict.set_item("passed", report.passed)?;
+        dict.set_item("failed", report.failed)?;
+        dict.set_item("warnings", report.warnings)?;
+        dict.set_item("is_healthy", report.is_healthy())?;
+        Ok(dict.to_object(py))
+    }
+
+    /// Return version metadata for this repository. Returns a dict with:
+    ///   schema_version: int
+    ///   created_by: str
+    ///   last_opened_by: str
+    ///   created_at: str or None
+    ///   last_opened_at: str or None
+    fn version_info(&self, py: Python) -> PyResult<PyObject> {
+        let writ_dir = self.inner.writ_dir();
+        let version = writ_core::migrate::RepoVersion::load(writ_dir)
+            .map_err(writ_err)?;
+        match version {
+            Some(v) => to_pydict(py, &v),
+            None => {
+                // Legacy repo — return minimal info
+                let dict = pyo3::types::PyDict::new(py);
+                dict.set_item("schema_version", 0)?;
+                dict.set_item("created_by", pyo3::types::PyNone::get(py))?;
+                dict.set_item("last_opened_by", pyo3::types::PyNone::get(py))?;
+                dict.set_item("created_at", pyo3::types::PyNone::get(py))?;
+                dict.set_item("last_opened_at", pyo3::types::PyNone::get(py))?;
+                Ok(dict.to_object(py))
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

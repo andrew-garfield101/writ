@@ -43,19 +43,80 @@ Field names declared once in the header. Row count declared explicitly. No brace
 
 ## Benchmarks
 
-Real measurements from writ's benchmark suite (F.14), comparing payload size across all three formats on representative project data:
+All numbers come from writ's benchmark suite, which runs in CI using tiktoken cl100k_base (the BPE tokenizer used by GPT-4 and close enough to Claude's tokenizer for benchmarking). The benchmark generates a realistic `ContextOutput` struct with 5 specs, 10 recent seals, and 40 tracked files — the same struct that `repo.context()` returns in production — and formats it through each formatter. Results are verified against Claude's actual tokenizer via the Anthropic API.
 
-| Data Type | JSON | JSON Compact | TOON | TOON vs JSON |
-|-----------|------|-------------|------|-------------|
-| Seal log (20 seals) | 20,650 B | 14,869 B | 13,733 B | **33% smaller** |
-| Full context (5 specs, 10 seals, 40 files) | 8,182 B | 6,252 B | 6,507 B | **20% smaller** |
-| Spec list (15 specs) | 5,912 B | 4,831 B | 5,297 B | **10% smaller** |
+### Git vs Writ: cost per capability
 
-Seal logs show the most dramatic savings because they're highly tabular — each seal repeats the same fields (id, summary, agent, timestamp, spec). TOON's header once format eliminates all that redundancy. Full context is a mix of nested and tabular data, so savings are more modest but still substantial.
+The core question: what does it cost an agent to understand project state?
 
-Token savings are typically higher than byte savings. JSON structural characters — `{`, `}`, `[`, `]`, `"`, `:` — each consume individual tokens in most tokenizers. TOON eliminates these entirely, so the token reduction exceeds the byte reduction.
+Without writ, an agent runs multiple git commands — `git status`, `git log`, `git diff --stat`, `git branch -a` — each returning unstructured text that needs parsing and synthesis. With writ, one call returns structured data ready for immediate consumption.
 
-These savings compound. Five agents making 10 context calls per session means hundreds of redundant key tokens per call eliminated. At fleet scale (50+ agents), that translates directly to measurable cost reduction and reduced context window pressure — agents can work on larger projects before hitting limits.
+| Source | Tokens | Capabilities | Tokens per Capability |
+|--------|--------|-------------|----------------------|
+| git (5 commands) | 895 | 4 | 224 |
+| writ context (TOON) | 1,685 | 10 | 168 |
+
+**Git capabilities (4):** working state, commit history, diff stat, branches.
+
+**Writ capabilities (10):** working state, seal history, diff, specs, agent activity, integration risk, convergence status, file contention, chain integrity, session state.
+
+Writ's total token count is higher because it delivers 2.5x more information. But per capability, writ is 25% more efficient — and it does it in a single call with structured output, versus five separate commands returning text that the agent has to parse, correlate, and synthesize.
+
+### TOON vs JSON: format efficiency
+
+Within writ, TOON reduces the structural overhead of the output itself. Real byte savings on representative project data:
+
+| Data Type | Savings (TOON vs JSON) |
+|-----------|----------------------|
+| Seal log (20 seals) | **~33%** |
+| Full context | **~20%** |
+| Spec list | **~10%** |
+
+Actual token savings from BPE tokenization are more modest than byte savings — BPE tokenizers are smart about merging structural characters (`{"` becomes one token, `": "` becomes one token). The measured token reductions are approximately 29% on seal logs, 15% on full context, and 10% on spec lists. Still meaningful, still compounding at scale — but we report the real numbers.
+
+### Fleet scaling
+
+At scale, the efficiency compounds. A 10 agent fleet reading context 5 times each makes 50 writ calls vs 250 git commands. The token cost is 84,250 (writ) vs 44,750 (git) — but writ delivers structured, pre-parsed output with full multi-agent awareness. Git output requires each agent to parse, correlate, and synthesize five separate command outputs, adding interpretation overhead that doesn't show up in raw token counts.
+
+The tool call reduction alone is significant. 50 calls vs 250 calls means fewer round trips, less orchestration complexity, and less context window consumed by intermediate parsing.
+
+### Adaptive output
+
+Writ context is adaptive. Empty sections are omitted entirely — no diverged branches means the field doesn't appear, no scope violations means no violations section, low integration risk from a solo agent means no risk block. This isn't a format trick. It's a design principle. Solo agents get a lean context. Fleet deployments get the full picture. The output scales with complexity, not with a fixed schema.
+
+## Verifying benchmarks
+
+Writ's token efficiency claims are tested in CI. You can reproduce them yourself.
+
+### Rust benchmarks (tiktoken cl100k_base)
+
+Requires the writ source and Rust toolchain:
+
+```bash
+git clone https://github.com/andrew-garfield101/writ.git
+cd writ
+cargo test -p writ-core benchmark -- --nocapture
+```
+
+This runs 10 benchmark tests covering context, seal logs, spec lists, fleet scaling, and per-section token breakdowns.
+
+### Anthropic API benchmarks (ground truth Claude counts)
+
+Requires Python and an Anthropic API key:
+
+```bash
+pip install anthropic
+export ANTHROPIC_API_KEY=sk-ant-...
+python scripts/anthropic-token-bench.py
+```
+
+Add `--live` to benchmark against your own writ repo:
+
+```bash
+python scripts/anthropic-token-bench.py --live
+```
+
+These use Claude's actual tokenizer via the API, giving exact token counts rather than estimates.
 
 ## Choosing a Format
 

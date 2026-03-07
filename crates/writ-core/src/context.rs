@@ -89,6 +89,13 @@ pub struct SealSummary {
 impl SealSummary {
     /// Create a compact summary from a full Seal.
     pub fn from_seal(seal: &Seal) -> Self {
+        Self::from_seal_with_paths(seal, true)
+    }
+
+    /// Create a compact summary, optionally including changed file paths.
+    /// Omitting paths on older seals saves tokens — agents can use `writ diff`
+    /// or `writ show` to inspect specific seals when needed.
+    pub fn from_seal_with_paths(seal: &Seal, include_paths: bool) -> Self {
         let status = match seal.status {
             TaskStatus::InProgress => "in-progress",
             TaskStatus::Complete => "complete",
@@ -105,7 +112,11 @@ impl SealSummary {
             spec_id: seal.spec_id.clone(),
             status,
             verification: VerificationSummary::from_verification(&seal.verification),
-            changed_paths: seal.changes.iter().map(|c| c.path.clone()).collect(),
+            changed_paths: if include_paths {
+                seal.changes.iter().map(|c| c.path.clone()).collect()
+            } else {
+                vec![]
+            },
         }
     }
 }
@@ -394,8 +405,8 @@ pub struct ContextOutput {
 
     /// Top-level integration risk assessment.
     /// Computed from diverged branches, file contention, and scope violations.
-    /// Agents/orchestrators can check `integration_risk.level` before starting work.
-    /// Always present (level "low" when no risk factors).
+    /// Omitted when risk is low (score 0, no factors).
+    #[serde(default, skip_serializing_if = "IntegrationRisk::is_low")]
     pub integration_risk: IntegrationRisk,
 
     /// True when all specs in the repository are marked complete.
@@ -497,6 +508,21 @@ impl IntegrationRisk {
             level,
             factors,
             score,
+        }
+    }
+
+    /// True when risk is low with no factors — used to skip serialization.
+    pub fn is_low(&self) -> bool {
+        self.score == 0 && self.factors.is_empty()
+    }
+}
+
+impl Default for IntegrationRisk {
+    fn default() -> Self {
+        IntegrationRisk {
+            level: "low".to_string(),
+            factors: vec![],
+            score: 0,
         }
     }
 }

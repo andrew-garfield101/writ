@@ -25,6 +25,7 @@ pub mod ignore;
 pub mod index;
 pub mod keystore;
 pub mod lock;
+pub mod migrate;
 pub mod object;
 pub mod proposal;
 pub mod remote;

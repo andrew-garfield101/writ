@@ -402,6 +402,52 @@ Options:
   --limit <N>   Maximum entries
 ```
 
+## Maintenance Commands
+
+### `writ doctor`
+
+Run health checks on a `.writ/` repository. Read only by default.
+
+```bash
+writ doctor [OPTIONS]
+
+Options:
+  --json               Machine-readable JSON output (DoctorReport)
+  --fix                Reserved for future use (auto-repair common issues)
+```
+
+Runs 8 checks:
+
+| Check | What it verifies |
+|-------|-----------------|
+| `version_file` | `.writ/version.toml` exists and parses |
+| `schema_version` | Schema version matches current binary |
+| `directories` | Required dirs: objects, seals, specs, heads, keys, agents |
+| `index` | `.writ/index.json` exists and deserializes |
+| `config` | `.writ/config.toml` parses (if present) |
+| `master_key` | `keys/.master` exists |
+| `specs` | All spec JSON files deserialize |
+| `seals` | First 50 seal JSON files deserialize |
+
+Example output:
+
+```
+  ✓ version_file — version.toml exists and parses
+  ✓ schema_version — schema version 1 is current
+  ✓ directories — all expected directories present
+  ✓ index — index.json exists and deserializes
+  ✓ config — config.toml exists and parses
+  ✓ master_key — master key present
+  ✓ specs — 3 spec file(s) OK
+  ✓ seals — 12 seal file(s) sampled, all OK
+
+  8 passed, 0 failed, 0 warnings
+```
+
+Exit code 0 when all checks pass, 1 if any check fails.
+
+See [Version Compatibility](version-compat.md) for details on schema versioning, auto-migration, and troubleshooting.
+
 ## Remote Sync
 
 ### `writ push`

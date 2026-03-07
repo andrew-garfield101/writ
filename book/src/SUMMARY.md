@@ -30,6 +30,7 @@
 - [CLI Reference](reference/cli.md)
 - [Python SDK](reference/python-sdk.md)
 - [Configuration](reference/configuration.md)
+- [Version Compatibility](reference/version-compat.md)
 - [Error Codes](reference/error-codes.md)
 
 ---

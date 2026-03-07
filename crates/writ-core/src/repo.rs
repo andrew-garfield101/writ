@@ -139,6 +139,9 @@ impl Repository {
         let index = Index::default();
         index.save(&writ_dir.join("index.json"))?;
 
+        // Write schema version stamp.
+        crate::migrate::RepoVersion::new().save(&writ_dir)?;
+
         Self::open(root)
     }
 
@@ -151,6 +154,31 @@ impl Repository {
 
         if !writ_dir.exists() {
             return Err(WritError::NotARepo);
+        }
+
+        // --- Schema version check & auto-migration ---
+        let current_schema = crate::migrate::CURRENT_SCHEMA_VERSION;
+        let repo_version = crate::migrate::RepoVersion::load(&writ_dir)?;
+        let schema = repo_version.as_ref().map(|v| v.schema_version).unwrap_or(0);
+
+        if schema > current_schema {
+            return Err(WritError::Other(format!(
+                "this repo uses schema version {schema}, but this binary only supports up to \
+                 {current_schema} — please update writ"
+            )));
+        }
+
+        if schema < current_schema {
+            crate::migrate::migrate(&writ_dir, schema, current_schema)?;
+        }
+
+        // Update last_opened_by stamp.
+        {
+            let mut v = crate::migrate::RepoVersion::load(&writ_dir)?
+                .unwrap_or_default();
+            v.last_opened_by = env!("CARGO_PKG_VERSION").to_string();
+            v.last_opened_at = Some(chrono::Utc::now());
+            v.save(&writ_dir)?;
         }
 
         // Load storage config for ObjectStore compression settings.
@@ -1917,11 +1945,14 @@ impl Repository {
         match scope {
             ContextScope::Full => {
                 let specs = self.list_specs()?;
+                // Include changed_paths only on the 3 most recent seals to save tokens.
+                // Agents can use `writ show SEAL_ID` for paths on older seals.
                 let recent: Vec<SealSummary> = seals
                     .iter()
                     .filter(apply_filter)
                     .take(seal_limit)
-                    .map(SealSummary::from_seal)
+                    .enumerate()
+                    .map(|(i, s)| SealSummary::from_seal_with_paths(s, i < 3))
                     .collect();
 
                 let index = self.load_index()?;

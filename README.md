@@ -8,22 +8,21 @@
 [![Docs](https://img.shields.io/badge/docs-andrew--garfield101.github.io%2Fwrit-blue)](https://andrew-garfield101.github.io/writ/)
 
 
-Writ is a version control system designed from the ground up for LLMs and
-agentic systems. Instead of bolting conventions onto a VCS built for humans,
-writ provides elegant, AI native version control through **specs**, **seals**,
-**context**, and **convergence**.
+Agents are writing production code, managing infrastructure, processing documents at scale. They are remarkably capable. The version control they're using? Still git. Still designed for humans typing at keyboards. Agents spend tokens on tooling overhead — parsing unstructured text, reconstructing project state from multiple calls, navigating merge conflicts that conventional tools weren't built to handle. The tooling doesn't match what agents can do.
+
+Writ changes that equation. Structured context in one call. Semantic convergence that merges meaning, not lines. Cryptographic integrity across any environment. And a clean round trip back to git when the work is done.
 
 Writ works alongside git, not instead of it.
 
-**One call context.** Agents waste tokens and compute building situational awareness — `git log`, `git diff`, `git status`, parsing unstructured text, reconstructing project state across multiple tool calls. A single `writ context` returns everything an agent needs — specs, seals, working state, file contention, integration risk — in structured JSON. One call. One structured response. The format agents work best with.
+**One call context.** Building situational awareness with current tools means multiple calls, parsing unstructured output, synthesizing project state from fragments. That's tokens and compute spent on infrastructure, not on the agent's actual task. `writ context` delivers everything — specs, seals, working state, file contention, integration risk — in one structured response. With TOON output format, even the structural overhead disappears. Agents spend tokens on reasoning, not parsing.
 
-**Semantic convergence.** When multiple agents touch the same files, writ merges *meaning*, not lines. Language aware analyzers decompose code structurally, compose additive changes automatically, and escalate real conflicts with full context. The core principle: compose, don't choose.
+**Semantic convergence.** When multiple agents touch the same files, conventional merging sees conflicts. Writ sees structure. Language aware analyzers decompose code into imports, definitions, and statements — composing additive changes automatically and escalating real conflicts with full context and confidence scores. No `<<<<` markers. No guesswork.
 
 **Cryptographic integrity.** BLAKE3 hash chains and Ed25519 signatures on every seal. Agent identity with trust levels and scope enforcement. Content traceability ensures no line in merged output appears from thin air. Tamper with any checkpoint and the chain breaks.
 
-**Environment agnostic.** Zero-trust environments where every agent action is verified. Fully autonomous systems like [OpenClaw](https://github.com/openclaw) where agents operate with full autonomy. Mixed setups with humans in the loop. VMs, bare metal, containers, CI runners. Writ provides version control for whatever environment agents work in — software development, knowledge work, any iterative task that agents touch.
+**Environment agnostic.** Zero trust setups where every agent action is verified. Fully autonomous systems like [OpenClaw](https://github.com/openclaw) where agents operate without oversight. Mixed workflows with humans in the loop. VMs, containers, CI runners, bare metal. Writ provides version control for whatever environment agents work in.
 
-**Built for any scale.** Deployment profiles from a 500MB Raspberry Pi to unlimited enterprise. Lifecycle management and garbage collection keep repositories clean without ever compromising the immutable seal history.
+**Built for any scale.** An indie developer running 15 agents. An enterprise org running 500 across multiple orchestrators. Writ's efficiency compounds — context costs drop, convergence handles what git can't, and deployment profiles scale from a 500MB Raspberry Pi to unlimited enterprise. The more agents in the system, the more writ matters.
 
 > *"One `writ context` call and I know who did what, which specs are complete, where branches diverged, and what files are contested. That is genuinely valuable and unlike anything available in git alone."*
 >
@@ -67,7 +66,7 @@ writ init
 
 That's it. Writ detects your environment and configures sensible defaults automatically. If you're in a git repo, it reads the branch and HEAD. If Claude Code is present (`CLAUDE.md` or `.claude/`), it creates `/writ-seal` and `/writ-context` slash commands. If Codex is detected (`AGENTS.md` or `.codex/`), it adds writ workflow instructions. For any other agent framework, the CLI is available in PATH and the Python SDK works out of the box. See the [quickstart guide](https://andrew-garfield101.github.io/writ/getting-started/quickstart.html) for a full walkthrough.
 
-The full round-trip looks like this:
+The full round trip looks like this:
 
 ```bash
 # Human checks out a branch, sets up writ
@@ -139,13 +138,16 @@ Writ puts agent-native metadata inside the VCS:
 
 ## Context
 
-The most expensive thing in an agent's workflow is building situational awareness. With git, that means multiple tool calls — `git log`, `git diff`, `git status`, reading files — each returning text that needs parsing and synthesis. Every call costs tokens. Every response needs interpretation. The agent spends compute reconstructing what writ delivers in a single structured response.
+Situational awareness is the most expensive recurring cost in an agentic workflow. With conventional tools, that means multiple calls — `git log`, `git diff`, `git status`, reading files — each returning unstructured text that needs parsing and synthesis. Capable agents spend a significant portion of their compute budget on tooling overhead instead of their actual task.
 
-```python
-ctx = repo.context(spec="auth-migration")
+Writ consolidates all of that into a single call:
+
+```bash
+# One call. Full situational awareness.
+writ context --format toon --spec auth-migration
 ```
 
-One call. One structured dict. The format agents work best with:
+One structured response. Everything an agent needs to start working immediately:
 
 - **Spec details** — title, description, status, dependencies, file scope, acceptance criteria
 - **Recent seals** — who did what, when, with which files and verification results
@@ -157,11 +159,17 @@ One call. One structured dict. The format agents work best with:
 - **Scope violations** — seals that touched files outside their spec's declared scope
 - **Session status** — whether all specs are complete, with inline summary
 
-Compare: with git, an agent makes 4-5 tool calls, parses unstructured text from each, and synthesizes its own situational model. With writ, it makes one call and gets structured JSON with everything it needs to start working immediately. That's not an incremental improvement — it's a category difference in how agents bootstrap into a task.
+Or programmatically:
+
+```python
+ctx = repo.context(spec="auth-migration", format="toon")
+```
+
+With git, an agent makes 4-5 tool calls and synthesizes its own situational model from unstructured text. With writ, one call returns structured data ready for immediate consumption. That's a fundamental shift in how agents bootstrap into a task.
 
 ### Output Formats
 
-By default, `writ context` returns JSON. For LLM agents, TOON (Token Oriented Object Notation) delivers the same structured data in significantly fewer tokens. Field names declared once, rows streamed as values, no braces, no repeated keys:
+Every time an agent requests context, there's a token tax — repeated key names, structural punctuation, formatting overhead. Tokens spent on syntax instead of reasoning. TOON eliminates that tax:
 
 ```
 seals[5]{id,summary,agent,timestamp,spec}:
@@ -170,31 +178,26 @@ seals[5]{id,summary,agent,timestamp,spec}:
   seal-0043,Scale test scenarios,bri,2026-03-04T10:30:00Z,S-045
 ```
 
-Benchmarks on representative project data (payload size, TOON vs JSON):
+Field names declared once. Rows streamed as values. No braces, no repeated keys.
 
-| Data | JSON | TOON | Reduction |
-|------|------|------|-----------|
-| Seal log (20 seals) | 20,650 B | 13,733 B | **33%** |
-| Full context (5 specs, 10 seals, 40 files) | 8,182 B | 6,507 B | **20%** |
-| Spec list (15 specs) | 5,912 B | 5,297 B | **10%** |
+One `writ context` call replaces five git commands and delivers [25% more information per token](https://andrew-garfield101.github.io/writ/concepts/output-formats.html). TOON format reduces output size by 20-33% versus JSON. These savings compound at fleet scale — fewer calls, less parsing, more context window for reasoning. See the [output formats guide](https://andrew-garfield101.github.io/writ/concepts/output-formats.html) for the full benchmark methodology and numbers.
 
-Token savings are typically higher — JSON structural characters (braces, brackets, quotes, colons) each consume individual tokens that TOON eliminates entirely. These savings compound. Five agents calling context ten times per session means hundreds of redundant key tokens per call eliminated. At fleet scale, that's compute budget recovered for actual reasoning.
-
-Format preference is configurable globally (`~/.writ/config`), per project (`.writ/config.toml`), or per call (`--format`). See the [output formats guide](https://andrew-garfield101.github.io/writ/concepts/output-formats.html) for the full reference.
+Context output is also adaptive. Solo agent with no divergence? Integration risk and convergence sections don't appear. No scope violations? That section is omitted. The output scales with complexity, not with a fixed schema — a single agent gets a lean response, a 50 agent fleet gets the full picture. Every token in the response carries information.
 
 ## Multi-Agent Workflow
 
-Three agents, different specs, working concurrently. Sealing is serialized via advisory file locks, so agents queue safely.
+Three agents, different specs, working concurrently. Sealing is serialized via advisory file locks, so agents queue safely:
 
-```python
-# Agent A: auth migration
-repo.seal(summary="token refresh", agent_id="auth-dev", spec_id="auth-migration")
+```bash
+# Agent A: auth migration (sealing work in progress)
+writ seal -s "token refresh endpoint" --agent auth-dev --spec auth-migration
 
-# Agent B: payments (concurrent, different spec)
-repo.seal(summary="stripe integration", agent_id="pay-dev", spec_id="payments", status="complete")
+# Agent B: payments (marking task complete)
+writ seal -s "stripe integration" --agent pay-dev --spec payments
+writ spec done payments
 
-# Agent C: testing (concurrent, cross-cutting)
-repo.seal(summary="42 tests passing", agent_id="test-bot", spec_id="test-suite", tests_passed=42)
+# Agent C: testing (cross-cutting)
+writ seal -s "42 tests passing" --agent test-bot --spec test-suite --tests-passed 42
 ```
 
 The human checks in:
@@ -216,11 +219,11 @@ Full transparency. No branch archaeology. No parsing commit messages to figure o
 
 ## Convergence
 
-The most complex problem in multi-agent development isn't writing code — it's merging it. When five agents work concurrently on overlapping files, traditional line-based merging falls apart. Writ merges *meaning*, not lines.
+Five agents. Same file. Git sees five conflicts. Your options: resolve them manually, pick a winner and hope, or assign files to single owners — which defeats the purpose of having multiple agents in the first place.
 
-Git worktrees give agents isolation. They don't give agents convergence. When five diverged branches need to become one codebase, line based merge sees conflicts everywhere. Writ's structural understanding means most of those "conflicts" auto resolve without human intervention.
+This is the problem no amount of git configuration, worktree isolation, or PR automation solves. Worktrees give agents isolation. Nothing in conventional tooling gives them convergence. Isolation keeps agents from stepping on each other. Convergence brings their work back together. Git handles the first. Writ handles the second.
 
-Writ's convergence engine understands code structurally — it knows the difference between an import, a function definition, and a statement. When two agents both add imports to the same file, writ doesn't see a "conflict" — it sees two additive changes and composes them. When two agents modify the same function body differently, writ knows that's a real conflict and escalates it with full context.
+Writ's convergence engine understands code structurally. It knows the difference between an import, a function definition, and a statement. When two agents both add imports to the same file, writ doesn't see a conflict — it sees two additive changes and composes them. When two agents add functions with different names, writ composes them. When two agents modify the same function body differently, writ knows that's a real semantic conflict and escalates it with full context for human or orchestrator review. No `<<<<` markers. No guesswork. Structured data all the way through.
 
 Five deterministic resolution patterns handle the common cases:
 
@@ -232,25 +235,15 @@ Five deterministic resolution patterns handle the common cases:
 | **Additive Composition** | Both sides preserved base and added content — compose |
 | **Superset Containment** | One side contains everything the other has — use the superset |
 
-Every resolution is confidence-scored. High confidence (≥ 0.85) auto-resolves. Low confidence escalates with structured context for human or orchestrator review. Conflicts are structured JSON — not `<<<<` markers — so orchestrator agents can resolve them programmatically.
+Every resolution is confidence scored. High confidence (≥ 0.85) auto-resolves. Low confidence escalates with structured context so orchestrator agents can resolve conflicts programmatically — or surface them to a human with all the data they need to decide.
 
-The resolution pipeline is layered and auditable. Spec-aware resolution uses writ's first-class spec and seal metadata — file scope, acceptance criteria, design notes — to make informed decisions that no other VCS can make. Post-merge verification catches structural damage automatically — duplicate definitions, unbalanced delimiters, content loss, leftover conflict markers — before bad merges reach the working tree. Content traceability ensures every line in merged output traces back to an input — novel content from bugs or hallucinations is detected and rejected.
+The pipeline behind this is layered and auditable. Spec aware resolution uses writ's first class spec and seal metadata — file scope, acceptance criteria, design notes — to make informed merge decisions that no other VCS has the context to make. Post-merge verification catches structural damage automatically — duplicate definitions, unbalanced delimiters, content loss, leftover conflict markers — before bad merges ever reach the working tree. Content traceability ensures every line in merged output traces back to an input. Novel content — from bugs, hallucinations, or compromised agents — is detected and rejected.
 
-Merge ordering is optimized automatically: specs that touch disjoint files merge first, minimizing conflict complexity for the overlapping cases that follow. See the [convergence deep dive](https://andrew-garfield101.github.io/writ/concepts/convergence.html) for the full six phase pipeline.
+Merge ordering is optimized automatically: specs that touch disjoint files merge first, minimizing conflict complexity for the overlapping cases that follow. At scale, this is the difference between a working codebase and a merge conflict graveyard. See the [convergence deep dive](https://andrew-garfield101.github.io/writ/concepts/convergence.html) for the full six phase pipeline.
 
 ```bash
-# Merge ALL diverged branches at once — escalate what can't be auto-resolved
-writ converge-all --apply --strategy escalate
-```
-
-```python
-report = repo.converge_all(strategy="escalate", apply=True)
-print(f"Merged {len(report['merge_order'])} branches")
-print(f"Auto-merged: {report['total_auto_merged']}, Resolved: {report['total_resolutions']}")
-
-if report.get("quality_report"):
-    qr = report["quality_report"]
-    print(f"Quality score: {qr['quality_score']}/100 — {qr['summary']}")
+# Merge all diverged branches — auto-resolve what's confident, escalate the rest
+writ converge-all --apply --strategy most-complete
 ```
 
 ### Integration Risk
@@ -404,7 +397,7 @@ writ push / pull                      # sync with remotes
 writ/
 ├── crates/
 │   ├── writ-core/    # Rust: objects, index, seals, specs, diff, context, convergence, bridge
-│   ├── writ-cli/     # CLI (clap): install, seal, context, converge, summary, restore, ...
+│   ├── writ-cli/     # CLI (clap): init, seal, context, converge, summary, restore, ...
 │   └── writ-py/      # Python bindings (PyO3) + Agent SDK (Pipeline, Agent, Phase)
 ```
 
@@ -441,10 +434,9 @@ pytest tests/
 
 ## Roadmap
 
-- **LLM-assisted convergence.** Direct LLM API integration for conflict resolution — when deterministic patterns can't resolve a conflict, writ queries an LLM to compose a resolution from the existing code. Composition only — the LLM can select, reorder, and combine from the inputs, never generate novel code. Feature-flagged with full audit trail
-- **Spec-aware resolution.** Convergence Phase 4 uses writ's first-class spec metadata — file scope, acceptance criteria, semantic intent — to resolve ambiguous conflicts that no other VCS has the context to handle
-- **MCP server.** Model Context Protocol integration for IDE-native writ access
-- **Homebrew distribution.** `brew install writ` via tap
+- **LLM assisted convergence.** Direct LLM API integration for conflict resolution — when deterministic patterns can't resolve a conflict, writ queries an LLM to compose a resolution from the existing code. Composition only — the LLM can select, reorder, and combine from the inputs, never generate novel code. Feature flagged with full audit trail
+- **Spec aware resolution.** Convergence Phase 4 uses writ's first class spec metadata — file scope, acceptance criteria, semantic intent — to resolve ambiguous conflicts that no other VCS has the context to handle
+- **MCP server.** Model Context Protocol integration for IDE native writ access
 
 See [CHANGELOG.md](CHANGELOG.md) for shipped features and version history.
 

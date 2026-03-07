@@ -537,6 +537,17 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigCommands,
     },
+
+    /// Check repository health and schema version.
+    Doctor {
+        /// Output as JSON instead of human-readable.
+        #[arg(long)]
+        json: bool,
+
+        /// Attempt to fix problems (reserved for future use).
+        #[arg(long)]
+        fix: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1291,6 +1302,7 @@ fn main() {
             ConfigCommands::List { format } => cmd_config_list(&cwd, &format),
             ConfigCommands::Unset { key, format } => cmd_config_unset(&cwd, &key, &format),
         },
+        Commands::Doctor { json, fix } => cmd_doctor(&cwd, json, fix),
     };
 
     if let Err(e) = result {
@@ -6777,6 +6789,57 @@ fn cmd_config_unset(
         _ => {
             println!("{} {} (reset to default)", "unset".green(), key);
         }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Doctor
+// ---------------------------------------------------------------------------
+
+fn cmd_doctor(
+    cwd: &PathBuf,
+    json: bool,
+    fix: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open(cwd)?;
+    let report = writ_core::migrate::DoctorReport::run(repo.writ_dir());
+
+    if fix {
+        eprintln!(
+            "{} --fix is reserved for a future release. Showing report only.",
+            "note:".yellow()
+        );
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    // Human-readable output
+    for check in &report.checks {
+        let icon = match check.status {
+            writ_core::migrate::CheckStatus::Pass => "✓".green().to_string(),
+            writ_core::migrate::CheckStatus::Fail => "✗".red().to_string(),
+            writ_core::migrate::CheckStatus::Warning => "!".yellow().to_string(),
+        };
+        println!("  {} {} — {}", icon, check.name, check.message);
+    }
+
+    println!();
+    let failed_str = report.failed.to_string();
+    let warn_str = report.warnings.to_string();
+    println!(
+        "  {} passed, {} failed, {} warnings",
+        report.passed.to_string().green(),
+        if report.failed > 0 { failed_str.red().to_string() } else { failed_str },
+        if report.warnings > 0 { warn_str.yellow().to_string() } else { warn_str },
+    );
+
+    if !report.is_healthy() {
+        std::process::exit(1);
     }
 
     Ok(())

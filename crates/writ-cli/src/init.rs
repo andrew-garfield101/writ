@@ -117,7 +117,9 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
     );
     println!();
     println!("No global configuration found. Let's set up your preferences.");
-    println!("(These apply globally and to this project. Override per-project with --reconfigure.)");
+    println!(
+        "(These apply globally and to this project. Override per-project with --reconfigure.)"
+    );
     println!();
 
     // Name detection

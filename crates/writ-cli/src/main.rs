@@ -1614,10 +1614,7 @@ fn cmd_init(
 
             if plan.enable_claude {
                 println!("{} Claude Code integration configured", "✓".green());
-                println!(
-                    "  {} Agent permissions: Bash(writ *)",
-                    "→".green()
-                );
+                println!("  {} Agent permissions: Bash(writ *)", "→".green());
                 println!(
                     "  {} Agent directive: writ usage instruction added",
                     "→".green()

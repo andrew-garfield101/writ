@@ -85,7 +85,7 @@ class TestInstallHooksClaudeMd:
         assert "Writ Version Control" in content
 
     def test_install_hooks_claudemd_has_separator(self, tmp_path: Path):
-        """Separator (---) appears between existing content and writ section."""
+        """Separator (---) appears between writ section and existing content (prepend order)."""
         (tmp_path / "CLAUDE.md").write_text("# My Project\n\nExisting content.\n")
         writ.install_hooks(str(tmp_path))
 
@@ -93,7 +93,8 @@ class TestInstallHooksClaudeMd:
         assert "---" in content
         separator_idx = content.index("---")
         marker_idx = content.index(BEGIN_MARKER)
-        assert separator_idx < marker_idx
+        # Writ section is prepended, so marker comes before the separator.
+        assert marker_idx < separator_idx
 
     def test_install_hooks_claudemd_has_required_commands(self, tmp_path: Path):
         """CLAUDE.md writ section contains required workflow commands."""

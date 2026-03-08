@@ -219,9 +219,10 @@ fn ensure_claude_instructions(root: &Path) -> WritResult<Option<String>> {
     let arr = instructions.as_array_mut().unwrap();
 
     // Check if a writ instruction is already present.
-    let already_has = arr
-        .iter()
-        .any(|v| v.as_str().map_or(false, |s| s.contains(WRIT_INSTRUCTION_MARKER)));
+    let already_has = arr.iter().any(|v| {
+        v.as_str()
+            .map_or(false, |s| s.contains(WRIT_INSTRUCTION_MARKER))
+    });
 
     if already_has {
         return Ok(None);
@@ -304,7 +305,11 @@ pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
             updated.push("CLAUDE.md".to_string());
         } else {
             // Prepend marked section to existing file (writ section first for visibility).
-            let new_content = format!("{}\n\n---\n\n{}", marked_section.trim_end(), content.trim());
+            let new_content = format!(
+                "{}\n\n---\n\n{}\n",
+                marked_section.trim_end(),
+                content.trim()
+            );
             atomic_write(&claude_md, new_content.as_bytes())?;
             updated.push("CLAUDE.md".to_string());
         }
@@ -333,7 +338,12 @@ pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
     // Ensure Bash(writ *) permission in .claude/settings.json.
     match ensure_claude_permissions(root) {
         Ok(Some(path)) => {
-            if root.join(".claude").join("settings.json").metadata().is_ok() {
+            if root
+                .join(".claude")
+                .join("settings.json")
+                .metadata()
+                .is_ok()
+            {
                 // File existed before or was just created — either way it's been set up.
                 updated.push(path);
             } else {
@@ -342,7 +352,10 @@ pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
         }
         Ok(None) => {} // Already had the permission
         Err(e) => {
-            eprintln!("warning: could not configure Claude Code permissions: {}", e);
+            eprintln!(
+                "warning: could not configure Claude Code permissions: {}",
+                e
+            );
         }
     }
 
@@ -1790,8 +1803,7 @@ mod tests {
         let result = ensure_claude_permissions(dir.path()).unwrap();
         assert!(result.is_some());
 
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let allow = parsed["permissions"]["allow"].as_array().unwrap();
         assert!(allow.iter().any(|v| v.as_str() == Some("Bash(writ *)")));
@@ -1809,8 +1821,7 @@ mod tests {
 
         ensure_claude_permissions(dir.path()).unwrap();
 
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let allow = parsed["permissions"]["allow"].as_array().unwrap();
         // Both permissions should be present.
@@ -1827,8 +1838,7 @@ mod tests {
         let result = ensure_claude_permissions(dir.path()).unwrap();
         assert!(result.is_none(), "second call should be a no-op");
 
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let allow = parsed["permissions"]["allow"].as_array().unwrap();
         // Should only have one entry, not duplicated.
@@ -1846,8 +1856,7 @@ mod tests {
         let result = remove_claude_permissions(dir.path()).unwrap();
         assert!(result.is_some());
 
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let allow = parsed["permissions"]["allow"].as_array().unwrap();
         assert!(!allow.iter().any(|v| v.as_str() == Some("Bash(writ *)")));
@@ -1865,8 +1874,7 @@ mod tests {
 
         remove_claude_permissions(dir.path()).unwrap();
 
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let allow = parsed["permissions"]["allow"].as_array().unwrap();
         assert!(allow.iter().any(|v| v.as_str() == Some("Bash(git *)")));
@@ -1900,15 +1908,13 @@ mod tests {
         hook_claude_code(dir.path()).unwrap();
 
         // Verify permission exists.
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         assert!(content.contains("Bash(writ *)"));
 
         unhook_claude_code(dir.path()).unwrap();
 
         // Permission should be removed.
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         assert!(!content.contains("Bash(writ *)"));
     }
 
@@ -1951,8 +1957,7 @@ mod tests {
         let result = ensure_claude_instructions(dir.path()).unwrap();
         assert!(result.is_some());
 
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let instructions = parsed["instructions"].as_array().unwrap();
         assert_eq!(instructions.len(), 1);
@@ -1974,8 +1979,7 @@ mod tests {
 
         ensure_claude_instructions(dir.path()).unwrap();
 
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let instructions = parsed["instructions"].as_array().unwrap();
         assert_eq!(instructions.len(), 2);
@@ -1996,8 +2000,7 @@ mod tests {
         let result = ensure_claude_instructions(dir.path()).unwrap();
         assert!(result.is_none(), "second call should be a no-op");
 
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let instructions = parsed["instructions"].as_array().unwrap();
         let count = instructions
@@ -2017,8 +2020,7 @@ mod tests {
         let result = remove_claude_instructions(dir.path()).unwrap();
         assert!(result.is_some());
 
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let instructions = parsed["instructions"].as_array().unwrap();
         assert!(instructions.is_empty());
@@ -2036,8 +2038,7 @@ mod tests {
 
         remove_claude_instructions(dir.path()).unwrap();
 
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let instructions = parsed["instructions"].as_array().unwrap();
         assert_eq!(instructions.len(), 1);
@@ -2074,15 +2075,13 @@ mod tests {
         hook_claude_code(dir.path()).unwrap();
 
         // Verify instruction exists.
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         assert!(content.contains(WRIT_INSTRUCTION_MARKER));
 
         unhook_claude_code(dir.path()).unwrap();
 
         // Instruction should be removed.
-        let content =
-            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         assert!(
             !content.contains(WRIT_INSTRUCTION_MARKER),
             "unhook should remove writ instruction"
@@ -2092,7 +2091,11 @@ mod tests {
     #[test]
     fn test_claudemd_prepends_to_existing() {
         let dir = tempdir().unwrap();
-        fs::write(dir.path().join("CLAUDE.md"), "# My Project\n\nUser stuff.\n").unwrap();
+        fs::write(
+            dir.path().join("CLAUDE.md"),
+            "# My Project\n\nUser stuff.\n",
+        )
+        .unwrap();
 
         hook_claude_code(dir.path()).unwrap();
 

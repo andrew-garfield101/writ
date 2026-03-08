@@ -182,12 +182,14 @@ fn remove_claude_permissions(root: &Path) -> WritResult<Option<String>> {
 }
 
 /// The instruction string added to `.claude/settings.json` so agents treat writ
-/// usage as a user directive rather than optional project documentation.
-const WRIT_INSTRUCTION: &str = "This project uses writ for version control. \
-At the start of every task, run `writ context` to check project state and other agents' activity. \
-After each meaningful unit of work, run `writ seal -s '<summary>' --agent claude-code` to create \
-a recoverable checkpoint. When your task is complete, run `writ spec done <spec-id>`. \
-Never run `git commit` or `writ finish` — the user handles the git round-trip.";
+/// usage as a mandatory directive, not optional project documentation.
+const WRIT_INSTRUCTION: &str = "MANDATORY: This project uses writ for version control. \
+You MUST follow this workflow — it is not optional. \
+1) BEFORE starting any work, run `writ context` to check project state. \
+2) AFTER each meaningful unit of work, you MUST run `writ seal -s '<summary>' --agent claude-code`. \
+3) When your task is complete, you MUST run `writ spec done <spec-id>` BEFORE reporting results. \
+Your task is NOT complete until you have sealed your work. \
+NEVER run `git commit`, `git add`, `git push`, or `writ finish` — the user handles git.";
 
 /// Substring used to detect whether a writ instruction is already present.
 const WRIT_INSTRUCTION_MARKER: &str = "writ for version control";
@@ -275,13 +277,22 @@ fn remove_claude_instructions(root: &Path) -> WritResult<Option<String>> {
     }
 }
 
-/// The command run by the UserPromptSubmit hook.
-/// Runs `writ context` so the agent sees project state before its first action.
-/// Falls back silently if writ is not available.
-const WRIT_HOOK_COMMAND: &str = "writ context 2>/dev/null || true";
-
 /// Substring used to detect whether a writ hook is already present.
 const WRIT_HOOK_MARKER: &str = "writ context";
+
+/// Build the hook command with an absolute path to the writ binary.
+/// Falls back to bare `writ` if the binary can't be located.
+fn writ_hook_command() -> String {
+    let writ_path = std::process::Command::new("which")
+        .arg("writ")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "writ".to_string());
+    format!("{} context 2>/dev/null || true", writ_path)
+}
 
 /// The hook event names where writ injects context.
 /// - SessionStart: fires once when a session begins (agent sees writ state immediately)
@@ -355,11 +366,12 @@ fn ensure_claude_hook(root: &Path) -> WritResult<Option<String>> {
         }
     };
 
+    let command = writ_hook_command();
     let hook_entry = serde_json::json!({
         "hooks": [
             {
                 "type": "command",
-                "command": WRIT_HOOK_COMMAND,
+                "command": command,
                 "timeout": 10
             }
         ]
@@ -1001,26 +1013,24 @@ fn is_dir_empty(path: &Path) -> bool {
 }
 
 fn writ_claude_md_section() -> String {
-    r#"## Writ Version Control
+    r#"## Writ Version Control (MANDATORY)
 
-This project uses writ for version control alongside git.
+This project uses writ for version control. You MUST follow this workflow.
 
-### Recommended Workflow
-1. Run `writ context` to get structured project state
+### Required Workflow
+1. BEFORE starting any work, run `writ context` to check project state
 2. Create or claim a spec: `writ spec add --id <id> --title "<description>"`
-3. Work on your task, checkpointing regularly: `writ seal -s "<summary>"`
-4. When your task is complete: `writ spec done <id>`
+3. AFTER each meaningful unit of work, you MUST run `writ seal -s "<summary>"`
+4. When your task is complete, you MUST run `writ spec done <id>` BEFORE reporting results to the user
 
-### Context Retrieval
-- `writ context` returns project state in token-optimized TOON format by default
-- For standard JSON: `writ context --format json`
+Your task is NOT complete until you have sealed your work and run `writ spec done`.
 
-### Available Commands
-- `writ context` — structured project state (files, specs, activity)
-- `writ seal -s "<summary>"` — checkpoint your work
+### Commands
+- `writ context` — structured project state (files, specs, activity). Run this FIRST.
+- `writ seal -s "<summary>"` — checkpoint your work. You MUST do this after each unit of work.
 - `writ spec add --id <id> --title "<description>"` — create a task spec
 - `writ spec status` — view active specs
-- `writ spec done <id>` — mark your task complete
+- `writ spec done <id>` — mark your task complete. You MUST do this before reporting results.
 - `writ status` — project overview (agents, specs, progress)
 - `writ diff` — preview file changes
 - `writ log` — recent seal history
@@ -1029,10 +1039,11 @@ This project uses writ for version control alongside git.
 - `/writ-seal` — interactive seal creation
 - `/writ-context` — get project context
 
-### Guidelines
-- Checkpoint with `writ seal` after each meaningful unit of work
-- Always run `writ spec done` when your task is complete
-- Include meaningful summaries in seals so other agents understand your work
+### Rules
+- You MUST run `writ context` before starting work
+- You MUST run `writ seal` after each meaningful unit of work
+- You MUST run `writ spec done` before reporting results to the user
+- You MUST include meaningful summaries in seals so other agents understand your work
 - Do NOT run `git add`, `git commit`, or `git push` — the user manages the git round-trip via `writ finish`
 - Do NOT run `writ finish` — this is the git integration command managed by the user or orchestrator
 - `writ restore <seal-id>` overwrites working directory files — use only when you need to revert to a known-good state
@@ -1040,28 +1051,26 @@ This project uses writ for version control alongside git.
 }
 
 fn writ_agents_md_section() -> String {
-    r#"## Version Control — Writ
+    r#"## Version Control — Writ (MANDATORY)
 
-This project uses writ (AI-native version control) for checkpointing and coordination.
+This project uses writ for version control. You MUST follow this workflow.
 
-### Workflow
-1. Run `writ context` at the start of every task to understand project state
+### Required Workflow
+1. BEFORE starting any work, run `writ context` to check project state
 2. Create specs for tasks: `writ spec add --id <id> --title "<description>"`
-3. Checkpoint with `writ seal -s "<summary>"` after meaningful progress
-4. Complete tasks with `writ spec done <id>`
+3. AFTER each meaningful unit of work, you MUST run `writ seal -s "<summary>"`
+4. When complete, you MUST run `writ spec done <id>` BEFORE reporting results
 
-### Context Retrieval
-- `writ context` returns project state in token-optimized TOON format (20-33% fewer bytes)
-- For standard JSON: `writ context --format json`
+Your task is NOT complete until you have sealed your work.
 
-### Key Commands
-- `writ context` — structured project state
-- `writ seal -s "<summary>"` — checkpoint work
+### Commands
+- `writ context` — structured project state. Run this FIRST.
+- `writ seal -s "<summary>"` — checkpoint work. MUST do this after each unit of work.
 - `writ spec add / status / done` — task management
 - `writ status` — project overview
 - `writ log` — seal history
 
-Do not run `git commit` or `writ finish` — the user manages the git round-trip.
+Do NOT run `git commit` or `writ finish` — the user manages the git round-trip.
 `writ restore <seal-id>` overwrites working directory files — use only when reverting to a known-good state.
 "#
     .to_string()
@@ -1101,10 +1110,10 @@ writ context --spec your-spec-id
 
 /// Content for `.writ/AGENT_INSTRUCTIONS.md`.
 fn agent_instructions_content() -> String {
-    r#"# Writ — Agent Workflow Instructions
+    r#"# Writ — Agent Workflow Instructions (MANDATORY)
 
-Include these instructions in your agent's system prompt or configuration
-to enable writ-based version control.
+Include these instructions in your agent's system prompt or configuration.
+These are mandatory requirements, not suggestions.
 
 ---
 
@@ -1112,14 +1121,16 @@ to enable writ-based version control.
 
 This project uses writ for version control. The `writ` CLI is available in PATH.
 
-## Workflow
+## Required Workflow
 
-1. Run `writ context` at the start of every task to understand project state
+You MUST follow these steps. They are not optional.
+
+1. BEFORE starting any work, run `writ context` to check project state
 2. Create or claim a spec: `writ spec add --id <id> --title "<description>"`
 3. Do your work in small increments
-4. Run `writ seal -s "<summary>" --agent <your-id> --spec <spec-id>` after each meaningful chunk
+4. AFTER each meaningful unit of work, you MUST run `writ seal -s "<summary>" --agent <your-id> --spec <spec-id>`
 5. Check `writ context` periodically to see what other agents have done
-6. When task is complete: `writ spec done <id>`
+6. When task is complete, you MUST run `writ spec done <id>` BEFORE reporting results
 
 ## Spec Lifecycle
 
@@ -1163,8 +1174,10 @@ Available formats:
 
 ## Rules
 
-- Checkpoint with `writ seal` after each meaningful unit of work
-- Always run `writ spec done` when your task is complete
+- You MUST run `writ context` before starting work
+- You MUST run `writ seal` after each meaningful unit of work
+- You MUST run `writ spec done` before reporting results to the user
+- Your task is NOT complete until sealed
 - Include meaningful summaries in seals for other agents' context
 - Include test results when available: `--tests-passed N --tests-failed M`
 - Do NOT run `git add`, `git commit`, or `git push` — the user manages git via `writ finish`
@@ -1174,9 +1187,10 @@ Available formats:
 
 ### System Prompt Snippet
 Add to your agent's system prompt:
-"This project uses writ for version control. Run `writ context` at the start
-of each task. Checkpoint work with `writ seal -s '<summary>'`. Mark tasks
-complete with `writ spec done <id>`. Do not run git commit or writ finish."
+"MANDATORY: This project uses writ for version control. You MUST run `writ context`
+before starting work. You MUST run `writ seal -s '<summary>'` after each unit of work.
+You MUST run `writ spec done <id>` before reporting results. Your task is NOT complete
+until sealed. NEVER run git commit or writ finish."
 
 ### Tool Definition (for function-calling agents)
 ```json
@@ -1440,8 +1454,8 @@ mod tests {
             "missing writ spec done in workflow"
         );
         assert!(
-            section.contains("Recommended Workflow"),
-            "missing recommended workflow heading"
+            section.contains("Required Workflow"),
+            "missing required workflow heading"
         );
     }
 
@@ -1489,10 +1503,7 @@ mod tests {
     #[test]
     fn test_claude_md_section_has_guidelines_section() {
         let section = writ_claude_md_section();
-        assert!(
-            section.contains("### Guidelines"),
-            "missing guidelines heading"
-        );
+        assert!(section.contains("### Rules"), "missing rules heading");
         assert!(
             section.contains("writ seal"),
             "missing seal checkpoint guideline"
@@ -1500,12 +1511,12 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_md_section_has_toon_reference() {
+    fn test_claude_md_section_has_mandatory_language() {
         let section = writ_claude_md_section();
-        assert!(section.contains("TOON"), "missing TOON reference");
+        assert!(section.contains("MUST"), "missing MUST directive");
         assert!(
-            section.contains("--format json"),
-            "missing JSON fallback reference"
+            section.contains("NOT complete"),
+            "missing completion gate language"
         );
     }
 
@@ -1548,7 +1559,7 @@ mod tests {
     fn test_agents_md_section_prohibits_git_and_finish() {
         let section = writ_agents_md_section();
         assert!(
-            section.contains("Do not run `git commit` or `writ finish`"),
+            section.contains("Do NOT run `git commit` or `writ finish`"),
             "missing git/finish prohibition"
         );
     }
@@ -1568,9 +1579,13 @@ mod tests {
     }
 
     #[test]
-    fn test_agents_md_section_has_toon_reference() {
+    fn test_agents_md_section_has_mandatory_language() {
         let section = writ_agents_md_section();
-        assert!(section.contains("TOON"), "missing TOON reference");
+        assert!(section.contains("MUST"), "missing MUST directive");
+        assert!(
+            section.contains("NOT complete"),
+            "missing completion gate language"
+        );
     }
 
     // --- Generic agent instructions tests ---

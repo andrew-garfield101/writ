@@ -275,6 +275,162 @@ fn remove_claude_instructions(root: &Path) -> WritResult<Option<String>> {
     }
 }
 
+/// The command run by the UserPromptSubmit hook.
+/// Runs `writ context` so the agent sees project state before its first action.
+/// Falls back silently if writ is not available.
+const WRIT_HOOK_COMMAND: &str = "writ context 2>/dev/null || true";
+
+/// Substring used to detect whether a writ hook is already present.
+const WRIT_HOOK_MARKER: &str = "writ context";
+
+/// The hook event names where writ injects context.
+/// - SessionStart: fires once when a session begins (agent sees writ state immediately)
+/// - UserPromptSubmit: fires on every user prompt (agent sees updated state each turn)
+const WRIT_HOOK_EVENTS: &[&str] = &["SessionStart", "UserPromptSubmit"];
+
+/// Check if a hook event array already contains a writ hook entry.
+fn has_writ_hook_entry(arr: &[serde_json::Value]) -> bool {
+    arr.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map_or(false, |inner| {
+                inner.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .map_or(false, |cmd| cmd.contains(WRIT_HOOK_MARKER))
+                })
+            })
+    })
+}
+
+/// Remove writ hook entries from a hook event array. Returns true if any were removed.
+fn remove_writ_hook_entries(arr: &mut Vec<serde_json::Value>) -> bool {
+    let before = arr.len();
+    arr.retain(|entry| {
+        !entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map_or(false, |inner| {
+                inner.iter().any(|hook| {
+                    hook.get("command")
+                        .and_then(|c| c.as_str())
+                        .map_or(false, |cmd| cmd.contains(WRIT_HOOK_MARKER))
+                })
+            })
+    });
+    arr.len() < before
+}
+
+/// Add `SessionStart` and `UserPromptSubmit` hooks to `.claude/settings.json`
+/// that run `writ context` to inject project state into agent conversations.
+///
+/// - `SessionStart`: agent sees writ state the moment a session opens
+/// - `UserPromptSubmit`: agent sees updated state on every subsequent prompt
+fn ensure_claude_hook(root: &Path) -> WritResult<Option<String>> {
+    let claude_dir = root.join(".claude");
+    if !claude_dir.exists() {
+        fs::create_dir_all(&claude_dir)?;
+    }
+
+    let settings_path = claude_dir.join("settings.json");
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let hooks = settings
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+
+    let hooks_obj = match hooks.as_object_mut() {
+        Some(obj) => obj,
+        None => {
+            // hooks field exists but isn't an object — don't touch it
+            return Ok(None);
+        }
+    };
+
+    let hook_entry = serde_json::json!({
+        "hooks": [
+            {
+                "type": "command",
+                "command": WRIT_HOOK_COMMAND,
+                "timeout": 10
+            }
+        ]
+    });
+
+    let mut any_added = false;
+
+    for event_name in WRIT_HOOK_EVENTS {
+        let event_hooks = hooks_obj
+            .entry(*event_name)
+            .or_insert_with(|| serde_json::json!([]));
+
+        let arr = match event_hooks.as_array_mut() {
+            Some(a) => a,
+            None => continue, // Not an array — don't touch it
+        };
+
+        if !has_writ_hook_entry(arr) {
+            arr.push(hook_entry.clone());
+            any_added = true;
+        }
+    }
+
+    if !any_added {
+        return Ok(None);
+    }
+
+    let json = serde_json::to_string_pretty(&settings)
+        .map_err(|e| crate::error::WritError::Other(format!("JSON serialize: {}", e)))?;
+    atomic_write(&settings_path, format!("{}\n", json).as_bytes())?;
+
+    Ok(Some(".claude/settings.json".to_string()))
+}
+
+/// Remove writ hooks from all event types in `.claude/settings.json` during uninit.
+fn remove_claude_hook(root: &Path) -> WritResult<Option<String>> {
+    let settings_path = root.join(".claude").join("settings.json");
+    if !settings_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&settings_path)?;
+    let mut settings: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+
+    let mut any_removed = false;
+
+    if let Some(hooks) = settings.get_mut("hooks") {
+        for event_name in WRIT_HOOK_EVENTS {
+            if let Some(event_hooks) = hooks.get_mut(*event_name) {
+                if let Some(arr) = event_hooks.as_array_mut() {
+                    if remove_writ_hook_entries(arr) {
+                        any_removed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    if any_removed {
+        let json = serde_json::to_string_pretty(&settings)
+            .map_err(|e| crate::error::WritError::Other(format!("JSON serialize: {}", e)))?;
+        atomic_write(&settings_path, format!("{}\n", json).as_bytes())?;
+        Ok(Some(".claude/settings.json".to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Generate writ integration hooks for Claude Code.
 pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
     let mut created = Vec::new();
@@ -365,6 +521,15 @@ pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
         Ok(None) => {}    // Already had the instruction
         Err(e) => {
             eprintln!("warning: could not add Claude Code instruction: {}", e);
+        }
+    }
+
+    // Add UserPromptSubmit hook to inject writ context at conversation start.
+    match ensure_claude_hook(root) {
+        Ok(Some(_)) => {} // settings.json already tracked above
+        Ok(None) => {}    // Already had the hook
+        Err(e) => {
+            eprintln!("warning: could not add Claude Code hook: {}", e);
         }
     }
 
@@ -574,6 +739,15 @@ pub fn unhook_claude_code(root: &Path) -> WritResult<UninstallHookResult> {
         Ok(None) => {}
         Err(e) => {
             eprintln!("warning: could not remove Claude Code instruction: {}", e);
+        }
+    }
+
+    // Remove UserPromptSubmit hook from .claude/settings.json.
+    match remove_claude_hook(root) {
+        Ok(Some(_)) => {} // settings.json already tracked above
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("warning: could not remove Claude Code hook: {}", e);
         }
     }
 
@@ -2106,6 +2280,202 @@ mod tests {
         assert!(
             writ_pos < user_pos,
             "writ section should be prepended, not appended"
+        );
+    }
+
+    // --- Claude Code hook tests (SessionStart + UserPromptSubmit) ---
+
+    #[test]
+    fn test_ensure_claude_hook_creates_both_events() {
+        let dir = tempdir().unwrap();
+        let result = ensure_claude_hook(dir.path()).unwrap();
+        assert!(result.is_some());
+
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        // Both SessionStart and UserPromptSubmit should have hooks.
+        for event in WRIT_HOOK_EVENTS {
+            let hooks = parsed["hooks"][event].as_array().unwrap();
+            assert_eq!(hooks.len(), 1, "{} should have exactly 1 hook entry", event);
+            let inner = hooks[0]["hooks"].as_array().unwrap();
+            assert_eq!(inner[0]["type"].as_str().unwrap(), "command");
+            assert!(inner[0]["command"]
+                .as_str()
+                .unwrap()
+                .contains(WRIT_HOOK_MARKER));
+        }
+    }
+
+    #[test]
+    fn test_ensure_claude_hook_merges_existing() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(
+            dir.path().join(".claude").join("settings.json"),
+            r#"{"permissions": {"allow": ["Read"]}, "instructions": ["Be nice"]}"#,
+        )
+        .unwrap();
+
+        ensure_claude_hook(dir.path()).unwrap();
+
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // Existing fields preserved.
+        assert!(parsed["permissions"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("Read")));
+        assert!(parsed["instructions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("Be nice")));
+        // Both hooks added.
+        for event in WRIT_HOOK_EVENTS {
+            let hooks = parsed["hooks"][event].as_array().unwrap();
+            assert_eq!(hooks.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_ensure_claude_hook_idempotent() {
+        let dir = tempdir().unwrap();
+        ensure_claude_hook(dir.path()).unwrap();
+        let result = ensure_claude_hook(dir.path()).unwrap();
+        assert!(result.is_none(), "second call should be a no-op");
+
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        for event in WRIT_HOOK_EVENTS {
+            let hooks = parsed["hooks"][event].as_array().unwrap();
+            assert_eq!(hooks.len(), 1, "{} hook should not be duplicated", event);
+        }
+    }
+
+    #[test]
+    fn test_ensure_claude_hook_preserves_other_hooks() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(
+            dir.path().join(".claude").join("settings.json"),
+            r#"{"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "echo hi"}]}]}}"#,
+        )
+        .unwrap();
+
+        ensure_claude_hook(dir.path()).unwrap();
+
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // PreToolUse preserved.
+        assert!(parsed["hooks"]["PreToolUse"].as_array().unwrap().len() == 1);
+        // Both writ hooks added.
+        for event in WRIT_HOOK_EVENTS {
+            assert!(parsed["hooks"][event].as_array().unwrap().len() == 1);
+        }
+    }
+
+    #[test]
+    fn test_remove_claude_hook_removes_both_events() {
+        let dir = tempdir().unwrap();
+        ensure_claude_hook(dir.path()).unwrap();
+        let result = remove_claude_hook(dir.path()).unwrap();
+        assert!(result.is_some());
+
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        for event in WRIT_HOOK_EVENTS {
+            let hooks = parsed["hooks"][event].as_array().unwrap();
+            assert!(
+                hooks.is_empty(),
+                "{} hooks should be empty after removal",
+                event
+            );
+        }
+    }
+
+    #[test]
+    fn test_remove_claude_hook_preserves_other() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        // Set up settings with both a writ hook and a custom hook in UserPromptSubmit.
+        let settings = serde_json::json!({
+            "hooks": {
+                "UserPromptSubmit": [
+                    {
+                        "hooks": [{"type": "command", "command": "echo custom"}]
+                    },
+                    {
+                        "hooks": [{"type": "command", "command": "writ context 2>/dev/null || true"}]
+                    }
+                ],
+                "SessionStart": [
+                    {
+                        "hooks": [{"type": "command", "command": "writ context 2>/dev/null || true"}]
+                    }
+                ]
+            }
+        });
+        fs::write(
+            dir.path().join(".claude").join("settings.json"),
+            serde_json::to_string_pretty(&settings).unwrap(),
+        )
+        .unwrap();
+
+        remove_claude_hook(dir.path()).unwrap();
+
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // UserPromptSubmit: only custom hook remains.
+        let ups = parsed["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(ups.len(), 1, "should only remove the writ hook");
+        assert!(ups[0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("echo custom"));
+        // SessionStart: writ hook removed, array empty.
+        let ss = parsed["hooks"]["SessionStart"].as_array().unwrap();
+        assert!(ss.is_empty());
+    }
+
+    #[test]
+    fn test_remove_claude_hook_noop_when_missing() {
+        let dir = tempdir().unwrap();
+        let result = remove_claude_hook(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_hook_claude_code_adds_both_hooks() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        let settings_path = dir.path().join(".claude").join("settings.json");
+        let content = fs::read_to_string(&settings_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        for event in WRIT_HOOK_EVENTS {
+            let hooks = parsed["hooks"][event].as_array().unwrap();
+            assert_eq!(hooks.len(), 1, "hook_claude_code should add {} hook", event);
+        }
+    }
+
+    #[test]
+    fn test_unhook_claude_code_removes_hooks() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        // Verify hooks exist.
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        assert!(content.contains(WRIT_HOOK_MARKER));
+
+        unhook_claude_code(dir.path()).unwrap();
+
+        // Hooks should be removed.
+        let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        assert!(
+            !content.contains(WRIT_HOOK_MARKER),
+            "unhook should remove all writ hook commands"
         );
     }
 }

@@ -1619,6 +1619,10 @@ fn cmd_init(
                     "  {} Agent directive: writ usage instruction added",
                     "→".green()
                 );
+                println!(
+                    "  {} Prompt hook: writ context injected at conversation start",
+                    "→".green()
+                );
             }
             if plan.enable_codex {
                 println!("{} Codex / OpenAI integration configured", "✓".green());

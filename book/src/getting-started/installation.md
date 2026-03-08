@@ -65,6 +65,46 @@ writ --help
 # Shows all available commands
 ```
 
+## Removing Writ
+
+Writ has two layers: **per project** setup and the **system install**. Remove either or both depending on what you need.
+
+### Remove writ from a project
+
+```bash
+writ uninit --force
+```
+
+This removes `.writ/`, framework hooks (CLAUDE.md markers, slash commands, settings.json permissions), and the `.gitignore` entry. Your source code, git history, and other config are never touched.
+
+Use `--keep-writignore` if you want to preserve your `.writignore` file.
+
+### Remove writ from your system
+
+Depends on how you installed it:
+
+```bash
+# PyPI
+pip uninstall writ-vcs -y
+
+# Cargo
+cargo uninstall writ
+
+# Homebrew (when available)
+brew uninstall writ
+
+# From source — remove the binary you added to PATH
+rm /path/to/writ
+```
+
+After uninstalling, optionally remove global config:
+
+```bash
+rm -rf ~/.writ/
+```
+
+This is a small config directory. Removing it is safe and has no effect on your projects or git history.
+
 ## Next Steps
 
 Head to the [Quickstart](quickstart.md) to set up writ in a project and create your first seal.

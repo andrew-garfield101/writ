@@ -125,7 +125,7 @@ SAMPLE_WRIT_SECTION = textwrap.dedent("""\
 
     ### Context Retrieval
     - `writ context` returns project state in token-optimized TOON format by default
-    - TOON uses ~40% fewer tokens than JSON with identical information
+    - TOON uses 20-33% fewer bytes than JSON with identical information
     - For standard JSON output: `writ context --format json`
 
     ### Available Commands

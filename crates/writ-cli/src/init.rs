@@ -38,6 +38,8 @@ pub struct InitOptions {
     pub name: Option<String>,
     /// GC deployment profile.
     pub profile: String,
+    /// Re-prompt for project-level settings even if global config exists.
+    pub reconfigure: bool,
     /// Output display format: "human" or "json".
     pub output_format: String,
 }
@@ -114,8 +116,8 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
         "Welcome to writ — AI-native version control for agentic development.".bold()
     );
     println!();
-    println!("No global configuration found. Let's set that up first.");
-    println!("(This only happens once. Settings apply to all projects unless overridden.)");
+    println!("No global configuration found. Let's set up your preferences.");
+    println!("(These apply globally and to this project. Override per-project with --reconfigure.)");
     println!();
 
     // Name detection
@@ -130,7 +132,7 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
     println!();
     let format_options = &["toon", "json", "json-compact"];
     let format_descriptions = &[
-        "Token-Oriented Object Notation (~40% fewer tokens)",
+        "Token-Oriented Object Notation (20-33% fewer bytes)",
         "Standard JSON (maximum compatibility)",
         "Minified JSON",
     ];
@@ -224,16 +226,41 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
     let scan = EnvironmentScan::scan(&cwd);
 
     // Phase 1: global setup (if needed)
+    let fresh_global = !scan.global_config_exists;
     let global_config = maybe_global_setup(&scan, opts);
-    let new_global = if !scan.global_config_exists {
+    let new_global = if fresh_global {
         Some(global_config.clone())
     } else {
         None
     };
 
+    // Skip format/workflow prompts when:
+    // - Global config was just created this run (user already chose them), OR
+    // - Global config existed and user didn't pass --reconfigure
+    // Only re-ask when --reconfigure is explicitly set.
+    let skip_project_overrides = !opts.reconfigure;
+
     // Phase 2 begins: display scan results (I.6)
     if opts.output_format != "json" {
         display_scan_results(&scan);
+    }
+
+    // When global config already existed, show what defaults we're using.
+    if !fresh_global && !opts.yes && !opts.reconfigure && opts.output_format != "json" {
+        let fmt = global_config.output_format().unwrap_or("toon");
+        let mode = global_config.commit_mode().unwrap_or("user");
+        println!();
+        println!(
+            "  {} Using global defaults: format={}, workflow={}",
+            "→".green(),
+            fmt.bold(),
+            mode.bold(),
+        );
+        println!(
+            "  {} Run {} to override for this project.",
+            "·".dimmed(),
+            "writ init --reconfigure".bold(),
+        );
     }
 
     // Handle already-initialized case (I.6)
@@ -265,11 +292,19 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
     let (enable_claude, enable_codex, enable_generic) =
         resolve_frameworks(&scan, &global_config, opts);
 
-    // Output format (I.9)
-    let output_format = resolve_output_format(&global_config, opts);
+    // Output format (I.9) — skip if user just set it in global setup
+    let output_format = if skip_project_overrides {
+        global_config.output_format().unwrap_or("toon").to_string()
+    } else {
+        resolve_output_format(&global_config, opts)
+    };
 
-    // W.24: Workflow mode (per-project override)
-    let workflow_mode = resolve_workflow_mode(&global_config, opts);
+    // W.24: Workflow mode — skip if user just set it in global setup
+    let workflow_mode = if skip_project_overrides {
+        global_config.commit_mode().unwrap_or("user").to_string()
+    } else {
+        resolve_workflow_mode(&global_config, opts)
+    };
 
     // Project name
     let project_name = opts
@@ -658,8 +693,8 @@ fn resolve_output_format(global: &GlobalConfig, opts: &InitOptions) -> String {
             "{}",
             "── Output Format ───────────────────────────────────".dimmed()
         );
-        println!("writ can output context in multiple formats. For LLM agents, TOON uses ~40%");
-        println!("fewer tokens than JSON with identical information.");
+        println!("writ can output context in multiple formats. For LLM agents, TOON uses 20-33%");
+        println!("fewer bytes than JSON with identical information.");
 
         let options = &[
             "toon          Token-Oriented Object Notation (recommended for agents)",

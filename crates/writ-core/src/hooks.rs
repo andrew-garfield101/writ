@@ -181,6 +181,99 @@ fn remove_claude_permissions(root: &Path) -> WritResult<Option<String>> {
     }
 }
 
+/// The instruction string added to `.claude/settings.json` so agents treat writ
+/// usage as a user directive rather than optional project documentation.
+const WRIT_INSTRUCTION: &str = "This project uses writ for version control. \
+At the start of every task, run `writ context` to check project state and other agents' activity. \
+After each meaningful unit of work, run `writ seal -s '<summary>' --agent claude-code` to create \
+a recoverable checkpoint. When your task is complete, run `writ spec done <spec-id>`. \
+Never run `git commit` or `writ finish` — the user handles the git round-trip.";
+
+/// Substring used to detect whether a writ instruction is already present.
+const WRIT_INSTRUCTION_MARKER: &str = "writ for version control";
+
+/// Add a writ usage instruction to `.claude/settings.json`.
+///
+/// Instructions in settings.json carry user-directive weight — the agent treats
+/// them as "the user told me to do this" rather than "the project docs mention this."
+fn ensure_claude_instructions(root: &Path) -> WritResult<Option<String>> {
+    let claude_dir = root.join(".claude");
+    if !claude_dir.exists() {
+        fs::create_dir_all(&claude_dir)?;
+    }
+
+    let settings_path = claude_dir.join("settings.json");
+    let mut settings: serde_json::Value = if settings_path.exists() {
+        let content = fs::read_to_string(&settings_path)?;
+        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
+    } else {
+        serde_json::json!({})
+    };
+
+    let instructions = settings
+        .as_object_mut()
+        .unwrap()
+        .entry("instructions")
+        .or_insert_with(|| serde_json::json!([]));
+
+    let arr = instructions.as_array_mut().unwrap();
+
+    // Check if a writ instruction is already present.
+    let already_has = arr
+        .iter()
+        .any(|v| v.as_str().map_or(false, |s| s.contains(WRIT_INSTRUCTION_MARKER)));
+
+    if already_has {
+        return Ok(None);
+    }
+
+    arr.push(serde_json::Value::String(WRIT_INSTRUCTION.to_string()));
+
+    let json = serde_json::to_string_pretty(&settings)
+        .map_err(|e| crate::error::WritError::Other(format!("JSON serialize: {}", e)))?;
+    atomic_write(&settings_path, format!("{}\n", json).as_bytes())?;
+
+    Ok(Some(".claude/settings.json".to_string()))
+}
+
+/// Remove the writ instruction from `.claude/settings.json` during uninit.
+fn remove_claude_instructions(root: &Path) -> WritResult<Option<String>> {
+    let settings_path = root.join(".claude").join("settings.json");
+    if !settings_path.exists() {
+        return Ok(None);
+    }
+
+    let content = fs::read_to_string(&settings_path)?;
+    let mut settings: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(v) => v,
+        Err(_) => return Ok(None),
+    };
+
+    let removed = if let Some(instructions) = settings.get_mut("instructions") {
+        if let Some(arr) = instructions.as_array_mut() {
+            let before = arr.len();
+            arr.retain(|v| {
+                v.as_str()
+                    .map_or(true, |s| !s.contains(WRIT_INSTRUCTION_MARKER))
+            });
+            arr.len() < before
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    if removed {
+        let json = serde_json::to_string_pretty(&settings)
+            .map_err(|e| crate::error::WritError::Other(format!("JSON serialize: {}", e)))?;
+        atomic_write(&settings_path, format!("{}\n", json).as_bytes())?;
+        Ok(Some(".claude/settings.json".to_string()))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Generate writ integration hooks for Claude Code.
 pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
     let mut created = Vec::new();
@@ -210,8 +303,8 @@ pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
             atomic_write(&claude_md, new_content.as_bytes())?;
             updated.push("CLAUDE.md".to_string());
         } else {
-            // Append marked section to existing file.
-            let new_content = format!("{}\n\n---\n\n{}", content.trim_end(), marked_section);
+            // Prepend marked section to existing file (writ section first for visibility).
+            let new_content = format!("{}\n\n---\n\n{}", marked_section.trim_end(), content.trim());
             atomic_write(&claude_md, new_content.as_bytes())?;
             updated.push("CLAUDE.md".to_string());
         }
@@ -250,6 +343,15 @@ pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
         Ok(None) => {} // Already had the permission
         Err(e) => {
             eprintln!("warning: could not configure Claude Code permissions: {}", e);
+        }
+    }
+
+    // Add writ usage instruction to .claude/settings.json.
+    match ensure_claude_instructions(root) {
+        Ok(Some(_)) => {} // settings.json already tracked above
+        Ok(None) => {}    // Already had the instruction
+        Err(e) => {
+            eprintln!("warning: could not add Claude Code instruction: {}", e);
         }
     }
 
@@ -450,6 +552,15 @@ pub fn unhook_claude_code(root: &Path) -> WritResult<UninstallHookResult> {
         Ok(None) => {} // Permission wasn't there or file doesn't exist
         Err(e) => {
             eprintln!("warning: could not remove Claude Code permissions: {}", e);
+        }
+    }
+
+    // Remove writ instruction from .claude/settings.json.
+    match remove_claude_instructions(root) {
+        Ok(Some(_)) => {} // settings.json already tracked above
+        Ok(None) => {}
+        Err(e) => {
+            eprintln!("warning: could not remove Claude Code instruction: {}", e);
         }
     }
 
@@ -753,7 +864,7 @@ This project uses writ (AI-native version control) for checkpointing and coordin
 4. Complete tasks with `writ spec done <id>`
 
 ### Context Retrieval
-- `writ context` returns project state in token-optimized TOON format (~40% fewer tokens)
+- `writ context` returns project state in token-optimized TOON format (20-33% fewer bytes)
 - For standard JSON: `writ context --format json`
 
 ### Key Commands
@@ -787,7 +898,7 @@ const CLAUDE_CONTEXT_COMMAND: &str = r#"Show the current writ context for this p
 writ context
 ```
 
-This returns project state in TOON format (~40% fewer tokens than JSON).
+This returns project state in TOON format (20-33% fewer bytes than JSON).
 For standard JSON output:
 
 ```bash
@@ -843,7 +954,7 @@ writ supports multiple output formats. For LLM consumption, use TOON:
     writ context --format toon
 
 TOON (Token-Oriented Object Notation) provides the same structured data as JSON
-in ~40% fewer tokens. Field names are declared once, rows are streamed as values.
+in 20-33% fewer bytes. Field names are declared once, rows are streamed as values.
 
 Available formats:
 - toon        Token-optimized (recommended for agents)
@@ -1829,6 +1940,169 @@ mod tests {
         assert!(
             content.contains("overwrites working directory"),
             "agent instructions should warn about restore"
+        );
+    }
+
+    // --- Claude Code settings.json instruction tests ---
+
+    #[test]
+    fn test_ensure_claude_instructions_creates() {
+        let dir = tempdir().unwrap();
+        let result = ensure_claude_instructions(dir.path()).unwrap();
+        assert!(result.is_some());
+
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let instructions = parsed["instructions"].as_array().unwrap();
+        assert_eq!(instructions.len(), 1);
+        assert!(instructions[0]
+            .as_str()
+            .unwrap()
+            .contains(WRIT_INSTRUCTION_MARKER));
+    }
+
+    #[test]
+    fn test_ensure_claude_instructions_merges_existing() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(
+            dir.path().join(".claude").join("settings.json"),
+            r#"{"instructions": ["Always use TypeScript"], "permissions": {"allow": []}}"#,
+        )
+        .unwrap();
+
+        ensure_claude_instructions(dir.path()).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let instructions = parsed["instructions"].as_array().unwrap();
+        assert_eq!(instructions.len(), 2);
+        assert!(instructions
+            .iter()
+            .any(|v| v.as_str() == Some("Always use TypeScript")));
+        assert!(instructions
+            .iter()
+            .any(|v| v.as_str().unwrap().contains(WRIT_INSTRUCTION_MARKER)));
+        // Other fields preserved.
+        assert!(parsed["permissions"].is_object());
+    }
+
+    #[test]
+    fn test_ensure_claude_instructions_idempotent() {
+        let dir = tempdir().unwrap();
+        ensure_claude_instructions(dir.path()).unwrap();
+        let result = ensure_claude_instructions(dir.path()).unwrap();
+        assert!(result.is_none(), "second call should be a no-op");
+
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let instructions = parsed["instructions"].as_array().unwrap();
+        let count = instructions
+            .iter()
+            .filter(|v| {
+                v.as_str()
+                    .map_or(false, |s| s.contains(WRIT_INSTRUCTION_MARKER))
+            })
+            .count();
+        assert_eq!(count, 1, "instruction should not be duplicated");
+    }
+
+    #[test]
+    fn test_remove_claude_instructions_removes() {
+        let dir = tempdir().unwrap();
+        ensure_claude_instructions(dir.path()).unwrap();
+        let result = remove_claude_instructions(dir.path()).unwrap();
+        assert!(result.is_some());
+
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let instructions = parsed["instructions"].as_array().unwrap();
+        assert!(instructions.is_empty());
+    }
+
+    #[test]
+    fn test_remove_claude_instructions_preserves_other() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        fs::write(
+            dir.path().join(".claude").join("settings.json"),
+            r#"{"instructions": ["Always use TypeScript", "This project uses writ for version control. Do stuff."]}"#,
+        )
+        .unwrap();
+
+        remove_claude_instructions(dir.path()).unwrap();
+
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let instructions = parsed["instructions"].as_array().unwrap();
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].as_str().unwrap(), "Always use TypeScript");
+    }
+
+    #[test]
+    fn test_remove_claude_instructions_noop_when_missing() {
+        let dir = tempdir().unwrap();
+        let result = remove_claude_instructions(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_hook_claude_code_adds_instruction() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        let settings_path = dir.path().join(".claude").join("settings.json");
+        let content = fs::read_to_string(&settings_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let instructions = parsed["instructions"].as_array().unwrap();
+        assert!(
+            instructions
+                .iter()
+                .any(|v| v.as_str().unwrap().contains(WRIT_INSTRUCTION_MARKER)),
+            "hook_claude_code should add writ instruction"
+        );
+    }
+
+    #[test]
+    fn test_unhook_claude_code_removes_instruction() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        // Verify instruction exists.
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        assert!(content.contains(WRIT_INSTRUCTION_MARKER));
+
+        unhook_claude_code(dir.path()).unwrap();
+
+        // Instruction should be removed.
+        let content =
+            fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
+        assert!(
+            !content.contains(WRIT_INSTRUCTION_MARKER),
+            "unhook should remove writ instruction"
+        );
+    }
+
+    #[test]
+    fn test_claudemd_prepends_to_existing() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("CLAUDE.md"), "# My Project\n\nUser stuff.\n").unwrap();
+
+        hook_claude_code(dir.path()).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
+        // Writ section should come before user content.
+        let writ_pos = content.find(MARKER_BEGIN).unwrap();
+        let user_pos = content.find("User stuff").unwrap();
+        assert!(
+            writ_pos < user_pos,
+            "writ section should be prepended, not appended"
         );
     }
 }

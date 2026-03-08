@@ -34,3 +34,13 @@ testing/
 # Built CLI binaries in wheel data (committed via CI, not locally)
 crates/writ-py/writ.data/scripts/writ
 crates/writ-py/writ.data/scripts/writ.exe
+
+
+# team docs and notes
+docs/
+scratch.md
+CLAUDE.md
+scripts/
+old_readmes/
+
+*.dSYM/

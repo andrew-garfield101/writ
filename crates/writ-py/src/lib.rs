@@ -537,7 +537,7 @@ impl PyRepository {
     /// - `"dict"` (default): returns a parsed Python dict
     /// - `"json"`: returns a pretty-printed JSON string
     /// - `"json-compact"`: returns a minified JSON string
-    /// - `"toon"`: returns a TOON string (~40% fewer tokens than JSON)
+    /// - `"toon"`: returns a TOON string (20-33% fewer bytes than JSON)
     #[pyo3(signature = (spec=None, seal_limit=10, status=None, agent=None, for_agent=None, format="dict"))]
     fn context(
         &self,

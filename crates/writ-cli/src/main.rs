@@ -84,6 +84,10 @@ enum Commands {
         /// Set project name (default: auto-detected from manifest or directory name).
         #[arg(long)]
         name: Option<String>,
+
+        /// Re-prompt for project-level settings even if global config exists.
+        #[arg(long)]
+        reconfigure: bool,
     },
 
     /// Remove writ from this project (inverse of init).
@@ -986,6 +990,7 @@ fn main() {
             frameworks,
             output_fmt,
             name,
+            reconfigure,
         } => {
             let opts = init::InitOptions {
                 yes,
@@ -997,6 +1002,7 @@ fn main() {
                 frameworks,
                 format: output_fmt,
                 name,
+                reconfigure,
                 profile: profile.clone(),
                 output_format: format.clone(),
             };
@@ -1609,7 +1615,11 @@ fn cmd_init(
             if plan.enable_claude {
                 println!("{} Claude Code integration configured", "✓".green());
                 println!(
-                    "  {} Agent permissions: Bash(writ *) in .claude/settings.json",
+                    "  {} Agent permissions: Bash(writ *)",
+                    "→".green()
+                );
+                println!(
+                    "  {} Agent directive: writ usage instruction added",
                     "→".green()
                 );
             }

@@ -117,7 +117,7 @@ impl OutputFormatter for JsonCompactFormatter {
 // ---------------------------------------------------------------------------
 
 /// Token-Oriented Object Notation formatter. Uses tabular header format
-/// for arrays of uniform structs, achieving ~40% token savings vs JSON.
+/// for arrays of uniform structs, achieving 20-33% byte savings vs JSON.
 ///
 /// Output includes a header comment with project name, format, and timestamp.
 pub struct ToonFormatter {

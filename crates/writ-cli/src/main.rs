@@ -4320,7 +4320,7 @@ fn cmd_spec_done(
         Some(spec_id.clone()),
         TaskStatus::Complete,
         verification,
-        false,
+        true, // allow empty — spec done is a metadata operation, changes may already be sealed
     )?;
 
     // Mark spec as done

@@ -8,21 +8,23 @@
 [![Docs](https://img.shields.io/badge/docs-andrew--garfield101.github.io%2Fwrit-blue)](https://andrew-garfield101.github.io/writ/)
 
 
-Agents are writing production code, managing infrastructure, processing documents at scale. They are remarkably capable. The version control they're using? Still git. Still designed for humans typing at keyboards. Agents spend tokens on tooling overhead — parsing unstructured text, reconstructing project state from multiple calls, navigating merge conflicts that conventional tools weren't built to handle. The tooling doesn't match what agents can do.
+Writ is a version control system designed from the ground up for LLMs and agentic systems. 
 
-Writ changes that equation. Structured context in one call. Semantic convergence that merges meaning, not lines. Cryptographic integrity across any environment. And a clean round trip back to git when the work is done.
+Instead of bolting conventions into a VCS built for humans, writ provides elegant AI native version control. 
+
+Structured context in one call. Semantic convergence that merges meaning, not lines. Cryptographic integrity across any environment. And a clean round trip back to git when the work is done.
 
 Writ works alongside git, not instead of it.
 
-**One call context.** Building situational awareness with current tools means multiple calls, parsing unstructured output, synthesizing project state from fragments. That's tokens and compute spent on infrastructure, not on the agent's actual task. `writ context` delivers everything — specs, seals, working state, file contention, integration risk — in one structured response. With TOON output format, even the structural overhead disappears. Agents spend tokens on reasoning, not parsing.
+**Context in one call.** Building situational awareness with current tools means multiple calls, parsing unstructured output, synthesizing project state from fragments. That's tokens and compute spent on infrastructure, not on the agent's actual task. `writ context` delivers everything. specs, seals, working state, file contention, integration risk all in one structured response. And with token optimized format options (TOON), even the structural overhead disappears. Agents spend tokens on reasoning, not parsing.
 
-**Semantic convergence.** When multiple agents touch the same files, conventional merging sees conflicts. Writ sees structure. Language aware analyzers decompose code into imports, definitions, and statements — composing additive changes automatically and escalating real conflicts with full context and confidence scores. No `<<<<` markers. No guesswork.
+**Semantic convergence.** When multiple agents touch the same files, conventional merging sees conflicts. Writ sees structure and merges meaning. Language aware analyzers decompose code into imports, definitions, and statements, composing additive changes automatically and escalating real conflicts with full context and confidence scores. No `<<<<` markers. No guesswork.
 
 **Cryptographic integrity.** BLAKE3 hash chains and Ed25519 signatures on every seal. Agent identity with trust levels and scope enforcement. Content traceability ensures no line in merged output appears from thin air. Tamper with any checkpoint and the chain breaks.
 
 **Environment agnostic.** Zero trust setups where every agent action is verified. Fully autonomous systems like [OpenClaw](https://github.com/openclaw) where agents operate without oversight. Mixed workflows with humans in the loop. VMs, containers, CI runners, bare metal. Writ provides version control for whatever environment agents work in.
 
-**Built for any scale.** An indie developer running 15 agents. An enterprise org running 500 across multiple orchestrators. Writ's efficiency compounds — context costs drop, convergence handles what git can't, and deployment profiles scale from a 500MB Raspberry Pi to unlimited enterprise. The more agents in the system, the more writ matters.
+**Built for any scale.** Writ's efficiency compounds at scale. Context costs drop, convergence handles what git can't, and deployment profiles scale from a 500MB Raspberry Pi to unlimited enterprise. The more agents in the system, the more writ matters. Lifecycle management and garbage collection keep repositories clean without ever compromising the immutable seal history.
 
 > *"One `writ context` call and I know who did what, which specs are complete, where branches diverged, and what files are contested. That is genuinely valuable and unlike anything available in git alone."*
 >
@@ -64,55 +66,61 @@ One command sets up everything:
 writ init
 ```
 
-That's it. Writ detects your environment and configures sensible defaults automatically. If you're in a git repo, it reads the branch and HEAD. If Claude Code is present (`CLAUDE.md` or `.claude/`), it creates `/writ-seal` and `/writ-context` slash commands. If Codex is detected (`AGENTS.md` or `.codex/`), it adds writ workflow instructions. For any other agent framework, the CLI is available in PATH and the Python SDK works out of the box. See the [quickstart guide](https://andrew-garfield101.github.io/writ/getting-started/quickstart.html) for a full walkthrough.
+That's it. Writ detects your environment and configures sensible defaults automatically. If you're in a git repo, it reads the branch and HEAD.
+   Detected agent frameworks get writ workflow instructions injected into their configuration files — CLAUDE.md for Claude Code, AGENTS.md for
+  Codex. Claude Code also gets /writ-seal and /writ-context slash commands. For any other agent framework, the CLI is available in PATH and the
+  Python SDK works out of the box. See the quickstart guide for a full walkthrough.
 
 The full round trip looks like this:
 
 ```bash
-# Human checks out a branch, sets up writ
-writ init
+  # Human sets up the project
+  writ init
 
-# Agents work — sealing checkpoints as they go
-writ seal -s "added auth module" --agent implementer --spec auth
-writ seal -s "tests passing" --agent tester --spec auth --tests-passed 42
+  # Human defines work and kicks off agents (your existing workflow)
+  writ spec add --id auth --title "Add auth module"
+  # Launch agents however you normally do — Claude Code, Codex, scripts, etc.
 
-# Agent marks its task complete
-writ spec done auth
+  # Agents work — sealing checkpoints as they go
+  writ seal -s "added auth module" --agent implementer --spec auth
+  writ seal -s "tests passing" --agent tester --spec auth --tests-passed 42
 
-# One call gives agents everything they need
-writ context --format toon              # token-optimized for LLM agents
+  # Agent marks its task complete
+  writ spec done auth
 
-# Human checks in on progress from anywhere
-writ status
+  # One call gives agents everything they need
+  writ context --format toon # token-optimized for LLM agents
 
-# When ready, promote completed work to git
-writ finish
+  # Human checks in on progress from anywhere
+  writ status
 
-# Or generate commit messages and PR descriptions from the full session history
-git commit -m "$(writ summary --format commit)"
-gh pr create --body "$(writ summary --format pr)"
+  # When ready, promote completed work to git
+  writ finish # stages, commits, marks specs committed
+
+  # Standard git from here
+  git push
 ```
 
-Every command in this workflow is available to agents by default after `writ init`. No additional configuration. No agent-specific setup scripts. Agents seal checkpoints and mark tasks complete. The user checks in with `writ status` and promotes completed work to git with `writ finish`. Three commands for the user. The agents handle the rest.
+Every command in this workflow is available to agents by default after `writ init`. No additional configuration. No agent specific setup scripts. Agents seal checkpoints and mark tasks complete. The user checks in with `writ status` and promotes completed work to git with `writ finish`. Three commands for the user. The agents handle the rest. A full getting started guide with example workflows available https://andrew-garfield101.github.io/writ/getting-started/quickstart.html
 
 ```
  Human world                    Agent world                       Human world
 ┌──────────┐  writ init     ┌─────────────────┐  writ finish   ┌──────────────┐
 │ git repo │ ──────────────→│ agents work:    │ ─────────────→ │ git commit   │
 │ (branch) │                │ seal, spec done │  writ status   │ with full    │
-│          │                │ context, log    │◀──────────────│ provenance   │
+│          │                │ context, log    │◀────────────── │ provenance   │
 └──────────┘                └─────────────────┘                └──────────────┘
 ```
 
 ## Why Writ
 
-Most multi-agent tooling gives each agent a git worktree and merges via PRs. That handles **isolation** — keeping agents from stepping on each other's files. It doesn't handle **convergence** — bringing their work back together when they inevitably touch the same code.
+Most multi agent tooling gives each agent a git worktree and merges via PRs. That handles **isolation** keeping agents from stepping on each other's files. It doesn't handle **convergence** bringing their work back together when they inevitably touch the same code.
 
 Git worktrees weren't designed for agents. They solve the wrong problem at the wrong layer. The agent still has to shell out to a CLI, parse unstructured text output, reconstruct project state from multiple commands, and hope that merge conflicts get caught before they corrupt the codebase. Every one of those steps burns tokens and compute on work that isn't the agent's actual task.
 
-Orchestration frameworks like OpenClaw, CrewAI, and LangGraph coordinate what agents *do*. But they don't provide version control for what agents *produce*. When a sub-agent in an automated pipeline modifies a file that another sub-agent depends on, there's no structured record of what changed, who changed it, or how to safely merge the results. The orchestrator coordinates tasks. Writ controls the artifacts.
+Orchestration frameworks like OpenClaw, CrewAI, and LangGraph coordinate what agents *do*. But they don't provide version control for what agents *produce*. When a sub agent in an automated pipeline modifies a file that another sub agent depends on, there's no structured record of what changed, who changed it, or how to safely merge the results. The orchestrator coordinates tasks. Writ controls the artifacts.
 
-Writ puts agent-native metadata inside the VCS:
+Writ puts agent native metadata inside the VCS:
 
 | Git | Writ | What Changes |
 |-----|------|-------------|
@@ -130,15 +138,15 @@ Writ puts agent-native metadata inside the VCS:
 
 ### Use Cases
 
-- **Multi-agent software development.** Multiple coding agents working concurrently on overlapping codebases — the core use case writ was designed for
+- **Multi agent software development.** Multiple coding agents working concurrently on overlapping codebases. The core use case writ was designed for
 - **Single-agent workflows.** Even one agent benefits from structured checkpoints, context(), and the git round-trip — `writ init` → work → `writ finish`
-- **Autonomous pipelines.** Sub-agents in orchestration frameworks (OpenClaw, CrewAI, custom systems) producing artifacts that need version control, provenance, and safe convergence
-- **Knowledge work.** Documentation, configuration, data processing — any iterative task where agents modify shared files and need structured history
+- **Autonomous pipelines.** Sub agents in orchestration frameworks (OpenClaw, CrewAI, custom systems) producing artifacts that need version control, provenance, and safe convergence
+- **Knowledge work.** Documentation, configuration, data processing. Any iterative task where agents modify shared files and need structured history
 - **Human-AI collaboration.** Mixed workflows where humans and agents contribute to the same project, with full transparency into who did what
 
 ## Context
 
-Situational awareness is the most expensive recurring cost in an agentic workflow. With conventional tools, that means multiple calls — `git log`, `git diff`, `git status`, reading files — each returning unstructured text that needs parsing and synthesis. Capable agents spend a significant portion of their compute budget on tooling overhead instead of their actual task.
+Situational awareness is the most expensive recurring cost in an agentic workflow. With conventional tools, that means multiple calls — `git log`, `git diff`, `git status`, reading files, each returning unstructured text that needs parsing and synthesis. Capable agents spend a significant portion of their compute budget on tooling overhead instead of their actual task. At fleet scale, that overhead compounds, every agent, every session, every context read.
 
 Writ consolidates all of that into a single call:
 
@@ -169,7 +177,7 @@ With git, an agent makes 4-5 tool calls and synthesizes its own situational mode
 
 ### Output Formats
 
-Every time an agent requests context, there's a token tax — repeated key names, structural punctuation, formatting overhead. Tokens spent on syntax instead of reasoning. TOON eliminates that tax:
+Every time an agent requests context, there's token use, repeated key names, structural punctuation, formatting overhead. Tokens spent on syntax instead of reasoning. TOON minimizes that token use. 
 
 ```
 seals[5]{id,summary,agent,timestamp,spec}:
@@ -180,13 +188,12 @@ seals[5]{id,summary,agent,timestamp,spec}:
 
 Field names declared once. Rows streamed as values. No braces, no repeated keys.
 
-One `writ context` call replaces five git commands and delivers [25% more information per token](https://andrew-garfield101.github.io/writ/concepts/output-formats.html). TOON format reduces output size by 20-33% versus JSON. These savings compound at fleet scale — fewer calls, less parsing, more context window for reasoning. See the [output formats guide](https://andrew-garfield101.github.io/writ/concepts/output-formats.html) for the full benchmark methodology and numbers.
+One `writ context` call replaces five git commands and delivers [25% more information per token](https://andrew-garfield101.github.io/writ/concepts/output-formats.html). TOON format reduces output size by 20-33% versus JSON. These savings compound at fleet scale, fewer calls, less parsing, more context window for reasoning. See the [output formats guide](https://andrew-garfield101.github.io/writ/concepts/output-formats.html) for the full benchmark methodology and numbers.
 
-Context output is also adaptive. Solo agent with no divergence? Integration risk and convergence sections don't appear. No scope violations? That section is omitted. The output scales with complexity, not with a fixed schema — a single agent gets a lean response, a 50 agent fleet gets the full picture. Every token in the response carries information.
+Context output is also adaptive. Solo agent with no divergence? Integration risk and convergence sections don't appear. No scope violations? That section is omitted. The output scales with complexity, not with a fixed schema. A single agent gets a lean response, a 50 agent fleet gets the full picture. Every token in the response carries information.
 
 ## Multi-Agent Workflow
-
-Three agents, different specs, working concurrently. Sealing is serialized via advisory file locks, so agents queue safely:
+Three agents, different specs, one repository. No branches, no merge conflicts, no coordination overhead:
 
 ```bash
 # Agent A: auth migration (sealing work in progress)
@@ -200,7 +207,7 @@ writ spec done payments
 writ seal -s "42 tests passing" --agent test-bot --spec test-suite --tests-passed 42
 ```
 
-The human checks in:
+The human checks in with a single command:
 
 ```bash
 $ writ status
@@ -215,7 +222,7 @@ $ writ status
   1 spec complete · run `writ finish` when ready
 ```
 
-Full transparency. No branch archaeology. No parsing commit messages to figure out which agent did what.
+Full transparency. No branch archaeology, no parsing commit messages. Every agent's work is tracked, attributed, and queryable from the moment it happens.
 
 ## Convergence
 
@@ -360,7 +367,7 @@ with Agent("implementer", spec_id="auth") as agent:
 writ init                             # guided setup (git detect + bridge import + framework integration)
 writ init --yes                       # non-interactive setup (CI-safe, accept all defaults)
 writ init --profile production        # setup with a deployment profile (storage budgets, retention)
-writ uninstall [--force]              # clean removal of writ from the project
+writ uninit [--force]                 # clean removal of writ from the project
 writ seal -s "..." --agent ID         # create a structured checkpoint
 writ context [--spec ID] [--format]   # structured context dump (json, toon, human, brief)
 writ status [--watch] [--completed]   # fleet overview: agents, specs, progress

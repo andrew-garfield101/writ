@@ -489,46 +489,10 @@ pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
         created.push("CLAUDE.md".to_string());
     }
 
-    let commands_dir = root.join(".claude").join("commands");
-    if !commands_dir.exists() {
-        fs::create_dir_all(&commands_dir)?;
-    }
-
-    let seal_cmd = commands_dir.join("writ-seal.md");
-    if !seal_cmd.exists() {
-        atomic_write(&seal_cmd, CLAUDE_SEAL_COMMAND.as_bytes())?;
-        created.push(".claude/commands/writ-seal.md".to_string());
-    }
-
-    let context_cmd = commands_dir.join("writ-context.md");
-    if !context_cmd.exists() {
-        atomic_write(&context_cmd, CLAUDE_CONTEXT_COMMAND.as_bytes())?;
-        created.push(".claude/commands/writ-context.md".to_string());
-    }
-
-    let spec_done_cmd = commands_dir.join("writ-spec-done.md");
-    if !spec_done_cmd.exists() {
-        atomic_write(&spec_done_cmd, CLAUDE_SPEC_DONE_COMMAND.as_bytes())?;
-        created.push(".claude/commands/writ-spec-done.md".to_string());
-    }
-
-    let status_cmd = commands_dir.join("writ-status.md");
-    if !status_cmd.exists() {
-        atomic_write(&status_cmd, CLAUDE_STATUS_COMMAND.as_bytes())?;
-        created.push(".claude/commands/writ-status.md".to_string());
-    }
-
-    let finish_cmd = commands_dir.join("writ-finish.md");
-    if !finish_cmd.exists() {
-        atomic_write(&finish_cmd, CLAUDE_FINISH_COMMAND.as_bytes())?;
-        created.push(".claude/commands/writ-finish.md".to_string());
-    }
-
-    let diff_cmd = commands_dir.join("writ-diff.md");
-    if !diff_cmd.exists() {
-        atomic_write(&diff_cmd, CLAUDE_DIFF_COMMAND.as_bytes())?;
-        created.push(".claude/commands/writ-diff.md".to_string());
-    }
+    // Generate all 17 slash command files.
+    let sc_result = crate::slash_commands::generate_slash_commands(root)?;
+    created.extend(sc_result.created);
+    updated.extend(sc_result.updated);
 
     // Ensure Bash(writ *) permission in .claude/settings.json.
     match ensure_claude_permissions(root) {
@@ -742,48 +706,9 @@ pub fn unhook_claude_code(root: &Path) -> WritResult<UninstallHookResult> {
         }
     }
 
-    // Remove writ command files.
-    let commands_dir = root.join(".claude").join("commands");
-    let seal_cmd = commands_dir.join("writ-seal.md");
-    if seal_cmd.exists() {
-        fs::remove_file(&seal_cmd)?;
-        removed.push(".claude/commands/writ-seal.md".to_string());
-    }
-
-    let context_cmd = commands_dir.join("writ-context.md");
-    if context_cmd.exists() {
-        fs::remove_file(&context_cmd)?;
-        removed.push(".claude/commands/writ-context.md".to_string());
-    }
-
-    let spec_done_cmd = commands_dir.join("writ-spec-done.md");
-    if spec_done_cmd.exists() {
-        fs::remove_file(&spec_done_cmd)?;
-        removed.push(".claude/commands/writ-spec-done.md".to_string());
-    }
-
-    let status_cmd = commands_dir.join("writ-status.md");
-    if status_cmd.exists() {
-        fs::remove_file(&status_cmd)?;
-        removed.push(".claude/commands/writ-status.md".to_string());
-    }
-
-    let finish_cmd = commands_dir.join("writ-finish.md");
-    if finish_cmd.exists() {
-        fs::remove_file(&finish_cmd)?;
-        removed.push(".claude/commands/writ-finish.md".to_string());
-    }
-
-    let diff_cmd = commands_dir.join("writ-diff.md");
-    if diff_cmd.exists() {
-        fs::remove_file(&diff_cmd)?;
-        removed.push(".claude/commands/writ-diff.md".to_string());
-    }
-
-    // Clean up empty commands dir (only if we emptied it).
-    if commands_dir.exists() && is_dir_empty(&commands_dir) {
-        let _ = fs::remove_dir(&commands_dir);
-    }
+    // Remove all writ slash command files.
+    let sc_removed = crate::slash_commands::remove_slash_commands(root)?;
+    removed.extend(sc_removed);
 
     // Remove Bash(writ *) permission from .claude/settings.json.
     match remove_claude_permissions(root) {
@@ -1066,15 +991,15 @@ fn is_dir_empty(path: &Path) -> bool {
 fn writ_claude_md_section() -> String {
     r#"## Writ Version Control (MANDATORY)
 
-This project uses writ for version control. You MUST follow this workflow.
+**FIRST ACTION: Run `writ context` before doing anything else.**
 
-### Required Workflow
-1. BEFORE starting any work, run `writ context` to check project state
-2. Create or claim a spec: `writ spec add --id <id> --title "<description>"`
-3. AFTER each meaningful unit of work, you MUST run `writ seal -s "<summary>" --agent claude-code`
-4. When your task is complete, you MUST run `writ spec done <id>` BEFORE reporting results to the user
+**EVERY TASK requires these 3 commands — no exceptions, no matter how small the task:**
+1. `writ spec add --id <id> --title "<description>"` — register your task
+2. `writ seal -s "<summary>" --agent claude-code` — after each unit of work
+3. `writ spec done <id>` — BEFORE reporting results to the user
 
-Your task is NOT complete until you have sealed your work and run `writ spec done`.
+Your task is NOT complete until you have run all three.
+Do NOT run `git commit`, `git add`, `git push`, or `writ finish`.
 
 ### Commands
 - `writ context` — structured project state (files, specs, activity). Run this FIRST.
@@ -1086,14 +1011,6 @@ Your task is NOT complete until you have sealed your work and run `writ spec don
 - `writ diff` — preview file changes
 - `writ log` — recent seal history
 
-### Slash Commands
-- `/writ-context` — get project context
-- `/writ-seal` — checkpoint current work
-- `/writ-spec-done` — mark a spec complete
-- `/writ-status` — fleet overview
-- `/writ-finish` — promote work to git (human use)
-- `/writ-diff` — view changes
-
 ### Rules
 - You MUST run `writ context` before starting work
 - You MUST run `writ seal -s "<summary>" --agent claude-code` after each meaningful unit of work
@@ -1101,7 +1018,6 @@ Your task is NOT complete until you have sealed your work and run `writ spec don
 - You MUST include meaningful summaries in seals so other agents understand your work
 - Do NOT run `git add`, `git commit`, or `git push` — the user manages the git round-trip via `writ finish`
 - Do NOT run `writ finish` — this is the git integration command managed by the user or orchestrator
-- `writ restore <seal-id>` overwrites working directory files — use only when you need to revert to a known-good state
 "#.to_string()
 }
 
@@ -1130,88 +1046,6 @@ Do NOT run `git commit` or `writ finish` — the user manages the git round-trip
 "#
     .to_string()
 }
-
-const CLAUDE_SEAL_COMMAND: &str = r#"Seal the current work as a writ checkpoint.
-
-Run this command to create a structured checkpoint:
-
-```bash
-writ seal -s "$ARGUMENTS" --agent claude-code --spec your-spec-id
-```
-
-To include test results, add `--tests-passed N --tests-failed M`.
-When your task is fully complete, run `writ spec done <spec-id>` instead.
-"#;
-
-const CLAUDE_CONTEXT_COMMAND: &str = r#"Show the current writ context for this project.
-
-```bash
-writ context
-```
-
-This returns project state in TOON format (20-33% fewer bytes than JSON).
-For standard JSON output:
-
-```bash
-writ context --format json
-```
-
-To scope context to a specific spec:
-
-```bash
-writ context --spec your-spec-id
-```
-"#;
-
-const CLAUDE_SPEC_DONE_COMMAND: &str = r#"Mark a spec as complete.
-
-```bash
-writ spec done $ARGUMENTS
-```
-
-This marks the specified spec as complete and creates a final seal.
-The spec moves from `active` to `completed` status.
-
-Use this when your task is fully finished. The user will then run `writ finish` to promote the work to a git commit.
-"#;
-
-const CLAUDE_STATUS_COMMAND: &str = r#"Show project overview with agent and spec status.
-
-```bash
-writ status
-```
-
-Displays a fleet overview: active agents, spec progress, and recent activity.
-Use this to see what other agents are working on and overall project state.
-"#;
-
-const CLAUDE_FINISH_COMMAND: &str = r#"Promote completed specs to git commits.
-
-**Note:** This command is for the human user, not agents. Agents should use `writ spec done` instead.
-
-```bash
-writ finish
-```
-
-Options:
-- `writ finish --spec <id>` — finish a specific spec
-- `writ finish --all` — finish all completed specs
-- `writ finish --dry-run` — preview what would be committed
-"#;
-
-const CLAUDE_DIFF_COMMAND: &str = r#"View file changes tracked by writ.
-
-```bash
-writ diff
-```
-
-Options:
-- `writ diff --spec <id>` — changes for a specific spec
-- `writ diff --agent <id>` — changes by a specific agent
-- `writ diff --stat` — summary only (files and line counts)
-- `writ diff --name-only` — file paths only
-- `writ diff --cached` — completed but uncommitted changes
-"#;
 
 /// Content for `.writ/AGENT_INSTRUCTIONS.md`.
 fn agent_instructions_content() -> String {
@@ -1567,8 +1401,8 @@ mod tests {
             "missing writ spec done in workflow"
         );
         assert!(
-            section.contains("Required Workflow"),
-            "missing required workflow heading"
+            section.contains("EVERY TASK requires these 3 commands"),
+            "missing front-loaded mandatory workflow"
         );
     }
 
@@ -1634,17 +1468,16 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_md_section_has_slash_commands() {
+    fn test_claude_md_section_has_mandatory_commands() {
         let section = writ_claude_md_section();
+        // Front-loaded mandatory commands must be present
         for cmd in &[
-            "/writ-context",
-            "/writ-seal",
-            "/writ-spec-done",
-            "/writ-status",
-            "/writ-finish",
-            "/writ-diff",
+            "writ context",
+            "writ seal",
+            "writ spec add",
+            "writ spec done",
         ] {
-            assert!(section.contains(cmd), "missing {} slash command", cmd);
+            assert!(section.contains(cmd), "missing {} command", cmd);
         }
     }
 
@@ -2001,88 +1834,7 @@ mod tests {
         assert!(cleaned.trim().is_empty());
     }
 
-    // --- Slash command content tests ---
-
-    #[test]
-    fn test_seal_command_has_spec_and_done_docs() {
-        assert!(
-            CLAUDE_SEAL_COMMAND.contains("--spec"),
-            "missing spec flag doc"
-        );
-        assert!(
-            CLAUDE_SEAL_COMMAND.contains("writ spec done"),
-            "missing spec done reference"
-        );
-    }
-
-    #[test]
-    fn test_context_command_has_toon_reference() {
-        assert!(
-            CLAUDE_CONTEXT_COMMAND.contains("TOON"),
-            "missing TOON reference"
-        );
-        assert!(
-            CLAUDE_CONTEXT_COMMAND.contains("--format json"),
-            "missing JSON fallback"
-        );
-    }
-
-    #[test]
-    fn test_spec_done_command_content() {
-        assert!(
-            CLAUDE_SPEC_DONE_COMMAND.contains("writ spec done"),
-            "missing spec done command"
-        );
-        assert!(
-            CLAUDE_SPEC_DONE_COMMAND.contains("writ finish"),
-            "missing finish reference"
-        );
-    }
-
-    #[test]
-    fn test_status_command_content() {
-        assert!(
-            CLAUDE_STATUS_COMMAND.contains("writ status"),
-            "missing status command"
-        );
-        assert!(
-            CLAUDE_STATUS_COMMAND.contains("fleet overview"),
-            "missing fleet overview description"
-        );
-    }
-
-    #[test]
-    fn test_finish_command_content() {
-        assert!(
-            CLAUDE_FINISH_COMMAND.contains("writ finish"),
-            "missing finish command"
-        );
-        assert!(
-            CLAUDE_FINISH_COMMAND.contains("human user"),
-            "missing human user note"
-        );
-        assert!(
-            CLAUDE_FINISH_COMMAND.contains("--dry-run"),
-            "missing dry-run flag"
-        );
-    }
-
-    #[test]
-    fn test_diff_command_content() {
-        assert!(
-            CLAUDE_DIFF_COMMAND.contains("writ diff"),
-            "missing diff command"
-        );
-        assert!(CLAUDE_DIFF_COMMAND.contains("--stat"), "missing stat flag");
-        assert!(
-            CLAUDE_DIFF_COMMAND.contains("--name-only"),
-            "missing name-only flag"
-        );
-        assert!(
-            CLAUDE_DIFF_COMMAND.contains("--cached"),
-            "missing cached flag"
-        );
-    }
+    // Slash command content tests now live in slash_commands::tests.
 
     // --- Install hooks integration test ---
 
@@ -2288,15 +2040,15 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_md_has_restore_warning() {
+    fn test_claude_md_has_git_commit_prohibition() {
         let section = writ_claude_md_section();
         assert!(
-            section.contains("writ restore"),
-            "CLAUDE.md template should warn about writ restore"
+            section.contains("Do NOT run `git commit`"),
+            "CLAUDE.md template should prohibit git commit"
         );
         assert!(
-            section.contains("overwrites working directory"),
-            "should explain restore is destructive"
+            section.contains("Do NOT run `writ finish`"),
+            "CLAUDE.md template should prohibit writ finish"
         );
     }
 

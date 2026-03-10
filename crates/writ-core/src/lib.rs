@@ -33,6 +33,7 @@ pub mod repo;
 pub mod seal;
 pub mod security;
 pub mod settings;
+pub mod slash_commands;
 pub mod spec;
 pub mod state;
 pub mod status;

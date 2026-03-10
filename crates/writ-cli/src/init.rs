@@ -117,9 +117,7 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
     );
     println!();
     println!("No global configuration found. Let's set up your preferences.");
-    println!(
-        "These apply to all your projects. To customize a specific project later,"
-    );
+    println!("These apply to all your projects. To customize a specific project later,");
     println!(
         "run {} in that project's directory.",
         "writ init --reconfigure".bold(),
@@ -820,19 +818,15 @@ fn display_summary(
     }
 
     if claude {
-        for cmd_file in &[
-            "writ-context.md",
-            "writ-seal.md",
-            "writ-spec-done.md",
-            "writ-status.md",
-            "writ-finish.md",
-            "writ-diff.md",
-        ] {
-            println!(
-                "  {:<40} Claude Code slash command",
-                format!(".claude/commands/{}", cmd_file)
-            );
-        }
+        println!(
+            "  {:<40} {} Claude Code slash commands",
+            ".claude/commands/writ-*.md",
+            writ_core::slash_commands::SLASH_COMMAND_TEMPLATES.len()
+        );
+        println!(
+            "  {:<40} MCP server for native tool integration",
+            ".mcp.json"
+        );
 
         if scan.claude_md_exists {
             println!("  {:<40} append writ section (file exists)", "CLAUDE.md");
@@ -861,7 +855,6 @@ fn display_summary(
     let mode = config.commit_mode().unwrap_or("user");
     let mode_desc = match mode {
         "user" => "run `writ finish` to promote completed work to git",
-        "propose" => "orchestrator proposes, you approve",
         "auto" => "fully autonomous commits",
         _ => "",
     };

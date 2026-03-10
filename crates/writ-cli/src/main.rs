@@ -558,6 +558,18 @@ enum Commands {
         action: ConfigCommands,
     },
 
+    /// Start the MCP (Model Context Protocol) server for native AI agent integration.
+    #[command(name = "mcp-serve")]
+    McpServe,
+
+    /// Write .mcp.json config so Claude Code discovers writ's MCP tools.
+    #[command(name = "mcp-install")]
+    McpInstall {
+        /// Write to Claude Desktop config instead of project .mcp.json.
+        #[arg(long)]
+        desktop: bool,
+    },
+
     /// Check repository health and schema version.
     Doctor {
         /// Output as JSON instead of human-readable.
@@ -1335,6 +1347,8 @@ fn main() {
             ConfigCommands::List { format } => cmd_config_list(&cwd, &format),
             ConfigCommands::Unset { key, format } => cmd_config_unset(&cwd, &key, &format),
         },
+        Commands::McpServe => cmd_mcp_serve(&cwd),
+        Commands::McpInstall { desktop } => cmd_mcp_install(&cwd, desktop),
         Commands::Doctor { json, fix } => cmd_doctor(&cwd, json, fix),
     };
 
@@ -1468,6 +1482,23 @@ fn short_hash(input: &str) -> String {
     let mut hasher = DefaultHasher::new();
     input.hash(&mut hasher);
     format!("{:04x}", hasher.finish() & 0xFFFF)
+}
+
+/// Check if `writ context` was run recently by reading the `.writ/.context_token` file.
+/// Returns true if the token exists and is less than 4 hours old.
+fn check_context_token(cwd: &PathBuf) -> bool {
+    let token_path = cwd.join(".writ").join(".context_token");
+    match std::fs::read_to_string(&token_path) {
+        Ok(ts) => {
+            if let Ok(token_time) = ts.trim().parse::<i64>() {
+                let now = chrono::Utc::now().timestamp();
+                now - token_time < 4 * 3600
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
 }
 
 /// Resolve the effective convergence strategy.
@@ -1614,6 +1645,12 @@ fn cmd_init(
         if let Err(e) = writ_core::hooks::append_gitignore(cwd) {
             hook_warnings.push(format!(".gitignore: {}", e));
         }
+        // MCP.6: Generate .mcp.json when Claude Code is enabled.
+        if plan.enable_claude {
+            if let Err(e) = generate_mcp_json(cwd) {
+                hook_warnings.push(format!(".mcp.json: {}", e));
+            }
+        }
         for warning in &hook_warnings {
             eprintln!("{} {}", "warning:".yellow().bold(), warning);
         }
@@ -1675,6 +1712,12 @@ fn cmd_init(
                     "  {} Prompt hook: writ context injected at conversation start",
                     "→".green()
                 );
+                if cwd.join(".mcp.json").exists() {
+                    println!(
+                        "  {} MCP server: .mcp.json (native tool integration)",
+                        "→".green()
+                    );
+                }
             }
             if plan.enable_codex {
                 println!("{} Codex / OpenAI integration configured", "✓".green());
@@ -1694,7 +1737,6 @@ fn cmd_init(
             let commit_mode = plan.project_config.commit_mode().unwrap_or("user");
             let mode_desc = match commit_mode {
                 "user" => "run `writ finish` to promote completed work to git",
-                "propose" => "orchestrator proposes, you approve",
                 "auto" => "fully autonomous commits",
                 _ => "",
             };
@@ -1788,6 +1830,7 @@ fn cmd_uninit(
     }
 
     let result = Repository::uninstall(cwd, keep_writignore)?;
+    let mcp_removed = remove_mcp_json(cwd);
 
     match format {
         "json" => println!("{}", serde_json::to_string_pretty(&result)?),
@@ -1801,6 +1844,10 @@ fn cmd_uninit(
 
             if result.writignore_removed {
                 println!("removed .writignore");
+            }
+
+            if mcp_removed {
+                println!("removed .mcp.json");
             }
 
             for hook in &result.hooks_removed {
@@ -1883,6 +1930,35 @@ fn cmd_seal(
     expected_head: Option<String>,
     enforce_scope: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let is_agent = detect_agent_from_env().is_some();
+
+    // C.13: Seal enforcement — agents must link seals to specs.
+    if spec_id.is_none() {
+        if is_agent {
+            eprintln!("{} No active spec for this seal.", "ERROR:".red().bold());
+            eprintln!("  Run: writ spec add --id <id> --title \"<title>\"");
+            eprintln!("  Then retry your seal.");
+            eprintln!();
+            eprintln!("  Agents must link seals to specs for tracking and coordination.");
+            process::exit(1);
+        } else {
+            eprintln!(
+                "{} This seal has no spec. Run `writ spec add` for tracking.",
+                "warning:".yellow().bold()
+            );
+        }
+    }
+
+    // C.14: Context token check — warn if writ context wasn't run recently.
+    if is_agent && !check_context_token(cwd) {
+        eprintln!(
+            "{} No `writ context` run detected this session.",
+            "warning:".yellow().bold()
+        );
+        eprintln!("  Run `writ context` first to get project state.");
+        eprintln!("  Seal saved, but your work may conflict with other agents.");
+    }
+
     let mut repo = Repository::open(cwd)?;
     repo.set_enforce_scope(enforce_scope);
 
@@ -2600,6 +2676,10 @@ fn cmd_context(
             }
         }
     }
+
+    // C.14: Write context token so `writ seal` can verify context was run.
+    let token_path = cwd.join(".writ").join(".context_token");
+    let _ = std::fs::write(&token_path, chrono::Utc::now().timestamp().to_string());
 
     Ok(())
 }
@@ -6834,6 +6914,159 @@ fn cmd_config_unset(
             println!("{} {} (reset to default)", "unset".green(), key);
         }
     }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// MCP Server
+// ---------------------------------------------------------------------------
+
+/// Generate .mcp.json for Claude Code MCP discovery.
+/// Only writes if file doesn't exist or content differs (idempotent).
+fn generate_mcp_json(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let mcp_path = cwd.join(".mcp.json");
+    let config = serde_json::json!({
+        "mcpServers": {
+            "writ": {
+                "command": "writ",
+                "args": ["mcp-serve"]
+            }
+        }
+    });
+    let content = format!("{}\n", serde_json::to_string_pretty(&config)?);
+
+    if mcp_path.exists() {
+        let existing = std::fs::read_to_string(&mcp_path)?;
+        if existing == content {
+            return Ok(());
+        }
+    }
+
+    std::fs::write(&mcp_path, content)?;
+    Ok(())
+}
+
+/// Remove .mcp.json if it was generated by writ.
+fn remove_mcp_json(cwd: &PathBuf) -> bool {
+    let mcp_path = cwd.join(".mcp.json");
+    if !mcp_path.exists() {
+        return false;
+    }
+    // Only remove if it contains our writ server entry
+    if let Ok(content) = std::fs::read_to_string(&mcp_path) {
+        if content.contains("\"writ\"") && content.contains("mcp-serve") {
+            let _ = std::fs::remove_file(&mcp_path);
+            return true;
+        }
+    }
+    false
+}
+
+fn cmd_mcp_serve(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let writ_binary = std::env::current_exe()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "writ".to_string());
+
+    let project_dir = cwd.to_string_lossy().to_string();
+
+    let rt = tokio::runtime::Runtime::new()?;
+    rt.block_on(writ_mcp::run_mcp_server(writ_binary, project_dir))?;
+
+    Ok(())
+}
+
+fn cmd_mcp_install(cwd: &PathBuf, desktop: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if desktop {
+        let config_path = dirs_mcp_desktop_config();
+        write_mcp_desktop_config(&config_path)?;
+        println!(
+            "{} Updated Claude Desktop config at {}",
+            "✓".green(),
+            config_path.display()
+        );
+        return Ok(());
+    }
+
+    // Default: write project-level .mcp.json
+    let mcp_path = cwd.join(".mcp.json");
+    let config = serde_json::json!({
+        "mcpServers": {
+            "writ": {
+                "command": "writ",
+                "args": ["mcp-serve"]
+            }
+        }
+    });
+
+    let content = serde_json::to_string_pretty(&config)?;
+    std::fs::write(&mcp_path, format!("{}\n", content))?;
+
+    println!(
+        "{} Generated {} (MCP server for Claude Code)",
+        "✓".green(),
+        mcp_path.display()
+    );
+    println!("  Commit this file so collaborators get MCP tools automatically.");
+
+    Ok(())
+}
+
+/// Path to Claude Desktop's config file.
+fn dirs_mcp_desktop_config() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux / other: XDG-style
+        let config = std::env::var("XDG_CONFIG_HOME")
+            .or_else(|_| std::env::var("HOME").map(|h| format!("{}/.config", h)))
+            .unwrap_or_else(|_| ".config".to_string());
+        PathBuf::from(config)
+            .join("Claude")
+            .join("claude_desktop_config.json")
+    }
+}
+
+/// Merge writ server entry into Claude Desktop config (preserving existing servers).
+fn write_mcp_desktop_config(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config: serde_json::Value = if path.exists() {
+        let existing = std::fs::read_to_string(path)?;
+        serde_json::from_str(&existing)?
+    } else {
+        serde_json::json!({})
+    };
+
+    let servers = config
+        .as_object_mut()
+        .ok_or("Desktop config is not a JSON object")?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+
+    servers
+        .as_object_mut()
+        .ok_or("mcpServers is not a JSON object")?
+        .insert(
+            "writ".to_string(),
+            serde_json::json!({
+                "command": "writ",
+                "args": ["mcp-serve"]
+            }),
+        );
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let content = serde_json::to_string_pretty(&config)?;
+    std::fs::write(path, format!("{}\n", content))?;
 
     Ok(())
 }

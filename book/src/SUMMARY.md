@@ -24,6 +24,8 @@
 - [Suggested Uses](guides/suggested-uses.md)
 - [CI/CD Integration](guides/ci-cd.md)
 - [Convergence Resolution](guides/convergence-resolution.md)
+- [MCP Server](guides/mcp-server.md)
+- [Slash Commands](guides/slash-commands.md)
 
 # Reference
 

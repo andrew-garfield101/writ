@@ -475,3 +475,33 @@ writ remote init <PATH>        # Initialize a remote repository
 writ remote add <NAME> <PATH>  # Add a named remote
 writ remote status [REMOTE]    # Check remote state
 ```
+
+## MCP Server
+
+### `writ mcp-serve`
+
+Start the MCP server. Communicates over stdio using the standard MCP protocol. Normally started automatically by the MCP client (Claude Code or Claude Desktop) using the config in `.mcp.json`.
+
+```bash
+writ mcp-serve
+```
+
+The server exposes 17 tools matching the full writ CLI. Each tool calls the CLI via subprocess — same behavior, same output, same enforcement. See the [MCP server guide](../guides/mcp-server.md) for the full tool list and setup instructions.
+
+### `writ mcp-install`
+
+Generate MCP configuration for agent frameworks.
+
+```bash
+writ mcp-install [OPTIONS]
+
+Options:
+  --desktop     Write config for Claude Desktop instead of project .mcp.json
+  --global      Write config to global Claude Code settings
+```
+
+**Default (no flags):** Writes `.mcp.json` to project root. Commit this to git for zero setup team adoption.
+
+**`--desktop`:** Writes to Claude Desktop's config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS).
+
+> **Note:** `writ init` automatically generates `.mcp.json` when Claude Code is detected. Use `writ mcp-install` for manual setup or when adding MCP to an existing project.

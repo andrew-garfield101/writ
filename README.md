@@ -14,7 +14,7 @@ Instead of bolting conventions into a VCS built for humans, writ provides elegan
 
 Structured context in one call. Semantic convergence that merges meaning, not lines. Cryptographic integrity across any environment. And a clean round trip back to git when the work is done.
 
-Writ works alongside git, not instead of it.
+Writ works alongside git, not instead of it. One `writ init` and agents get everything: native MCP tools, slash commands, workflow instructions, and a structured CLI. No plugins, no configuration, no separate install.
 
 **Context in one call.** Building situational awareness with current tools means multiple calls, parsing unstructured output, synthesizing project state from fragments. That's tokens and compute spent on infrastructure, not on the agent's actual task. `writ context` delivers everything. specs, seals, working state, file contention, integration risk all in one structured response. And with token optimized format options (TOON), even the structural overhead disappears. Agents spend tokens on reasoning, not parsing.
 
@@ -41,6 +41,7 @@ Writ works alongside git, not instead of it.
 - [Security](#security)
 - [Lifecycle and Storage](#lifecycle-and-storage)
 - [Python SDK](#python-sdk)
+- [MCP Server](#mcp-server)
 - [CLI Reference](#cli-reference)
 - [Architecture](#architecture)
 - [Building from Source](#building-from-source)
@@ -361,6 +362,38 @@ with Agent("implementer", spec_id="auth") as agent:
     agent.seal("implemented token refresh", tests_passed=12)
 ```
 
+## MCP Server
+
+Writ ships a native MCP (Model Context Protocol) server built in Rust. It's part of the `writ` binary — no separate install, no Python runtime, no plugins. When an agent connects via MCP, every writ command is available as a native tool in the agent's palette.
+
+```bash
+# Automatic: writ init generates .mcp.json for Claude Code
+writ init
+
+# Manual: generate MCP config for Claude Code
+writ mcp-install
+
+# Manual: generate MCP config for Claude Desktop
+writ mcp-install --desktop
+```
+
+When `.mcp.json` is committed to your repository, every developer who clones the project gets MCP tools automatically. Zero setup for the team.
+
+17 tools are available through MCP, matching the full CLI:
+
+| Category | Tools |
+|----------|-------|
+| **Core Workflow** | `writ_context`, `writ_seal`, `writ_spec_add`, `writ_spec_done` |
+| **Status and Review** | `writ_status`, `writ_diff`, `writ_log`, `writ_show` |
+| **Spec Management** | `writ_spec_status`, `writ_spec_show`, `writ_spec_reopen` |
+| **Round Trip** | `writ_finish`, `writ_summary` |
+| **Recovery and Convergence** | `writ_restore`, `writ_converge` |
+| **Diagnostics** | `writ_verify`, `writ_doctor` |
+
+Each tool is a thin wrapper around the CLI. Same behavior, same output, same enforcement. `writ_seal` requires a spec (C.13 enforcement at the schema level). `writ_context` defaults to TOON format and writes the context token (C.14). The MCP server is the CLI, just reachable through the protocol agents already speak.
+
+See the [MCP server guide](https://andrew-garfield101.github.io/writ/guides/mcp-server.html) for the full setup walkthrough and tool reference.
+
 ## CLI Reference
 
 ```
@@ -396,6 +429,9 @@ writ show SEAL_ID [--diff]            # inspect a seal
 writ restore SEAL_ID                  # restore to a seal's state
 writ bridge import                    # import git state as baseline
 writ push / pull                      # sync with remotes
+writ mcp-serve                        # start MCP server (used by .mcp.json)
+writ mcp-install [--desktop]          # generate MCP config for Claude Code or Claude Desktop
+writ doctor [--json]                  # repo health check (8 diagnostic checks)
 ```
 
 ## Architecture
@@ -404,7 +440,8 @@ writ push / pull                      # sync with remotes
 writ/
 ├── crates/
 │   ├── writ-core/    # Rust: objects, index, seals, specs, diff, context, convergence, bridge
-│   ├── writ-cli/     # CLI (clap): init, seal, context, converge, summary, restore, ...
+│   ├── writ-cli/     # CLI (clap): init, seal, context, converge, summary, restore, mcp-serve, ...
+│   ├── writ-mcp/     # MCP server (rmcp): 17 tools, CLI passthrough, stdio transport
 │   └── writ-py/      # Python bindings (PyO3) + Agent SDK (Pipeline, Agent, Phase)
 ```
 
@@ -418,11 +455,12 @@ writ/
 
 | Framework | Detection | What Gets Installed |
 |-----------|-----------|-------------------|
-| **Claude Code** | `CLAUDE.md` or `.claude/` exists | Writ workflow in `CLAUDE.md`, `/writ-seal` and `/writ-context` slash commands |
+| **Claude Code** | `CLAUDE.md` or `.claude/` exists | Writ workflow in `CLAUDE.md`, 17 slash commands in `.claude/commands/`, `.mcp.json` for native MCP tools |
+| **Claude Desktop** | `writ mcp-install --desktop` | MCP server config in Claude Desktop settings |
 | **Codex** | `AGENTS.md` or `.codex/` exists | Writ workflow section in `AGENTS.md` |
 | **Any agent** | Always | `.writignore`, baseline seal, writ CLI available in PATH |
 
-We're continuously expanding framework integrations for the most widely used agent tools and models, while maintaining flexible configuration for custom built agentic systems.
+The MCP server and slash commands ship with writ. No separate install, no Python runtime, no plugins. `writ init` detects your environment and sets up everything automatically. See the [MCP server guide](https://andrew-garfield101.github.io/writ/guides/mcp-server.html) for setup details and the full tool list.
 
 ## Building from Source
 
@@ -443,7 +481,6 @@ pytest tests/
 
 - **LLM assisted convergence.** Direct LLM API integration for conflict resolution when deterministic patterns can't resolve a conflict, writ queries an LLM to compose a resolution from the existing code. Composition only, the LLM can select, reorder, and combine from the inputs, never generate novel code. Feature flagged with full audit trail
 - **Spec aware resolution.** Convergence Phase 4 uses writ's first class spec metadata — file scope, acceptance criteria, semantic intent — to resolve ambiguous conflicts that no other VCS has the context to handle
-- **MCP server.** Model Context Protocol integration for IDE native writ access
 
 See [CHANGELOG.md](CHANGELOG.md) for shipped features and version history.
 

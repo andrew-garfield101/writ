@@ -118,7 +118,11 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
     println!();
     println!("No global configuration found. Let's set up your preferences.");
     println!(
-        "(These apply globally and to this project. Override per-project with --reconfigure.)"
+        "These apply to all your projects. To customize a specific project later,"
+    );
+    println!(
+        "run {} in that project's directory.",
+        "writ init --reconfigure".bold(),
     );
     println!();
 
@@ -159,10 +163,9 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
 
     // W.23: Workflow mode selection
     println!();
-    let mode_options = &["user", "propose", "auto"];
+    let mode_options = &["user", "auto"];
     let mode_descriptions = &[
         "You run `writ finish` manually (recommended)",
-        "Orchestrator proposes, you approve",
         "Fully autonomous (CI/pipelines)",
     ];
     println!("Default workflow mode (how completed work becomes git commits):");
@@ -247,13 +250,13 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
         display_scan_results(&scan);
     }
 
-    // When global config already existed, show what defaults we're using.
+    // When global config already existed, show what saved preferences we're using.
     if !fresh_global && !opts.yes && !opts.reconfigure && opts.output_format != "json" {
         let fmt = global_config.output_format().unwrap_or("toon");
         let mode = global_config.commit_mode().unwrap_or("user");
         println!();
         println!(
-            "  {} Using global defaults: format={}, workflow={}",
+            "  {} Using saved preferences: format={}, workflow={}",
             "→".green(),
             fmt.bold(),
             mode.bold(),
@@ -771,7 +774,6 @@ fn resolve_workflow_mode(global: &GlobalConfig, opts: &InitOptions) -> String {
 
         let options = &[
             "user      You run `writ finish` manually (recommended)",
-            "propose   Orchestrator proposes, you approve",
             "auto      Fully autonomous (CI/pipelines)",
         ];
 
@@ -784,8 +786,7 @@ fn resolve_workflow_mode(global: &GlobalConfig, opts: &InitOptions) -> String {
 
         match choice {
             0 => "user".into(),
-            1 => "propose".into(),
-            2 => "auto".into(),
+            1 => "auto".into(),
             _ => "user".into(),
         }
     }
@@ -819,14 +820,19 @@ fn display_summary(
     }
 
     if claude {
-        println!(
-            "  {:<40} Claude Code slash command",
-            ".claude/commands/writ-seal.md"
-        );
-        println!(
-            "  {:<40} Claude Code slash command",
-            ".claude/commands/writ-context.md"
-        );
+        for cmd_file in &[
+            "writ-context.md",
+            "writ-seal.md",
+            "writ-spec-done.md",
+            "writ-status.md",
+            "writ-finish.md",
+            "writ-diff.md",
+        ] {
+            println!(
+                "  {:<40} Claude Code slash command",
+                format!(".claude/commands/{}", cmd_file)
+            );
+        }
 
         if scan.claude_md_exists {
             println!("  {:<40} append writ section (file exists)", "CLAUDE.md");

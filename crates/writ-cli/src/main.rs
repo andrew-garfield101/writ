@@ -1408,14 +1408,66 @@ fn make_formatter(name: &str, cwd: &PathBuf) -> Option<Box<dyn format::OutputFor
 }
 
 /// Resolve the effective agent ID for seals.
+///
+/// Priority: explicit --agent flag > settings.default_agent > env var auto-detect > "human".
+/// Auto-detect checks for known agent framework env vars (Claude Code, Codex, etc.)
+/// and generates a session-specific ID like "claude-code-a3f2" so each agent instance
+/// is uniquely identifiable even without passing --agent.
 fn resolve_agent(explicit: Option<&str>, cwd: &PathBuf) -> String {
     if let Some(a) = explicit {
         return a.to_string();
     }
-    Repository::open(cwd)
+    if let Some(configured) = Repository::open(cwd)
         .ok()
         .and_then(|r| r.settings().default_agent.clone())
-        .unwrap_or_else(|| "human".to_string())
+    {
+        return configured;
+    }
+    // Auto-detect agent identity from environment variables.
+    if let Some(detected) = detect_agent_from_env() {
+        return detected;
+    }
+    "human".to_string()
+}
+
+/// Detect agent identity from known framework environment variables.
+/// Returns a session-specific ID like "claude-code-a3f2" for uniqueness.
+fn detect_agent_from_env() -> Option<String> {
+    // Claude Code sets CLAUDE_CODE_SESSION_ID or CLAUDE_SESSION_ID
+    for var in &[
+        "CLAUDE_CODE_SESSION_ID",
+        "CLAUDE_SESSION_ID",
+        "ANTHROPIC_SESSION_ID",
+    ] {
+        if let Ok(session_id) = std::env::var(var) {
+            let suffix = short_hash(&session_id);
+            return Some(format!("claude-code-{}", suffix));
+        }
+    }
+
+    // Codex sets CODEX_SESSION or similar
+    for var in &["CODEX_SESSION", "CODEX_SESSION_ID"] {
+        if let Ok(session_id) = std::env::var(var) {
+            let suffix = short_hash(&session_id);
+            return Some(format!("codex-{}", suffix));
+        }
+    }
+
+    // Generic: any AGENT_ID env var is used directly
+    if let Ok(agent_id) = std::env::var("WRIT_AGENT_ID") {
+        return Some(agent_id);
+    }
+
+    None
+}
+
+/// Generate a short 4-character hash suffix from a string for agent ID uniqueness.
+fn short_hash(input: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    input.hash(&mut hasher);
+    format!("{:04x}", hasher.finish() & 0xFFFF)
 }
 
 /// Resolve the effective convergence strategy.
@@ -4297,8 +4349,8 @@ fn cmd_spec_done(
         }
     };
 
-    // Create final seal
-    let agent_id = agent.unwrap_or("human");
+    // Create final seal — use resolve_agent for auto-detect support
+    let agent_id = resolve_agent(agent, cwd);
     let seal_summary = summary.as_deref().unwrap_or("Spec completed").to_string();
 
     let seal_agent = AgentIdentity {

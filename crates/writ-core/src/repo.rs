@@ -2823,11 +2823,16 @@ impl Repository {
     pub fn mark_spec_done(&self, spec_id: &str, summary: Option<String>) -> WritResult<Spec> {
         let mut spec = self.load_spec(spec_id)?;
 
+        // Idempotent: if already complete, update summary if provided and return success.
+        // This prevents errors when seal() auto-promotes the spec via auto_promote_spec_status
+        // before mark_spec_done is called, and avoids agent retry loops.
         if matches!(spec.status, crate::spec::SpecStatus::Complete) {
-            return Err(WritError::Other(format!(
-                "spec '{}' is already complete",
-                spec_id
-            )));
+            if let Some(s) = summary {
+                spec.completion_summary = Some(s);
+                spec.updated_at = chrono::Utc::now();
+                self.save_spec(&spec)?;
+            }
+            return Ok(spec);
         }
 
         let now = chrono::Utc::now();

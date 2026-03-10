@@ -67,7 +67,7 @@ writ init
 ```
 
 That's it. Writ detects your environment and configures sensible defaults automatically. If you're in a git repo, it reads the branch and HEAD.
-   Detected agent frameworks get writ workflow instructions injected into their configuration files — CLAUDE.md for Claude Code, AGENTS.md for
+   Detected agent frameworks get writ workflow instructions injected into their configuration files,  CLAUDE.md for Claude Code, AGENTS.md for
   Codex. Claude Code also gets /writ-seal and /writ-context slash commands. For any other agent framework, the CLI is available in PATH and the
   Python SDK works out of the box. See the quickstart guide for a full walkthrough.
 
@@ -226,9 +226,9 @@ Full transparency. No branch archaeology, no parsing commit messages. Every agen
 
 ## Convergence
 
-Five agents. Same file. Git sees five conflicts. Your options: resolve them manually, pick a winner and hope, or assign files to single owners — which defeats the purpose of having multiple agents in the first place.
+Five agents. Same file. Git sees five conflicts. Your options: resolve them manually, pick a winner, or assign files to single owners, which defeats the purpose of having multiple agents in the first place.
 
-This is the problem no amount of git configuration, worktree isolation, or PR automation solves. Worktrees give agents isolation. Nothing in conventional tooling gives them convergence. Isolation keeps agents from stepping on each other. Convergence brings their work back together. Git handles the first. Writ handles the second.
+This is what git configuration, worktree isolation, and PR automation don't solve. Worktrees give agents isolation. Nothing in conventional tooling gives them convergence. Isolation keeps agents from stepping on each other. Convergence brings their work back together. Git handles the first. Writ handles the second.
 
 Writ's convergence engine understands code structurally. It knows the difference between an import, a function definition, and a statement. When two agents both add imports to the same file, writ doesn't see a conflict — it sees two additive changes and composes them. When two agents add functions with different names, writ composes them. When two agents modify the same function body differently, writ knows that's a real semantic conflict and escalates it with full context for human or orchestrator review. No `<<<<` markers. No guesswork. Structured data all the way through.
 
@@ -244,9 +244,9 @@ Five deterministic resolution patterns handle the common cases:
 
 Every resolution is confidence scored. High confidence (≥ 0.85) auto-resolves. Low confidence escalates with structured context so orchestrator agents can resolve conflicts programmatically — or surface them to a human with all the data they need to decide.
 
-The pipeline behind this is layered and auditable. Spec aware resolution uses writ's first class spec and seal metadata — file scope, acceptance criteria, design notes — to make informed merge decisions that no other VCS has the context to make. Post-merge verification catches structural damage automatically — duplicate definitions, unbalanced delimiters, content loss, leftover conflict markers — before bad merges ever reach the working tree. Content traceability ensures every line in merged output traces back to an input. Novel content — from bugs, hallucinations, or compromised agents — is detected and rejected.
+The pipeline behind this is layered and auditable. Spec aware resolution uses writ's first class spec and seal metadata, file scope, acceptance criteria, design notes, to make informed merge decisions that no other VCS has the context to make. Post-merge verification catches structural damage automatically. Duplicate definitions, unbalanced delimiters, content loss, leftover conflict markers, before bad merges ever reach the working tree. Content traceability ensures every line in merged output traces back to an input. Novel content, from bugs, hallucinations, or compromised agents is detected and rejected.
 
-Merge ordering is optimized automatically: specs that touch disjoint files merge first, minimizing conflict complexity for the overlapping cases that follow. At scale, this is the difference between a working codebase and a merge conflict graveyard. See the [convergence deep dive](https://andrew-garfield101.github.io/writ/concepts/convergence.html) for the full six phase pipeline.
+Merge ordering is optimized automatically: specs that touch disjoint files merge first, minimizing conflict complexity for the overlapping cases that follow. At scale, this is the difference between a working codebase and hours of manual conflict resolution. See the [convergence deep dive](https://andrew-garfield101.github.io/writ/concepts/convergence.html) for the full six phase pipeline.
 
 ```bash
 # Merge all diverged branches — auto-resolve what's confident, escalate the rest
@@ -282,7 +282,7 @@ writ show a3f8b2 --diff
 writ restore a3f8b2
 ```
 
-Agents can do the same thing programmatically. If an agent detects that something went wrong — tests failing, scope violations piling up — it can walk the seal history and self-correct:
+Agents can do the same thing programmatically. If an agent detects that something went wrong like tests failing, scope violations piling up, it can walk the seal history and self-correct:
 
 ```python
 seals = repo.log(limit=10)
@@ -422,7 +422,7 @@ writ/
 | **Codex** | `AGENTS.md` or `.codex/` exists | Writ workflow section in `AGENTS.md` |
 | **Any agent** | Always | `.writignore`, baseline seal, writ CLI available in PATH |
 
-We're continuously expanding framework integrations for the most widely used agent tools and models, while maintaining flexible configuration for custom-built agentic systems.
+We're continuously expanding framework integrations for the most widely used agent tools and models, while maintaining flexible configuration for custom built agentic systems.
 
 ## Building from Source
 
@@ -441,7 +441,7 @@ pytest tests/
 
 ## Roadmap
 
-- **LLM assisted convergence.** Direct LLM API integration for conflict resolution — when deterministic patterns can't resolve a conflict, writ queries an LLM to compose a resolution from the existing code. Composition only — the LLM can select, reorder, and combine from the inputs, never generate novel code. Feature flagged with full audit trail
+- **LLM assisted convergence.** Direct LLM API integration for conflict resolution when deterministic patterns can't resolve a conflict, writ queries an LLM to compose a resolution from the existing code. Composition only, the LLM can select, reorder, and combine from the inputs, never generate novel code. Feature flagged with full audit trail
 - **Spec aware resolution.** Convergence Phase 4 uses writ's first class spec metadata — file scope, acceptance criteria, semantic intent — to resolve ambiguous conflicts that no other VCS has the context to handle
 - **MCP server.** Model Context Protocol integration for IDE native writ access
 

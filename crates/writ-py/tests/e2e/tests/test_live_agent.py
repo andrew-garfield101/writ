@@ -2,7 +2,7 @@
 
 Maps to S1.6 and S5.5 of the pre-beta testing guide.
 These tests are expensive and require the claude CLI.
-Run with: pytest e2e/ --live
+Run with: pytest crates/writ-py/tests/e2e/tests/ --live
 
 All tests in this file are marked @pytest.mark.live and will be
 skipped unless --live is passed.
@@ -10,10 +10,8 @@ skipped unless --live is passed.
 
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 import pytest
 
@@ -21,41 +19,50 @@ from helpers.cli import (
     AgentScorecard,
     git_log,
     writ_cmd,
-    writ_context,
-    writ_log,
-    writ_spec_list,
 )
 
 pytestmark = [pytest.mark.live, pytest.mark.slow]
 
-# Add roundtrip to path for prompts and runner
-_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
-sys.path.insert(0, str(_REPO_ROOT / "testing" / "roundtrip"))
+
+# Zero-writ prompt — no mention of writ at all. Agent should discover it
+# from CLAUDE.md and use context/spec/seal/done organically.
+PORTFOLIO_BLOG_PROMPT = (
+    "You are working on an Astro 5 portfolio site in this directory. "
+    "Add a blog section: create a content collection for blog posts with "
+    "title, date, tags, and description fields. Write 3 sample posts about "
+    "software testing topics. Create a blog listing page at /blog that shows "
+    "posts sorted by date, and a dynamic route for individual post pages at "
+    "/blog/[slug]. Use the existing BaseLayout and match the site's design "
+    "patterns."
+)
 
 
-@pytest.fixture
-def claude_bin_required() -> str:
-    """claude CLI binary — skip if not found."""
-    result = shutil.which("claude")
-    if not result:
-        pytest.skip("claude CLI not found on PATH")
-    return result
-
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _run_claude_agent(
     claude_bin: str,
-    project_path: Path,
+    cwd: Path,
     prompt: str,
     timeout: int = 300,
 ) -> subprocess.CompletedProcess:
-    """Launch a claude -p agent session."""
+    """Launch a claude -p session with the given prompt."""
     return subprocess.run(
         [claude_bin, "-p", prompt, "--dangerously-skip-permissions"],
-        cwd=project_path,
+        cwd=cwd,
         capture_output=True,
         text=True,
         timeout=timeout,
     )
+
+
+@pytest.fixture
+def claude_bin_required(claude_bin):
+    """Skip test if claude CLI is not available."""
+    if claude_bin is None:
+        pytest.skip("claude CLI not found on PATH")
+    return claude_bin
 
 
 # ---------------------------------------------------------------------------
@@ -77,15 +84,13 @@ class TestSingleAgentAdoption:
         (no mention of writ). The agent should discover writ from CLAUDE.md
         and use context/spec/seal/done organically.
         """
-        from prompts import PORTFOLIO_BLOG
-
         commits_before = len(git_log(portfolio_project))
 
         try:
             result = _run_claude_agent(
                 claude_bin_required,
                 portfolio_project,
-                PORTFOLIO_BLOG,
+                PORTFOLIO_BLOG_PROMPT,
                 timeout=300,
             )
         except subprocess.TimeoutExpired:
@@ -98,7 +103,6 @@ class TestSingleAgentAdoption:
             portfolio_project,
             git_commits_before=commits_before,
         )
-        scorecard.print_report(score)
 
         assert score["total"] > 0, "Agent produced no writ activity at all"
         assert score["pass"], (
@@ -119,8 +123,18 @@ class TestMultiAgentAdoption:
         claude_bin_required: str,
         tmp_path: Path,
     ):
-        """S5.5: 3-agent scenario — all should adopt writ."""
-        from live.runner import run_scenario
+        """S5.5: 3-agent scenario — all should adopt writ.
+
+        Requires testing/roundtrip/live/runner.py (internal tooling).
+        Skips if runner is not available.
+        """
+        try:
+            from live.runner import run_scenario
+        except ImportError:
+            pytest.skip(
+                "Multi-agent runner not available "
+                "(requires internal testing/roundtrip/)"
+            )
 
         result = run_scenario(
             "api-3",

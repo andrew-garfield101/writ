@@ -23,11 +23,8 @@ _E2E_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _E2E_DIR.parent.parent.parent.parent  # crates/writ-py/tests/e2e/ → repo root
 
 # Add e2e/ to sys.path so `from helpers.cli import ...` works in test files.
-# testing/roundtrip/ is added AFTER so it doesn't shadow our helpers package.
 if str(_E2E_DIR) not in sys.path:
     sys.path.insert(0, str(_E2E_DIR))
-if str(_REPO_ROOT / "testing" / "roundtrip") not in sys.path:
-    sys.path.append(str(_REPO_ROOT / "testing" / "roundtrip"))
 
 
 # ---------------------------------------------------------------------------
@@ -119,9 +116,41 @@ def writ_project_with_spec(writ_project: Path, writ_bin: str) -> Path:
 
 @pytest.fixture
 def portfolio_project(writ_project: Path) -> Path:
-    """Writ project with portfolio scaffold."""
-    from scaffolds import scaffold_portfolio
-    scaffold_portfolio(writ_project)
+    """Writ project with Astro portfolio scaffold (for live agent tests)."""
+    ws = writ_project
+    (ws / "package.json").write_text(
+        '{"name":"test-portfolio","type":"module","version":"0.0.1",'
+        '"scripts":{"dev":"astro dev","build":"astro check && astro build"},'
+        '"dependencies":{"astro":"^5.5.0"}}\n'
+    )
+    (ws / "astro.config.mjs").write_text(
+        "import { defineConfig } from 'astro/config';\n"
+        "export default defineConfig({ site: 'https://example.dev' });\n"
+    )
+    src = ws / "src"
+    layouts = src / "layouts"
+    layouts.mkdir(parents=True)
+    (layouts / "BaseLayout.astro").write_text(
+        "---\nconst { title } = Astro.props;\n---\n"
+        "<!doctype html><html><head><title>{title}</title></head>\n"
+        "<body><nav><a href='/'>Portfolio</a></nav>"
+        "<main><slot /></main></body></html>\n"
+    )
+    pages = src / "pages"
+    pages.mkdir(parents=True)
+    (pages / "index.astro").write_text(
+        "---\nimport BaseLayout from '../layouts/BaseLayout.astro';\n---\n"
+        "<BaseLayout title='Home'><h1>Welcome</h1></BaseLayout>\n"
+    )
+    (pages / "projects.astro").write_text(
+        "---\nimport BaseLayout from '../layouts/BaseLayout.astro';\n---\n"
+        "<BaseLayout title='Projects'><p>Coming soon.</p></BaseLayout>\n"
+    )
+    (pages / "contact.astro").write_text(
+        "---\nimport BaseLayout from '../layouts/BaseLayout.astro';\n---\n"
+        "<BaseLayout title='Contact'><p>Get in touch.</p></BaseLayout>\n"
+    )
+    (ws / ".gitignore").write_text("dist/\nnode_modules/\n.astro/\n")
     return writ_project
 
 

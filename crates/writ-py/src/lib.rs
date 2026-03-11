@@ -1396,7 +1396,9 @@ impl PyRepository {
     /// - `keep_files`: If True, keep the parallel working directory files.
     #[pyo3(signature = (name, keep_files=false))]
     fn delete_workspace(&self, name: &str, keep_files: bool) -> PyResult<()> {
-        self.inner.delete_workspace(name, keep_files).map_err(writ_err)?;
+        self.inner
+            .delete_workspace(name, keep_files)
+            .map_err(writ_err)?;
         Ok(())
     }
 

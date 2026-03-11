@@ -7248,7 +7248,9 @@ impl Repository {
             if let Ok(entries) = std::fs::read_dir(&workspaces_dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
-                    if name == self.active_workspace || !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    if name == self.active_workspace
+                        || !entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
+                    {
                         continue;
                     }
                     let ws_dir = entry.path();
@@ -7258,12 +7260,21 @@ impl Repository {
                         if let Ok(content) = std::fs::read_to_string(&head_path) {
                             let mut current: Option<String> = {
                                 let t = content.trim();
-                                if t.is_empty() { None } else { Some(t.to_string()) }
+                                if t.is_empty() {
+                                    None
+                                } else {
+                                    Some(t.to_string())
+                                }
                             };
                             while let Some(seal_id) = current {
-                                if !seen.insert(seal_id.clone()) { break; }
+                                if !seen.insert(seal_id.clone()) {
+                                    break;
+                                }
                                 match self.load_seal(&seal_id) {
-                                    Ok(seal) => { current = seal.parent.clone(); all_seals.push(seal); }
+                                    Ok(seal) => {
+                                        current = seal.parent.clone();
+                                        all_seals.push(seal);
+                                    }
                                     Err(_) => break,
                                 }
                             }
@@ -7277,12 +7288,21 @@ impl Repository {
                                 if let Ok(tip) = std::fs::read_to_string(spec_entry.path()) {
                                     let mut current: Option<String> = {
                                         let t = tip.trim();
-                                        if t.is_empty() { None } else { Some(t.to_string()) }
+                                        if t.is_empty() {
+                                            None
+                                        } else {
+                                            Some(t.to_string())
+                                        }
                                     };
                                     while let Some(seal_id) = current {
-                                        if !seen.insert(seal_id.clone()) { break; }
+                                        if !seen.insert(seal_id.clone()) {
+                                            break;
+                                        }
                                         match self.load_seal(&seal_id) {
-                                            Ok(seal) => { current = seal.parent.clone(); all_seals.push(seal); }
+                                            Ok(seal) => {
+                                                current = seal.parent.clone();
+                                                all_seals.push(seal);
+                                            }
                                             Err(_) => break,
                                         }
                                     }

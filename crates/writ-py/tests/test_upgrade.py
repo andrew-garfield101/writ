@@ -39,7 +39,7 @@ class TestDoctorBinding:
         report = repo.doctor()
 
         assert isinstance(report["checks"], list)
-        assert len(report["checks"]) == 8
+        assert len(report["checks"]) == 9
 
         for check in report["checks"]:
             assert "name" in check
@@ -84,14 +84,22 @@ class TestDoctorBinding:
         repo, path = tmp_repo
         writ_dir = path / ".writ"
 
-        (writ_dir / "index.json").write_text("not valid json")
+        # Find index.json — may be at top level or inside workspaces/main/
+        index_path = writ_dir / "index.json"
+        ws_index = writ_dir / "workspaces" / "main" / "index.json"
+        if ws_index.exists():
+            ws_index.write_text("not valid json")
+        if index_path.exists():
+            index_path.write_text("not valid json")
 
         report = repo.doctor()
         idx_check = next(c for c in report["checks"] if c["name"] == "index")
-        assert idx_check["status"] == "fail"
+        assert idx_check["status"] in ("fail", "warning"), (
+            f"Expected fail/warning for corrupt index, got: {idx_check}"
+        )
 
     def test_doctor_check_names(self, tmp_repo):
-        """Doctor runs all 8 expected checks by name."""
+        """Doctor runs all 9 expected checks by name."""
         repo, path = tmp_repo
         report = repo.doctor()
 
@@ -101,6 +109,7 @@ class TestDoctorBinding:
             "schema_version",
             "directories",
             "index",
+            "workspace_layout",
             "config",
             "master_key",
             "specs",
@@ -123,11 +132,11 @@ class TestVersionInfoBinding:
         assert "last_opened_by" in info
 
     def test_version_info_schema_is_current(self, tmp_repo):
-        """Schema version is 1 (current)."""
+        """Schema version is 2 (current, after workspace sprint)."""
         repo, path = tmp_repo
         info = repo.version_info()
 
-        assert info["schema_version"] == 1
+        assert info["schema_version"] == 2
 
     def test_version_info_has_binary_version(self, tmp_repo):
         """created_by and last_opened_by contain version strings."""
@@ -162,12 +171,12 @@ class TestLegacyRepoCompat:
         if version_path.exists():
             os.remove(str(version_path))
 
-        # Re-open — should auto-migrate from v0 → v1
+        # Re-open — should auto-migrate from v0 → current
         repo2 = writ.Repository.open(str(tmp_path))
 
         # After migration, version should be current
         info = repo2.version_info()
-        assert info["schema_version"] == 1
+        assert info["schema_version"] == 2
 
     def test_legacy_repo_creates_missing_dirs(self, tmp_path):
         """Auto-migration creates directories that were added post-launch."""

@@ -16,7 +16,7 @@ Structured context in one call. Semantic convergence that merges meaning, not li
 
 Writ works alongside git, not instead of it. One `writ init` and agents get everything: native MCP tools, slash commands, workflow instructions, and a structured CLI. No plugins, no configuration, no separate install.
 
-**Context in one call.** Building situational awareness with current tools means multiple calls, parsing unstructured output, synthesizing project state from fragments. That's tokens and compute spent on infrastructure, not on the agent's actual task. `writ context` delivers everything. specs, seals, working state, file contention, integration risk all in one structured response. And with token optimized format options (TOON), even the structural overhead disappears. Agents spend tokens on reasoning, not parsing.
+**Context in one call.** Building situational awareness with current tools means multiple calls, parsing unstructured output, synthesizing project state from fragments. That's tokens and compute spent on infrastructure, not on the agent's actual task. `writ context` delivers everything. specs, seals, working state, file contention, integration risk all in one structured response. And with token optimized format options (TOON) even the structural overhead disappears. Agents spend tokens on reasoning, not parsing.
 
 **Semantic convergence.** When multiple agents touch the same files, conventional merging sees conflicts. Writ sees structure and merges meaning. Language aware analyzers decompose code into imports, definitions, and statements, composing additive changes automatically and escalating real conflicts with full context and confidence scores. No `<<<<` markers. No guesswork.
 
@@ -37,6 +37,7 @@ Writ works alongside git, not instead of it. One `writ init` and agents get ever
 - [Context](#context)
 - [Multi-Agent Workflow](#multi-agent-workflow)
 - [Convergence](#convergence)
+- [Workspaces](#workspaces)
 - [Going Back](#going-back)
 - [Security](#security)
 - [Lifecycle and Storage](#lifecycle-and-storage)
@@ -68,7 +69,7 @@ writ init
 ```
 
 That's it. Writ detects your environment and configures sensible defaults automatically. If you're in a git repo, it reads the branch and HEAD.
-   Detected agent frameworks get writ workflow instructions injected into their configuration files,  CLAUDE.md for Claude Code, AGENTS.md for
+   Detected agent frameworks get writ workflow instructions added to their configuration files,  CLAUDE.md for Claude Code, AGENTS.md for
   Codex. Claude Code also gets /writ-seal and /writ-context slash commands. For any other agent framework, the CLI is available in PATH and the
   Python SDK works out of the box. See the quickstart guide for a full walkthrough.
 
@@ -127,7 +128,7 @@ Writ puts agent native metadata inside the VCS:
 |-----|------|-------------|
 | Branch | **Spec** | Structured requirement with status, dependencies, file scope, acceptance criteria |
 | Commit | **Seal** | Checkpoint with agent identity, spec linkage, verification, status lifecycle |
-| `git status` | `writ context` | One call returns everything an agent needs — not text to parse |
+| Multiple `git` commands | `writ context` | One call returns everything an agent needs — not text to parse |
 | `git merge` | `writ converge-all` | Multi-branch convergence with strategy selection and structured conflict reports |
 | `git checkout <ref>` | `writ restore` | Restore working directory to any seal — every seal is an immutable snapshot |
 | (nothing) | **Integration risk** | Automatic risk scoring from divergence, contention, and scope violations |
@@ -182,9 +183,9 @@ Every time an agent requests context, there's token use, repeated key names, str
 
 ```
 seals[5]{id,summary,agent,timestamp,spec}:
-  seal-0041,Implement phase 3 pattern matching,cc,2026-03-04T10:00:00Z,S-041
-  seal-0042,Add import deduplication,amis,2026-03-04T10:15:00Z,S-039
-  seal-0043,Scale test scenarios,bri,2026-03-04T10:30:00Z,S-045
+  seal-0041,Implement phase 3 pattern matching,agent-1,2026-03-04T10:00:00Z,S-041
+  seal-0042,Add import deduplication,agent-2,2026-03-04T10:15:00Z,S-039
+  seal-0043,Scale test scenarios,agent-3,2026-03-04T10:30:00Z,S-045
 ```
 
 Field names declared once. Rows streamed as values. No braces, no repeated keys.
@@ -194,7 +195,7 @@ One `writ context` call replaces five git commands and delivers [25% more inform
 Context output is also adaptive. Solo agent with no divergence? Integration risk and convergence sections don't appear. No scope violations? That section is omitted. The output scales with complexity, not with a fixed schema. A single agent gets a lean response, a 50 agent fleet gets the full picture. Every token in the response carries information.
 
 ## Multi-Agent Workflow
-Three agents, different specs, one repository. No branches, no merge conflicts, no coordination overhead:
+Three agents, different specs, one repository. No branches, no text level merge conflicts, no coordination overhead:
 
 ```bash
 # Agent A: auth migration (sealing work in progress)
@@ -251,7 +252,7 @@ Merge ordering is optimized automatically: specs that touch disjoint files merge
 
 ```bash
 # Merge all diverged branches — auto-resolve what's confident, escalate the rest
-writ converge-all --apply --strategy most-complete
+writ converge-all --apply --strategy escalate
 ```
 
 ### Integration Risk
@@ -265,6 +266,33 @@ writ context --format human
 #   - file touched by 11 agents (>=5)
 #   - 6 scope violations (>5)
 ```
+
+## Workspaces
+
+Git worktrees give agents isolation — separate directories, separate files, no stepping on each other. They don't give agents convergence. When the work is done, you're back to `git merge` and line level conflicts.
+
+Writ workspaces give agents both. Each workspace is an isolated parallel environment with its own directory, its own index, and its own scoped context. When teams finish, `writ converge-workspaces` brings their work together through the convergence engine — structurally, not line by line.
+
+```bash
+# Create workspaces for two teams
+writ workspace create auth-team --path ../ws-auth --specs "auth-*"
+writ workspace create payments-team --path ../ws-payments --specs "pay-*"
+
+# Agents work in their workspace — all commands just work
+cd ../ws-auth
+writ context                    # scoped: only auth specs, auth seals, auth files
+writ seal -s "JWT endpoint" --agent auth-dev --spec auth-0
+writ spec done auth-0
+
+# Converge when ready
+cd my-project
+writ converge-workspaces auth-team payments-team
+writ finish
+```
+
+Scoped context is the multiplier. In a 30 spec project, an agent in the auth workspace sees only the 3 specs that matter. Fewer tokens, less noise, sharper focus. All workspaces share the same object store, seal chain, and spec definitions — isolation is at the working directory level, not at the data level.
+
+See the [workspaces guide](https://andrew-garfield101.github.io/writ/guides/workspaces.html) for the full architecture, spec assignment, and convergence workflow.
 
 ## Going Back
 
@@ -329,7 +357,7 @@ AI models update. Tooling shifts. What agents produce today may need to be rolle
 
 **Deployment profiles.** Pre-configured storage budgets and retention periods for different environments — from a 500MB Raspberry Pi to unlimited enterprise.
 
-**Workflow modes.** Three modes that scale from solo developer to enterprise fleet. `user` mode (default): you run `writ finish` manually. `propose` mode: an orchestrator groups and proposes commits, you review and accept. `auto` mode: fully autonomous commit pipeline with configurable safety rails — test verification, max specs per commit, branch targeting. Configure globally or per project. See the [configuration reference](https://andrew-garfield101.github.io/writ/reference/configuration.html) for details.
+**Workflow modes.** Two modes that scale from solo developer to enterprise fleet. `user` mode (default): you run `writ finish` manually. `auto` mode: fully autonomous commit pipeline with configurable safety rails — test verification, max specs per commit, branch targeting. Configure globally or per project. See the [configuration reference](https://andrew-garfield101.github.io/writ/reference/configuration.html) for details.
 
 ```bash
 writ gc status                             # storage breakdown + stale spec warnings
@@ -351,7 +379,7 @@ seal = repo.seal(
 )
 ```
 
-Higher-level abstractions for agent workflows:
+Higher-level abstractions for agent workflows (planned, not yet available):
 
 ```python
 from writ.sdk import Agent, Phase, Pipeline
@@ -379,7 +407,7 @@ writ mcp-install --desktop
 
 When `.mcp.json` is committed to your repository, every developer who clones the project gets MCP tools automatically. Zero setup for the team.
 
-17 tools are available through MCP, matching the full CLI:
+21 tools are available through MCP, matching the full CLI:
 
 | Category | Tools |
 |----------|-------|
@@ -388,6 +416,7 @@ When `.mcp.json` is committed to your repository, every developer who clones the
 | **Spec Management** | `writ_spec_status`, `writ_spec_show`, `writ_spec_reopen` |
 | **Round Trip** | `writ_finish`, `writ_summary` |
 | **Recovery and Convergence** | `writ_restore`, `writ_converge` |
+| **Workspaces** | `writ_workspace_create`, `writ_workspace_list`, `writ_workspace_status`, `writ_workspace_delete` |
 | **Diagnostics** | `writ_verify`, `writ_doctor` |
 
 Each tool is a thin wrapper around the CLI. Same behavior, same output, same enforcement. `writ_seal` requires a spec (C.13 enforcement at the schema level). `writ_context` defaults to TOON format and writes the context token (C.14). The MCP server is the CLI, just reachable through the protocol agents already speak.
@@ -411,7 +440,8 @@ writ finish [--strategy per-spec]      # promote completed specs → git commit(
 writ finish --yes                     # accept defaults, no prompts (same as current behavior)
 writ finish --dry-run                 # preview without committing
 writ converge LEFT RIGHT [--apply]    # two-spec convergence
-writ converge-all --apply --strategy  # merge all diverged branches (escalate, manual, orchestrator)
+writ converge-all --apply --strategy  # merge all diverged branches
+writ converge-workspaces a b         # merge across named workspaces
 writ verify --chain                   # verify cryptographic integrity of the full seal chain
 writ verify --seal SEAL_ID            # verify a specific seal's hash and signature
 writ security events [--severity]     # security audit log with filtering
@@ -419,7 +449,7 @@ writ spec add --id ID --title "..."   # register a spec
 writ spec status [--state active]     # show specs, optionally filtered by lifecycle state
 writ spec done ID [-s "..."]          # mark spec complete (creates final seal)
 writ spec cancel ID                   # cancel a spec (lifecycle transition)
-writ reopen --spec ID                 # reopen completed spec for continued work
+writ spec reopen ID                   # reopen completed spec for continued work
 writ gc status                        # storage breakdown + stale spec warnings
 writ gc run [--dry-run] [--yes]       # generate and execute cleanup plan
 writ gc storage                       # detailed storage usage by category
@@ -429,6 +459,12 @@ writ show SEAL_ID [--diff]            # inspect a seal
 writ restore SEAL_ID                  # restore to a seal's state
 writ bridge import                    # import git state as baseline
 writ push / pull                      # sync with remotes
+writ workspace create <name> [--path] [--specs]  # create isolated parallel workspace
+writ workspace list                              # list all workspaces with paths and specs
+writ workspace status [name]                     # workspace details and progress
+writ workspace delete <name> [--keep-files]      # remove workspace, preserve history
+writ spec assign <id> --workspace <name>         # scope a spec to a workspace
+writ spec unassign <id>                          # make a spec globally visible again
 writ mcp-serve                        # start MCP server (used by .mcp.json)
 writ mcp-install [--desktop]          # generate MCP config for Claude Code or Claude Desktop
 writ doctor [--json]                  # repo health check (8 diagnostic checks)
@@ -449,7 +485,7 @@ writ/
 
 **Integrity:** BLAKE3 hash chains link every seal to its predecessor. Ed25519 digital signatures authenticate authorship. `writ verify --chain` validates the entire history in one command.
 
-**Test coverage:** 1,350+ Rust tests, 400+ Python tests, 41 YAML scenario tests across unit, integration, and end-to-end layers.
+**Test coverage:** 1,800+ Rust tests, 400+ Python tests, 41 YAML scenario tests across unit, integration, and end-to-end layers.
 
 ### Framework Support
 
@@ -479,8 +515,8 @@ pytest tests/
 
 ## Roadmap
 
-- **LLM assisted convergence.** Direct LLM API integration for conflict resolution when deterministic patterns can't resolve a conflict, writ queries an LLM to compose a resolution from the existing code. Composition only, the LLM can select, reorder, and combine from the inputs, never generate novel code. Feature flagged with full audit trail
-- **Spec aware resolution.** Convergence Phase 4 uses writ's first class spec metadata — file scope, acceptance criteria, semantic intent — to resolve ambiguous conflicts that no other VCS has the context to handle
+- **LLM assisted convergence (in preview).** Direct LLM API integration for conflict resolution when deterministic patterns can't resolve a conflict, writ queries an LLM to compose a resolution from the existing code. Composition only, the LLM can select, reorder, and combine from the inputs, never generate novel code. Implemented and feature flagged with full audit trail
+- **Spec aware resolution (in preview).** Convergence Phase 4 uses writ's first class spec metadata — file scope, acceptance criteria, semantic intent — to resolve ambiguous conflicts that no other VCS has the context to handle. Implemented and feature flagged
 
 See [CHANGELOG.md](CHANGELOG.md) for shipped features and version history.
 

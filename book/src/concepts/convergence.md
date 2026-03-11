@@ -106,7 +106,6 @@ print(f"Auto-merged: {report['total_auto_merged']}")
 | `escalate` | Auto resolve high confidence conflicts, escalate the rest. Recommended for most workflows. |
 | `three-way-merge` | Standard three way merge. Leaves conflict markers where resolution fails. |
 | `most-recent` | Prefers the most recently sealed version on conflict. |
-| `most-complete` | Prefers the version with more content on conflict. |
 | `orchestrator` | Reports all conflicts as structured JSON for an orchestrator agent to resolve programmatically. |
 
 The `orchestrator` strategy is designed for automated pipelines. Instead of `<<<<<<<` markers that need text parsing, conflicts come back as structured JSON that orchestrator agents can resolve programmatically. This is the convergence equivalent of what `writ context` does for project state: structured data, not text to parse.

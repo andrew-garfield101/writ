@@ -361,10 +361,18 @@ impl StorageReport {
             }
         }
 
-        // index.json is working state
-        let index_path = writ_dir.join("index.json");
-        if index_path.exists() {
-            if let Ok(meta) = fs::metadata(&index_path) {
+        // index.json is working state — check workspace path (v2) then flat (v1).
+        let ws_index = writ_dir.join("workspaces").join("main").join("index.json");
+        let flat_index = writ_dir.join("index.json");
+        let index_path = if ws_index.exists() {
+            Some(ws_index)
+        } else if flat_index.exists() {
+            Some(flat_index)
+        } else {
+            None
+        };
+        if let Some(path) = index_path {
+            if let Ok(meta) = fs::metadata(&path) {
                 let size = meta.len();
                 // Already counted in other_bytes, move to working_state
                 report.other_bytes = report.other_bytes.saturating_sub(size);
@@ -1482,6 +1490,7 @@ mod tests {
             completed_at: None,
             commit_hash: None,
             committed_at: None,
+            workspace: None,
         }
     }
 
@@ -2200,6 +2209,7 @@ mod tests {
             content_hash: None,
             chain_hash: None,
             signature: None,
+            workspace: "main".to_string(),
         }
     }
 

@@ -231,9 +231,25 @@ writ converge-all [OPTIONS]
 Options:
   --apply              Apply merge results
   --dry-run            Preview without applying
-  --strategy <STRAT>   escalate, three-way-merge, most-recent, most-complete, orchestrator
+  --strategy <STRAT>   escalate, three-way-merge, most-recent, orchestrator
   --format <FORMAT>    Output: json, human
 ```
+
+### `writ converge-workspaces`
+
+Merge across named workspaces.
+
+```bash
+writ converge-workspaces <WORKSPACE>... [OPTIONS]
+
+Options:
+  --apply              Apply merge results
+  --dry-run            Preview without applying
+  --strategy <STRAT>   escalate, three-way-merge, most-recent, orchestrator
+  --format <FORMAT>    Output: json, human
+```
+
+Non-overlapping changes merge cleanly. Overlapping changes go through the convergence engine.
 
 ## Spec Management
 
@@ -288,6 +304,22 @@ Cancel a spec.
 writ spec cancel <ID>
 ```
 
+### `writ spec assign`
+
+Assign a spec to a workspace. Assigned specs are visible only in their workspace and the main workspace.
+
+```bash
+writ spec assign <SPEC-ID> --workspace <NAME>
+```
+
+### `writ spec unassign`
+
+Remove a spec's workspace assignment. The spec becomes globally visible in all workspaces.
+
+```bash
+writ spec unassign <SPEC-ID>
+```
+
 ### `writ reopen`
 
 Reopen a completed spec for continued work. Sets the spec back to active. Seal history is preserved.
@@ -295,6 +327,58 @@ Reopen a completed spec for continued work. Sets the spec back to active. Seal h
 ```bash
 writ reopen --spec <ID>
 ```
+
+## Workspace Commands
+
+### `writ workspace create`
+
+Create a new isolated workspace with its own directory and files.
+
+```bash
+writ workspace create <NAME> [OPTIONS]
+
+Options:
+  --path <DIR>          Directory for the workspace (default: .writ/ws/<name>/)
+  --specs <FILTER>      Assign matching specs (glob or comma-separated IDs)
+  --from <WORKSPACE>    Create from another workspace's state instead of main
+```
+
+Creates a parallel directory with a full copy of the project files, its own index and HEAD, and a `.writ-workspace` pointer file back to the main project. All writ commands work from the workspace directory automatically.
+
+### `writ workspace list`
+
+List all workspaces with paths and spec counts.
+
+```bash
+writ workspace list
+
+# Output:
+#   main             .                  0 specs    base workspace
+#   auth-team        ../ws-auth         3 specs
+#   payments-team    ../ws-payments     4 specs
+```
+
+### `writ workspace status`
+
+Show detailed status for a workspace, including spec progress and seal counts.
+
+```bash
+writ workspace status [NAME]
+```
+
+### `writ workspace delete`
+
+Delete a workspace. Removes workspace state and parallel directory. Does NOT delete seals, specs, or objects from the shared store.
+
+```bash
+writ workspace delete <NAME> [OPTIONS]
+
+Options:
+  --force         Skip confirmation prompt
+  --keep-files    Preserve the parallel directory on disk
+```
+
+Cannot delete the main workspace.
 
 ## Security Commands
 

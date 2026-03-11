@@ -48,10 +48,7 @@ fn test_server_info_has_correct_name() {
     let server = WritMcpServer::new("writ".to_string(), ".".to_string());
     let info = server.get_info();
     assert_eq!(info.server_info.name, "writ");
-    assert_eq!(
-        info.server_info.title.as_deref(),
-        Some("writ MCP Server")
-    );
+    assert_eq!(info.server_info.title.as_deref(), Some("writ MCP Server"));
 }
 
 #[test]

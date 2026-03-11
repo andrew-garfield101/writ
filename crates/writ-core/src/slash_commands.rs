@@ -350,10 +350,58 @@ Options:
 };
 
 // ---------------------------------------------------------------------------
+// Workspace (3) — WS.27 (Izzy)
+// ---------------------------------------------------------------------------
+
+const WRIT_WORKSPACE_CREATE: SlashCommandTemplate = SlashCommandTemplate {
+    name: "writ-workspace-create",
+    content: r#"Create an isolated parallel workspace.
+
+```bash
+writ workspace create $ARGUMENTS
+```
+
+The argument is the workspace name (lowercase, alphanumeric, hyphens).
+
+Options:
+- `--path <dir>` — directory for the workspace (default: `.writ/ws/<name>/`)
+- `--specs <filter>` — assign matching specs (glob or comma-separated IDs)
+- `--from <workspace>` — create from another workspace's state instead of main
+
+Each workspace gets its own directory, index, and HEAD but shares the object store and seals with all other workspaces.
+"#,
+};
+
+const WRIT_WORKSPACE_LIST: SlashCommandTemplate = SlashCommandTemplate {
+    name: "writ-workspace-list",
+    content: r#"List all workspaces with paths and spec counts.
+
+```bash
+writ workspace list
+```
+
+Options:
+- `--format <fmt>` — output format: human (default), json
+"#,
+};
+
+const WRIT_WORKSPACE_STATUS: SlashCommandTemplate = SlashCommandTemplate {
+    name: "writ-workspace-status",
+    content: r#"Show detailed status for a specific workspace.
+
+```bash
+writ workspace status $ARGUMENTS
+```
+
+The argument is the workspace name. Shows specs assigned, recent seals, and file state.
+"#,
+};
+
+// ---------------------------------------------------------------------------
 // Template registry
 // ---------------------------------------------------------------------------
 
-/// All 17 slash command templates in workflow order.
+/// All 20 slash command templates in workflow order.
 pub const SLASH_COMMAND_TEMPLATES: &[&SlashCommandTemplate] = &[
     // Core Workflow (4)
     &WRIT_CONTEXT,
@@ -378,6 +426,10 @@ pub const SLASH_COMMAND_TEMPLATES: &[&SlashCommandTemplate] = &[
     // Diagnostics (2)
     &WRIT_VERIFY,
     &WRIT_DOCTOR,
+    // Workspace (3)
+    &WRIT_WORKSPACE_CREATE,
+    &WRIT_WORKSPACE_LIST,
+    &WRIT_WORKSPACE_STATUS,
 ];
 
 /// Generate all slash command files in `.claude/commands/`.
@@ -480,8 +532,8 @@ mod tests {
     fn test_template_count() {
         assert_eq!(
             SLASH_COMMAND_TEMPLATES.len(),
-            17,
-            "expected 17 slash command templates"
+            20,
+            "expected 20 slash command templates"
         );
     }
 
@@ -520,7 +572,7 @@ mod tests {
     fn test_generate_creates_all_files() {
         let dir = tempdir().unwrap();
         let result = generate_slash_commands(dir.path()).unwrap();
-        assert_eq!(result.created.len(), 17);
+        assert_eq!(result.created.len(), 20);
         assert!(result.updated.is_empty());
 
         for template in SLASH_COMMAND_TEMPLATES {
@@ -582,7 +634,7 @@ mod tests {
         generate_slash_commands(dir.path()).unwrap();
 
         let removed = remove_slash_commands(dir.path()).unwrap();
-        assert_eq!(removed.len(), 17);
+        assert_eq!(removed.len(), 20);
 
         // Commands dir should be cleaned up.
         assert!(!dir.path().join(".claude").join("commands").exists());
@@ -602,7 +654,7 @@ mod tests {
         fs::write(&custom, "custom stuff").unwrap();
 
         let removed = remove_slash_commands(dir.path()).unwrap();
-        assert_eq!(removed.len(), 17);
+        assert_eq!(removed.len(), 20);
 
         // Custom file should still exist.
         assert!(custom.exists());
@@ -694,5 +746,27 @@ mod tests {
             !content.contains("--full"),
             "writ-diff must not reference --full (doesn't exist)"
         );
+    }
+
+    // --- Workspace slash command tests (WS.27) ---
+
+    #[test]
+    fn test_workspace_create_template() {
+        assert_eq!(WRIT_WORKSPACE_CREATE.name, "writ-workspace-create");
+        assert!(WRIT_WORKSPACE_CREATE.content.contains("workspace create"));
+        assert!(WRIT_WORKSPACE_CREATE.content.contains("--path"));
+        assert!(WRIT_WORKSPACE_CREATE.content.contains("--specs"));
+    }
+
+    #[test]
+    fn test_workspace_list_template() {
+        assert_eq!(WRIT_WORKSPACE_LIST.name, "writ-workspace-list");
+        assert!(WRIT_WORKSPACE_LIST.content.contains("workspace list"));
+    }
+
+    #[test]
+    fn test_workspace_status_template() {
+        assert_eq!(WRIT_WORKSPACE_STATUS.name, "writ-workspace-status");
+        assert!(WRIT_WORKSPACE_STATUS.content.contains("workspace status"));
     }
 }

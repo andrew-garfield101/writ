@@ -48,7 +48,7 @@ Slash commands are thin wrappers. They don't contain business logic — they doc
 | Command | What It Does |
 |---------|-------------|
 | `/writ-restore` | Restore working directory to any seal's state. |
-| `/writ-converge` | Merge diverged branches. Strategies: three-way-merge, most-recent, most-complete. |
+| `/writ-converge` | Merge diverged branches. Strategies: escalate, three-way-merge, most-recent, orchestrator. |
 
 ### Diagnostics
 

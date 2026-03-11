@@ -116,7 +116,7 @@ The server starts on stdio and waits for MCP protocol messages.
 | Tool | Parameters | What It Does |
 |------|-----------|-------------|
 | `writ_restore` | seal_id (required) | Restore working directory to any seal's state. |
-| `writ_converge` | strategy (optional), dry_run (optional) | Merge diverged branches. Strategies: three-way-merge, most-recent, most-complete. |
+| `writ_converge` | strategy (optional), dry_run (optional) | Merge diverged branches. Strategies: escalate, three-way-merge, most-recent, orchestrator. |
 
 ### Diagnostics
 

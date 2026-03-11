@@ -570,6 +570,7 @@ impl PyRepository {
         let filter = ContextFilter {
             status: filter_status,
             agent,
+            workspace: None,
         };
         let ctx = self
             .inner
@@ -1353,6 +1354,100 @@ impl PyRepository {
                 Ok(dict.to_object(py))
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Workspace management
+    // -------------------------------------------------------------------
+
+    /// Get the active workspace name.
+    fn active_workspace(&self) -> String {
+        self.inner.active_workspace().to_string()
+    }
+
+    /// Create a new isolated parallel workspace.
+    ///
+    /// Parameters:
+    /// - `name`: Workspace name (lowercase, alphanumeric, hyphens).
+    /// - `path`: Directory for the workspace (default: .writ/ws/<name>/).
+    /// - `from_workspace`: Create from another workspace's state instead of main.
+    ///
+    /// Returns workspace info as a dict with name, path, head_seal, spec_count, is_main.
+    #[pyo3(signature = (name, path=None, from_workspace=None))]
+    fn create_workspace(
+        &self,
+        py: Python,
+        name: &str,
+        path: Option<&str>,
+        from_workspace: Option<&str>,
+    ) -> PyResult<PyObject> {
+        let path_buf = path.map(PathBuf::from);
+        let info = self
+            .inner
+            .create_workspace(name, path_buf.as_deref(), from_workspace)
+            .map_err(writ_err)?;
+        to_pydict(py, &info)
+    }
+
+    /// Delete a workspace. Cannot delete "main".
+    ///
+    /// Parameters:
+    /// - `name`: Workspace name to delete.
+    /// - `keep_files`: If True, keep the parallel working directory files.
+    #[pyo3(signature = (name, keep_files=false))]
+    fn delete_workspace(&self, name: &str, keep_files: bool) -> PyResult<()> {
+        self.inner.delete_workspace(name, keep_files).map_err(writ_err)?;
+        Ok(())
+    }
+
+    /// List all workspaces.
+    ///
+    /// Returns a list of dicts, each with: name, path, head_seal, spec_count, is_main.
+    fn list_workspaces(&self, py: Python) -> PyResult<PyObject> {
+        let workspaces = self.inner.list_workspaces().map_err(writ_err)?;
+        to_pydict(py, &workspaces)
+    }
+
+    /// Assign a spec to a workspace.
+    ///
+    /// The workspace must exist. The spec's workspace field is set so it
+    /// appears in workspace-scoped context and convergence.
+    fn assign_spec_to_workspace(&self, spec_id: &str, workspace: &str) -> PyResult<()> {
+        self.inner
+            .assign_spec_to_workspace(spec_id, workspace)
+            .map_err(writ_err)?;
+        Ok(())
+    }
+
+    /// Unassign a spec from its workspace, making it globally visible again.
+    fn unassign_spec_from_workspace(&self, spec_id: &str) -> PyResult<()> {
+        self.inner
+            .unassign_spec_from_workspace(spec_id)
+            .map_err(writ_err)?;
+        Ok(())
+    }
+
+    /// Converge work from parallel workspaces back into main.
+    ///
+    /// Parameters:
+    /// - `workspace_names`: List of workspace names to merge. Cannot include "main".
+    /// - `strategy`: "three-way-merge" (default), "most-recent", or "escalate".
+    /// - `dry_run`: If True, preview without applying.
+    ///
+    /// Returns a ConvergeAllReport dict with merge results, conflicts, and warnings.
+    #[pyo3(signature = (workspace_names, strategy="three-way-merge", dry_run=false))]
+    fn converge_workspaces(
+        &self,
+        py: Python,
+        workspace_names: Vec<String>,
+        strategy: &str,
+        dry_run: bool,
+    ) -> PyResult<PyObject> {
+        let report = self
+            .inner
+            .converge_workspaces(&workspace_names, strategy, dry_run)
+            .map_err(writ_err)?;
+        to_pydict(py, &report)
     }
 }
 

@@ -489,7 +489,7 @@ pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
         created.push("CLAUDE.md".to_string());
     }
 
-    // Generate all 17 slash command files.
+    // Generate all slash command files.
     let sc_result = crate::slash_commands::generate_slash_commands(root)?;
     created.extend(sc_result.created);
     updated.extend(sc_result.updated);
@@ -1250,18 +1250,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let result = hook_claude_code(dir.path()).unwrap();
         assert!(result.files_created.contains(&"CLAUDE.md".to_string()));
-        for cmd_file in &[
-            ".claude/commands/writ-seal.md",
-            ".claude/commands/writ-context.md",
-            ".claude/commands/writ-spec-done.md",
-            ".claude/commands/writ-status.md",
-            ".claude/commands/writ-finish.md",
-            ".claude/commands/writ-diff.md",
-        ] {
+        // Verify all slash command templates were created.
+        for template in crate::slash_commands::SLASH_COMMAND_TEMPLATES {
+            let path = format!(".claude/commands/{}.md", template.name);
             assert!(
-                result.files_created.contains(&cmd_file.to_string()),
+                result.files_created.contains(&path),
                 "missing {} in created files",
-                cmd_file
+                path
             );
         }
 
@@ -1666,18 +1661,13 @@ mod tests {
 
         let result = unhook_claude_code(dir.path()).unwrap();
         assert!(result.files_removed.contains(&"CLAUDE.md".to_string()));
-        for cmd_file in &[
-            ".claude/commands/writ-seal.md",
-            ".claude/commands/writ-context.md",
-            ".claude/commands/writ-spec-done.md",
-            ".claude/commands/writ-status.md",
-            ".claude/commands/writ-finish.md",
-            ".claude/commands/writ-diff.md",
-        ] {
+        // Verify all slash command templates were removed.
+        for template in crate::slash_commands::SLASH_COMMAND_TEMPLATES {
+            let path = format!(".claude/commands/{}.md", template.name);
             assert!(
-                result.files_removed.contains(&cmd_file.to_string()),
+                result.files_removed.contains(&path),
                 "missing {} in removed files",
-                cmd_file
+                path
             );
         }
         assert!(!dir.path().join("CLAUDE.md").exists());

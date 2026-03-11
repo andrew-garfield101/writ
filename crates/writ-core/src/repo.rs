@@ -3,7 +3,7 @@
 //! A Repository ties together the object store, index, seals, and specs
 //! into a unified interface.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -54,6 +54,8 @@ pub struct Repository {
     enforce_scope: bool,
     /// Persistent repository settings loaded from `.writ/settings.json`.
     settings: crate::settings::WritSettings,
+    /// Active workspace name. Defaults to "main".
+    active_workspace: String,
 }
 
 /// Snapshot of git working tree state, used by install().
@@ -125,10 +127,14 @@ impl Repository {
         fs::create_dir_all(writ_dir.join("objects"))?;
         fs::create_dir_all(writ_dir.join("seals"))?;
         fs::create_dir_all(writ_dir.join("specs"))?;
-        fs::create_dir_all(writ_dir.join("heads"))?;
         fs::create_dir_all(writ_dir.join("keys"))?;
         fs::create_dir_all(writ_dir.join("agents"))?;
-        fs::write(writ_dir.join("HEAD"), "")?;
+
+        // Create workspace directory structure — index, HEAD, and spec heads
+        // live per-workspace rather than at .writ/ root.
+        let ws_dir = writ_dir.join("workspaces").join("main");
+        fs::create_dir_all(ws_dir.join("heads"))?;
+        fs::write(ws_dir.join("HEAD"), "")?;
 
         // Generate the convergence engine keypair (encrypted at rest via KeyStore)
         let ks = KeyStore::open(&writ_dir);
@@ -137,7 +143,7 @@ impl Repository {
         ks.store_agent_key("convergence", &signing_key, &verifying_key)?;
 
         let index = Index::default();
-        index.save(&writ_dir.join("index.json"))?;
+        index.save(&ws_dir.join("index.json"))?;
 
         // Write schema version stamp.
         crate::migrate::RepoVersion::new().save(&writ_dir)?;
@@ -215,7 +221,49 @@ impl Repository {
             last_context_head: Mutex::new(None),
             enforce_scope,
             settings,
+            active_workspace: "main".to_string(),
         })
+    }
+
+    /// Open a repository with a specific workspace active.
+    ///
+    /// Validates that the workspace exists (has a state directory under
+    /// `.writ/workspaces/<name>/`) and sets it as the active workspace.
+    pub fn open_workspace(root: &Path, workspace: &str) -> WritResult<Self> {
+        let mut repo = Self::open(root)?;
+        let ws_dir = repo.writ_dir.join("workspaces").join(workspace);
+        if !ws_dir.exists() {
+            return Err(WritError::InvalidInput(format!(
+                "workspace '{}' does not exist (no directory at {})",
+                workspace,
+                ws_dir.display()
+            )));
+        }
+        repo.active_workspace = workspace.to_string();
+        Ok(repo)
+    }
+
+    /// Detect if a directory is inside a parallel workspace and open the
+    /// parent repository with that workspace active.
+    ///
+    /// Checks for a `.writ-workspace` pointer file in `dir`. If found,
+    /// opens the parent repository and sets the workspace. Otherwise falls
+    /// back to `Repository::open(dir)`.
+    pub fn open_from_dir(dir: &Path) -> WritResult<Self> {
+        let pointer_path = dir.join(".writ-workspace");
+        if pointer_path.exists() {
+            let pointer = crate::workspace::parse_workspace_pointer(&pointer_path)?;
+            let parent_writ_dir = std::path::Path::new(&pointer.parent);
+            // The parent .writ/ dir's parent is the project root
+            let project_root = parent_writ_dir.parent().ok_or_else(|| {
+                WritError::Other(format!(
+                    ".writ-workspace points to '{}' which has no parent directory",
+                    pointer.parent
+                ))
+            })?;
+            return Self::open_workspace(project_root, &pointer.workspace);
+        }
+        Self::open(dir)
     }
 
     /// Enable or disable hard scope enforcement on seal().
@@ -595,6 +643,7 @@ impl Repository {
             seal_warnings,
             parent_seal_hash,
         );
+        seal.workspace = self.active_workspace.clone();
 
         // Sign with agent's key if available, otherwise unsigned
         let ks = KeyStore::open(&self.writ_dir);
@@ -602,8 +651,8 @@ impl Repository {
         seal.secure(signing_key.as_ref());
 
         self.save_seal(&seal)?;
-        atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
-        index.save(&self.writ_dir.join("index.json"))?;
+        atomic_write(&self.workspace_dir().join("HEAD"), seal.id.as_bytes())?;
+        index.save(&self.workspace_dir().join("index.json"))?;
 
         if let Some(ref sid) = spec_id {
             self.write_spec_head(sid, &seal.id)?;
@@ -825,7 +874,7 @@ impl Repository {
         let head_chain = self.verify_chain(verifying_key)?;
 
         let mut spec_chains = Vec::new();
-        let heads_dir = self.writ_dir.join("heads");
+        let heads_dir = self.workspace_dir().join("heads");
         if heads_dir.exists() {
             let mut spec_ids: Vec<String> = Vec::new();
             for entry in fs::read_dir(&heads_dir)? {
@@ -998,7 +1047,7 @@ impl Repository {
             set
         };
 
-        let heads_dir = self.writ_dir.join("heads");
+        let heads_dir = self.workspace_dir().join("heads");
         if !heads_dir.exists() {
             return Ok(Vec::new());
         }
@@ -1071,6 +1120,99 @@ impl Repository {
 
         specs.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(specs)
+    }
+
+    /// List all workspaces by reading `.writ/workspaces/` directory entries.
+    ///
+    /// Returns `WorkspaceInfo` for each workspace, including name, path,
+    /// HEAD seal, spec count, and whether it's the main workspace.
+    pub fn list_workspaces(&self) -> WritResult<Vec<crate::workspace::WorkspaceInfo>> {
+        let workspaces_dir = self.writ_dir.join("workspaces");
+        let mut result = Vec::new();
+
+        if !workspaces_dir.exists() {
+            return Ok(result);
+        }
+
+        let all_specs = self.list_specs()?;
+
+        for entry in fs::read_dir(&workspaces_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+
+            let name = entry.file_name().to_string_lossy().to_string();
+            let ws_dir = entry.path();
+            let is_main = name == "main";
+
+            // Read HEAD seal for this workspace.
+            let head_seal = {
+                let head_path = ws_dir.join("HEAD");
+                if head_path.exists() {
+                    let content = fs::read_to_string(&head_path).unwrap_or_default();
+                    let trimmed = content.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                } else {
+                    None
+                }
+            };
+
+            // Count specs assigned to this workspace.
+            let spec_count = all_specs
+                .iter()
+                .filter(|s| {
+                    if is_main {
+                        // Main sees specs with no workspace assignment or explicitly "main".
+                        s.workspace.is_none() || s.workspace.as_deref() == Some("main")
+                    } else {
+                        s.workspace.as_deref() == Some(&name)
+                    }
+                })
+                .count();
+
+            // Resolve the working directory path for this workspace.
+            let path = if is_main {
+                self.root.clone()
+            } else {
+                // Check for config.toml to get the explicit path.
+                let config_path = ws_dir.join("config.toml");
+                if config_path.exists() {
+                    let config_str = fs::read_to_string(&config_path).unwrap_or_default();
+                    if let Ok(config) =
+                        toml::from_str::<crate::workspace::WorkspaceConfig>(&config_str)
+                    {
+                        PathBuf::from(config.path)
+                    } else {
+                        // Fallback: default auto-generated path.
+                        self.writ_dir.join("ws").join(&name)
+                    }
+                } else {
+                    self.writ_dir.join("ws").join(&name)
+                }
+            };
+
+            result.push(crate::workspace::WorkspaceInfo {
+                name,
+                path,
+                head_seal,
+                spec_count,
+                is_main,
+            });
+        }
+
+        // Sort: main first, then alphabetical.
+        result.sort_by(|a, b| match (a.is_main, b.is_main) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a.name.cmp(&b.name),
+        });
+
+        Ok(result)
     }
 
     /// Generate a high-level project status for the round-trip workflow.
@@ -1363,6 +1505,37 @@ impl Repository {
         Ok(())
     }
 
+    /// Assign a spec to a workspace.
+    ///
+    /// Sets `spec.workspace = Some(workspace)`. Validates that both the spec
+    /// and the workspace exist. Reassigning to a different workspace is allowed.
+    pub fn assign_spec_to_workspace(&self, spec_id: &str, workspace: &str) -> WritResult<()> {
+        // Validate workspace exists.
+        let ws_dir = self.writ_dir.join("workspaces").join(workspace);
+        if !ws_dir.exists() {
+            return Err(WritError::InvalidInput(format!(
+                "workspace '{}' does not exist",
+                workspace
+            )));
+        }
+
+        let mut spec = self.load_spec(spec_id)?;
+        spec.workspace = Some(workspace.to_string());
+        self.save_spec(&spec)?;
+        Ok(())
+    }
+
+    /// Unassign a spec from its workspace, making it globally visible.
+    ///
+    /// Sets `spec.workspace = None`. The spec remains intact; only the
+    /// workspace association is cleared.
+    pub fn unassign_spec_from_workspace(&self, spec_id: &str) -> WritResult<()> {
+        let mut spec = self.load_spec(spec_id)?;
+        spec.workspace = None;
+        self.save_spec(&spec)?;
+        Ok(())
+    }
+
     /// Scan for stale specs (Active specs past the stale timeout).
     ///
     /// Returns `(spec_id, seconds_since_last_activity)` for each stale
@@ -1409,6 +1582,240 @@ impl Repository {
     /// Get the persistent repository settings.
     pub fn settings(&self) -> &crate::settings::WritSettings {
         &self.settings
+    }
+
+    /// Get the active workspace name.
+    pub fn active_workspace(&self) -> &str {
+        &self.active_workspace
+    }
+
+    // ─── Workspace Management ─────────────────────────────────────
+
+    /// Create a new parallel workspace with its own directory and file state.
+    ///
+    /// Each workspace gets:
+    /// - Its own directory under `.writ/workspaces/<name>/` (index, HEAD, heads)
+    /// - A parallel working directory with files copied from the object store
+    /// - A `.writ-workspace` pointer file in the working directory
+    /// - A `config.toml` recording ancestry for convergence
+    ///
+    /// If `path` is None, the workspace directory is auto-generated at
+    /// `.writ/ws/<name>/`. If `from` is None, creates from the current
+    /// workspace's state (usually "main").
+    pub fn create_workspace(
+        &self,
+        name: &str,
+        path: Option<&Path>,
+        from: Option<&str>,
+    ) -> WritResult<crate::workspace::WorkspaceInfo> {
+        use crate::workspace::{
+            validate_workspace_name, write_workspace_pointer, WorkspaceConfig, WorkspaceInfo,
+            WorkspacePointer,
+        };
+
+        // Validate workspace name.
+        validate_workspace_name(name)?;
+
+        // Check for duplicate workspace name.
+        let ws_state_dir = self.writ_dir.join("workspaces").join(name);
+        if ws_state_dir.exists() {
+            return Err(WritError::Other(format!(
+                "workspace '{}' already exists",
+                name
+            )));
+        }
+
+        // Determine source workspace.
+        let source_ws = from.unwrap_or(&self.active_workspace);
+        let source_ws_dir = self.writ_dir.join("workspaces").join(source_ws);
+        if !source_ws_dir.exists() {
+            return Err(WritError::Other(format!(
+                "source workspace '{}' does not exist",
+                source_ws
+            )));
+        }
+
+        // Determine target working directory.
+        let target_dir = match path {
+            Some(p) => {
+                if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    self.root.join(p)
+                }
+            }
+            None => self.writ_dir.join("ws").join(name),
+        };
+
+        // Reject if target already contains a .writ/ directory.
+        if target_dir.join(".writ").exists() {
+            return Err(WritError::Other(format!(
+                "target directory '{}' already contains a .writ/ directory",
+                target_dir.display()
+            )));
+        }
+
+        // Reject if target already contains a .writ-workspace file.
+        if target_dir.join(".writ-workspace").exists() {
+            return Err(WritError::Other(format!(
+                "target directory '{}' is already a writ workspace",
+                target_dir.display()
+            )));
+        }
+
+        // Load source workspace index and HEAD.
+        let source_index = crate::index::Index::load(&source_ws_dir.join("index.json"))?;
+        let source_head_path = source_ws_dir.join("HEAD");
+        let source_head = if source_head_path.exists() {
+            let content = fs::read_to_string(&source_head_path)?;
+            let trimmed = content.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        } else {
+            None
+        };
+
+        // Create workspace state directory: .writ/workspaces/<name>/
+        fs::create_dir_all(ws_state_dir.join("heads"))?;
+
+        // Copy HEAD from source.
+        fs::write(
+            ws_state_dir.join("HEAD"),
+            source_head.as_deref().unwrap_or(""),
+        )?;
+
+        // Copy index from source.
+        source_index.save(&ws_state_dir.join("index.json"))?;
+
+        // Copy spec heads from source.
+        let source_heads = source_ws_dir.join("heads");
+        if source_heads.exists() {
+            for entry in fs::read_dir(&source_heads)? {
+                let entry = entry?;
+                if entry.file_type()?.is_file() {
+                    fs::copy(
+                        entry.path(),
+                        ws_state_dir.join("heads").join(entry.file_name()),
+                    )?;
+                }
+            }
+        }
+
+        // Write workspace config (ancestry for convergence).
+        let writ_dir_canonical =
+            fs::canonicalize(&self.writ_dir).unwrap_or_else(|_| self.writ_dir.clone());
+        let config = WorkspaceConfig {
+            name: name.to_string(),
+            path: target_dir.to_string_lossy().to_string(),
+            ancestor_seal: source_head.clone(),
+            created_from: source_ws.to_string(),
+        };
+        let config_toml = toml::to_string_pretty(&config).map_err(|e| {
+            WritError::Other(format!("failed to serialize workspace config: {}", e))
+        })?;
+        crate::fsutil::atomic_write(&ws_state_dir.join("config.toml"), config_toml.as_bytes())?;
+
+        // Create the target working directory and populate with files.
+        fs::create_dir_all(&target_dir)?;
+        let mut file_count = 0usize;
+        for (rel_path, entry) in &source_index.entries {
+            let dest_path = target_dir.join(rel_path);
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let content = self.objects.retrieve(&entry.hash)?;
+            fs::write(&dest_path, &content)?;
+            file_count += 1;
+        }
+        let _ = file_count; // used for info but not returned directly
+
+        // Write .writ-workspace pointer file.
+        let pointer = WorkspacePointer {
+            parent: writ_dir_canonical.to_string_lossy().to_string(),
+            workspace: name.to_string(),
+        };
+        write_workspace_pointer(&target_dir.join(".writ-workspace"), &pointer)?;
+
+        // Canonicalize target_dir now that it exists.
+        let final_path = fs::canonicalize(&target_dir).unwrap_or_else(|_| target_dir);
+
+        Ok(WorkspaceInfo {
+            name: name.to_string(),
+            path: final_path,
+            head_seal: source_head,
+            spec_count: 0,
+            is_main: false,
+        })
+    }
+
+    /// Delete a workspace. Removes state from `.writ/workspaces/<name>/` and
+    /// optionally removes the parallel working directory.
+    ///
+    /// Does NOT delete seals, specs, or objects from the shared store.
+    pub fn delete_workspace(&self, name: &str, keep_files: bool) -> WritResult<()> {
+        if name == "main" {
+            return Err(WritError::InvalidInput(
+                "cannot delete the main workspace".to_string(),
+            ));
+        }
+
+        let ws_state_dir = self.writ_dir.join("workspaces").join(name);
+        if !ws_state_dir.exists() {
+            return Err(WritError::Other(format!(
+                "workspace '{}' does not exist",
+                name
+            )));
+        }
+
+        // Read the workspace's working directory path before removing config.
+        let ws_path = {
+            let config_path = ws_state_dir.join("config.toml");
+            if config_path.exists() {
+                let config_str = fs::read_to_string(&config_path)?;
+                let config: crate::workspace::WorkspaceConfig = toml::from_str(&config_str)
+                    .map_err(|e| {
+                        WritError::Other(format!(
+                            "failed to parse workspace config for '{}': {}",
+                            name, e
+                        ))
+                    })?;
+                Some(PathBuf::from(config.path))
+            } else {
+                None
+            }
+        };
+
+        // Unassign any specs assigned to this workspace (return them to global).
+        let specs = self.list_specs()?;
+        for spec in &specs {
+            if spec.workspace.as_deref() == Some(name) {
+                let mut updated = spec.clone();
+                updated.workspace = None;
+                let spec_path = self
+                    .writ_dir
+                    .join("specs")
+                    .join(format!("{}.json", spec.id));
+                let data = serde_json::to_string_pretty(&updated)?;
+                crate::fsutil::atomic_write(&spec_path, data.as_bytes())?;
+            }
+        }
+
+        // Remove workspace state directory.
+        fs::remove_dir_all(&ws_state_dir)?;
+
+        // Remove parallel working directory unless --keep-files.
+        if !keep_files {
+            if let Some(ref path) = ws_path {
+                if path.exists() {
+                    fs::remove_dir_all(path)?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Diff working tree against the last seal (HEAD).
@@ -1536,7 +1943,7 @@ impl Repository {
         }
 
         // 2. Walk each spec head chain, adding unseen seals.
-        let heads_dir = self.writ_dir.join("heads");
+        let heads_dir = self.workspace_dir().join("heads");
         if heads_dir.exists() {
             let mut spec_ids: Vec<String> = Vec::new();
             for entry in fs::read_dir(&heads_dir)? {
@@ -1558,7 +1965,7 @@ impl Repository {
         // 3. Walk archived pre-convergence branch tips. These chains were
         //    orphaned when apply_convergence advanced spec heads, but the
         //    seals still exist in the object store.
-        let merged_heads_path = self.writ_dir.join("merged-heads");
+        let merged_heads_path = self.workspace_dir().join("merged-heads");
         if merged_heads_path.exists() {
             let contents = fs::read_to_string(&merged_heads_path)?;
             for line in contents.lines() {
@@ -1948,15 +2355,6 @@ impl Repository {
         match scope {
             ContextScope::Full => {
                 let specs = self.list_specs()?;
-                // Include changed_paths only on the 3 most recent seals to save tokens.
-                // Agents can use `writ show SEAL_ID` for paths on older seals.
-                let recent: Vec<SealSummary> = seals
-                    .iter()
-                    .filter(apply_filter)
-                    .take(seal_limit)
-                    .enumerate()
-                    .map(|(i, s)| SealSummary::from_seal_with_paths(s, i < 3))
-                    .collect();
 
                 let index = self.load_index()?;
                 let file_scope: Vec<String> = index.entries.keys().cloned().collect();
@@ -2024,10 +2422,77 @@ impl Repository {
                 );
                 // Always include integration risk (even when low) so agents always see the field.
 
+                // Workspace scoping: filter specs and seals when workspace is set.
+                let ws_filter = filter.workspace.as_deref();
+                let (scoped_specs, dependencies) = if let Some(ws) = ws_filter {
+                    let mut in_scope = Vec::new();
+                    let mut dep_ids: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+
+                    for spec in &specs {
+                        let spec_ws = spec.workspace.as_deref();
+                        // Include: spec assigned to this workspace OR globally visible
+                        if spec_ws == Some(ws) || spec_ws.is_none() {
+                            // Collect cross-workspace dependency IDs
+                            for dep_id in &spec.depends_on {
+                                dep_ids.insert(dep_id.clone());
+                            }
+                            in_scope.push(spec.clone());
+                        }
+                    }
+
+                    // Build dependency context for deps NOT already in scope
+                    let in_scope_ids: std::collections::HashSet<&str> =
+                        in_scope.iter().map(|s| s.id.as_str()).collect();
+                    let deps: Vec<crate::context::DependencyContext> = specs
+                        .iter()
+                        .filter(|s| {
+                            dep_ids.contains(&s.id) && !in_scope_ids.contains(s.id.as_str())
+                        })
+                        .map(|s| crate::context::DependencyContext {
+                            id: s.id.clone(),
+                            title: s.title.clone(),
+                            status: format!("{:?}", s.status).to_lowercase(),
+                            workspace: s.workspace.as_deref().unwrap_or("global").to_string(),
+                        })
+                        .collect();
+
+                    (in_scope, deps)
+                } else {
+                    (specs, Vec::new())
+                };
+
+                // Filter seals by workspace when scoped
+                let recent: Vec<SealSummary> = seals
+                    .iter()
+                    .filter(apply_filter)
+                    .filter(|s| ws_filter.map_or(true, |ws| s.workspace == ws))
+                    .take(seal_limit)
+                    .enumerate()
+                    .map(|(i, s)| SealSummary::from_seal_with_paths(s, i < 3))
+                    .collect();
+
+                // Filter agent activity by workspace when scoped
+                let agent_activity = if let Some(ws) = ws_filter {
+                    let ws_seals: Vec<Seal> = all_seals
+                        .iter()
+                        .filter(|s| s.workspace == ws)
+                        .cloned()
+                        .collect();
+                    Self::build_agent_activity(&ws_seals, None)
+                } else {
+                    agent_activity
+                };
+
                 let mut result = ContextOutput {
                     writ_version: "0.1.0".to_string(),
+                    workspace: ws_filter.map(|s| s.to_string()),
                     active_spec: None,
-                    all_specs: if specs.is_empty() { None } else { Some(specs) },
+                    all_specs: if scoped_specs.is_empty() {
+                        None
+                    } else {
+                        Some(scoped_specs)
+                    },
                     working_state: ws_summary,
                     recent_seals: recent,
                     pending_changes,
@@ -2044,6 +2509,7 @@ impl Repository {
                     integration_risk,
                     chain_integrity: self.build_chain_integrity(),
                     stale_specs: stale_specs.clone(),
+                    dependencies,
                     session_complete: false,
                     session_summary: None,
                     recommended_action: None,
@@ -2372,6 +2838,7 @@ impl Repository {
 
                 Ok(ContextOutput {
                     writ_version: "0.1.0".to_string(),
+                    workspace: filter.workspace.clone(),
                     active_spec: Some(spec),
                     all_specs: None,
                     working_state: filtered_ws,
@@ -2390,6 +2857,7 @@ impl Repository {
                     integration_risk,
                     chain_integrity: self.build_chain_integrity(),
                     stale_specs: stale_specs.clone(),
+                    dependencies: Vec::new(),
                     session_complete: false,
                     session_summary: None,
                     recommended_action,
@@ -2646,6 +3114,7 @@ impl Repository {
 
                 Ok(ContextOutput {
                     writ_version: "0.1.0".to_string(),
+                    workspace: filter.workspace.clone(),
                     active_spec: None, // agent may have multiple specs
                     all_specs: if agent_specs.is_empty() {
                         None
@@ -2668,6 +3137,7 @@ impl Repository {
                     integration_risk,
                     chain_integrity: self.build_chain_integrity(),
                     stale_specs,
+                    dependencies: Vec::new(),
                     session_complete: false, // agent scope is partial view
                     session_summary: None,
                     recommended_action,
@@ -2749,8 +3219,8 @@ impl Repository {
             }
         }
 
-        target_index.save(&self.writ_dir.join("index.json"))?;
-        atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
+        target_index.save(&self.workspace_dir().join("index.json"))?;
+        atomic_write(&self.workspace_dir().join("HEAD"), seal.id.as_bytes())?;
 
         // Update the spec head if the restored seal is spec-scoped, so
         // diverged_branches() reflects the restored state accurately.
@@ -3327,7 +3797,7 @@ impl Repository {
             let size = content.len() as u64;
             index.upsert(path, hash, size);
         }
-        index.save(&self.writ_dir.join("index.json"))?;
+        index.save(&self.workspace_dir().join("index.json"))?;
 
         // Archive the right spec's current head before advancing it.
         // This preserves the diverged seal chain so log_all() / summary()
@@ -3345,6 +3815,424 @@ impl Repository {
         self.check_all_specs_complete();
 
         Ok(())
+    }
+
+    /// Converge work from multiple parallel workspaces back into the main workspace.
+    ///
+    /// For each non-main workspace:
+    /// 1. Load its current index and the ancestor index (from `config.toml`)
+    /// 2. Compute which files changed (diff workspace index vs ancestor)
+    /// 3. Non-overlapping changes are taken directly
+    /// 4. Overlapping changes (same file modified by multiple workspaces) go through
+    ///    `three_way_merge(ancestor, accumulated, workspace)` for structural merge
+    ///
+    /// Returns a `ConvergeAllReport` compatible with the spec-based convergence
+    /// reporting structure. When `dry_run` is false and the merge is clean, writes
+    /// files to the main workspace's working directory and updates its index.
+    pub fn converge_workspaces(
+        &self,
+        workspace_names: &[String],
+        strategy: &str,
+        dry_run: bool,
+    ) -> WritResult<ConvergeAllReport> {
+        use crate::workspace::WorkspaceConfig;
+
+        // Map strategy string to ConvergeStrategy enum.
+        let converge_strategy = match strategy {
+            "most-recent" => ConvergeStrategy::MostRecent,
+            "escalate" => ConvergeStrategy::Escalate,
+            _ => ConvergeStrategy::Manual, // three-way-merge and others use manual
+        };
+
+        // Validate: must have at least one workspace to merge.
+        if workspace_names.is_empty() {
+            return Ok(ConvergeAllReport {
+                base_spec: "main".to_string(),
+                merge_order: Vec::new(),
+                merges: Vec::new(),
+                strategy: strategy.to_string(),
+                total_auto_merged: 0,
+                total_conflicts: 0,
+                total_resolutions: 0,
+                is_clean: true,
+                degraded: false,
+                applied: false,
+                warnings: Vec::new(),
+                escalations: Vec::new(),
+                quality_report: None,
+                files_changed: Vec::new(),
+                convergence_record: None,
+            });
+        }
+
+        // Validate all workspace names exist.
+        for ws_name in workspace_names {
+            let ws_dir = self.writ_dir.join("workspaces").join(ws_name);
+            if !ws_dir.exists() {
+                return Err(WritError::InvalidInput(format!(
+                    "workspace '{}' does not exist",
+                    ws_name
+                )));
+            }
+            if ws_name == "main" {
+                return Err(WritError::InvalidInput(
+                    "cannot converge 'main' into itself — specify non-main workspaces to merge"
+                        .to_string(),
+                ));
+            }
+        }
+
+        // Load main workspace's current index as the starting accumulated state.
+        let main_ws_dir = self.writ_dir.join("workspaces").join("main");
+        let main_index = crate::index::Index::load(&main_ws_dir.join("index.json"))?;
+        let mut accumulated: HashMap<String, String> = HashMap::new();
+        for path in main_index.entries.keys() {
+            if let Ok(Some(c)) = self.file_content_at_tree(&main_index, path) {
+                accumulated.insert(path.clone(), c);
+            }
+        }
+
+        // Track which files the accumulated state has modified.
+        let mut accumulated_modified: HashSet<String> = HashSet::new();
+
+        let merge_order: Vec<String> = workspace_names.to_vec();
+        let mut merges = Vec::new();
+        let mut total_auto_merged = 0usize;
+        let mut total_conflicts = 0usize;
+        let mut total_resolutions = 0usize;
+        let mut warnings: Vec<String> = Vec::new();
+        let mut all_escalations: Vec<convergence::PipelineEscalation> = Vec::new();
+        let mut all_clean = true;
+        let mut any_degraded = false;
+
+        let conv_logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+        let _ = conv_logger.emit_convergence_event(
+            "workspace_convergence_started",
+            crate::security::Severity::Info,
+            &format!(
+                "Workspace convergence started: {} workspaces into main, strategy={}",
+                workspace_names.len(),
+                strategy
+            ),
+        );
+
+        for ws_name in workspace_names {
+            let step_result: Result<(), String> = (|| {
+                let ws_state_dir = self.writ_dir.join("workspaces").join(ws_name);
+
+                // Load workspace config for ancestor seal.
+                let config_path = ws_state_dir.join("config.toml");
+                let config: WorkspaceConfig = if config_path.exists() {
+                    let config_str = fs::read_to_string(&config_path).map_err(|e| e.to_string())?;
+                    toml::from_str(&config_str)
+                        .map_err(|e| format!("bad config.toml for '{}': {}", ws_name, e))?
+                } else {
+                    return Err(format!(
+                        "workspace '{}' has no config.toml — cannot determine ancestor",
+                        ws_name
+                    ));
+                };
+
+                // Load ancestor index (the state when this workspace was created).
+                let ancestor_index = if let Some(ref ancestor_id) = config.ancestor_seal {
+                    let ancestor_seal = self.load_seal(ancestor_id).map_err(|e| e.to_string())?;
+                    self.load_tree_index(&ancestor_seal.tree)
+                        .map_err(|e| e.to_string())?
+                } else {
+                    // No ancestor seal means workspace was created from empty state.
+                    crate::index::Index::default()
+                };
+
+                // Load this workspace's current index.
+                let ws_index = crate::index::Index::load(&ws_state_dir.join("index.json"))
+                    .map_err(|e| e.to_string())?;
+
+                // Build content maps for ancestor and workspace.
+                let mut ancestor_content: HashMap<String, String> = HashMap::new();
+                for path in ancestor_index.entries.keys() {
+                    if let Ok(Some(c)) = self.file_content_at_tree(&ancestor_index, path) {
+                        ancestor_content.insert(path.clone(), c);
+                    }
+                }
+
+                let mut ws_content: HashMap<String, String> = HashMap::new();
+                for path in ws_index.entries.keys() {
+                    if let Ok(Some(c)) = self.file_content_at_tree(&ws_index, path) {
+                        ws_content.insert(path.clone(), c);
+                    }
+                }
+
+                // Compute which files changed in this workspace vs ancestor.
+                let mut ws_modified: HashSet<String> = HashSet::new();
+                // New or modified files.
+                for (path, content) in &ws_content {
+                    match ancestor_content.get(path) {
+                        Some(ancestor_c) if ancestor_c == content => {} // unchanged
+                        _ => {
+                            ws_modified.insert(path.clone());
+                        }
+                    }
+                }
+                // Deleted files (in ancestor but not in workspace).
+                for path in ancestor_content.keys() {
+                    if !ws_content.contains_key(path) {
+                        ws_modified.insert(path.clone());
+                    }
+                }
+
+                if ws_modified.is_empty() {
+                    // This workspace has no changes — skip.
+                    merges.push(MergeStepResult {
+                        left_spec: "main".to_string(),
+                        right_spec: ws_name.clone(),
+                        auto_merged: 0,
+                        conflicts: 0,
+                        left_only: 0,
+                        right_only: 0,
+                        conflict_files: Vec::new(),
+                        resolutions: Vec::new(),
+                        clean: true,
+                        degraded: false,
+                        error: None,
+                    });
+                    return Ok(());
+                }
+
+                // Partition into overlapping (both accumulated and workspace modified)
+                // and workspace-only changes.
+                let shared: Vec<String> = ws_modified
+                    .iter()
+                    .filter(|f| accumulated_modified.contains(*f))
+                    .cloned()
+                    .collect();
+                let ws_only: Vec<String> = ws_modified
+                    .iter()
+                    .filter(|f| !accumulated_modified.contains(*f))
+                    .cloned()
+                    .collect();
+
+                let mut step_auto = 0usize;
+                let mut step_conflicts_count = 0usize;
+                let mut step_conflict_files: Vec<String> = Vec::new();
+                let mut resolutions_records: Vec<ResolutionRecord> = Vec::new();
+                let mut step_clean = true;
+                let mut step_degraded = false;
+
+                // Three-way merge for overlapping files.
+                for path in &shared {
+                    let base = ancestor_content.get(path).cloned().unwrap_or_default();
+                    let left = accumulated.get(path).cloned().unwrap_or_default();
+                    let right = ws_content.get(path).cloned().unwrap_or_default();
+
+                    if left == right {
+                        continue; // Same change in both — no conflict.
+                    }
+                    if left == base {
+                        // Only workspace changed — take workspace version.
+                        accumulated.insert(path.clone(), right);
+                        accumulated_modified.insert(path.clone());
+                        step_auto += 1;
+                        continue;
+                    }
+                    if right == base {
+                        // Only accumulated changed — keep accumulated.
+                        continue;
+                    }
+
+                    // Both sides changed differently — three-way merge.
+                    match convergence::three_way_merge(&base, &left, &right) {
+                        convergence::FileMergeResult::Clean(content) => {
+                            accumulated.insert(path.clone(), content);
+                            accumulated_modified.insert(path.clone());
+                            step_auto += 1;
+                        }
+                        convergence::FileMergeResult::Conflict(_regions) => {
+                            step_conflicts_count += 1;
+                            step_conflict_files.push(path.clone());
+
+                            // Apply strategy for unresolved conflicts.
+                            match converge_strategy {
+                                #[allow(deprecated)]
+                                ConvergeStrategy::MostRecent => {
+                                    // Prefer workspace version (it's the "incoming" change).
+                                    accumulated.insert(path.clone(), right.clone());
+                                    accumulated_modified.insert(path.clone());
+
+                                    let lost_warning = format!(
+                                        "Discarded {} line(s) from accumulated in favor of workspace '{}'",
+                                        left.lines().count(),
+                                        ws_name,
+                                    );
+                                    warnings.push(format!("{}: {}", path, lost_warning));
+                                    step_degraded = true;
+
+                                    resolutions_records.push(ResolutionRecord {
+                                        path: path.clone(),
+                                        strategy: "most-recent".to_string(),
+                                        chosen_spec: Some(ws_name.clone()),
+                                        lost_content_warning: Some(lost_warning),
+                                    });
+                                    total_resolutions += 1;
+                                }
+                                ConvergeStrategy::Escalate => {
+                                    all_escalations.push(convergence::PipelineEscalation {
+                                        file_path: path.clone(),
+                                        reason: "workspace-conflict".to_string(),
+                                        conflict_class: "overlapping-modification".to_string(),
+                                        left_spec: "accumulated".to_string(),
+                                        right_spec: ws_name.clone(),
+                                        recommended_action: format!(
+                                            "Review conflicting changes in '{}' between accumulated and workspace '{}'",
+                                            path, ws_name
+                                        ),
+                                        left_content: Some(left.clone()),
+                                        right_content: Some(right.clone()),
+                                        suggested_content: None,
+                                        suggestion_confidence: None,
+                                    });
+                                    step_clean = false;
+                                    all_clean = false;
+                                }
+                                _ => {
+                                    // Manual / Orchestrator — leave unresolved.
+                                    step_clean = false;
+                                    all_clean = false;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Workspace-only files: add directly to accumulated.
+                for path in &ws_only {
+                    if let Some(content) = ws_content.get(path) {
+                        accumulated.insert(path.clone(), content.clone());
+                    } else {
+                        // File was deleted in workspace. Remove from accumulated.
+                        accumulated.remove(path);
+                    }
+                    accumulated_modified.insert(path.clone());
+                    step_auto += 1;
+                }
+
+                total_auto_merged += step_auto;
+                total_conflicts += step_conflicts_count;
+
+                if !step_clean {
+                    all_clean = false;
+                }
+                if step_degraded {
+                    any_degraded = true;
+                }
+
+                merges.push(MergeStepResult {
+                    left_spec: "main".to_string(),
+                    right_spec: ws_name.clone(),
+                    auto_merged: step_auto,
+                    conflicts: step_conflicts_count,
+                    left_only: 0,
+                    right_only: ws_only.len(),
+                    conflict_files: step_conflict_files,
+                    resolutions: resolutions_records,
+                    clean: step_clean,
+                    degraded: step_degraded,
+                    error: None,
+                });
+
+                Ok(())
+            })();
+
+            if let Err(e) = step_result {
+                all_clean = false;
+                merges.push(MergeStepResult {
+                    left_spec: "main".to_string(),
+                    right_spec: ws_name.clone(),
+                    auto_merged: 0,
+                    conflicts: 0,
+                    left_only: 0,
+                    right_only: 0,
+                    conflict_files: Vec::new(),
+                    resolutions: Vec::new(),
+                    clean: false,
+                    degraded: false,
+                    error: Some(e),
+                });
+            }
+        }
+
+        // Apply to main workspace if not dry_run and merge is clean.
+        let did_apply = !dry_run && all_clean;
+        if did_apply {
+            let _lock = self.lock()?;
+
+            for (path, content) in &accumulated {
+                let file_path = self.validate_path(path)?;
+                if let Some(parent) = file_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&file_path, content)?;
+            }
+
+            // Update main workspace index.
+            let mut index = crate::index::Index::load(&main_ws_dir.join("index.json"))?;
+            for (path, content) in &accumulated {
+                let hash = self.objects.store(content.as_bytes())?;
+                let size = content.len() as u64;
+                index.upsert(path, hash, size);
+            }
+            index.save(&main_ws_dir.join("index.json"))?;
+        }
+
+        // Collect files changed.
+        let mut files_changed: Vec<String> = accumulated_modified.iter().cloned().collect();
+        files_changed.sort();
+
+        // Emit completion event.
+        let completion_event_type = if any_degraded {
+            "workspace_convergence_degraded"
+        } else {
+            "workspace_convergence_completed"
+        };
+        let completion_severity = if any_degraded {
+            crate::security::Severity::Warning
+        } else {
+            crate::security::Severity::Info
+        };
+        let _ =
+            conv_logger.emit_convergence_event(
+                completion_event_type,
+                completion_severity,
+                &format!(
+                "Workspace convergence {}: {} workspaces, {} auto-merged, {} conflicts, clean={}",
+                if any_degraded { "degraded" } else { "completed" },
+                workspace_names.len(),
+                total_auto_merged,
+                total_conflicts,
+                all_clean
+            ),
+            );
+
+        // Deduplicate warnings.
+        let mut seen = HashSet::new();
+        warnings.retain(|w| seen.insert(w.clone()));
+
+        Ok(ConvergeAllReport {
+            base_spec: "main".to_string(),
+            merge_order,
+            merges,
+            strategy: strategy.to_string(),
+            total_auto_merged,
+            total_conflicts,
+            total_resolutions,
+            is_clean: all_clean,
+            degraded: any_degraded,
+            applied: did_apply,
+            warnings,
+            escalations: all_escalations,
+            quality_report: None,
+            files_changed,
+            convergence_record: None,
+        })
     }
 
     /// Converge ALL diverged branches in sequence.
@@ -4140,7 +5028,7 @@ impl Repository {
                 let size = content.len() as u64;
                 index.upsert(path, hash, size);
             }
-            index.save(&self.writ_dir.join("index.json"))?;
+            index.save(&self.workspace_dir().join("index.json"))?;
 
             // Update diverged specs' heads so they're no longer diverged.
             for (spec_id, _right_seal_id) in &right_seal_ids {
@@ -4545,6 +5433,7 @@ impl Repository {
             seal_warnings,
             parent_seal_hash,
         );
+        seal.workspace = self.active_workspace.clone();
 
         // Sign with agent's key if available, otherwise unsigned
         let ks = KeyStore::open(&self.writ_dir);
@@ -4552,8 +5441,8 @@ impl Repository {
         seal.secure(signing_key.as_ref());
 
         self.save_seal(&seal)?;
-        atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
-        index.save(&self.writ_dir.join("index.json"))?;
+        atomic_write(&self.workspace_dir().join("HEAD"), seal.id.as_bytes())?;
+        index.save(&self.workspace_dir().join("index.json"))?;
 
         if let Some(ref sid) = spec_id {
             self.write_spec_head(sid, &seal.id)?;
@@ -4924,12 +5813,20 @@ impl Repository {
         Ok(self.root.join(rel_path))
     }
 
+    /// Path to the active workspace directory: `.writ/workspaces/<name>/`.
+    /// All per-workspace state (index.json, HEAD, heads/) lives here.
+    fn workspace_dir(&self) -> PathBuf {
+        self.writ_dir
+            .join("workspaces")
+            .join(&self.active_workspace)
+    }
+
     fn load_index(&self) -> WritResult<Index> {
-        Index::load(&self.writ_dir.join("index.json"))
+        Index::load(&self.workspace_dir().join("index.json"))
     }
 
     fn read_head(&self) -> WritResult<Option<String>> {
-        let head_path = self.writ_dir.join("HEAD");
+        let head_path = self.workspace_dir().join("HEAD");
         let content = fs::read_to_string(&head_path)?;
         let trimmed = content.trim();
         if trimmed.is_empty() {
@@ -4941,7 +5838,7 @@ impl Repository {
 
     /// Read the tip seal for a specific spec.
     fn read_spec_head(&self, spec_id: &str) -> WritResult<Option<String>> {
-        let path = self.writ_dir.join("heads").join(spec_id);
+        let path = self.workspace_dir().join("heads").join(spec_id);
         if !path.exists() {
             return Ok(None);
         }
@@ -4956,7 +5853,7 @@ impl Repository {
 
     /// Update the tip seal for a specific spec.
     fn write_spec_head(&self, spec_id: &str, seal_id: &str) -> WritResult<()> {
-        let heads_dir = self.writ_dir.join("heads");
+        let heads_dir = self.workspace_dir().join("heads");
         if !heads_dir.exists() {
             fs::create_dir_all(&heads_dir)?;
         }
@@ -4966,7 +5863,7 @@ impl Repository {
     /// Record a pre-convergence branch tip so `log_all()` can still walk
     /// orphaned seal chains after convergence advances the spec head.
     fn archive_merged_head(&self, seal_id: &str) -> WritResult<()> {
-        let path = self.writ_dir.join("merged-heads");
+        let path = self.workspace_dir().join("merged-heads");
         let mut contents = if path.exists() {
             fs::read_to_string(&path)?
         } else {
@@ -5342,6 +6239,7 @@ impl Repository {
             seal_warnings,
             parent_seal_hash,
         );
+        seal.workspace = self.active_workspace.clone();
 
         // Sign with agent's key if available, otherwise unsigned
         let ks = KeyStore::open(&self.writ_dir);
@@ -5349,8 +6247,8 @@ impl Repository {
         seal.secure(signing_key.as_ref());
 
         self.save_seal(&seal)?;
-        atomic_write(&self.writ_dir.join("HEAD"), seal.id.as_bytes())?;
-        index.save(&self.writ_dir.join("index.json"))?;
+        atomic_write(&self.workspace_dir().join("HEAD"), seal.id.as_bytes())?;
+        index.save(&self.workspace_dir().join("index.json"))?;
 
         // Refresh the index to match the actual working directory so the
         // next seal() only captures the agent's genuine changes, not the
@@ -5374,7 +6272,7 @@ impl Repository {
                     }
                 }
             }
-            index.save(&self.writ_dir.join("index.json"))?;
+            index.save(&self.workspace_dir().join("index.json"))?;
         }
 
         let bridge_state = BridgeState {
@@ -5831,13 +6729,13 @@ impl Repository {
         let head_updated = match (&local_head, &remote_head) {
             (_, None) => false,
             (None, Some(remote_h)) => {
-                atomic_write(&self.writ_dir.join("HEAD"), remote_h.as_bytes())?;
+                atomic_write(&self.workspace_dir().join("HEAD"), remote_h.as_bytes())?;
                 true
             }
             (Some(local_h), Some(remote_h)) if local_h == remote_h => false,
             (Some(local_h), Some(remote_h)) => {
                 if self.is_descendant(remote_h, local_h)? {
-                    atomic_write(&self.writ_dir.join("HEAD"), remote_h.as_bytes())?;
+                    atomic_write(&self.workspace_dir().join("HEAD"), remote_h.as_bytes())?;
                     true
                 } else if self.is_descendant(local_h, remote_h)? {
                     // Local is ahead — no-op
@@ -6168,6 +7066,7 @@ impl Repository {
                 .clone()
                 .or(incoming.commit_hash.clone()),
             committed_at: existing.committed_at.or(incoming.committed_at),
+            workspace: existing.workspace.clone().or(incoming.workspace.clone()),
         }
     }
 
@@ -6339,7 +7238,63 @@ impl Repository {
     /// a structured output suitable for generating git commit messages and
     /// reviewing what happened during an agentic workflow.
     pub fn summary(&self) -> WritResult<SummaryOutput> {
-        let all_seals = self.log_all()?;
+        let mut all_seals = self.log_all()?;
+
+        // Also collect seals from other workspace chains so the summary
+        // reflects cross-workspace work even before convergence.
+        let workspaces_dir = self.writ_dir.join("workspaces");
+        if workspaces_dir.exists() {
+            let mut seen: HashSet<String> = all_seals.iter().map(|s| s.id.clone()).collect();
+            if let Ok(entries) = std::fs::read_dir(&workspaces_dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name == self.active_workspace || !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                        continue;
+                    }
+                    let ws_dir = entry.path();
+                    // Walk this workspace's HEAD chain.
+                    let head_path = ws_dir.join("HEAD");
+                    if head_path.exists() {
+                        if let Ok(content) = std::fs::read_to_string(&head_path) {
+                            let mut current: Option<String> = {
+                                let t = content.trim();
+                                if t.is_empty() { None } else { Some(t.to_string()) }
+                            };
+                            while let Some(seal_id) = current {
+                                if !seen.insert(seal_id.clone()) { break; }
+                                match self.load_seal(&seal_id) {
+                                    Ok(seal) => { current = seal.parent.clone(); all_seals.push(seal); }
+                                    Err(_) => break,
+                                }
+                            }
+                        }
+                    }
+                    // Walk this workspace's spec head chains.
+                    let heads_dir = ws_dir.join("heads");
+                    if heads_dir.exists() {
+                        if let Ok(spec_entries) = std::fs::read_dir(&heads_dir) {
+                            for spec_entry in spec_entries.flatten() {
+                                if let Ok(tip) = std::fs::read_to_string(spec_entry.path()) {
+                                    let mut current: Option<String> = {
+                                        let t = tip.trim();
+                                        if t.is_empty() { None } else { Some(t.to_string()) }
+                                    };
+                                    while let Some(seal_id) = current {
+                                        if !seen.insert(seal_id.clone()) { break; }
+                                        match self.load_seal(&seal_id) {
+                                            Ok(seal) => { current = seal.parent.clone(); all_seals.push(seal); }
+                                            Err(_) => break,
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Re-sort newest-first.
+            all_seals.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        }
 
         // Skip bridge import seals for the summary.
         let work_seals: Vec<&Seal> = all_seals
@@ -6444,6 +7399,14 @@ impl Repository {
         let diverged = self.diverged_branches().unwrap_or_default();
         let convergence_recommended = !diverged.is_empty();
 
+        // Detect workspace convergence: collect unique non-main workspace names.
+        let workspace_names: BTreeSet<String> = work_seals
+            .iter()
+            .filter(|s| s.workspace != "main")
+            .map(|s| s.workspace.clone())
+            .collect();
+        let has_workspace_convergence = !workspace_names.is_empty();
+
         // Build the headline.
         let completed_specs: Vec<&SpecSummaryEntry> = specs_summary
             .iter()
@@ -6451,7 +7414,24 @@ impl Repository {
             .collect();
         let agent_count = agents.len();
 
-        let headline = if specs_summary.is_empty() && work_seals.is_empty() {
+        let headline = if has_workspace_convergence && completed_specs.len() >= 2 {
+            // Workspace convergence headline.
+            let mut ws_names: Vec<&str> = workspace_names.iter().map(|s| s.as_str()).collect();
+            ws_names.sort();
+            let ws_list = match ws_names.len() {
+                1 => ws_names[0].to_string(),
+                2 => format!("{} and {}", ws_names[0], ws_names[1]),
+                _ => {
+                    let (last, rest) = ws_names.split_last().unwrap();
+                    format!("{}, and {}", rest.join(", "), last)
+                }
+            };
+            format!(
+                "writ: converge {} — {} specs completed",
+                ws_list,
+                completed_specs.len(),
+            )
+        } else if specs_summary.is_empty() && work_seals.is_empty() {
             "writ: no changes".to_string()
         } else if specs_summary.is_empty() {
             // Persona A: no specs — synthesize from seal summaries.
@@ -6534,6 +7514,51 @@ impl Repository {
                     a.specs_touched.join(", "),
                 ));
             }
+            body_lines.push(String::new());
+        }
+
+        // Workspace breakdown: if seals came from multiple workspaces,
+        // include a workspace section showing which work came from where.
+        let mut ws_specs: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for seal in &work_seals {
+            if seal.workspace != "main" {
+                let entry = ws_specs.entry(seal.workspace.clone()).or_default();
+                if let Some(ref sid) = seal.spec_id {
+                    if !entry.contains(sid) {
+                        entry.push(sid.clone());
+                    }
+                }
+            }
+        }
+
+        if !ws_specs.is_empty() {
+            body_lines.push("Workspaces:".to_string());
+            for (ws_name, spec_ids) in &ws_specs {
+                let spec_count = spec_ids.len();
+                let id_list = if spec_ids.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", spec_ids.join(", "))
+                };
+                body_lines.push(format!(
+                    "  - {}: {} spec{}{}",
+                    ws_name,
+                    spec_count,
+                    if spec_count == 1 { "" } else { "s" },
+                    id_list,
+                ));
+            }
+
+            // Summary line: total specs and files across workspaces.
+            let total_ws_specs: usize = ws_specs.values().map(|v| v.len()).sum();
+            body_lines.push(String::new());
+            body_lines.push(format!(
+                "{} specs completed · {} files merged · {} workspace{}",
+                total_ws_specs,
+                files_changed.len(),
+                ws_specs.len(),
+                if ws_specs.len() == 1 { "" } else { "s" },
+            ));
             body_lines.push(String::new());
         }
 
@@ -7547,8 +8572,11 @@ mod tests {
         assert!(dir.path().join(".writ/objects").exists());
         assert!(dir.path().join(".writ/seals").exists());
         assert!(dir.path().join(".writ/specs").exists());
-        assert!(dir.path().join(".writ/HEAD").exists());
-        assert!(dir.path().join(".writ/index.json").exists());
+        // Per-workspace state lives under .writ/workspaces/main/
+        assert!(dir.path().join(".writ/workspaces/main").exists());
+        assert!(dir.path().join(".writ/workspaces/main/HEAD").exists());
+        assert!(dir.path().join(".writ/workspaces/main/index.json").exists());
+        assert!(dir.path().join(".writ/workspaces/main/heads").exists());
     }
 
     #[test]
@@ -9969,6 +10997,7 @@ mod tests {
         let filter = ContextFilter {
             status: Some(TaskStatus::Complete),
             agent: Some("worker-1".to_string()),
+            workspace: None,
         };
         let ctx = repo.context(ContextScope::Full, 10, &filter).unwrap();
         assert_eq!(ctx.recent_seals.len(), 1);
@@ -11268,6 +12297,7 @@ mod verify_all_chains_tests {
             completed_at: None,
             commit_hash: None,
             committed_at: None,
+            workspace: None,
         };
         repo.add_spec(&spec).unwrap();
 
@@ -11330,6 +12360,7 @@ mod verify_all_chains_tests {
                 completed_at: None,
                 commit_hash: None,
                 committed_at: None,
+                workspace: None,
             };
             repo.add_spec(&spec).unwrap();
         }
@@ -13864,6 +14895,7 @@ mod remote_tests {
             completed_at: None,
             commit_hash: None,
             committed_at: None,
+            workspace: None,
         };
 
         let spec_in_progress = crate::spec::Spec {
@@ -18717,6 +19749,146 @@ mod summary_tests {
         assert_eq!(parsed.total_seals, summary.total_seals);
         assert_eq!(parsed.headline, summary.headline);
     }
+
+    // --- WS.25: Workspace-aware summary (Lee) ---
+
+    #[test]
+    fn test_summary_includes_workspace_section_after_convergence() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create workspace and seal from it.
+        repo.create_workspace("auth-team", None, None).unwrap();
+
+        // Create specs and assign to workspace.
+        let mut spec = crate::spec::Spec::new("auth-1".into(), "Login flow".into(), "".into());
+        spec.workspace = Some("auth-team".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        // Seal from main workspace.
+        std::fs::write(dir.path().join("main.txt"), "main work").unwrap();
+        repo.seal(
+            agent("dev-a"),
+            "main work".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Open repo as auth-team workspace and seal.
+        let ws_path = dir.path().join(".writ/ws/auth-team");
+        std::fs::write(ws_path.join("auth.txt"), "auth work").unwrap();
+        let auth_repo = Repository::open_workspace(dir.path(), "auth-team").unwrap();
+        auth_repo
+            .seal(
+                agent("dev-b"),
+                "auth implementation".into(),
+                Some("auth-1".to_string()),
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Summary from main should include workspace section.
+        let summary = repo.summary().unwrap();
+        assert!(
+            summary.body.contains("Workspaces:"),
+            "summary body should contain workspace section, got:\n{}",
+            summary.body
+        );
+        assert!(
+            summary.body.contains("auth-team"),
+            "summary body should mention auth-team workspace"
+        );
+    }
+
+    #[test]
+    fn test_summary_omits_workspace_section_when_no_convergence() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("f.txt"), "content").unwrap();
+        repo.seal(
+            agent("dev"),
+            "regular work".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let summary = repo.summary().unwrap();
+        assert!(
+            !summary.body.contains("Workspaces:"),
+            "summary should not have workspace section for single-workspace work"
+        );
+    }
+
+    #[test]
+    fn test_summary_headline_reflects_workspace_convergence() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create two workspaces.
+        repo.create_workspace("auth-team", None, None).unwrap();
+        repo.create_workspace("payments", None, None).unwrap();
+
+        // Create completed specs assigned to each workspace.
+        let mut spec1 = crate::spec::Spec::new("auth-1".into(), "Auth".into(), "".into());
+        spec1.workspace = Some("auth-team".to_string());
+        spec1.status = crate::spec::SpecStatus::Complete;
+        repo.add_spec(&spec1).unwrap();
+
+        let mut spec2 = crate::spec::Spec::new("pay-1".into(), "Payments".into(), "".into());
+        spec2.workspace = Some("payments".to_string());
+        spec2.status = crate::spec::SpecStatus::Complete;
+        repo.add_spec(&spec2).unwrap();
+
+        // Seal from each workspace.
+        // Write files to project root — each workspace's cloned index is empty,
+        // so files at the project root appear as new changes to scan.
+        std::fs::write(dir.path().join("auth.txt"), "auth code").unwrap();
+        let auth_repo = Repository::open_workspace(dir.path(), "auth-team").unwrap();
+        auth_repo
+            .seal(
+                agent("dev-a"),
+                "auth done".into(),
+                Some("auth-1".to_string()),
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        std::fs::write(dir.path().join("pay.txt"), "pay code").unwrap();
+        let pay_repo = Repository::open_workspace(dir.path(), "payments").unwrap();
+        pay_repo
+            .seal(
+                agent("dev-b"),
+                "payments done".into(),
+                Some("pay-1".to_string()),
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let summary = repo.summary().unwrap();
+        assert!(
+            summary.headline.contains("converge"),
+            "headline should mention convergence, got: {}",
+            summary.headline
+        );
+        assert!(
+            summary.headline.contains("auth-team"),
+            "headline should mention auth-team, got: {}",
+            summary.headline
+        );
+    }
 }
 
 #[cfg(test)]
@@ -18838,14 +20010,7 @@ mod scale_tests {
 
         let start = Instant::now();
         let ctx = repo
-            .context(
-                ContextScope::Full,
-                20,
-                &ContextFilter {
-                    status: None,
-                    agent: None,
-                },
-            )
+            .context(ContextScope::Full, 20, &ContextFilter::default())
             .unwrap();
         let ctx_time = start.elapsed();
         assert_eq!(ctx.recent_seals.len(), 20);
@@ -18860,10 +20025,7 @@ mod scale_tests {
             .context(
                 ContextScope::Spec("ctx-spec".into()),
                 10,
-                &ContextFilter {
-                    status: None,
-                    agent: None,
-                },
+                &ContextFilter::default(),
             )
             .unwrap();
         let spec_ctx_time = start.elapsed();
@@ -25320,10 +26482,7 @@ mod lifecycle_tests {
         spec.last_activity = chrono::Utc::now() - chrono::Duration::hours(5);
         repo.add_spec(&spec).unwrap();
 
-        let filter = crate::context::ContextFilter {
-            status: None,
-            agent: None,
-        };
+        let filter = crate::context::ContextFilter::default();
         let ctx = repo
             .context(crate::context::ContextScope::Full, 10, &filter)
             .unwrap();
@@ -25349,10 +26508,7 @@ mod lifecycle_tests {
         // Create a fresh spec
         create_spec(&repo, "fresh-spec");
 
-        let filter = crate::context::ContextFilter {
-            status: None,
-            agent: None,
-        };
+        let filter = crate::context::ContextFilter::default();
         let ctx = repo
             .context(crate::context::ContextScope::Full, 10, &filter)
             .unwrap();
@@ -25475,5 +26631,1167 @@ mod lifecycle_tests {
         assert!(repo.settings().default_agent.is_none());
         assert!(repo.settings().enforce_scope.is_none());
         assert!(repo.settings().convergence.auto_resolve.is_none());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workspace tests (WS.4)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::*;
+    use crate::seal::{AgentIdentity, AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    fn test_agent() -> AgentIdentity {
+        AgentIdentity {
+            id: "test-human".to_string(),
+            agent_type: AgentType::Human,
+        }
+    }
+
+    #[test]
+    fn test_create_workspace_creates_state_directory() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let ws_dir = dir.path().join(".writ/ws/auth-team");
+        let info = repo.create_workspace("auth-team", None, None).unwrap();
+
+        assert_eq!(info.name, "auth-team");
+        assert!(!info.is_main);
+        // Workspace state created.
+        assert!(dir.path().join(".writ/workspaces/auth-team").exists());
+        assert!(dir.path().join(".writ/workspaces/auth-team/HEAD").exists());
+        assert!(dir
+            .path()
+            .join(".writ/workspaces/auth-team/index.json")
+            .exists());
+        assert!(dir.path().join(".writ/workspaces/auth-team/heads").exists());
+        assert!(dir
+            .path()
+            .join(".writ/workspaces/auth-team/config.toml")
+            .exists());
+        // Auto-generated working directory created.
+        assert!(ws_dir.exists());
+        // Pointer file created.
+        assert!(ws_dir.join(".writ-workspace").exists());
+    }
+
+    #[test]
+    fn test_create_workspace_with_explicit_path() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let ws_path = dir.path().join("ws-payments");
+        let info = repo
+            .create_workspace("payments", Some(&ws_path), None)
+            .unwrap();
+
+        assert_eq!(info.name, "payments");
+        assert!(ws_path.exists());
+        assert!(ws_path.join(".writ-workspace").exists());
+    }
+
+    #[test]
+    fn test_create_workspace_pointer_file_content() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_workspace("auth-team", None, None).unwrap();
+
+        let ws_dir = dir.path().join(".writ/ws/auth-team");
+        let pointer =
+            crate::workspace::parse_workspace_pointer(&ws_dir.join(".writ-workspace")).unwrap();
+        assert_eq!(pointer.workspace, "auth-team");
+        // Parent should point to the .writ/ directory.
+        assert!(pointer.parent.contains(".writ"));
+    }
+
+    #[test]
+    fn test_create_workspace_copies_index() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a file and seal it to populate the index.
+        std::fs::write(dir.path().join("hello.txt"), "hello world").unwrap();
+        repo.seal(
+            test_agent(),
+            "initial file".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let info = repo.create_workspace("test-ws", None, None).unwrap();
+
+        // The workspace's index should match main's.
+        let ws_index =
+            crate::index::Index::load(&dir.path().join(".writ/workspaces/test-ws/index.json"))
+                .unwrap();
+        assert!(ws_index.is_tracked("hello.txt"));
+
+        // File should be copied to the workspace working directory.
+        let ws_file = info.path.join("hello.txt");
+        assert!(ws_file.exists());
+        assert_eq!(std::fs::read_to_string(&ws_file).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn test_create_workspace_copies_head() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let seal = repo
+            .seal(
+                test_agent(),
+                "initial".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let info = repo.create_workspace("ws-1", None, None).unwrap();
+
+        assert_eq!(info.head_seal, Some(seal.id));
+    }
+
+    #[test]
+    fn test_create_workspace_rejects_duplicate_name() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_workspace("auth", None, None).unwrap();
+        let result = repo.create_workspace("auth", None, None);
+        assert!(result.is_err());
+        assert!(
+            format!("{}", result.unwrap_err()).contains("already exists"),
+            "should mention already exists"
+        );
+    }
+
+    #[test]
+    fn test_create_workspace_rejects_invalid_names() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        assert!(repo.create_workspace("", None, None).is_err());
+        assert!(repo.create_workspace("Auth-Team", None, None).is_err());
+        assert!(repo.create_workspace("auth_team", None, None).is_err());
+        assert!(repo.create_workspace("auth team", None, None).is_err());
+        assert!(repo.create_workspace("-auth", None, None).is_err());
+        assert!(repo.create_workspace("auth-", None, None).is_err());
+        assert!(repo.create_workspace("auth--team", None, None).is_err());
+    }
+
+    #[test]
+    fn test_create_workspace_rejects_path_with_writ_dir() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Target path that already has a .writ/ directory.
+        let bad_path = dir.path().join("other-project");
+        std::fs::create_dir_all(bad_path.join(".writ")).unwrap();
+
+        let result = repo.create_workspace("test", Some(&bad_path), None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_create_workspace_from_another_workspace() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a file, seal, then create workspace A from main.
+        std::fs::write(dir.path().join("base.txt"), "base content").unwrap();
+        repo.seal(
+            test_agent(),
+            "base".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.create_workspace("ws-a", None, None).unwrap();
+
+        // Create workspace B from ws-a.
+        let info = repo.create_workspace("ws-b", None, Some("ws-a")).unwrap();
+
+        // ws-b should have the same file.
+        assert!(info.path.join("base.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(info.path.join("base.txt")).unwrap(),
+            "base content"
+        );
+    }
+
+    #[test]
+    fn test_two_workspaces_exist_simultaneously() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("shared.txt"), "shared").unwrap();
+        repo.seal(
+            test_agent(),
+            "shared".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ws_a = repo.create_workspace("ws-a", None, None).unwrap();
+        let ws_b = repo.create_workspace("ws-b", None, None).unwrap();
+
+        // Both have the shared file.
+        assert!(ws_a.path.join("shared.txt").exists());
+        assert!(ws_b.path.join("shared.txt").exists());
+
+        // Both have independent state dirs.
+        assert!(dir.path().join(".writ/workspaces/ws-a").exists());
+        assert!(dir.path().join(".writ/workspaces/ws-b").exists());
+    }
+
+    #[test]
+    fn test_delete_workspace_removes_state() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_workspace("doomed", None, None).unwrap();
+        assert!(dir.path().join(".writ/workspaces/doomed").exists());
+        assert!(dir.path().join(".writ/ws/doomed").exists());
+
+        repo.delete_workspace("doomed", false).unwrap();
+
+        assert!(!dir.path().join(".writ/workspaces/doomed").exists());
+        assert!(!dir.path().join(".writ/ws/doomed").exists());
+    }
+
+    #[test]
+    fn test_delete_workspace_keep_files() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+        repo.seal(
+            test_agent(),
+            "add file".to_string(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.create_workspace("keep-me", None, None).unwrap();
+
+        repo.delete_workspace("keep-me", true).unwrap();
+
+        // State directory removed, working directory preserved.
+        assert!(!dir.path().join(".writ/workspaces/keep-me").exists());
+        assert!(dir.path().join(".writ/ws/keep-me").exists());
+        assert!(dir.path().join(".writ/ws/keep-me/file.txt").exists());
+    }
+
+    #[test]
+    fn test_delete_main_workspace_rejected() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.delete_workspace("main", false);
+        assert!(result.is_err());
+        assert!(format!("{}", result.unwrap_err()).contains("cannot delete"));
+    }
+
+    #[test]
+    fn test_delete_nonexistent_workspace_errors() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.delete_workspace("ghost", false);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_workspace_config_records_ancestor() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let seal = repo
+            .seal(
+                test_agent(),
+                "initial".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        repo.create_workspace("ws-test", None, None).unwrap();
+
+        let config_path = dir.path().join(".writ/workspaces/ws-test/config.toml");
+        let config_str = std::fs::read_to_string(&config_path).unwrap();
+        let config: crate::workspace::WorkspaceConfig = toml::from_str(&config_str).unwrap();
+
+        assert_eq!(config.name, "ws-test");
+        assert_eq!(config.ancestor_seal, Some(seal.id));
+        assert_eq!(config.created_from, "main");
+    }
+
+    #[test]
+    fn test_active_workspace_defaults_to_main() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        assert_eq!(repo.active_workspace(), "main");
+    }
+
+    #[test]
+    fn test_delete_workspace_preserves_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a file, seal, then create workspace.
+        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let seal = repo
+            .seal(
+                test_agent(),
+                "add file".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        repo.create_workspace("ephemeral", None, None).unwrap();
+        repo.delete_workspace("ephemeral", false).unwrap();
+
+        // Seal should still exist in shared store.
+        let loaded = repo.load_seal(&seal.id);
+        assert!(loaded.is_ok(), "seal should survive workspace deletion");
+    }
+
+    #[test]
+    fn test_delete_workspace_unassigns_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Add a spec and assign it to the workspace.
+        let mut spec = crate::spec::Spec::new(
+            "auth".to_string(),
+            "Auth feature".to_string(),
+            "Implement authentication".to_string(),
+        );
+        spec.workspace = Some("doomed-ws".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        // Create and delete the workspace.
+        repo.create_workspace("doomed-ws", None, None).unwrap();
+        repo.delete_workspace("doomed-ws", false).unwrap();
+
+        // Spec should now have no workspace assignment.
+        let updated_spec = repo.load_spec("auth").unwrap();
+        assert!(
+            updated_spec.workspace.is_none(),
+            "spec should be unassigned after workspace deletion"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // WS.18: Workspace overview data tests (Haris)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ws18_single_workspace_list() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let workspaces = repo.list_workspaces().unwrap();
+        assert_eq!(workspaces.len(), 1, "only main workspace should exist");
+        assert!(workspaces[0].is_main);
+    }
+
+    #[test]
+    fn test_ws18_multiple_workspaces_listed() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_workspace("auth-team", None, None).unwrap();
+        repo.create_workspace("payments", None, None).unwrap();
+
+        let workspaces = repo.list_workspaces().unwrap();
+        assert_eq!(workspaces.len(), 3);
+        assert_eq!(workspaces[0].name, "main");
+        assert!(workspaces[0].is_main);
+        assert_eq!(workspaces[1].name, "auth-team");
+        assert_eq!(workspaces[2].name, "payments");
+    }
+
+    #[test]
+    fn test_ws18_workspace_spec_counts_accurate() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_workspace("auth-team", None, None).unwrap();
+
+        // Add specs: 2 assigned to auth-team, 1 unassigned (global/main).
+        let mut spec1 = crate::spec::Spec::new(
+            "login".to_string(),
+            "Login flow".to_string(),
+            "Implement login".to_string(),
+        );
+        spec1.workspace = Some("auth-team".to_string());
+        repo.add_spec(&spec1).unwrap();
+
+        let mut spec2 = crate::spec::Spec::new(
+            "oauth".to_string(),
+            "OAuth integration".to_string(),
+            "Add OAuth support".to_string(),
+        );
+        spec2.workspace = Some("auth-team".to_string());
+        repo.add_spec(&spec2).unwrap();
+
+        let spec3 = crate::spec::Spec::new(
+            "readme".to_string(),
+            "Update README".to_string(),
+            "Improve docs".to_string(),
+        );
+        repo.add_spec(&spec3).unwrap();
+
+        let workspaces = repo.list_workspaces().unwrap();
+        let main = workspaces.iter().find(|w| w.is_main).unwrap();
+        let auth = workspaces.iter().find(|w| w.name == "auth-team").unwrap();
+
+        assert_eq!(auth.spec_count, 2, "auth-team should have 2 specs");
+        assert_eq!(main.spec_count, 1, "main should have 1 unassigned spec");
+    }
+
+    // --- WS.13+WS.14: Spec assign/unassign (Lee) ---
+
+    #[test]
+    fn test_assign_spec_to_workspace() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.create_workspace("auth-team", None, None).unwrap();
+
+        let spec = crate::spec::Spec::new("auth-1".into(), "Login".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        repo.assign_spec_to_workspace("auth-1", "auth-team")
+            .unwrap();
+        let loaded = repo.load_spec("auth-1").unwrap();
+        assert_eq!(loaded.workspace, Some("auth-team".to_string()));
+    }
+
+    #[test]
+    fn test_unassign_spec_from_workspace() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.create_workspace("auth-team", None, None).unwrap();
+
+        let spec = crate::spec::Spec::new("auth-1".into(), "Login".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        repo.assign_spec_to_workspace("auth-1", "auth-team")
+            .unwrap();
+        repo.unassign_spec_from_workspace("auth-1").unwrap();
+        let loaded = repo.load_spec("auth-1").unwrap();
+        assert_eq!(loaded.workspace, None);
+    }
+
+    #[test]
+    fn test_assign_to_nonexistent_workspace_errors() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("auth-1".into(), "Login".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        let result = repo.assign_spec_to_workspace("auth-1", "no-such-ws");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_assign_nonexistent_spec_errors() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.create_workspace("auth-team", None, None).unwrap();
+
+        let result = repo.assign_spec_to_workspace("no-such-spec", "auth-team");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_reassign_changes_workspace() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.create_workspace("auth-team", None, None).unwrap();
+        repo.create_workspace("payments", None, None).unwrap();
+
+        let spec = crate::spec::Spec::new("shared-1".into(), "Shared".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        repo.assign_spec_to_workspace("shared-1", "auth-team")
+            .unwrap();
+        repo.assign_spec_to_workspace("shared-1", "payments")
+            .unwrap();
+        let loaded = repo.load_spec("shared-1").unwrap();
+        assert_eq!(loaded.workspace, Some("payments".to_string()));
+    }
+
+    #[test]
+    fn test_assign_preserves_other_spec_fields() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.create_workspace("auth-team", None, None).unwrap();
+
+        let mut spec = crate::spec::Spec::new("auth-1".into(), "Login flow".into(), "OAuth".into());
+        spec.tech_stack = vec!["rust".to_string(), "oauth".to_string()];
+        repo.add_spec(&spec).unwrap();
+
+        repo.assign_spec_to_workspace("auth-1", "auth-team")
+            .unwrap();
+        let loaded = repo.load_spec("auth-1").unwrap();
+
+        assert_eq!(loaded.title, "Login flow");
+        assert_eq!(loaded.description, "OAuth");
+        assert_eq!(loaded.tech_stack, vec!["rust", "oauth"]);
+        assert_eq!(loaded.workspace, Some("auth-team".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // WS.9 + WS.11: Seal tagging + command compatibility
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_seal_tags_workspace_name() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "hello").unwrap();
+        let result = repo
+            .seal(
+                test_agent(),
+                "seal in main".into(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(result.workspace, "main");
+    }
+
+    #[test]
+    fn test_open_workspace_sets_active() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.create_workspace("auth", None, None).unwrap();
+
+        let ws_repo = Repository::open_workspace(dir.path(), "auth").unwrap();
+        assert_eq!(ws_repo.active_workspace(), "auth");
+    }
+
+    #[test]
+    fn test_open_workspace_invalid_name_errors() {
+        let dir = tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+
+        let result = Repository::open_workspace(dir.path(), "nonexistent");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_open_from_dir_detects_workspace_pointer() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a workspace — this creates a parallel directory with .writ-workspace
+        let ws_info = repo.create_workspace("test-ws", None, None).unwrap();
+
+        // open_from_dir on the workspace dir should resolve the workspace
+        let ws_repo = Repository::open_from_dir(&ws_info.path).unwrap();
+        assert_eq!(ws_repo.active_workspace(), "test-ws");
+    }
+
+    #[test]
+    fn test_open_from_dir_falls_back_to_open() {
+        let dir = tempdir().unwrap();
+        Repository::init(dir.path()).unwrap();
+
+        // No .writ-workspace file → falls back to open(), defaults to main
+        let repo = Repository::open_from_dir(dir.path()).unwrap();
+        assert_eq!(repo.active_workspace(), "main");
+    }
+
+    #[test]
+    fn test_workspace_independent_head_and_index() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Seal in main
+        fs::write(dir.path().join("main.txt"), "main content").unwrap();
+        let main_seal = repo
+            .seal(
+                test_agent(),
+                "main seal".into(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Create workspace — it gets its own HEAD copied from main
+        repo.create_workspace("ws-a", None, None).unwrap();
+        let ws_repo = Repository::open_workspace(dir.path(), "ws-a").unwrap();
+
+        // Workspace HEAD should match main's HEAD at creation time
+        let ws_head = ws_repo.read_head().unwrap();
+        assert_eq!(ws_head, Some(main_seal.id.clone()));
+
+        // After another seal in main, workspace HEAD should NOT advance
+        fs::write(dir.path().join("main.txt"), "main v2").unwrap();
+        let main_seal2 = repo
+            .seal(
+                test_agent(),
+                "main seal 2".into(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let main_head = repo.read_head().unwrap().unwrap();
+        let ws_head = ws_repo.read_head().unwrap().unwrap();
+        assert_eq!(main_head, main_seal2.id);
+        // Workspace HEAD stayed at the original seal — independent!
+        assert_eq!(ws_head, main_seal.id);
+        assert_ne!(main_head, ws_head);
+
+        // Seal workspace tag
+        assert_eq!(main_seal2.workspace, "main");
+    }
+
+    // -----------------------------------------------------------------------
+    // WS.16 + WS.17: Workspace-scoped context + dependency awareness
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_context_main_workspace_shows_all_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Add specs — some assigned to workspaces, some global
+        let mut spec_a = crate::spec::Spec::new("auth-1".into(), "Auth".into(), "".into());
+        spec_a.workspace = Some("auth".to_string());
+        repo.add_spec(&spec_a).unwrap();
+
+        let spec_b = crate::spec::Spec::new("global-1".into(), "Global".into(), "".into());
+        repo.add_spec(&spec_b).unwrap();
+
+        // Main workspace with no filter shows all specs
+        let filter = crate::context::ContextFilter::default();
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        let spec_ids: Vec<&str> = ctx
+            .all_specs
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert!(spec_ids.contains(&"auth-1"));
+        assert!(spec_ids.contains(&"global-1"));
+        assert!(ctx.workspace.is_none()); // main = no workspace header
+    }
+
+    #[test]
+    fn test_context_workspace_scoped_filters_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.create_workspace("auth", None, None).unwrap();
+
+        // Spec assigned to auth workspace
+        let mut spec_a = crate::spec::Spec::new("auth-1".into(), "Auth flow".into(), "".into());
+        spec_a.workspace = Some("auth".to_string());
+        repo.add_spec(&spec_a).unwrap();
+
+        // Global spec (visible everywhere)
+        let spec_g = crate::spec::Spec::new("shared".into(), "Shared lib".into(), "".into());
+        repo.add_spec(&spec_g).unwrap();
+
+        // Spec assigned to different workspace
+        let mut spec_p = crate::spec::Spec::new("pay-1".into(), "Payment flow".into(), "".into());
+        spec_p.workspace = Some("payments".to_string());
+        repo.add_spec(&spec_p).unwrap();
+
+        // Context scoped to auth workspace
+        let filter = crate::context::ContextFilter {
+            workspace: Some("auth".to_string()),
+            ..Default::default()
+        };
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        let spec_ids: Vec<&str> = ctx
+            .all_specs
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+
+        // auth-1 (assigned to auth) and shared (global) are visible
+        assert!(spec_ids.contains(&"auth-1"));
+        assert!(spec_ids.contains(&"shared"));
+        // pay-1 (assigned to payments) is NOT visible
+        assert!(!spec_ids.contains(&"pay-1"));
+        // Workspace header set
+        assert_eq!(ctx.workspace.as_deref(), Some("auth"));
+    }
+
+    #[test]
+    fn test_context_workspace_scoped_filters_seals() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.create_workspace("auth", None, None).unwrap();
+
+        // Seal in main
+        fs::write(dir.path().join("file.txt"), "v1").unwrap();
+        repo.seal(
+            test_agent(),
+            "main work".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Context scoped to auth — should NOT show main's seals
+        let filter = crate::context::ContextFilter {
+            workspace: Some("auth".to_string()),
+            ..Default::default()
+        };
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        assert!(
+            ctx.recent_seals.is_empty(),
+            "auth workspace should have no seals yet"
+        );
+    }
+
+    #[test]
+    fn test_context_dependency_awareness() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.create_workspace("auth", None, None).unwrap();
+
+        // Shared config spec in main/global
+        let config_spec =
+            crate::spec::Spec::new("shared-config".into(), "App config".into(), "".into());
+        repo.add_spec(&config_spec).unwrap();
+
+        // Auth spec depends on shared-config
+        let mut auth_spec = crate::spec::Spec::new("auth-1".into(), "Auth".into(), "".into());
+        auth_spec.workspace = Some("auth".to_string());
+        auth_spec.depends_on = vec!["shared-config".to_string()];
+        repo.add_spec(&auth_spec).unwrap();
+
+        // Context scoped to auth should show shared-config as a dependency
+        let filter = crate::context::ContextFilter {
+            workspace: Some("auth".to_string()),
+            ..Default::default()
+        };
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        // shared-config is global, so it's in all_specs AND dependencies is empty
+        // (because it's already visible)
+        let spec_ids: Vec<&str> = ctx
+            .all_specs
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert!(spec_ids.contains(&"shared-config"));
+        assert!(ctx.dependencies.is_empty());
+    }
+
+    #[test]
+    fn test_context_cross_workspace_dependency_shown() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.create_workspace("auth", None, None).unwrap();
+        repo.create_workspace("payments", None, None).unwrap();
+
+        // Payment spec assigned to payments workspace
+        let mut pay_spec =
+            crate::spec::Spec::new("pay-api".into(), "Payment API".into(), "".into());
+        pay_spec.workspace = Some("payments".to_string());
+        repo.add_spec(&pay_spec).unwrap();
+
+        // Auth spec depends on pay-api (cross-workspace dependency)
+        let mut auth_spec = crate::spec::Spec::new("auth-1".into(), "Auth".into(), "".into());
+        auth_spec.workspace = Some("auth".to_string());
+        auth_spec.depends_on = vec!["pay-api".to_string()];
+        repo.add_spec(&auth_spec).unwrap();
+
+        // Context scoped to auth
+        let filter = crate::context::ContextFilter {
+            workspace: Some("auth".to_string()),
+            ..Default::default()
+        };
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        // pay-api should NOT be in all_specs (it's in payments workspace)
+        let spec_ids: Vec<&str> = ctx
+            .all_specs
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert!(!spec_ids.contains(&"pay-api"));
+
+        // But it SHOULD be in dependencies
+        assert_eq!(ctx.dependencies.len(), 1);
+        assert_eq!(ctx.dependencies[0].id, "pay-api");
+        assert_eq!(ctx.dependencies[0].title, "Payment API");
+        assert_eq!(ctx.dependencies[0].workspace, "payments");
+    }
+
+    #[test]
+    fn test_context_no_workspace_filter_returns_full_context() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let mut spec = crate::spec::Spec::new("s1".into(), "Spec 1".into(), "".into());
+        spec.workspace = Some("team-a".to_string());
+        repo.add_spec(&spec).unwrap();
+
+        // No workspace filter → all specs visible, no dependencies section
+        let filter = crate::context::ContextFilter::default();
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        assert!(ctx.workspace.is_none());
+        assert!(ctx.dependencies.is_empty());
+        assert!(ctx.all_specs.as_ref().unwrap().iter().any(|s| s.id == "s1"));
+    }
+
+    // ─── Workspace Convergence Tests (WS.19-WS.24) ──────────────────
+
+    #[test]
+    fn test_converge_workspaces_empty_list() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let report = repo
+            .converge_workspaces(&[], "three-way-merge", false)
+            .unwrap();
+        assert!(report.is_clean);
+        assert_eq!(report.total_auto_merged, 0);
+        assert!(report.merge_order.is_empty());
+    }
+
+    #[test]
+    fn test_converge_workspaces_nonexistent_workspace() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result =
+            repo.converge_workspaces(&["ghost-team".to_string()], "three-way-merge", false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("ghost-team"),
+            "error should name the workspace"
+        );
+    }
+
+    #[test]
+    fn test_converge_workspaces_rejects_main() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.converge_workspaces(&["main".to_string()], "three-way-merge", false);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("main"),
+            "error should mention cannot converge main into itself"
+        );
+    }
+
+    #[test]
+    fn test_converge_workspaces_non_overlapping_changes() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a file in main and seal it (establishes ancestor state).
+        fs::write(dir.path().join("shared.txt"), "original content").unwrap();
+        let spec = crate::spec::Spec::new("setup".into(), "Setup".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+        repo.seal(
+            test_agent(),
+            "initial setup".to_string(),
+            Some("setup".to_string()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Create a workspace (captures current HEAD as ancestor).
+        let ws_dir = dir.path().join("ws-auth");
+        repo.create_workspace("auth-team", Some(&ws_dir), None)
+            .unwrap();
+
+        // Make a change ONLY in the workspace (different file).
+        fs::write(ws_dir.join("auth.txt"), "auth module code").unwrap();
+        // Update workspace index manually.
+        let ws_state_dir = dir.path().join(".writ/workspaces/auth-team");
+        let mut ws_index = crate::index::Index::load(&ws_state_dir.join("index.json")).unwrap();
+        let auth_content = b"auth module code";
+        let auth_hash = repo.objects.store(auth_content).unwrap();
+        ws_index.upsert("auth.txt", auth_hash, auth_content.len() as u64);
+        ws_index.save(&ws_state_dir.join("index.json")).unwrap();
+
+        // Converge auth-team back into main.
+        let report = repo
+            .converge_workspaces(&["auth-team".to_string()], "three-way-merge", false)
+            .unwrap();
+
+        assert!(report.is_clean);
+        assert!(report.applied);
+        assert_eq!(report.total_auto_merged, 1);
+        assert!(report.files_changed.contains(&"auth.txt".to_string()));
+
+        // Verify file was written to main working directory.
+        let main_auth = fs::read_to_string(dir.path().join("auth.txt")).unwrap();
+        assert_eq!(main_auth, "auth module code");
+    }
+
+    #[test]
+    fn test_converge_workspaces_overlapping_clean_merge() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create base file and seal.
+        fs::write(dir.path().join("app.py"), "line1\nline2\nline3\n").unwrap();
+        let spec = crate::spec::Spec::new("setup".into(), "Setup".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+        repo.seal(
+            test_agent(),
+            "initial".to_string(),
+            Some("setup".to_string()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Create two workspaces.
+        let ws_a_dir = dir.path().join("ws-a");
+        let ws_b_dir = dir.path().join("ws-b");
+        repo.create_workspace("team-a", Some(&ws_a_dir), None)
+            .unwrap();
+        repo.create_workspace("team-b", Some(&ws_b_dir), None)
+            .unwrap();
+
+        // team-a modifies top of file.
+        let a_content = "line1-modified-by-a\nline2\nline3\n";
+        let a_state_dir = dir.path().join(".writ/workspaces/team-a");
+        let mut a_index = crate::index::Index::load(&a_state_dir.join("index.json")).unwrap();
+        let a_hash = repo.objects.store(a_content.as_bytes()).unwrap();
+        a_index.upsert("app.py", a_hash, a_content.len() as u64);
+        a_index.save(&a_state_dir.join("index.json")).unwrap();
+
+        // team-b modifies bottom of file.
+        let b_content = "line1\nline2\nline3-modified-by-b\n";
+        let b_state_dir = dir.path().join(".writ/workspaces/team-b");
+        let mut b_index = crate::index::Index::load(&b_state_dir.join("index.json")).unwrap();
+        let b_hash = repo.objects.store(b_content.as_bytes()).unwrap();
+        b_index.upsert("app.py", b_hash, b_content.len() as u64);
+        b_index.save(&b_state_dir.join("index.json")).unwrap();
+
+        // Converge both workspaces into main.
+        let report = repo
+            .converge_workspaces(
+                &["team-a".to_string(), "team-b".to_string()],
+                "three-way-merge",
+                false,
+            )
+            .unwrap();
+
+        assert!(
+            report.is_clean,
+            "non-overlapping edits should merge cleanly"
+        );
+        assert!(report.applied);
+        assert_eq!(report.merges.len(), 2);
+
+        // Verify merged content has both changes.
+        let merged = fs::read_to_string(dir.path().join("app.py")).unwrap();
+        assert!(merged.contains("line1-modified-by-a"));
+        assert!(merged.contains("line3-modified-by-b"));
+    }
+
+    #[test]
+    fn test_converge_workspaces_dry_run_no_apply() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "original").unwrap();
+        let spec = crate::spec::Spec::new("setup".into(), "Setup".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+        repo.seal(
+            test_agent(),
+            "initial".to_string(),
+            Some("setup".to_string()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ws_dir = dir.path().join("ws-test");
+        repo.create_workspace("test-ws", Some(&ws_dir), None)
+            .unwrap();
+
+        // Modify file in workspace.
+        let ws_state_dir = dir.path().join(".writ/workspaces/test-ws");
+        let mut ws_index = crate::index::Index::load(&ws_state_dir.join("index.json")).unwrap();
+        let new_content = b"modified in workspace";
+        let hash = repo.objects.store(new_content).unwrap();
+        ws_index.upsert("file.txt", hash, new_content.len() as u64);
+        ws_index.save(&ws_state_dir.join("index.json")).unwrap();
+
+        // Dry run — should not write files.
+        let report = repo
+            .converge_workspaces(&["test-ws".to_string()], "three-way-merge", true)
+            .unwrap();
+
+        assert!(report.is_clean);
+        assert!(!report.applied, "dry_run should not apply changes");
+
+        // File should still be original.
+        let content = fs::read_to_string(dir.path().join("file.txt")).unwrap();
+        assert_eq!(content, "original");
+    }
+
+    #[test]
+    fn test_converge_workspaces_no_changes_workspace() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let spec = crate::spec::Spec::new("setup".into(), "Setup".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+        repo.seal(
+            test_agent(),
+            "initial".to_string(),
+            Some("setup".to_string()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let ws_dir = dir.path().join("ws-empty");
+        repo.create_workspace("empty-ws", Some(&ws_dir), None)
+            .unwrap();
+
+        // Don't modify anything in the workspace — converge should be clean no-op.
+        let report = repo
+            .converge_workspaces(&["empty-ws".to_string()], "three-way-merge", false)
+            .unwrap();
+
+        assert!(report.is_clean);
+        assert_eq!(report.total_auto_merged, 0);
+        assert!(report.files_changed.is_empty());
+    }
+
+    #[test]
+    fn test_converge_workspaces_conflict_with_escalate() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("config.py"), "setting = 1\n").unwrap();
+        let spec = crate::spec::Spec::new("setup".into(), "Setup".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+        repo.seal(
+            test_agent(),
+            "initial".to_string(),
+            Some("setup".to_string()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Create two workspaces that modify the same line.
+        let ws_a_dir = dir.path().join("ws-alpha");
+        let ws_b_dir = dir.path().join("ws-beta");
+        repo.create_workspace("alpha", Some(&ws_a_dir), None)
+            .unwrap();
+        repo.create_workspace("beta", Some(&ws_b_dir), None)
+            .unwrap();
+
+        // alpha: setting = 100
+        let a_state = dir.path().join(".writ/workspaces/alpha");
+        let mut a_idx = crate::index::Index::load(&a_state.join("index.json")).unwrap();
+        let a_content = b"setting = 100\n";
+        let a_hash = repo.objects.store(a_content).unwrap();
+        a_idx.upsert("config.py", a_hash, a_content.len() as u64);
+        a_idx.save(&a_state.join("index.json")).unwrap();
+
+        // beta: setting = 200
+        let b_state = dir.path().join(".writ/workspaces/beta");
+        let mut b_idx = crate::index::Index::load(&b_state.join("index.json")).unwrap();
+        let b_content = b"setting = 200\n";
+        let b_hash = repo.objects.store(b_content).unwrap();
+        b_idx.upsert("config.py", b_hash, b_content.len() as u64);
+        b_idx.save(&b_state.join("index.json")).unwrap();
+
+        // Converge with escalate strategy — should report conflicts.
+        let report = repo
+            .converge_workspaces(
+                &["alpha".to_string(), "beta".to_string()],
+                "escalate",
+                false,
+            )
+            .unwrap();
+
+        // Alpha merges cleanly (only workspace changed vs ancestor).
+        // Beta conflicts with accumulated (alpha's version) — same line, different value.
+        assert!(!report.is_clean, "conflicting edits should not be clean");
+        assert!(!report.applied, "unclean merge should not apply");
+        assert!(!report.escalations.is_empty(), "should have escalations");
     }
 }

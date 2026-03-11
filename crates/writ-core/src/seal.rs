@@ -111,6 +111,16 @@ pub struct Seal {
     /// Ed25519 signature of the content_hash, hex-encoded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+
+    // -- Workspace field (Workspace Sprint WS.0) --
+    /// Which workspace this seal was created in. Defaults to "main" for
+    /// backward compatibility with pre-workspace seals.
+    #[serde(default = "default_workspace")]
+    pub workspace: String,
+}
+
+fn default_workspace() -> String {
+    "main".to_string()
 }
 
 impl Seal {
@@ -151,6 +161,7 @@ impl Seal {
             content_hash: None,
             chain_hash: None,
             signature: None,
+            workspace: default_workspace(),
         };
 
         // Compute the seal's ID from its content

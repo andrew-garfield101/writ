@@ -1,0 +1,5 @@
+# Ignore all test result JSON files
+*.json
+
+# Keep this directory in git
+!.gitkeep

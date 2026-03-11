@@ -137,6 +137,9 @@ pub struct Spec {
     /// When the spec was committed to git.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub committed_at: Option<DateTime<Utc>>,
+    /// Workspace this spec is assigned to. None = globally visible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 impl std::str::FromStr for SpecStatus {
@@ -194,6 +197,7 @@ impl Spec {
             completed_at: None,
             commit_hash: None,
             committed_at: None,
+            workspace: None,
         }
     }
 
@@ -439,6 +443,56 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&LifecycleState::Archived).unwrap(),
             "\"archived\""
+        );
+    }
+
+    // --- Workspace field tests (WS.12) ---
+
+    #[test]
+    fn test_new_spec_has_no_workspace() {
+        let spec = Spec::new("test".into(), "Test".into(), "desc".into());
+        assert!(spec.workspace.is_none());
+    }
+
+    #[test]
+    fn test_spec_workspace_serialization_roundtrip() {
+        let mut spec = Spec::new("ws-test".into(), "WS Test".into(), "desc".into());
+        spec.workspace = Some("auth-team".into());
+
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(json.contains("\"workspace\":\"auth-team\""));
+
+        let recovered: Spec = serde_json::from_str(&json).unwrap();
+        assert_eq!(recovered.workspace.as_deref(), Some("auth-team"));
+    }
+
+    #[test]
+    fn test_spec_workspace_none_not_serialized() {
+        let spec = Spec::new("test".into(), "Test".into(), "desc".into());
+        let json = serde_json::to_string(&spec).unwrap();
+        assert!(
+            !json.contains("workspace"),
+            "workspace=None should be skipped in serialization"
+        );
+    }
+
+    #[test]
+    fn test_legacy_spec_without_workspace_deserializes_to_none() {
+        let json = r#"{
+            "id": "legacy-spec",
+            "title": "Legacy",
+            "description": "from before workspace sprint",
+            "status": "in-progress",
+            "depends_on": [],
+            "file_scope": [],
+            "created_at": "2026-02-20T00:00:00Z",
+            "updated_at": "2026-02-20T00:00:00Z",
+            "sealed_by": []
+        }"#;
+        let spec: Spec = serde_json::from_str(json).unwrap();
+        assert!(
+            spec.workspace.is_none(),
+            "legacy spec should have workspace=None"
         );
     }
 }

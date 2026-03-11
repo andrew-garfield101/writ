@@ -180,6 +180,44 @@ pub struct DoctorParams {
     pub fix: Option<bool>,
 }
 
+/// Parameters for writ_workspace_create tool.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceCreateParams {
+    /// Workspace name (lowercase, alphanumeric, hyphens).
+    pub name: String,
+    /// Directory for the workspace (default: .writ/ws/<name>/).
+    pub path: Option<String>,
+    /// Assign matching specs (glob or comma-separated IDs).
+    pub specs: Option<String>,
+    /// Create from another workspace's state instead of main.
+    pub from: Option<String>,
+}
+
+/// Parameters for writ_workspace_list tool.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceListParams {
+    /// Output format: 'human' (default) or 'json'.
+    pub format: Option<String>,
+}
+
+/// Parameters for writ_workspace_status tool.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceStatusParams {
+    /// Workspace name (default: current workspace).
+    pub name: Option<String>,
+    /// Output format: 'human' (default) or 'json'.
+    pub format: Option<String>,
+}
+
+/// Parameters for writ_workspace_delete tool.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WorkspaceDeleteParams {
+    /// Name of the workspace to delete.
+    pub name: String,
+    /// Keep the parallel working directory files.
+    pub keep_files: Option<bool>,
+}
+
 // ─── Server ──────────────────────────────────────────────────────
 
 /// The writ MCP server. Exposes writ CLI operations as native MCP tools.
@@ -569,6 +607,86 @@ impl WritMcpServer {
         }
         self.run_writ_owned(&args)
     }
+
+    // ─── Workspaces ─────────────────────────────────────────────
+
+    /// Create a new isolated parallel workspace.
+    #[tool(
+        name = "writ_workspace_create",
+        description = "Create a new isolated parallel workspace with its own index, HEAD, and working directory. Shares object store and specs with other workspaces."
+    )]
+    async fn writ_workspace_create(
+        &self,
+        Parameters(params): Parameters<WorkspaceCreateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut args = vec!["workspace".to_string(), "create".to_string(), params.name];
+        if let Some(p) = params.path {
+            args.extend(["--path".to_string(), p]);
+        }
+        if let Some(s) = params.specs {
+            args.extend(["--specs".to_string(), s]);
+        }
+        if let Some(f) = params.from {
+            args.extend(["--from".to_string(), f]);
+        }
+        self.run_writ_owned(&args)
+    }
+
+    /// List all workspaces.
+    #[tool(
+        name = "writ_workspace_list",
+        description = "List all workspaces — names, paths, spec counts, and active status."
+    )]
+    async fn writ_workspace_list(
+        &self,
+        Parameters(params): Parameters<WorkspaceListParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut args = vec!["workspace".to_string(), "list".to_string()];
+        if let Some(f) = params.format {
+            args.extend(["--format".to_string(), f]);
+        }
+        self.run_writ_owned(&args)
+    }
+
+    /// Show workspace status and details.
+    #[tool(
+        name = "writ_workspace_status",
+        description = "Show workspace details — assigned specs, HEAD seal, working directory path."
+    )]
+    async fn writ_workspace_status(
+        &self,
+        Parameters(params): Parameters<WorkspaceStatusParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut args = vec!["workspace".to_string(), "status".to_string()];
+        if let Some(n) = params.name {
+            args.push(n);
+        }
+        if let Some(f) = params.format {
+            args.extend(["--format".to_string(), f]);
+        }
+        self.run_writ_owned(&args)
+    }
+
+    /// Delete a workspace.
+    #[tool(
+        name = "writ_workspace_delete",
+        description = "Delete a workspace and optionally its working directory. Cannot delete the main workspace."
+    )]
+    async fn writ_workspace_delete(
+        &self,
+        Parameters(params): Parameters<WorkspaceDeleteParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut args = vec![
+            "workspace".to_string(),
+            "delete".to_string(),
+            params.name,
+            "--force".to_string(),
+        ];
+        if params.keep_files.unwrap_or(false) {
+            args.push("--keep-files".to_string());
+        }
+        self.run_writ_owned(&args)
+    }
 }
 
 // ─── CLI Bridge ──────────────────────────────────────────────────
@@ -693,7 +811,7 @@ mod tests {
     fn test_tool_count() {
         let server = WritMcpServer::new("writ".to_string(), ".".to_string());
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 17, "Expected 17 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 21, "Expected 21 tools, got {}", tools.len());
     }
 
     #[test]
@@ -720,6 +838,10 @@ mod tests {
             "writ_status",
             "writ_summary",
             "writ_verify",
+            "writ_workspace_create",
+            "writ_workspace_list",
+            "writ_workspace_status",
+            "writ_workspace_delete",
         ];
 
         for name in &expected {
@@ -783,10 +905,7 @@ mod tests {
         let schema = &tool.input_schema;
         let required = schema.get("required").unwrap().as_array().unwrap();
         let names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(
-            names.contains(&"seal_id"),
-            "restore must require 'seal_id'"
-        );
+        assert!(names.contains(&"seal_id"), "restore must require 'seal_id'");
     }
 
     #[test]
@@ -916,10 +1035,7 @@ mod tests {
             .await
             .unwrap();
         let text = result_text(&result);
-        assert_eq!(
-            text,
-            "seal -s did stuff --spec feat-1 --agent claude-code"
-        );
+        assert_eq!(text, "seal -s did stuff --spec feat-1 --agent claude-code");
     }
 
     #[tokio::test]
@@ -1106,10 +1222,7 @@ mod tests {
             .await
             .unwrap();
         let text = result_text(&result);
-        assert_eq!(
-            text,
-            "log --spec feat-1 --agent dev-1 --all --limit 5"
-        );
+        assert_eq!(text, "log --spec feat-1 --agent dev-1 --all --limit 5");
     }
 
     #[tokio::test]
@@ -1382,12 +1495,171 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let server = echo_server(dir.path());
         let result = server
-            .writ_doctor(Parameters(DoctorParams {
-                fix: Some(true),
-            }))
+            .writ_doctor(Parameters(DoctorParams { fix: Some(true) }))
             .await
             .unwrap();
         let text = result_text(&result);
         assert_eq!(text, "doctor --fix");
+    }
+
+    // ─── Arg building: Workspaces ──────────────────────────────
+
+    #[tokio::test]
+    async fn test_workspace_create_minimal() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_workspace_create(Parameters(WorkspaceCreateParams {
+                name: "auth-team".to_string(),
+                path: None,
+                specs: None,
+                from: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_eq!(text, "workspace create auth-team");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_create_with_all_params() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_workspace_create(Parameters(WorkspaceCreateParams {
+                name: "payments".to_string(),
+                path: Some("/tmp/ws-payments".to_string()),
+                specs: Some("pay-*,billing".to_string()),
+                from: Some("auth-team".to_string()),
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_eq!(
+            text,
+            "workspace create payments --path /tmp/ws-payments --specs pay-*,billing --from auth-team"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_workspace_list_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_workspace_list(Parameters(WorkspaceListParams { format: None }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_eq!(text, "workspace list");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_list_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_workspace_list(Parameters(WorkspaceListParams {
+                format: Some("json".to_string()),
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_eq!(text, "workspace list --format json");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_status_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_workspace_status(Parameters(WorkspaceStatusParams {
+                name: None,
+                format: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_eq!(text, "workspace status");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_status_with_name_and_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_workspace_status(Parameters(WorkspaceStatusParams {
+                name: Some("auth-team".to_string()),
+                format: Some("json".to_string()),
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_eq!(text, "workspace status auth-team --format json");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_delete_minimal() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_workspace_delete(Parameters(WorkspaceDeleteParams {
+                name: "old-ws".to_string(),
+                keep_files: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_eq!(text, "workspace delete old-ws --force");
+    }
+
+    #[tokio::test]
+    async fn test_workspace_delete_keep_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_workspace_delete(Parameters(WorkspaceDeleteParams {
+                name: "old-ws".to_string(),
+                keep_files: Some(true),
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_eq!(text, "workspace delete old-ws --force --keep-files");
+    }
+
+    // ─── Schema validation: Workspaces ─────────────────────────
+
+    #[test]
+    fn test_workspace_create_requires_name_in_schema() {
+        let server = WritMcpServer::new("writ".to_string(), ".".to_string());
+        let tools = server.tool_router.list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "writ_workspace_create")
+            .unwrap();
+        let schema = &tool.input_schema;
+        let required = schema.get("required").unwrap().as_array().unwrap();
+        let names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            names.contains(&"name"),
+            "workspace_create must require 'name'"
+        );
+    }
+
+    #[test]
+    fn test_workspace_delete_requires_name_in_schema() {
+        let server = WritMcpServer::new("writ".to_string(), ".".to_string());
+        let tools = server.tool_router.list_all();
+        let tool = tools
+            .iter()
+            .find(|t| t.name == "writ_workspace_delete")
+            .unwrap();
+        let schema = &tool.input_schema;
+        let required = schema.get("required").unwrap().as_array().unwrap();
+        let names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(
+            names.contains(&"name"),
+            "workspace_delete must require 'name'"
+        );
     }
 }

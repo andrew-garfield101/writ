@@ -29,6 +29,10 @@ pub struct ContextFilter {
     pub status: Option<TaskStatus>,
     /// Only include seals by this agent ID.
     pub agent: Option<String>,
+    /// Scope context to this workspace. When set, only specs assigned to this
+    /// workspace (or globally visible) and seals created in this workspace are
+    /// included. Cross-workspace dependencies shown as read-only summaries.
+    pub workspace: Option<String>,
 }
 
 /// Token-efficient verification summary for context output.
@@ -339,6 +343,10 @@ pub struct ContextOutput {
     /// Writ version marker for LLM parsing.
     pub writ_version: String,
 
+    /// Active workspace name. Always present (defaults to "main").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+
     /// The active spec, if scoped or if there's exactly one in-progress spec.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub active_spec: Option<Spec>,
@@ -435,8 +443,29 @@ pub struct ContextOutput {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub stale_specs: Vec<String>,
 
+    /// Cross-workspace dependency specs. When context is workspace-scoped,
+    /// this shows specs from other workspaces that our specs depend on.
+    /// Read-only summary: agents can see dependency status but not modify them.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub dependencies: Vec<DependencyContext>,
+
     /// Available writ operations for agent discoverability.
     pub available_operations: Vec<String>,
+}
+
+/// Read-only summary of a spec from another workspace that our specs depend on.
+/// Included in workspace-scoped context so agents can see dependency status
+/// without needing full cross-workspace visibility.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DependencyContext {
+    /// Spec ID of the dependency.
+    pub id: String,
+    /// Spec title.
+    pub title: String,
+    /// Current status.
+    pub status: String,
+    /// Which workspace this spec is assigned to (or "global" if unassigned).
+    pub workspace: String,
 }
 
 /// Top-level integration risk assessment computed from context signals.

@@ -37,6 +37,7 @@ pub mod slash_commands;
 pub mod spec;
 pub mod state;
 pub mod status;
+pub mod workspace;
 
 pub use error::{WritError, WritResult};
 pub use repo::Repository;

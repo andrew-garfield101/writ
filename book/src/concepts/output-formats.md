@@ -34,9 +34,9 @@ The same data in TOON:
 
 ```
 files[20]{path,hash,modified,agent,spec}:
-  src/main.rs,a3f2b1c...,2026-03-04T10:00:00Z,cc,S-041
-  src/lib.rs,b4e3c2d...,2026-03-04T09:45:00Z,amis,S-039
-  src/convergence.rs,c5f4d3e...,2026-03-04T09:30:00Z,cc,S-041
+  src/main.rs,a3f2b1c...,2026-03-04T10:00:00Z,agent-1,S-041
+  src/lib.rs,b4e3c2d...,2026-03-04T09:45:00Z,agent-2,S-039
+  src/convergence.rs,c5f4d3e...,2026-03-04T09:30:00Z,agent-1,S-041
 ```
 
 Field names declared once in the header. Row count declared explicitly. No braces, no repeated keys, no quotes unless a value contains a delimiter. The LLM receives identical information in significantly fewer tokens.
@@ -250,17 +250,17 @@ section_name[row_count]{field1,field2,field3}:
 # writ context | project: my-app | format: toon | timestamp: 2026-03-04T12:00:00Z
 
 files[3]{path,hash,modified,agent,spec}:
-  src/main.rs,a3f2b1c,2026-03-04T10:00:00Z,cc,S-041
-  src/lib.rs,b4e3c2d,2026-03-04T09:45:00Z,amis,S-039
-  src/convergence.rs,c5f4d3e,2026-03-04T09:30:00Z,cc,S-041
+  src/main.rs,a3f2b1c,2026-03-04T10:00:00Z,agent-1,S-041
+  src/lib.rs,b4e3c2d,2026-03-04T09:45:00Z,agent-2,S-039
+  src/convergence.rs,c5f4d3e,2026-03-04T09:30:00Z,agent-1,S-041
 
 seals[2]{id,summary,agent,timestamp,spec}:
-  seal-0041,Implement phase 3 pattern matching,cc,2026-03-04T10:00:00Z,S-041
-  seal-0039,Language analyzer improvements,amis,2026-03-04T09:45:00Z,S-039
+  seal-0041,Implement phase 3 pattern matching,agent-1,2026-03-04T10:00:00Z,S-041
+  seal-0039,Language analyzer improvements,agent-2,2026-03-04T09:45:00Z,S-039
 
 specs[2]{id,description,status,agent}:
-  S-041,Convergence phase 3,active,cc
-  S-039,Language analyzers,complete,amis
+  S-041,Convergence phase 3,active,agent-1
+  S-039,Language analyzers,complete,agent-2
 ```
 
 The single line comment header at the top costs a few tokens but gives the LLM metadata about what it's reading — project name, format, timestamp. Negligible cost, meaningful orientation.

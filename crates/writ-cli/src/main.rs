@@ -2,7 +2,7 @@
 
 mod init;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -454,6 +454,25 @@ enum Commands {
         auto_resolve: bool,
     },
 
+    /// Converge work from parallel workspaces back into the main workspace.
+    ConvergeWorkspaces {
+        /// Workspace names to merge into main.
+        workspaces: Vec<String>,
+
+        /// Output format: "json" (default) or "human".
+        #[arg(long)]
+        format: Option<String>,
+
+        /// Merge strategy for irreconcilable conflicts: "three-way-merge" (default),
+        /// "most-recent", or "escalate".
+        #[arg(long, default_value = "three-way-merge")]
+        strategy: String,
+
+        /// Dry run: show what would be merged without applying.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Manage specs (requirements).
     Spec {
         #[command(subcommand)]
@@ -568,6 +587,12 @@ enum Commands {
         /// Write to Claude Desktop config instead of project .mcp.json.
         #[arg(long)]
         desktop: bool,
+    },
+
+    /// Manage isolated parallel workspaces.
+    Workspace {
+        #[command(subcommand)]
+        action: WorkspaceCommands,
     },
 
     /// Check repository health and schema version.
@@ -788,6 +813,22 @@ enum SpecCommands {
         /// Spec ID to reopen.
         id: String,
     },
+
+    /// Assign a spec to a workspace. Scopes the spec to that workspace's context.
+    Assign {
+        /// Spec ID to assign.
+        id: String,
+
+        /// Workspace name to assign the spec to.
+        #[arg(long)]
+        workspace: String,
+    },
+
+    /// Unassign a spec from its workspace, making it globally visible.
+    Unassign {
+        /// Spec ID to unassign.
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -827,6 +868,56 @@ enum BridgeCommands {
         /// Output format: "human" (default) or "json".
         #[arg(long, default_value = "human")]
         format: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum WorkspaceCommands {
+    /// Create a new isolated parallel workspace.
+    Create {
+        /// Workspace name (lowercase, alphanumeric, hyphens).
+        name: String,
+
+        /// Directory for the workspace (default: .writ/ws/<name>/).
+        #[arg(long)]
+        path: Option<PathBuf>,
+
+        /// Assign matching specs (glob or comma-separated IDs).
+        #[arg(long)]
+        specs: Option<String>,
+
+        /// Create from another workspace's state instead of main.
+        #[arg(long)]
+        from: Option<String>,
+    },
+
+    /// List all workspaces.
+    List {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Show workspace status and details.
+    Status {
+        /// Workspace name (default: current workspace).
+        name: Option<String>,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Delete a workspace. Cannot delete "main".
+    Delete {
+        /// Name of the workspace to delete.
+        name: String,
+        /// Keep the parallel working directory files.
+        #[arg(long)]
+        keep_files: bool,
+        /// Skip confirmation prompt.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -1205,6 +1296,15 @@ fn main() {
             let strategy = resolve_strategy(strategy.as_deref(), &cwd);
             cmd_converge_all(&cwd, &format, apply, dry_run, &strategy, auto_resolve)
         }
+        Commands::ConvergeWorkspaces {
+            workspaces,
+            format,
+            strategy,
+            dry_run,
+        } => {
+            let format = resolve_format(format.as_deref(), &cwd, "json");
+            cmd_converge_workspaces(&cwd, &workspaces, &format, &strategy, dry_run)
+        }
         Commands::Spec { action } => match action {
             SpecCommands::Add {
                 id,
@@ -1252,6 +1352,8 @@ fn main() {
                 &format,
             ),
             SpecCommands::Reopen { id } => cmd_spec_reopen(&cwd, &id),
+            SpecCommands::Assign { id, workspace } => cmd_spec_assign(&cwd, &id, &workspace),
+            SpecCommands::Unassign { id } => cmd_spec_unassign(&cwd, &id),
         },
         Commands::Bridge { action } => match action {
             BridgeCommands::Import {
@@ -1347,6 +1449,29 @@ fn main() {
             ConfigCommands::List { format } => cmd_config_list(&cwd, &format),
             ConfigCommands::Unset { key, format } => cmd_config_unset(&cwd, &key, &format),
         },
+        Commands::Workspace { action } => match action {
+            WorkspaceCommands::Create {
+                name,
+                path,
+                specs,
+                from,
+            } => cmd_workspace_create(
+                &cwd,
+                &name,
+                path.as_deref(),
+                specs.as_deref(),
+                from.as_deref(),
+            ),
+            WorkspaceCommands::List { format } => cmd_workspace_list(&cwd, &format),
+            WorkspaceCommands::Status { name, format } => {
+                cmd_workspace_status(&cwd, name.as_deref(), &format)
+            }
+            WorkspaceCommands::Delete {
+                name,
+                keep_files,
+                force,
+            } => cmd_workspace_delete(&cwd, &name, keep_files, force),
+        },
         Commands::McpServe => cmd_mcp_serve(&cwd),
         Commands::McpInstall { desktop } => cmd_mcp_install(&cwd, desktop),
         Commands::Doctor { json, fix } => cmd_doctor(&cwd, json, fix),
@@ -1388,7 +1513,7 @@ fn resolve_format(explicit: Option<&str>, cwd: &PathBuf, fallback: &str) -> Stri
     }
 
     // Load project config (from .writ/config.toml or migrated settings.json)
-    let project = Repository::open(cwd)
+    let project = Repository::open_from_dir(cwd)
         .ok()
         .and_then(|r| ProjectConfig::load(r.writ_dir()).ok())
         .unwrap_or_default();
@@ -1401,7 +1526,7 @@ fn resolve_format(explicit: Option<&str>, cwd: &PathBuf, fallback: &str) -> Stri
 
 /// Resolve the project name from config, falling back to directory name.
 fn resolve_project_name(cwd: &PathBuf) -> Option<String> {
-    Repository::open(cwd)
+    Repository::open_from_dir(cwd)
         .ok()
         .and_then(|r| {
             ProjectConfig::load(r.writ_dir())
@@ -1431,7 +1556,7 @@ fn resolve_agent(explicit: Option<&str>, cwd: &PathBuf) -> String {
     if let Some(a) = explicit {
         return a.to_string();
     }
-    if let Some(configured) = Repository::open(cwd)
+    if let Some(configured) = Repository::open_from_dir(cwd)
         .ok()
         .and_then(|r| r.settings().default_agent.clone())
     {
@@ -1506,7 +1631,7 @@ fn resolve_strategy(explicit: Option<&str>, cwd: &PathBuf) -> String {
     if let Some(s) = explicit {
         return s.to_string();
     }
-    Repository::open(cwd)
+    Repository::open_from_dir(cwd)
         .ok()
         .and_then(|r| r.settings().convergence.strategy.clone())
         .unwrap_or_else(|| "escalate".to_string())
@@ -1610,6 +1735,26 @@ fn cmd_init(
     spec_description: Option<String>,
     opts: init::InitOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Init guard: detect if we're inside a parallel workspace directory.
+    let pointer_path = cwd.join(".writ-workspace");
+    if pointer_path.exists() {
+        if let Ok(pointer) = writ_core::workspace::parse_workspace_pointer(&pointer_path) {
+            eprintln!(
+                "error: This directory is a writ workspace (parent: {}).",
+                pointer.parent
+            );
+            eprintln!("  Writ commands work here automatically — no init needed.");
+            eprintln!(
+                "  To reinitialize the parent project: cd {} && writ init",
+                std::path::Path::new(&pointer.parent)
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| pointer.parent.clone())
+            );
+            std::process::exit(1);
+        }
+    }
+
     // Phase 1+2: Interactive flow collects user preferences via prompts.
     let plan = init::plan_init(&opts)?;
 
@@ -1761,7 +1906,7 @@ fn cmd_init(
 
     // Create a spec if --spec was provided.
     if let Some(ref id) = spec_id {
-        let repo = Repository::open(cwd)?;
+        let repo = Repository::open_from_dir(cwd)?;
         let title = spec_title.as_deref().unwrap_or(id);
         let desc = spec_description.as_deref().unwrap_or("");
         repo.add_spec(&Spec::new(id.clone(), title.to_string(), desc.to_string()))?;
@@ -1796,7 +1941,7 @@ fn cmd_uninit(
 
     if !force {
         // Preview what will be removed.
-        let repo = Repository::open(cwd).ok();
+        let repo = Repository::open_from_dir(cwd).ok();
         let seal_count = repo
             .as_ref()
             .and_then(|r| r.log().ok())
@@ -1873,7 +2018,7 @@ fn cmd_uninit(
 }
 
 fn cmd_state(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let state = repo.state()?;
 
     match format {
@@ -1959,7 +2104,7 @@ fn cmd_seal(
         eprintln!("  Seal saved, but your work may conflict with other agents.");
     }
 
-    let mut repo = Repository::open(cwd)?;
+    let mut repo = Repository::open_from_dir(cwd)?;
     repo.set_enforce_scope(enforce_scope);
 
     let agent = AgentIdentity {
@@ -2124,7 +2269,7 @@ fn cmd_log(
     spec: Option<String>,
     all: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let mut seals = match (&spec, all) {
         (Some(spec_id), _) => repo.spec_log(spec_id)?,
         (None, true) => repo.log_all()?,
@@ -2246,7 +2391,7 @@ fn cmd_diff(
     name_only: bool,
     cached: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     let mut diff_output = match (&from, &to) {
         (Some(f), Some(t)) => repo.diff_seals(f, t)?,
@@ -2466,7 +2611,7 @@ fn cmd_context(
     agent: Option<String>,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     let scope = if let Some(id) = spec {
         ContextScope::Spec(id)
@@ -2489,9 +2634,17 @@ fn cmd_context(
         None => None,
     };
 
+    // Auto-set workspace filter when repo is in a non-main workspace
+    let ws = if repo.active_workspace() != "main" {
+        Some(repo.active_workspace().to_string())
+    } else {
+        None
+    };
+
     let filter = ContextFilter {
         status: filter_status,
         agent,
+        workspace: ws,
     };
 
     let ctx = repo.context(scope, seal_limit, &filter)?;
@@ -2685,7 +2838,7 @@ fn cmd_context(
 }
 
 fn cmd_summary(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let summary = repo.summary()?;
 
     match format {
@@ -2841,7 +2994,7 @@ fn cmd_status(
         );
     }
 
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let status = repo.status()?;
 
     // Machine-readable output (W.3).
@@ -3043,6 +3196,71 @@ fn cmd_status(
         }
     }
 
+    // Workspace overview (WS.18): show when multiple workspaces exist.
+    let workspaces = repo.list_workspaces()?;
+    if workspaces.len() > 1 {
+        println!();
+        println!(
+            "{}",
+            "── Workspaces ──────────────────────────────────────".dimmed()
+        );
+        let all_specs = repo.list_specs()?;
+        for ws in &workspaces {
+            let path_str = if ws.is_main {
+                ".".to_string()
+            } else {
+                ws.path.display().to_string()
+            };
+
+            // Count specs by status for this workspace.
+            let ws_specs: Vec<_> = all_specs
+                .iter()
+                .filter(|s| {
+                    if ws.is_main {
+                        s.workspace.is_none() || s.workspace.as_deref() == Some("main")
+                    } else {
+                        s.workspace.as_deref() == Some(&ws.name)
+                    }
+                })
+                .collect();
+            let ws_complete = ws_specs
+                .iter()
+                .filter(|s| s.status == writ_core::spec::SpecStatus::Complete)
+                .count();
+            let ws_in_progress = ws_specs
+                .iter()
+                .filter(|s| s.status == writ_core::spec::SpecStatus::InProgress)
+                .count();
+
+            let suffix = if ws.is_main {
+                "  base workspace".to_string()
+            } else if ws_complete == ws_specs.len() && !ws_specs.is_empty() {
+                format!("  {} complete ← ready to converge", ws_complete)
+            } else {
+                let mut parts = Vec::new();
+                if ws_complete > 0 {
+                    parts.push(format!("{} complete", ws_complete));
+                }
+                if ws_in_progress > 0 {
+                    parts.push(format!("{} in-progress", ws_in_progress));
+                }
+                if parts.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", parts.join(", "))
+                }
+            };
+
+            println!(
+                "  {:<20} {:<25} {} specs{}",
+                ws.name,
+                path_str,
+                ws_specs.len(),
+                suffix
+            );
+        }
+    }
+
     // Empty state.
     if completed.is_empty() && in_progress.is_empty() {
         println!();
@@ -3086,7 +3304,7 @@ fn cmd_status_watch(
             )?;
 
             // Render status.
-            let repo = Repository::open(cwd)?;
+            let repo = Repository::open_from_dir(cwd)?;
             let status = repo.status()?;
 
             let now = chrono::Local::now();
@@ -3286,7 +3504,7 @@ fn cmd_finish(
     use colored::Colorize;
     use writ_core::git_ops::{Git2Ops, GitOps};
 
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     // Gather completed specs for display
     let specs = repo.list_specs()?;
@@ -3712,7 +3930,7 @@ fn cmd_finish_propose(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let specs = repo.list_specs()?;
     let committable: Vec<_> = specs.iter().filter(|s| s.is_committable()).collect();
 
@@ -3763,7 +3981,7 @@ fn cmd_finish_propose(
 fn cmd_finish_proposals(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let proposals = repo.list_proposals()?;
     let pending: Vec<_> = proposals.iter().filter(|p| p.is_pending()).collect();
 
@@ -3810,7 +4028,7 @@ fn cmd_finish_accept(
     use colored::Colorize;
     use writ_core::git_ops::{Git2Ops, GitOps};
 
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let proposal = repo.accept_proposal(proposal_id)?;
 
     // Execute the commit
@@ -3860,7 +4078,7 @@ fn cmd_finish_accept(
 fn cmd_finish_reject(cwd: &PathBuf, proposal_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let proposal = repo.reject_proposal(proposal_id)?;
 
     println!();
@@ -3880,7 +4098,7 @@ fn cmd_finish_auto(cwd: &PathBuf, strategy: &str) -> Result<(), Box<dyn std::err
     use writ_core::config::ProjectConfig;
     use writ_core::git_ops::{Git2Ops, GitOps};
 
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     // Load auto config
     let project_config = ProjectConfig::load(repo.writ_dir()).unwrap_or_default();
@@ -4023,7 +4241,7 @@ fn cmd_restore(
     force: bool,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     if !force {
         let short = &seal_id[..std::cmp::min(12, seal_id.len())];
@@ -4076,7 +4294,7 @@ fn cmd_show(
     show_diff: bool,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let seal = repo.get_seal(seal_id)?;
 
     match format {
@@ -4238,7 +4456,7 @@ fn cmd_spec_update(
     tech_stack: Option<Vec<String>>,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     let parsed_status = match status {
         Some(s) => Some(s.parse::<writ_core::spec::SpecStatus>().map_err(|e| e)?),
@@ -4293,7 +4511,7 @@ fn cmd_spec_add(
     design_notes: Option<Vec<String>>,
     tech_stack: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let mut spec = Spec::new(id.to_string(), title.to_string(), description.to_string());
     if let Some(ac) = acceptance_criteria {
         spec.acceptance_criteria = ac;
@@ -4326,7 +4544,7 @@ fn cmd_spec_status(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use writ_core::spec::LifecycleState;
 
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let mut specs = repo.list_specs()?;
 
     // Filter by lifecycle state if requested.
@@ -4389,7 +4607,7 @@ fn cmd_spec_done(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     // Auto-detect spec ID if not provided
     let spec_id = match id {
@@ -4484,21 +4702,21 @@ fn cmd_spec_done(
 }
 
 fn cmd_spec_cancel(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     repo.cancel_spec(id)?;
     println!("spec '{}' cancelled", id);
     Ok(())
 }
 
 fn cmd_spec_complete(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     repo.complete_spec(id)?;
     println!("spec '{}' lifecycle completed", id);
     Ok(())
 }
 
 fn cmd_spec_reopen(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     // Load spec for display info before reopening.
     let spec = repo.load_spec(id)?;
@@ -4519,6 +4737,51 @@ fn cmd_spec_reopen(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+fn cmd_spec_assign(
+    cwd: &PathBuf,
+    id: &str,
+    workspace: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open_from_dir(cwd)?;
+    let spec = repo.load_spec(id)?;
+    let old_ws = spec.workspace.as_deref().unwrap_or("(global)");
+
+    repo.assign_spec_to_workspace(id, workspace)?;
+
+    println!(
+        "Spec {} \"{}\" assigned to workspace '{}'.",
+        id, spec.title, workspace
+    );
+    if old_ws != "(global)" && old_ws != workspace {
+        println!("  (was: '{}')", old_ws);
+    }
+
+    Ok(())
+}
+
+fn cmd_spec_unassign(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open_from_dir(cwd)?;
+    let spec = repo.load_spec(id)?;
+
+    if spec.workspace.is_none() {
+        println!(
+            "Spec {} \"{}\" is already globally visible.",
+            id, spec.title
+        );
+        return Ok(());
+    }
+
+    let old_ws = spec.workspace.as_deref().unwrap_or("unknown");
+    repo.unassign_spec_from_workspace(id)?;
+
+    println!(
+        "Spec {} \"{}\" unassigned from workspace '{}'. Now globally visible.",
+        id, spec.title, old_ws
+    );
+
+    Ok(())
+}
+
 fn cmd_converge(
     cwd: &PathBuf,
     left_spec: &str,
@@ -4526,7 +4789,7 @@ fn cmd_converge(
     format: &str,
     apply: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let report = repo.converge(left_spec, right_spec)?;
 
     match format {
@@ -4703,7 +4966,7 @@ fn cmd_converge_all(
         }
     };
 
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     // Capture pre-convergence risk for delta reporting.
     let pre_risk = {
@@ -5119,6 +5382,134 @@ fn cmd_converge_all(
 }
 
 // -------------------------------------------------------------------
+// Converge Workspaces command
+// -------------------------------------------------------------------
+
+fn cmd_converge_workspaces(
+    cwd: &PathBuf,
+    workspaces: &[String],
+    format: &str,
+    strategy: &str,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open_from_dir(cwd)?;
+
+    if workspaces.is_empty() {
+        // If no workspaces specified, auto-detect all non-main workspaces.
+        let all_ws = repo.list_workspaces()?;
+        let non_main: Vec<String> = all_ws
+            .iter()
+            .filter(|ws| !ws.is_main)
+            .map(|ws| ws.name.clone())
+            .collect();
+
+        if non_main.is_empty() {
+            if format == "json" {
+                println!(
+                    "{{\"status\":\"no_workspaces\",\"message\":\"No non-main workspaces found\"}}"
+                );
+            } else {
+                println!("No non-main workspaces found to converge.");
+            }
+            return Ok(());
+        }
+
+        let report = repo.converge_workspaces(&non_main, strategy, dry_run)?;
+        print_converge_workspaces_report(&report, format, dry_run);
+        return Ok(());
+    }
+
+    let report = repo.converge_workspaces(workspaces, strategy, dry_run)?;
+    print_converge_workspaces_report(&report, format, dry_run);
+    Ok(())
+}
+
+fn print_converge_workspaces_report(
+    report: &writ_core::convergence::ConvergeAllReport,
+    format: &str,
+    dry_run: bool,
+) {
+    if format == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(report).unwrap_or_default()
+        );
+        return;
+    }
+
+    // Human-readable output.
+    use colored::Colorize;
+
+    let prefix = if dry_run { "[dry-run] " } else { "" };
+
+    println!(
+        "{}workspace convergence: {} workspace(s) into main",
+        prefix,
+        report.merge_order.len()
+    );
+    println!(
+        "  strategy: {}, clean: {}, applied: {}",
+        report.strategy.cyan(),
+        if report.is_clean {
+            "yes".green().to_string()
+        } else {
+            "no".red().to_string()
+        },
+        report.applied
+    );
+
+    if !report.merges.is_empty() {
+        println!("\n  merge steps:");
+        for step in &report.merges {
+            let status = if step.clean {
+                "clean".green().to_string()
+            } else {
+                "conflicts".red().to_string()
+            };
+            println!(
+                "    {} <- {}: {} auto-merged, {} conflicts [{}]",
+                step.left_spec, step.right_spec, step.auto_merged, step.conflicts, status
+            );
+            if let Some(ref err) = step.error {
+                println!("      error: {}", err.red());
+            }
+        }
+    }
+
+    if !report.files_changed.is_empty() {
+        println!("\n  files changed: {}", report.files_changed.len());
+        for f in &report.files_changed {
+            println!("    {}", f);
+        }
+    }
+
+    if !report.warnings.is_empty() {
+        println!("\n  warnings:");
+        for w in &report.warnings {
+            println!("    {}", w.yellow());
+        }
+    }
+
+    if !report.escalations.is_empty() {
+        println!("\n  escalations: {}", report.escalations.len());
+        for esc in &report.escalations {
+            println!("    {}: {}", esc.file_path, esc.reason);
+        }
+    }
+
+    if report.applied {
+        println!(
+            "\n  {}",
+            "Changes applied to main workspace. Seal the result with:".green()
+        );
+        println!(
+            "    writ seal -s \"converged {} workspace(s)\" --agent convergence-bot",
+            report.merge_order.len()
+        );
+    }
+}
+
+// -------------------------------------------------------------------
 // Resolve command
 // -------------------------------------------------------------------
 
@@ -5321,7 +5712,7 @@ fn resolve_single(
 }
 
 fn cmd_spec_show(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let spec = repo.load_spec(id)?;
 
     println!("spec: {}", spec.id);
@@ -5353,7 +5744,7 @@ fn cmd_bridge_import(
     agent_id: &str,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     let agent = AgentIdentity {
         id: agent_id.to_string(),
@@ -5384,7 +5775,7 @@ fn cmd_bridge_export(
     pr_body: bool,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     let result = repo.bridge_export(Some(branch))?;
 
@@ -5430,7 +5821,7 @@ fn cmd_bridge_export(
 }
 
 fn cmd_bridge_status(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     let status = repo.bridge_status()?;
 
@@ -5465,7 +5856,7 @@ fn cmd_bridge_status(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::err
 }
 
 fn cmd_push(cwd: &PathBuf, remote: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let result = repo.push(remote)?;
 
     match format {
@@ -5495,7 +5886,7 @@ fn cmd_push(cwd: &PathBuf, remote: &str, format: &str) -> Result<(), Box<dyn std
 }
 
 fn cmd_pull(cwd: &PathBuf, remote: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let result = repo.pull(remote)?;
 
     match format {
@@ -5540,21 +5931,21 @@ fn cmd_remote_init(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_remote_add(cwd: &PathBuf, name: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     repo.remote_add(name, path)?;
     println!("remote '{name}' added → {path}");
     Ok(())
 }
 
 fn cmd_remote_remove(cwd: &PathBuf, name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     repo.remote_remove(name)?;
     println!("remote '{name}' removed");
     Ok(())
 }
 
 fn cmd_remote_list(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let remotes = repo.remote_list()?;
 
     if remotes.is_empty() {
@@ -5573,7 +5964,7 @@ fn cmd_remote_status(
     remote: &str,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let status = repo.remote_status(remote)?;
 
     match format {
@@ -5611,7 +6002,7 @@ fn cmd_verify(
     seal_id: Option<&str>,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     if let Some(id) = seal_id {
         return cmd_verify_seal(&repo, id, format);
@@ -5907,7 +6298,7 @@ fn cmd_agent_register(
     registered_by: &str,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     let trust = TrustLevel::from_str_loose(trust_level).ok_or_else(|| {
         format!(
@@ -5939,7 +6330,7 @@ fn cmd_agent_register(
 }
 
 fn cmd_agent_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let agents = repo.list_agents()?;
 
     if agents.is_empty() {
@@ -5985,7 +6376,7 @@ fn cmd_agent_show(
     name: &str,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let agent = repo.load_agent(name)?;
 
     match format {
@@ -6026,7 +6417,7 @@ fn cmd_agent_revoke(
     reason: &str,
     compromise_timestamp: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     let ts = match compromise_timestamp {
         Some(s) => {
@@ -6059,14 +6450,14 @@ fn cmd_agent_revoke(
 }
 
 fn cmd_agent_suspend(cwd: &PathBuf, name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     repo.suspend_agent(name)?;
     println!("agent '{name}' suspended");
     Ok(())
 }
 
 fn cmd_agent_reactivate(cwd: &PathBuf, name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     repo.reactivate_agent(name)?;
     println!("agent '{name}' reactivated");
     Ok(())
@@ -6080,7 +6471,7 @@ fn cmd_agent_scope(
     list: bool,
     set: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
 
     if let Some(patterns) = set {
         let updated = repo.update_agent(
@@ -6266,7 +6657,7 @@ fn cmd_gc_run(
     }
 
     let config = writ_core::gc::GcConfig::load(&writ_dir)?;
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let specs = repo.list_specs()?;
     let logger = writ_core::security::SecurityEventLogger::new(&writ_dir);
     let events = logger.read_events(None)?;
@@ -6505,7 +6896,7 @@ fn cmd_gc_status(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::
     }
 
     let config = writ_core::gc::GcConfig::load(&writ_dir)?;
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let specs = repo.list_specs()?;
     let storage = writ_core::gc::StorageReport::scan(&writ_dir, config.budget_bytes)?;
 
@@ -6605,7 +6996,7 @@ fn cmd_gc_status(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::
 }
 
 fn cmd_gc_storage(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let storage = repo.storage_report()?;
 
     match format {
@@ -7072,11 +7463,211 @@ fn write_mcp_desktop_config(path: &PathBuf) -> Result<(), Box<dyn std::error::Er
 }
 
 // ---------------------------------------------------------------------------
+// Workspace
+// ---------------------------------------------------------------------------
+
+fn cmd_workspace_create(
+    cwd: &PathBuf,
+    name: &str,
+    path: Option<&Path>,
+    specs: Option<&str>,
+    from: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open_from_dir(cwd)?;
+    let info = repo.create_workspace(name, path, from)?;
+
+    println!(
+        "{} Created workspace '{}' at {}",
+        "✓".green(),
+        info.name,
+        info.path.display()
+    );
+
+    // Assign specs if --specs was provided.
+    if let Some(spec_pattern) = specs {
+        let all_specs = repo.list_specs()?;
+        let mut assigned = 0;
+
+        if spec_pattern.contains('*') {
+            // Glob matching.
+            let pattern = spec_pattern.replace('*', "");
+            for spec in &all_specs {
+                if spec_pattern.starts_with('*') && spec.id.ends_with(&pattern)
+                    || spec_pattern.ends_with('*') && spec.id.starts_with(&pattern)
+                    || spec.id.contains(&pattern)
+                {
+                    repo.assign_spec_to_workspace(&spec.id, name)?;
+                    assigned += 1;
+                }
+            }
+        } else {
+            // Comma-separated exact match.
+            for id in spec_pattern.split(',') {
+                let id = id.trim();
+                if !id.is_empty() {
+                    match repo.assign_spec_to_workspace(id, name) {
+                        Ok(()) => assigned += 1,
+                        Err(e) => eprintln!("  {}: {}", "warning".yellow(), e),
+                    }
+                }
+            }
+        }
+
+        if assigned > 0 {
+            println!(
+                "{} Assigned {} spec{} to workspace '{}'",
+                "✓".green(),
+                assigned,
+                if assigned == 1 { "" } else { "s" },
+                name
+            );
+        } else {
+            eprintln!(
+                "  {}: no specs matched pattern '{}'",
+                "warning".yellow(),
+                spec_pattern
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_workspace_status(
+    cwd: &PathBuf,
+    name: Option<&str>,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open_from_dir(cwd)?;
+    let workspaces = repo.list_workspaces()?;
+
+    let ws_name = name.unwrap_or(repo.active_workspace());
+
+    let ws = workspaces
+        .iter()
+        .find(|w| w.name == ws_name)
+        .ok_or_else(|| {
+            Box::<dyn std::error::Error>::from(format!("workspace '{}' not found", ws_name))
+        })?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&ws)?);
+        return Ok(());
+    }
+
+    let path_str = if ws.is_main {
+        ".".to_string()
+    } else {
+        ws.path.display().to_string()
+    };
+
+    println!("Workspace: {}", ws.name.cyan().bold());
+    println!("  Path:       {}", path_str);
+    println!("  Specs:      {}", ws.spec_count);
+    println!(
+        "  HEAD seal:  {}",
+        ws.head_seal.as_deref().unwrap_or("(none)")
+    );
+    if ws.is_main {
+        println!("  Type:       base workspace");
+    }
+
+    // Show assigned specs.
+    let all_specs = repo.list_specs()?;
+    let assigned: Vec<_> = all_specs
+        .iter()
+        .filter(|s| {
+            s.workspace.as_deref() == Some(ws_name) || (ws.is_main && s.workspace.is_none())
+        })
+        .collect();
+
+    if !assigned.is_empty() {
+        println!();
+        println!("  Specs:");
+        for spec in &assigned {
+            let status = format!("{:?}", spec.status).to_lowercase();
+            println!("    {} — {} [{}]", spec.id, spec.title, status);
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_workspace_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open_from_dir(cwd)?;
+    let workspaces = repo.list_workspaces()?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&workspaces)?);
+        return Ok(());
+    }
+
+    if workspaces.is_empty() {
+        println!("No workspaces found.");
+        return Ok(());
+    }
+
+    for ws in &workspaces {
+        let path_str = if ws.is_main {
+            ".".to_string()
+        } else {
+            ws.path.display().to_string()
+        };
+
+        let suffix = if ws.is_main {
+            "  base workspace".to_string()
+        } else {
+            String::new()
+        };
+
+        println!(
+            "  {:<20} {:<25} {} specs{}",
+            ws.name, path_str, ws.spec_count, suffix
+        );
+    }
+
+    Ok(())
+}
+
+fn cmd_workspace_delete(
+    cwd: &PathBuf,
+    name: &str,
+    keep_files: bool,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open_from_dir(cwd)?;
+
+    if !force {
+        eprintln!(
+            "{}",
+            format!("About to delete workspace '{name}'. This removes workspace state.").yellow()
+        );
+        if !keep_files {
+            eprintln!(
+                "{}",
+                "  The parallel working directory will also be removed.".yellow()
+            );
+        }
+        eprint!("Continue? [y/N] ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    repo.delete_workspace(name, keep_files)?;
+    println!("Workspace '{}' deleted.", name);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Doctor
 // ---------------------------------------------------------------------------
 
 fn cmd_doctor(cwd: &PathBuf, json: bool, fix: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open(cwd)?;
+    let repo = Repository::open_from_dir(cwd)?;
     let report = writ_core::migrate::DoctorReport::run(repo.writ_dir());
 
     if fix {
@@ -7222,6 +7813,7 @@ mod tests {
             completed_at: None,
             commit_hash: None,
             committed_at: None,
+            workspace: None,
         }
     }
 

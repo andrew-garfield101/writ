@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{WritError, WritResult};
 
 /// Current schema version. Bump this when the `.writ/` on-disk layout changes.
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Version metadata stored at `.writ/version.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +101,7 @@ pub fn migrate(writ_dir: &Path, from_version: u32, to_version: u32) -> WritResul
         eprintln!("writ: migrating .writ schema v{} → v{}", step - 1, step);
         match step {
             1 => migrate_v0_to_v1(writ_dir)?,
+            2 => migrate_v1_to_v2(writ_dir)?,
             _ => {
                 return Err(WritError::Other(format!(
                     "unknown migration step: v{} → v{}",
@@ -164,6 +165,65 @@ fn migrate_v0_to_v1(writ_dir: &Path) -> WritResult<()> {
     Ok(())
 }
 
+/// v1 → v2: Move flat layout to workspace layout.
+///
+/// Legacy repos stored `index.json`, `HEAD`, and `heads/` directly under `.writ/`.
+/// This migration moves them into `.writ/workspaces/main/` so the repo supports
+/// multiple workspaces. Shared state (objects, seals, specs, keys, agents) stays
+/// at the `.writ/` root.
+///
+/// Idempotent: if `.writ/workspaces/main/` already exists and contains the
+/// expected files, this is a no-op.
+fn migrate_v1_to_v2(writ_dir: &Path) -> WritResult<()> {
+    let ws_main = writ_dir.join("workspaces").join("main");
+
+    // If workspace layout already exists with an index, skip — already migrated.
+    if ws_main.join("index.json").exists() {
+        return Ok(());
+    }
+
+    fs::create_dir_all(ws_main.join("heads"))?;
+
+    // Move index.json
+    let flat_index = writ_dir.join("index.json");
+    if flat_index.exists() {
+        fs::copy(&flat_index, ws_main.join("index.json"))?;
+        fs::remove_file(&flat_index)?;
+    } else {
+        // No index at all — create an empty one so the workspace is valid.
+        let index = crate::index::Index::default();
+        index.save(&ws_main.join("index.json"))?;
+    }
+
+    // Move HEAD
+    let flat_head = writ_dir.join("HEAD");
+    if flat_head.exists() {
+        fs::copy(&flat_head, ws_main.join("HEAD"))?;
+        fs::remove_file(&flat_head)?;
+    } else {
+        fs::write(ws_main.join("HEAD"), "")?;
+    }
+
+    // Move heads/ directory contents
+    let flat_heads = writ_dir.join("heads");
+    if flat_heads.is_dir() {
+        let entries = fs::read_dir(&flat_heads)?;
+        for entry in entries.flatten() {
+            let src = entry.path();
+            if src.is_file() {
+                let name = entry.file_name();
+                fs::copy(&src, ws_main.join("heads").join(&name))?;
+                fs::remove_file(&src)?;
+            }
+        }
+        // Remove the now-empty flat heads directory.
+        // Use remove_dir (not remove_dir_all) so it only succeeds if empty.
+        let _ = fs::remove_dir(&flat_heads);
+    }
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Doctor — repository health checks
 // ---------------------------------------------------------------------------
@@ -208,8 +268,11 @@ impl DoctorReport {
         // 3. Expected directories
         checks.push(check_directories(writ_dir));
 
-        // 4. Index file
+        // 4. Index file (workspace-aware)
         checks.push(check_index(writ_dir));
+
+        // 4b. Workspace layout
+        checks.push(check_workspace_layout(writ_dir));
 
         // 5. Config file
         checks.push(check_config(writ_dir));
@@ -317,7 +380,8 @@ fn check_schema_current(writ_dir: &Path) -> DoctorCheck {
 }
 
 fn check_directories(writ_dir: &Path) -> DoctorCheck {
-    let expected = ["objects", "seals", "specs", "heads", "keys", "agents"];
+    // heads/ moved into workspaces/<name>/ in v2 — checked by check_workspace_layout.
+    let expected = ["objects", "seals", "specs", "keys", "agents"];
     let mut missing = Vec::new();
     for dir in &expected {
         if !writ_dir.join(dir).is_dir() {
@@ -340,14 +404,20 @@ fn check_directories(writ_dir: &Path) -> DoctorCheck {
 }
 
 fn check_index(writ_dir: &Path) -> DoctorCheck {
-    let path = writ_dir.join("index.json");
-    if !path.exists() {
+    // Check workspace-aware path first (v2+), fallback to flat (v1).
+    let ws_path = writ_dir.join("workspaces").join("main").join("index.json");
+    let flat_path = writ_dir.join("index.json");
+    let path = if ws_path.exists() {
+        ws_path
+    } else if flat_path.exists() {
+        flat_path
+    } else {
         return DoctorCheck {
             name: "index".into(),
             status: CheckStatus::Fail,
-            message: "missing .writ/index.json".into(),
+            message: "missing index.json (checked workspaces/main/ and root)".into(),
         };
-    }
+    };
     match fs::read_to_string(&path)
         .map_err(WritError::from)
         .and_then(|data| {
@@ -363,6 +433,48 @@ fn check_index(writ_dir: &Path) -> DoctorCheck {
             status: CheckStatus::Fail,
             message: format!("index.json is corrupt: {e}"),
         },
+    }
+}
+
+fn check_workspace_layout(writ_dir: &Path) -> DoctorCheck {
+    let ws_dir = writ_dir.join("workspaces");
+    if !ws_dir.is_dir() {
+        return DoctorCheck {
+            name: "workspace_layout".into(),
+            status: CheckStatus::Fail,
+            message: "missing .writ/workspaces/ directory".into(),
+        };
+    }
+    let main_dir = ws_dir.join("main");
+    if !main_dir.is_dir() {
+        return DoctorCheck {
+            name: "workspace_layout".into(),
+            status: CheckStatus::Fail,
+            message: "missing .writ/workspaces/main/ directory".into(),
+        };
+    }
+    let mut missing = Vec::new();
+    if !main_dir.join("index.json").exists() {
+        missing.push("index.json");
+    }
+    if !main_dir.join("HEAD").exists() {
+        missing.push("HEAD");
+    }
+    if !main_dir.join("heads").is_dir() {
+        missing.push("heads/");
+    }
+    if missing.is_empty() {
+        DoctorCheck {
+            name: "workspace_layout".into(),
+            status: CheckStatus::Pass,
+            message: "workspace layout is valid (main workspace present)".into(),
+        }
+    } else {
+        DoctorCheck {
+            name: "workspace_layout".into(),
+            status: CheckStatus::Fail,
+            message: format!("main workspace missing: {}", missing.join(", ")),
+        }
     }
 }
 
@@ -520,12 +632,13 @@ mod tests {
         fs::create_dir_all(writ_dir.join("objects")).unwrap();
         fs::create_dir_all(writ_dir.join("seals")).unwrap();
         fs::create_dir_all(writ_dir.join("specs")).unwrap();
-        fs::create_dir_all(writ_dir.join("heads")).unwrap();
         fs::create_dir_all(writ_dir.join("keys")).unwrap();
         fs::create_dir_all(writ_dir.join("agents")).unwrap();
-        fs::write(writ_dir.join("HEAD"), "").unwrap();
-        // Minimal index
-        fs::write(writ_dir.join("index.json"), r#"{"entries":{}}"#).unwrap();
+        // Workspace layout (v2)
+        let ws_main = writ_dir.join("workspaces").join("main");
+        fs::create_dir_all(ws_main.join("heads")).unwrap();
+        fs::write(ws_main.join("HEAD"), "").unwrap();
+        fs::write(ws_main.join("index.json"), r#"{"entries":{}}"#).unwrap();
         // Master key placeholder (KeyStore stores at keys/.master)
         fs::write(writ_dir.join("keys").join(".master"), "fake-key").unwrap();
         writ_dir
@@ -683,7 +796,12 @@ mod tests {
         let writ_dir = make_minimal_writ_dir(&tmp);
         RepoVersion::new().save(&writ_dir).unwrap();
 
-        fs::write(writ_dir.join("index.json"), "not json").unwrap();
+        // Corrupt the workspace index (v2 layout)
+        fs::write(
+            writ_dir.join("workspaces").join("main").join("index.json"),
+            "not json",
+        )
+        .unwrap();
 
         let report = DoctorReport::run(&writ_dir);
         let idx = report.checks.iter().find(|c| c.name == "index").unwrap();
@@ -910,7 +1028,7 @@ mod tests {
         let writ_dir = tmp.path().join(".writ");
 
         let report = DoctorReport::run(&writ_dir);
-        assert_eq!(report.checks.len(), 8);
+        assert_eq!(report.checks.len(), 9);
 
         // All checks should pass on a fresh init
         for check in &report.checks {
@@ -995,7 +1113,8 @@ mod tests {
         let writ_dir = make_minimal_writ_dir(&tmp);
         RepoVersion::new().save(&writ_dir).unwrap();
 
-        fs::remove_file(writ_dir.join("index.json")).unwrap();
+        // Remove the workspace-layout index.json
+        fs::remove_file(writ_dir.join("workspaces").join("main").join("index.json")).unwrap();
 
         let report = DoctorReport::run(&writ_dir);
         let idx = report.checks.iter().find(|c| c.name == "index").unwrap();
@@ -1047,12 +1166,236 @@ mod tests {
         RepoVersion::new().save(&writ_dir).unwrap();
 
         let report = DoctorReport::run(&writ_dir);
-        // Sprint spec says 8 checks
-        assert_eq!(report.checks.len(), 8, "doctor should run exactly 8 checks");
+        assert_eq!(report.checks.len(), 9, "doctor should run exactly 9 checks");
         assert_eq!(
             report.passed + report.failed + report.warnings,
-            8,
-            "counts should sum to total checks"
+            9,
+            "counts should sum to 9"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // WS.2: Flat-to-workspace migration tests (Haris)
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a flat-layout (v1) writ dir with index.json, HEAD, and
+    /// heads/ at the .writ/ root. No workspaces/ directory.
+    fn make_flat_writ_dir(tmp: &TempDir) -> PathBuf {
+        let writ_dir = tmp.path().join(".writ");
+        fs::create_dir_all(writ_dir.join("objects")).unwrap();
+        fs::create_dir_all(writ_dir.join("seals")).unwrap();
+        fs::create_dir_all(writ_dir.join("specs")).unwrap();
+        fs::create_dir_all(writ_dir.join("heads")).unwrap();
+        fs::create_dir_all(writ_dir.join("keys")).unwrap();
+        fs::create_dir_all(writ_dir.join("agents")).unwrap();
+        fs::write(writ_dir.join("HEAD"), "abc123").unwrap();
+        fs::write(
+            writ_dir.join("index.json"),
+            r#"{"entries":{"src/main.rs":{"hash":"deadbeef","size":100}}}"#,
+        )
+        .unwrap();
+        // Spec heads
+        fs::write(writ_dir.join("heads").join("auth"), "seal-auth-1").unwrap();
+        fs::write(writ_dir.join("heads").join("payments"), "seal-pay-1").unwrap();
+        // Master key
+        fs::write(writ_dir.join("keys").join(".master"), "fake-key").unwrap();
+        // Version stamp at v1
+        let mut v = RepoVersion::new();
+        v.schema_version = 1;
+        v.save(&writ_dir).unwrap();
+        writ_dir
+    }
+
+    #[test]
+    fn test_ws2_flat_layout_auto_migrates() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = make_flat_writ_dir(&tmp);
+
+        migrate(&writ_dir, 1, 2).unwrap();
+
+        let ws_main = writ_dir.join("workspaces").join("main");
+        assert!(ws_main.join("index.json").exists());
+        assert!(ws_main.join("HEAD").exists());
+        assert!(ws_main.join("heads").is_dir());
+        // Flat files should be gone
+        assert!(!writ_dir.join("index.json").exists());
+        assert!(!writ_dir.join("HEAD").exists());
+    }
+
+    #[test]
+    fn test_ws2_migrated_index_content_preserved() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = make_flat_writ_dir(&tmp);
+
+        migrate(&writ_dir, 1, 2).unwrap();
+
+        let ws_index = writ_dir.join("workspaces").join("main").join("index.json");
+        let data = fs::read_to_string(&ws_index).unwrap();
+        assert!(data.contains("src/main.rs"));
+        assert!(data.contains("deadbeef"));
+    }
+
+    #[test]
+    fn test_ws2_migrated_head_content_preserved() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = make_flat_writ_dir(&tmp);
+
+        migrate(&writ_dir, 1, 2).unwrap();
+
+        let ws_head = writ_dir.join("workspaces").join("main").join("HEAD");
+        let content = fs::read_to_string(&ws_head).unwrap();
+        assert_eq!(content.trim(), "abc123");
+    }
+
+    #[test]
+    fn test_ws2_migrated_spec_heads_preserved() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = make_flat_writ_dir(&tmp);
+
+        migrate(&writ_dir, 1, 2).unwrap();
+
+        let ws_heads = writ_dir.join("workspaces").join("main").join("heads");
+        let auth = fs::read_to_string(ws_heads.join("auth")).unwrap();
+        assert_eq!(auth.trim(), "seal-auth-1");
+        let pay = fs::read_to_string(ws_heads.join("payments")).unwrap();
+        assert_eq!(pay.trim(), "seal-pay-1");
+        // Flat heads dir should be removed (it was emptied)
+        assert!(!writ_dir.join("heads").is_dir());
+    }
+
+    #[test]
+    fn test_ws2_already_migrated_skips() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = make_flat_writ_dir(&tmp);
+
+        // First migration
+        migrate(&writ_dir, 1, 2).unwrap();
+        let ws_index = writ_dir.join("workspaces").join("main").join("index.json");
+        let content_after_first = fs::read_to_string(&ws_index).unwrap();
+
+        // Second migration — should be a no-op
+        migrate(&writ_dir, 1, 2).unwrap();
+        let content_after_second = fs::read_to_string(&ws_index).unwrap();
+        assert_eq!(content_after_first, content_after_second);
+    }
+
+    #[test]
+    fn test_ws2_idempotent_run_twice() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = make_flat_writ_dir(&tmp);
+
+        migrate(&writ_dir, 1, 2).unwrap();
+        // Run again from v1 — the idempotency check inside migrate_v1_to_v2
+        // sees the workspace index already exists and skips.
+        migrate_v1_to_v2(&writ_dir).unwrap();
+
+        let ws_main = writ_dir.join("workspaces").join("main");
+        assert!(ws_main.join("index.json").exists());
+        assert!(ws_main.join("HEAD").exists());
+    }
+
+    #[test]
+    fn test_ws2_missing_head_handled() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = make_flat_writ_dir(&tmp);
+        // Remove HEAD to simulate partial corruption
+        fs::remove_file(writ_dir.join("HEAD")).unwrap();
+
+        migrate(&writ_dir, 1, 2).unwrap();
+
+        // Should create an empty HEAD in workspace
+        let ws_head = writ_dir.join("workspaces").join("main").join("HEAD");
+        assert!(ws_head.exists());
+        assert!(fs::read_to_string(&ws_head).unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_ws2_missing_index_handled() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = make_flat_writ_dir(&tmp);
+        // Remove index.json to simulate partial corruption
+        fs::remove_file(writ_dir.join("index.json")).unwrap();
+
+        migrate(&writ_dir, 1, 2).unwrap();
+
+        // Should create a default empty index in workspace
+        let ws_index = writ_dir.join("workspaces").join("main").join("index.json");
+        assert!(ws_index.exists());
+        let data = fs::read_to_string(&ws_index).unwrap();
+        let idx: crate::index::Index = serde_json::from_str(&data).unwrap();
+        assert!(idx.entries.is_empty());
+    }
+
+    #[test]
+    fn test_ws2_no_seals_fresh_repo() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = tmp.path().join(".writ");
+        fs::create_dir_all(writ_dir.join("objects")).unwrap();
+        fs::create_dir_all(writ_dir.join("seals")).unwrap();
+        fs::create_dir_all(writ_dir.join("specs")).unwrap();
+        fs::create_dir_all(writ_dir.join("heads")).unwrap();
+        fs::create_dir_all(writ_dir.join("keys")).unwrap();
+        fs::create_dir_all(writ_dir.join("agents")).unwrap();
+        fs::write(writ_dir.join("HEAD"), "").unwrap();
+        fs::write(writ_dir.join("index.json"), r#"{"entries":{}}"#).unwrap();
+
+        migrate(&writ_dir, 1, 2).unwrap();
+
+        let ws_main = writ_dir.join("workspaces").join("main");
+        assert!(ws_main.join("index.json").exists());
+        assert!(ws_main.join("HEAD").exists());
+    }
+
+    #[test]
+    fn test_ws2_doctor_missing_workspace_dir() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = make_minimal_writ_dir(&tmp);
+        RepoVersion::new().save(&writ_dir).unwrap();
+
+        // Remove workspace directory entirely
+        fs::remove_dir_all(writ_dir.join("workspaces")).unwrap();
+
+        let report = DoctorReport::run(&writ_dir);
+        let ws_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "workspace_layout")
+            .unwrap();
+        assert_eq!(ws_check.status, CheckStatus::Fail);
+        assert!(ws_check.message.contains("workspaces"));
+    }
+
+    #[test]
+    fn test_ws2_doctor_corrupted_workspace_layout() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = make_minimal_writ_dir(&tmp);
+        RepoVersion::new().save(&writ_dir).unwrap();
+
+        // Remove index.json from workspace to simulate corruption
+        fs::remove_file(writ_dir.join("workspaces").join("main").join("index.json")).unwrap();
+
+        let report = DoctorReport::run(&writ_dir);
+        let ws_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "workspace_layout")
+            .unwrap();
+        assert_eq!(ws_check.status, CheckStatus::Fail);
+        assert!(ws_check.message.contains("index.json"));
+    }
+
+    #[test]
+    fn test_ws2_doctor_healthy_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let writ_dir = make_minimal_writ_dir(&tmp);
+        RepoVersion::new().save(&writ_dir).unwrap();
+
+        let report = DoctorReport::run(&writ_dir);
+        let ws_check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "workspace_layout")
+            .unwrap();
+        assert_eq!(ws_check.status, CheckStatus::Pass);
     }
 }

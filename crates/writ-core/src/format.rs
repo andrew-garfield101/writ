@@ -752,6 +752,7 @@ mod tests {
 
         ContextOutput {
             writ_version: "0.1.0".into(),
+            workspace: None,
             active_spec: None, // full context doesn't set active_spec
             all_specs: Some(specs),
             working_state: WorkingStateSummary {
@@ -785,6 +786,7 @@ mod tests {
             recommended_action: None,
             chain_integrity: None,
             stale_specs: vec![],
+            dependencies: vec![],
             available_operations: vec![
                 "seal".into(),
                 "context".into(),
@@ -1571,6 +1573,7 @@ mod tests {
         // Measure each section independently by formatting partial contexts
         let empty_ctx = ContextOutput {
             writ_version: "0.1.0".into(),
+            workspace: None,
             active_spec: None,
             all_specs: None,
             working_state: WorkingStateSummary {
@@ -1602,6 +1605,7 @@ mod tests {
             recommended_action: None,
             chain_integrity: None,
             stale_specs: vec![],
+            dependencies: vec![],
             available_operations: vec![],
         };
 

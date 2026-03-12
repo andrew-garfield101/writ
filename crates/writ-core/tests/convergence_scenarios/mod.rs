@@ -186,7 +186,7 @@ impl ScenarioBuilder {
             // NothingToSeal is ok for scenarios with identical changes
             if let Err(ref e) = seal_result {
                 let msg = format!("{e}");
-                if !msg.contains("NothingToSeal") && !msg.contains("nothing to seal") {
+                if !msg.contains("NothingToSeal") && !msg.contains("no changes to seal") {
                     seal_result.unwrap();
                 }
             }

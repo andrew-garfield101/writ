@@ -35,6 +35,8 @@ pub struct SealParams {
     pub agent: Option<String>,
     /// Specific file paths to seal (default: all changes).
     pub paths: Option<Vec<String>>,
+    /// Allow sealing with zero file changes (metadata-only seal).
+    pub allow_empty: Option<bool>,
 }
 
 /// Parameters for writ_spec_add tool.
@@ -310,18 +312,22 @@ impl WritMcpServer {
         if let Some(p) = params.paths {
             args.extend(["--paths".to_string(), p.join(",")]);
         }
+        if params.allow_empty.unwrap_or(false) {
+            args.push("--allow-empty".to_string());
+        }
         self.run_writ_owned(&args)
     }
 
     /// Create a new task spec before starting work.
     #[tool(
         name = "writ_spec_add",
-        description = "Create a new task spec before starting work. Every task should have a spec for tracking and attribution."
+        description = "Create a new task spec before starting work. Every task should have a spec for tracking and attribution. Returns the new spec plus a project state summary."
     )]
     async fn writ_spec_add(
         &self,
         Parameters(params): Parameters<SpecAddParams>,
     ) -> Result<CallToolResult, McpError> {
+        let spec_id = params.id.clone();
         let mut args = vec![
             "spec".to_string(),
             "add".to_string(),
@@ -333,7 +339,43 @@ impl WritMcpServer {
         if let Some(d) = params.description {
             args.extend(["--description".to_string(), d]);
         }
-        self.run_writ_owned(&args)
+        let add_result = self.run_writ_owned(&args)?;
+
+        // If spec add failed, return the error as-is.
+        if add_result.is_error.unwrap_or(false) {
+            return Ok(add_result);
+        }
+
+        // Append project state summary so the agent has context without a
+        // separate writ_context call.
+        let add_text = add_result
+            .content
+            .first()
+            .and_then(|c| {
+                let v = serde_json::to_value(c).ok()?;
+                v.get("text")?.as_str().map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+
+        let context_result = self.run_writ(&[
+            "spec", "status", "--format", "toon",
+        ])?;
+        let context_text = context_result
+            .content
+            .first()
+            .and_then(|c| {
+                let v = serde_json::to_value(c).ok()?;
+                v.get("text")?.as_str().map(|s| s.to_string())
+            })
+            .unwrap_or_default();
+
+        let combined = format!(
+            "{}\n\nspec created: {}\n\nproject specs:\n{}",
+            add_text.trim(),
+            spec_id,
+            context_text.trim(),
+        );
+        Ok(CallToolResult::success(vec![Content::text(combined)]))
     }
 
     /// Mark a task spec as complete.
@@ -1031,6 +1073,7 @@ mod tests {
                 spec: "feat-1".to_string(),
                 agent: None,
                 paths: None,
+                allow_empty: None,
             }))
             .await
             .unwrap();
@@ -1048,6 +1091,7 @@ mod tests {
                 spec: "api-1".to_string(),
                 agent: Some("backend-dev".to_string()),
                 paths: Some(vec!["src/app.py".to_string(), "src/models.py".to_string()]),
+                allow_empty: None,
             }))
             .await
             .unwrap();
@@ -1055,6 +1099,27 @@ mod tests {
         assert_eq!(
             text,
             "seal -s added routes --spec api-1 --agent backend-dev --paths src/app.py,src/models.py"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_seal_allow_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_seal(Parameters(SealParams {
+                summary: "metadata update".to_string(),
+                spec: "feat-1".to_string(),
+                agent: None,
+                paths: None,
+                allow_empty: Some(true),
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_eq!(
+            text,
+            "seal -s metadata update --spec feat-1 --agent claude-code --allow-empty"
         );
     }
 
@@ -1071,7 +1136,21 @@ mod tests {
             .await
             .unwrap();
         let text = result_text(&result);
-        assert_eq!(text, "spec add --id auth-flow --title Add authentication");
+        assert!(
+            text.contains("spec add --id auth-flow --title Add authentication"),
+            "should contain spec add command, got: {}",
+            text
+        );
+        assert!(
+            text.contains("spec created: auth-flow"),
+            "should contain spec created confirmation, got: {}",
+            text
+        );
+        assert!(
+            text.contains("project specs:"),
+            "should contain project specs summary, got: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -1087,9 +1166,15 @@ mod tests {
             .await
             .unwrap();
         let text = result_text(&result);
-        assert_eq!(
-            text,
-            "spec add --id auth-flow --title Add auth --description OAuth2 flow"
+        assert!(
+            text.contains("spec add --id auth-flow --title Add auth --description OAuth2 flow"),
+            "should contain spec add command with description, got: {}",
+            text
+        );
+        assert!(
+            text.contains("spec created: auth-flow"),
+            "should contain spec created confirmation, got: {}",
+            text
         );
     }
 

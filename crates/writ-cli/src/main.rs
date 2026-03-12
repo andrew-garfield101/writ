@@ -1572,7 +1572,12 @@ fn resolve_agent(explicit: Option<&str>, cwd: &PathBuf) -> String {
 /// Detect agent identity from known framework environment variables.
 /// Returns a session-specific ID like "claude-code-a3f2" for uniqueness.
 fn detect_agent_from_env() -> Option<String> {
-    // Claude Code sets CLAUDE_CODE_SESSION_ID or CLAUDE_SESSION_ID
+    // Explicit writ agent ID takes priority.
+    if let Ok(agent_id) = std::env::var("WRIT_AGENT_ID") {
+        return Some(agent_id);
+    }
+
+    // Claude Code: prefer session ID for unique suffix, fall back to PID.
     for var in &[
         "CLAUDE_CODE_SESSION_ID",
         "CLAUDE_SESSION_ID",
@@ -1583,18 +1588,18 @@ fn detect_agent_from_env() -> Option<String> {
             return Some(format!("claude-code-{}", suffix));
         }
     }
+    // CLAUDECODE=1 is set by Claude Code even when session ID vars are absent.
+    if std::env::var("CLAUDECODE").is_ok() {
+        let suffix = short_hash(&std::process::id().to_string());
+        return Some(format!("claude-code-{}", suffix));
+    }
 
-    // Codex sets CODEX_SESSION or similar
+    // Codex sets CODEX_SESSION or similar.
     for var in &["CODEX_SESSION", "CODEX_SESSION_ID"] {
         if let Ok(session_id) = std::env::var(var) {
             let suffix = short_hash(&session_id);
             return Some(format!("codex-{}", suffix));
         }
-    }
-
-    // Generic: any AGENT_ID env var is used directly
-    if let Ok(agent_id) = std::env::var("WRIT_AGENT_ID") {
-        return Some(agent_id);
     }
 
     None
@@ -1652,7 +1657,11 @@ fn error_hint(err: &dyn std::error::Error) -> Option<String> {
     }
     if msg.contains("no changes to seal") {
         return Some(
-            "make some file changes first, or use `--allow-empty` for metadata-only seals".into(),
+            "your working directory matches the last seal. This can happen if:\n  \
+             — another agent in the same directory sealed your files first\n  \
+             — your changes were already captured by a previous seal\n  \
+             Use `--allow-empty` to create a metadata-only seal."
+                .into(),
         );
     }
     if msg.contains("seal not found") {
@@ -1848,7 +1857,7 @@ fn cmd_init(
 
             if plan.enable_claude {
                 println!("{} Claude Code integration configured", "✓".green());
-                println!("  {} Agent permissions: Bash(writ *)", "→".green());
+                println!("  {} Agent permissions: Bash(writ *), mcp__writ__*", "→".green());
                 println!(
                     "  {} Agent directive: writ usage instruction added",
                     "→".green()

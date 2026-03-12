@@ -12,8 +12,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::WritResult;
 use crate::fsutil::atomic_write;
 
-/// The permission entry writ adds to Claude Code's settings.json.
+/// The permission entries writ adds to Claude Code's settings.json.
+/// Bash permission for CLI commands, MCP permission for native MCP tools.
 const WRIT_PERMISSION: &str = "Bash(writ *)";
+const WRIT_MCP_PERMISSION: &str = "mcp__writ__*";
 
 /// HTML comment markers for writ-managed sections in framework files.
 /// Used for idempotent append-in-place and surgical removal on uninstall.
@@ -116,16 +118,28 @@ fn ensure_claude_permissions(root: &Path) -> WritResult<Option<String>> {
 
     let allow_arr = allow.as_array_mut().unwrap();
 
-    // Check if already present.
-    let already_has = allow_arr
+    // Add both CLI and MCP permissions if not already present.
+    let mut changed = false;
+
+    let has_bash = allow_arr
         .iter()
         .any(|v| v.as_str() == Some(WRIT_PERMISSION));
-
-    if already_has {
-        return Ok(None);
+    if !has_bash {
+        allow_arr.push(serde_json::Value::String(WRIT_PERMISSION.to_string()));
+        changed = true;
     }
 
-    allow_arr.push(serde_json::Value::String(WRIT_PERMISSION.to_string()));
+    let has_mcp = allow_arr
+        .iter()
+        .any(|v| v.as_str() == Some(WRIT_MCP_PERMISSION));
+    if !has_mcp {
+        allow_arr.push(serde_json::Value::String(WRIT_MCP_PERMISSION.to_string()));
+        changed = true;
+    }
+
+    if !changed {
+        return Ok(None);
+    }
 
     let json = serde_json::to_string_pretty(&settings)
         .map_err(|e| crate::error::WritError::Other(format!("JSON serialize: {}", e)))?;
@@ -139,7 +153,8 @@ fn ensure_claude_permissions(root: &Path) -> WritResult<Option<String>> {
     }
 }
 
-/// Remove `Bash(writ *)` from `.claude/settings.json` during uninstall.
+/// Remove writ permissions (`Bash(writ *)` and `mcp__writ__*`) from
+/// `.claude/settings.json` during uninstall.
 ///
 /// Leaves the file in place even if the allow list becomes empty — we don't
 /// delete the user's settings file.
@@ -159,7 +174,10 @@ fn remove_claude_permissions(root: &Path) -> WritResult<Option<String>> {
         if let Some(allow) = permissions.get_mut("allow") {
             if let Some(arr) = allow.as_array_mut() {
                 let before = arr.len();
-                arr.retain(|v| v.as_str() != Some(WRIT_PERMISSION));
+                arr.retain(|v| {
+                    let s = v.as_str();
+                    s != Some(WRIT_PERMISSION) && s != Some(WRIT_MCP_PERMISSION)
+                });
                 arr.len() < before
             } else {
                 false
@@ -1918,6 +1936,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let allow = parsed["permissions"]["allow"].as_array().unwrap();
         assert!(allow.iter().any(|v| v.as_str() == Some("Bash(writ *)")));
+        assert!(allow.iter().any(|v| v.as_str() == Some("mcp__writ__*")));
     }
 
     #[test]
@@ -1938,6 +1957,7 @@ mod tests {
         // Both permissions should be present.
         assert!(allow.iter().any(|v| v.as_str() == Some("Bash(git *)")));
         assert!(allow.iter().any(|v| v.as_str() == Some("Bash(writ *)")));
+        assert!(allow.iter().any(|v| v.as_str() == Some("mcp__writ__*")));
         // Other fields preserved.
         assert_eq!(parsed["other"], serde_json::json!(true));
     }
@@ -1952,12 +1972,17 @@ mod tests {
         let content = fs::read_to_string(dir.path().join(".claude").join("settings.json")).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let allow = parsed["permissions"]["allow"].as_array().unwrap();
-        // Should only have one entry, not duplicated.
-        let count = allow
+        // Should only have one entry each, not duplicated.
+        let bash_count = allow
             .iter()
             .filter(|v| v.as_str() == Some("Bash(writ *)"))
             .count();
-        assert_eq!(count, 1, "permission should not be duplicated");
+        assert_eq!(bash_count, 1, "bash permission should not be duplicated");
+        let mcp_count = allow
+            .iter()
+            .filter(|v| v.as_str() == Some("mcp__writ__*"))
+            .count();
+        assert_eq!(mcp_count, 1, "mcp permission should not be duplicated");
     }
 
     #[test]
@@ -1971,6 +1996,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
         let allow = parsed["permissions"]["allow"].as_array().unwrap();
         assert!(!allow.iter().any(|v| v.as_str() == Some("Bash(writ *)")));
+        assert!(!allow.iter().any(|v| v.as_str() == Some("mcp__writ__*")));
     }
 
     #[test]
@@ -1979,7 +2005,7 @@ mod tests {
         fs::create_dir_all(dir.path().join(".claude")).unwrap();
         fs::write(
             dir.path().join(".claude").join("settings.json"),
-            r#"{"permissions": {"allow": ["Bash(git *)", "Bash(writ *)"]}}"#,
+            r#"{"permissions": {"allow": ["Bash(git *)", "Bash(writ *)", "mcp__writ__*"]}}"#,
         )
         .unwrap();
 
@@ -1990,6 +2016,7 @@ mod tests {
         let allow = parsed["permissions"]["allow"].as_array().unwrap();
         assert!(allow.iter().any(|v| v.as_str() == Some("Bash(git *)")));
         assert!(!allow.iter().any(|v| v.as_str() == Some("Bash(writ *)")));
+        assert!(!allow.iter().any(|v| v.as_str() == Some("mcp__writ__*")));
     }
 
     #[test]

@@ -347,6 +347,7 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
             stale_timeout: None,
         }),
         auto: None,
+        workspace: None,
     };
 
     // Summary and confirmation (I.10)

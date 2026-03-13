@@ -337,11 +337,27 @@ pub struct AgentActivity {
     pub specs_touched: Vec<String>,
 }
 
+/// Task context surfaced at the top of `writ context` when called from a workspace.
+/// Derived from the workspace's assigned spec.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskContext {
+    /// Task (spec) ID.
+    pub id: String,
+    /// Human-readable title.
+    pub title: String,
+    /// Current status (pending, in-progress, complete, blocked).
+    pub status: String,
+}
+
 /// The full context output, optimized for LLM consumption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextOutput {
     /// Writ version marker for LLM parsing.
     pub writ_version: String,
+
+    /// Task context — present when running inside a workspace with an assigned spec.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskContext>,
 
     /// Active workspace name. Always present (defaults to "main").
     #[serde(skip_serializing_if = "Option::is_none")]

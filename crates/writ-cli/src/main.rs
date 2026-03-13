@@ -2,6 +2,7 @@
 
 mod init;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -143,6 +144,31 @@ enum Commands {
         /// Description for the spec created with --spec.
         #[arg(long, requires = "spec")]
         description: Option<String>,
+    },
+
+    /// Create and manage tasks (spec + workspace in one command).
+    ///
+    /// Each task gets its own workspace directory at `workspaces/<id>/` where
+    /// an agent can work without interfering with other agents.
+    ///
+    /// Usage:
+    ///   writ task "description"     Create a new task
+    ///   writ task list              List all active tasks
+    #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+    Task {
+        /// Task description (used as spec title and prompt suggestion).
+        title: Option<String>,
+
+        /// Override the auto-derived spec/workspace ID.
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+
+        #[command(subcommand)]
+        action: Option<TaskCommands>,
     },
 
     /// Show working directory state.
@@ -391,6 +417,14 @@ enum Commands {
         /// Auto mode: commit immediately without prompts, using project auto config.
         #[arg(long)]
         auto: bool,
+
+        /// Auto-clean workspaces after committing (skip cleanup prompt).
+        #[arg(long, conflicts_with = "no_cleanup")]
+        cleanup: bool,
+
+        /// Skip workspace cleanup entirely after committing.
+        #[arg(long, conflicts_with = "cleanup")]
+        no_cleanup: bool,
     },
 
     /// Restore working directory to a specific seal's state.
@@ -604,6 +638,16 @@ enum Commands {
         /// Attempt to fix problems (reserved for future use).
         #[arg(long)]
         fix: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskCommands {
+    /// List all active tasks and their status.
+    List {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
     },
 }
 
@@ -1146,6 +1190,23 @@ fn main() {
             };
             cmd_init(&cwd, &format, &profile, spec, title, description, opts)
         }
+        Commands::Task {
+            title,
+            id,
+            format,
+            action,
+        } => match action {
+            Some(TaskCommands::List { format }) => cmd_task_list(&cwd, &format),
+            None => match title {
+                Some(title) => cmd_task_create(&cwd, &title, id, &format),
+                None => {
+                    eprintln!("error: task description is required");
+                    eprintln!("  usage: writ task \"description\"");
+                    eprintln!("  or:    writ task list");
+                    std::process::exit(1);
+                }
+            },
+        },
         Commands::State { format } => {
             let format = resolve_format(format.as_deref(), &cwd, "human");
             cmd_state(&cwd, &format)
@@ -1253,6 +1314,8 @@ fn main() {
             accept,
             reject,
             auto,
+            cleanup,
+            no_cleanup,
         } => {
             if proposals {
                 cmd_finish_proposals(&cwd)
@@ -1265,7 +1328,7 @@ fn main() {
             } else if auto {
                 cmd_finish_auto(&cwd, &strategy)
             } else {
-                cmd_finish(&cwd, full, dry_run, yes, &strategy)
+                cmd_finish(&cwd, full, dry_run, yes, cleanup, no_cleanup, &strategy)
             }
         }
         Commands::Restore {
@@ -1708,6 +1771,25 @@ fn error_hint(err: &dyn std::error::Error) -> Option<String> {
             "this object decompresses beyond the safety limit — it may be corrupted".into(),
         );
     }
+    // WV.8: When a spec already exists and we're inside a workspace, hint about using it.
+    if msg.contains("already exists") && msg.contains("spec '") {
+        // Extract spec ID from "spec 'foo' already exists"
+        if let Some(start) = msg.find("spec '").map(|i| i + 6) {
+            if let Some(end) = msg[start..].find('\'').map(|i| i + start) {
+                let spec_id = &msg[start..end];
+                // Check if we're in a workspace that has this spec assigned
+                if let Ok(cwd) = std::env::current_dir() {
+                    let ws_pointer = cwd.join(".writ-workspace");
+                    if ws_pointer.exists() {
+                        return Some(format!(
+                            "this spec is assigned to your workspace — use it with:\n  \
+                             writ seal -s \"your summary\" --spec {spec_id}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
 
     None
 }
@@ -1857,7 +1939,10 @@ fn cmd_init(
 
             if plan.enable_claude {
                 println!("{} Claude Code integration configured", "✓".green());
-                println!("  {} Agent permissions: Bash(writ *), mcp__writ__*", "→".green());
+                println!(
+                    "  {} Agent permissions: Bash(writ *), mcp__writ__*",
+                    "→".green()
+                );
                 println!(
                     "  {} Agent directive: writ usage instruction added",
                     "→".green()
@@ -2064,6 +2149,139 @@ fn cmd_state(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Erro
                     };
                 }
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_task_create(
+    cwd: &PathBuf,
+    title: &str,
+    id: Option<String>,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // WV.5: Warn if running from inside an existing workspace.
+    let ws_pointer = cwd.join(".writ-workspace");
+    if ws_pointer.exists() {
+        eprintln!(
+            "{} you're inside an existing workspace.",
+            "warning:".yellow().bold()
+        );
+        eprintln!("  Creating a task here would create a nested workspace.");
+        eprintln!("  Run `writ task` from the main project directory instead.");
+        eprintln!();
+        // In non-interactive (no TTY), error out.
+        if !std::io::stdin().is_terminal() {
+            return Err("refusing to create nested workspace in non-interactive mode".into());
+        }
+        eprint!("  Continue anyway? [y/N]: ");
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            eprintln!("  Cancelled.");
+            return Ok(());
+        }
+    }
+
+    let repo = Repository::open_from_dir(cwd)?;
+    let result = repo.create_task(title.to_string(), id)?;
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+        _ => {
+            println!(
+                "{} {}",
+                "task created:".green().bold(),
+                result.spec_id.cyan()
+            );
+            println!(
+                "  {} {}",
+                "workspace:".dimmed(),
+                result.workspace_path.display()
+            );
+            println!();
+            println!("  Launch an agent in this workspace:");
+            println!(
+                "    {}",
+                format!("cd {}", result.workspace_path.display()).cyan()
+            );
+            println!();
+            println!(
+                "  {} \"{}\"",
+                "Suggested prompt:".dimmed(),
+                result.suggested_prompt
+            );
+            println!("  {}", "Or provide your own prompt for the agent.".dimmed());
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_task_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+
+    let repo = Repository::open_from_dir(cwd)?;
+    let all_specs = repo.list_specs()?;
+    let task_specs: Vec<_> = all_specs.iter().filter(|s| s.workspace.is_some()).collect();
+
+    match format {
+        "json" => {
+            let tasks: Vec<serde_json::Value> = task_specs
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id,
+                        "title": s.title,
+                        "status": format!("{:?}", s.status).to_lowercase(),
+                        "workspace": s.workspace,
+                        "seal_count": s.sealed_by.len(),
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&tasks)?);
+        }
+        _ => {
+            if task_specs.is_empty() {
+                println!("No active tasks.");
+                println!();
+                println!(
+                    "  {} Create one with: {}",
+                    "→".dimmed(),
+                    "writ task \"description\"".bold()
+                );
+                return Ok(());
+            }
+
+            for spec in &task_specs {
+                let status_str = format!("{:?}", spec.status).to_lowercase();
+                let seal_count = spec.sealed_by.len();
+                let seal_str = if seal_count == 1 {
+                    "1 seal".to_string()
+                } else {
+                    format!("{} seals", seal_count)
+                };
+
+                if spec.status == writ_core::spec::SpecStatus::Complete {
+                    println!("  {:<24} {}   ({})", spec.id, "complete".green(), seal_str);
+                } else {
+                    println!("  {:<24} {:<10} {}", spec.id, seal_str, status_str.yellow());
+                }
+            }
+
+            let task_complete = task_specs
+                .iter()
+                .filter(|s| s.status == writ_core::spec::SpecStatus::Complete)
+                .count();
+            let task_in_progress = task_specs.len() - task_complete;
+            println!();
+            println!(
+                "  {} complete / {} in progress",
+                task_complete, task_in_progress
+            );
         }
     }
 
@@ -3205,6 +3423,53 @@ fn cmd_status(
         }
     }
 
+    // WV.7: Tasks section — specs with associated workspaces.
+    let all_specs = repo.list_specs()?;
+    let task_specs: Vec<_> = all_specs.iter().filter(|s| s.workspace.is_some()).collect();
+
+    if !task_specs.is_empty() {
+        println!();
+        println!(
+            "{}",
+            "── Tasks ───────────────────────────────────────────".dimmed()
+        );
+
+        for spec in &task_specs {
+            let status_str = format!("{:?}", spec.status).to_lowercase();
+            let seal_count = spec.sealed_by.len();
+            let seal_str = if seal_count == 1 {
+                "1 seal".to_string()
+            } else {
+                format!("{} seals", seal_count)
+            };
+
+            let display = if spec.status == writ_core::spec::SpecStatus::Complete {
+                format!("  {:<24} {}   ({})", spec.id, "complete".green(), seal_str)
+            } else {
+                format!("  {:<24} {:<10} {}", spec.id, seal_str, status_str.yellow())
+            };
+            println!("{display}");
+        }
+
+        let task_complete = task_specs
+            .iter()
+            .filter(|s| s.status == writ_core::spec::SpecStatus::Complete)
+            .count();
+        let task_in_progress = task_specs.len() - task_complete;
+        println!();
+        println!(
+            "  {} complete / {} in progress",
+            task_complete, task_in_progress
+        );
+        if task_complete > 0 {
+            println!(
+                "  Run {} when ready, or {} to converge and commit.",
+                "`writ converge-all`".bold(),
+                "`writ finish`".bold()
+            );
+        }
+    }
+
     // Workspace overview (WS.18): show when multiple workspaces exist.
     let workspaces = repo.list_workspaces()?;
     if workspaces.len() > 1 {
@@ -3213,7 +3478,6 @@ fn cmd_status(
             "{}",
             "── Workspaces ──────────────────────────────────────".dimmed()
         );
-        let all_specs = repo.list_specs()?;
         for ws in &workspaces {
             let path_str = if ws.is_main {
                 ".".to_string()
@@ -3463,7 +3727,7 @@ fn cmd_status_watch(
     match result {
         Ok(Some("finish")) => {
             println!();
-            cmd_finish(cwd, false, false, false, "single")?;
+            cmd_finish(cwd, false, false, false, false, false, "single")?;
         }
         Ok(Some("diff")) => {
             println!();
@@ -3508,12 +3772,67 @@ fn cmd_finish(
     full: bool,
     dry_run: bool,
     yes: bool,
+    cleanup: bool,
+    no_cleanup: bool,
     strategy: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
     use writ_core::git_ops::{Git2Ops, GitOps};
 
     let repo = Repository::open_from_dir(cwd)?;
+
+    // WV.6: Auto-converge outstanding workspaces before finishing.
+    let workspaces = repo.list_workspaces()?;
+    let non_main_ws: Vec<_> = workspaces.iter().filter(|ws| !ws.is_main).collect();
+    if !non_main_ws.is_empty() {
+        let ws_names: Vec<String> = non_main_ws.iter().map(|ws| ws.name.clone()).collect();
+        println!(
+            "  {} {} {} workspace{}...",
+            "→".dimmed(),
+            if dry_run {
+                "Would converge"
+            } else {
+                "Converging"
+            },
+            ws_names.len(),
+            if ws_names.len() == 1 { "" } else { "s" }
+        );
+        let report = repo.converge_workspaces(&ws_names, "three-way-merge", dry_run)?;
+        if !report.escalations.is_empty() {
+            eprintln!();
+            eprintln!(
+                "{} {} escalation{} need resolution:",
+                "error:".red().bold(),
+                report.escalations.len(),
+                if report.escalations.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+            for esc in &report.escalations {
+                eprintln!("  {} {}", "·".red(), esc.file_path);
+            }
+            eprintln!();
+            eprintln!(
+                "  Resolve escalations before finishing. Run {} to see details.",
+                "`writ converge-all --dry-run`".bold()
+            );
+            return Err("convergence has unresolved escalations".into());
+        }
+        if report.is_clean {
+            println!(
+                "  {} Converged {} file{} cleanly.",
+                "✓".green(),
+                report.total_auto_merged,
+                if report.total_auto_merged == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            );
+        }
+    }
 
     // Gather completed specs for display
     let specs = repo.list_specs()?;
@@ -3774,6 +4093,48 @@ fn cmd_finish(
                 other
             );
             std::process::exit(1);
+        }
+    }
+
+    // WV.6: Workspace cleanup after successful commit.
+    if !non_main_ws.is_empty() {
+        println!();
+        println!(
+            "  {} {} task{} committed.",
+            "✓".green().bold(),
+            non_main_ws.len(),
+            if non_main_ws.len() == 1 { "" } else { "s" }
+        );
+
+        let should_cleanup = if no_cleanup {
+            false
+        } else if cleanup || yes {
+            true
+        } else {
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                print!("\n  Clean up workspaces? [Y/n]: ");
+                std::io::Write::flush(&mut std::io::stdout())?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                let input = input.trim().to_lowercase();
+                input.is_empty() || input == "y" || input == "yes"
+            } else {
+                false
+            }
+        };
+
+        if should_cleanup {
+            for ws in &non_main_ws {
+                if ws.path.exists() {
+                    if let Err(e) = std::fs::remove_dir_all(&ws.path) {
+                        eprintln!("  warning: could not remove {}: {}", ws.path.display(), e);
+                    } else {
+                        println!("  removed {}/", ws.path.display());
+                    }
+                }
+                let _ = repo.delete_workspace(&ws.name, true);
+            }
         }
     }
 

@@ -271,28 +271,48 @@ writ context --format human
 
 Git worktrees give agents isolation — separate directories, separate files, no stepping on each other. They don't give agents convergence. When the work is done, you're back to `git merge` and line level conflicts.
 
-Writ workspaces give agents both. Each workspace is an isolated parallel environment with its own directory, its own index, and its own scoped context. When teams finish, `writ converge-workspaces` brings their work together through the convergence engine — structurally, not line by line.
+Writ gives agents both. One command creates everything an agent needs to work in isolation:
 
 ```bash
-# Create workspaces for two teams
-writ workspace create auth-team --path ../ws-auth --specs "auth-*"
-writ workspace create payments-team --path ../ws-payments --specs "pay-*"
+$ writ task "backend API work"
 
-# Agents work in their workspace — all commands just work
-cd ../ws-auth
-writ context                    # scoped: only auth specs, auth seals, auth files
-writ seal -s "JWT endpoint" --agent auth-dev --spec auth-0
-writ spec done auth-0
+  task created: backend-api-work
+    workspace: workspaces/backend-api-work/
 
-# Converge when ready
-cd my-project
-writ converge-workspaces auth-team payments-team
-writ finish
+  Launch an agent in this workspace:
+    cd workspaces/backend-api-work/
 ```
 
-Scoped context is the multiplier. In a 30 spec project, an agent in the auth workspace sees only the 3 specs that matter. Fewer tokens, less noise, sharper focus. All workspaces share the same object store, seal chain, and spec definitions — isolation is at the working directory level, not at the data level.
+`writ task` creates a spec, a workspace directory with a full project copy, and prints a launch command. The user's only job is to copy-paste the path into a terminal tab. The agent starts, runs `writ context`, sees its assigned task, and works.
 
-See the [workspaces guide](https://andrew-garfield101.github.io/writ/guides/workspaces.html) for the full architecture, spec assignment, and convergence workflow.
+```bash
+# The full multi agent flow
+writ init
+writ task "backend API work"         # creates workspace + spec
+writ task "payment integration"      # creates workspace + spec
+writ task "dashboard UI"             # creates workspace + spec
+
+# Launch agents in the printed workspace paths
+# Agents use 3 commands: context, seal, spec done. That's it.
+
+# When ready
+writ finish                          # auto-converges workspaces, commits to git
+git push
+```
+
+The human gets 3 commands: `init`, `task`, `finish`. Each agent gets 3 commands: `context`, `seal`, `spec done`. Agents discover their task via `writ context` — the assigned task appears at the top of the output. They never create specs, never touch workspaces, never run git.
+
+Same number of steps as the git workflow everyone already knows:
+
+| Git | Writ | What Improves |
+|-----|------|---------------|
+| `git checkout -b feature` | `writ task "description"` | Structured metadata: title, status, agent assignment |
+| `git add && git commit` | `writ seal` | Agent identity, spec linkage, immutable chain |
+| `git merge` | `writ finish` (auto-converges) | Structure aware, auto resolves independent changes |
+
+`writ finish` auto-converges outstanding workspaces before committing to git. If convergence is clean, it proceeds to commit and prompts to clean up workspace directories. If there are conflicts that need human attention, it stops and shows you what needs resolving.
+
+See the [workspaces guide](https://andrew-garfield101.github.io/writ/guides/workspaces.html) for the full architecture, advanced commands, and convergence workflow.
 
 ## Going Back
 
@@ -430,15 +450,18 @@ writ init                             # guided setup (git detect + bridge import
 writ init --yes                       # non-interactive setup (CI-safe, accept all defaults)
 writ init --profile production        # setup with a deployment profile (storage budgets, retention)
 writ uninit [--force]                 # clean removal of writ from the project
+writ task "description"              # create task: spec + workspace + launch command
+writ task list                       # show all active tasks and status
 writ seal -s "..." --agent ID         # create a structured checkpoint
 writ context [--spec ID] [--format]   # structured context dump (json, toon, human, brief)
 writ status [--watch] [--completed]   # fleet overview: agents, specs, progress
 writ log [--all] [--spec ID]          # seal history (--all includes diverged branches)
 writ summary --format commit          # one-line commit message with full provenance
 writ summary --format pr              # full PR description with spec/agent breakdown
-writ finish [--strategy per-spec]      # promote completed specs → git commit(s)
+writ finish [--strategy per-spec]      # auto-converge workspaces + promote specs → git commit(s)
 writ finish --yes                     # accept defaults, no prompts (same as current behavior)
 writ finish --dry-run                 # preview without committing
+writ finish --cleanup                 # auto-clean workspace directories after commit
 writ converge LEFT RIGHT [--apply]    # two-spec convergence
 writ converge-all --apply --strategy  # merge all diverged branches
 writ converge-workspaces a b         # merge across named workspaces

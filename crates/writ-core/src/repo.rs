@@ -113,6 +113,69 @@ fn query_git_state(root: &Path) -> Option<GitStateSnapshot> {
     })
 }
 
+/// Convert a task title into a URL-safe spec/workspace ID.
+///
+/// Rules: lowercase, replace non-alphanumeric with hyphens, collapse runs,
+/// trim leading/trailing hyphens, truncate at 50 characters.
+fn slugify_title(title: &str) -> String {
+    let slug: String = title
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
+    // Collapse runs of hyphens.
+    let mut collapsed = String::with_capacity(slug.len());
+    let mut prev_hyphen = false;
+    for c in slug.chars() {
+        if c == '-' {
+            if !prev_hyphen {
+                collapsed.push('-');
+            }
+            prev_hyphen = true;
+        } else {
+            collapsed.push(c);
+            prev_hyphen = false;
+        }
+    }
+    let trimmed = collapsed.trim_matches('-');
+    if trimmed.len() > 50 {
+        // Truncate at 50 chars, don't cut mid-hyphen.
+        let cut = &trimmed[..50];
+        cut.trim_end_matches('-').to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Ensure the workspace root directory is listed in the project `.gitignore`.
+///
+/// Called by `create_task()` on first invocation. Idempotent — safe to call
+/// multiple times. Handles missing `.gitignore` by creating one.
+///
+/// The `workspace_root` parameter comes from project config (default: `"workspaces"`).
+pub fn ensure_workspaces_gitignored(root: &Path, workspace_root: &str) -> WritResult<()> {
+    let gitignore_path = root.join(".gitignore");
+    let entry = format!("{}/", workspace_root.trim_end_matches('/'));
+
+    if gitignore_path.exists() {
+        let content = fs::read_to_string(&gitignore_path)?;
+        if content.lines().any(|line| line.trim() == entry) {
+            return Ok(());
+        }
+        let separator = if content.ends_with('\n') { "" } else { "\n" };
+        let new_content = format!(
+            "{}{}\n# writ workspace directories\n{}\n",
+            content, separator, entry
+        );
+        crate::fsutil::atomic_write(&gitignore_path, new_content.as_bytes())?;
+    } else {
+        let content = format!("# writ workspace directories\n{}\n", entry);
+        crate::fsutil::atomic_write(&gitignore_path, content.as_bytes())?;
+    }
+
+    Ok(())
+}
+
 impl Repository {
     /// Initialize a new writ repository in the given directory.
     ///
@@ -1589,6 +1652,75 @@ impl Repository {
         &self.active_workspace
     }
 
+    // ─── Task Management ──────────────────────────────────────────
+
+    /// Create a task: a spec + workspace bundle with a single command.
+    ///
+    /// This is syntactic sugar that:
+    /// 1. Slugifies the title into a spec ID (or uses the provided override)
+    /// 2. Creates a spec with the given title
+    /// 3. Creates a workspace at `workspaces/<id>/` (project root, not .writ/)
+    /// 4. Assigns the spec to the workspace
+    /// 5. Ensures `workspaces/` is in .gitignore
+    ///
+    /// Returns a `TaskCreationResult` with spec ID, workspace path, and
+    /// a suggested prompt derived from the title.
+    pub fn create_task(
+        &self,
+        title: String,
+        id_override: Option<String>,
+    ) -> WritResult<TaskCreationResult> {
+        let spec_id = match id_override {
+            Some(id) => id,
+            None => slugify_title(&title),
+        };
+
+        // Create the spec.
+        let spec = crate::spec::Spec::new(spec_id.clone(), title.clone(), String::new());
+        self.add_spec(&spec)?;
+
+        // Resolve workspace root from config (default: "workspaces").
+        let ws_root = crate::config::ProjectConfig::load(&self.writ_dir)
+            .map(|c| c.workspace_root().to_string())
+            .unwrap_or_else(|_| crate::config::DEFAULT_WORKSPACE_ROOT.to_string());
+
+        // Create workspace at project root <ws_root>/<id>/ (not .writ/ws/).
+        let ws_path = self.root.join(&ws_root).join(&spec_id);
+        let ws_info = self.create_workspace(&spec_id, Some(ws_path.as_path()), None)?;
+
+        // Assign the spec to the workspace.
+        self.assign_spec_to_workspace(&spec_id, &spec_id)?;
+
+        // Ensure workspace root is in .gitignore.
+        ensure_workspaces_gitignored(&self.root, &ws_root)?;
+
+        // Derive a suggested prompt from the title.
+        let suggested_prompt = {
+            let mut chars = title.chars();
+            match chars.next() {
+                Some(c) => {
+                    let first: String = c.to_uppercase().collect();
+                    let rest: String = chars.collect();
+                    let sentence = format!("{}{}", first, rest);
+                    if sentence.ends_with('.') {
+                        sentence
+                    } else {
+                        format!("{}.", sentence)
+                    }
+                }
+                None => String::new(),
+            }
+        };
+
+        Ok(TaskCreationResult {
+            spec_id,
+            title,
+            workspace_path: ws_info.path,
+            workspace_name: ws_info.name,
+            suggested_prompt,
+        })
+    }
+
     // ─── Workspace Management ─────────────────────────────────────
 
     /// Create a new parallel workspace with its own directory and file state.
@@ -2484,8 +2616,21 @@ impl Repository {
                     agent_activity
                 };
 
+                // Build task context from workspace's assigned spec.
+                let task_ctx = ws_filter.and_then(|ws| {
+                    scoped_specs
+                        .iter()
+                        .find(|s| s.workspace.as_deref() == Some(ws))
+                        .map(|s| crate::context::TaskContext {
+                            id: s.id.clone(),
+                            title: s.title.clone(),
+                            status: format!("{:?}", s.status).to_lowercase(),
+                        })
+                });
+
                 let mut result = ContextOutput {
                     writ_version: "0.1.0".to_string(),
+                    task: task_ctx,
                     workspace: ws_filter.map(|s| s.to_string()),
                     active_spec: None,
                     all_specs: if scoped_specs.is_empty() {
@@ -2838,6 +2983,7 @@ impl Repository {
 
                 Ok(ContextOutput {
                     writ_version: "0.1.0".to_string(),
+                    task: None,
                     workspace: filter.workspace.clone(),
                     active_spec: Some(spec),
                     all_specs: None,
@@ -3114,6 +3260,7 @@ impl Repository {
 
                 Ok(ContextOutput {
                     writ_version: "0.1.0".to_string(),
+                    task: None,
                     workspace: filter.workspace.clone(),
                     active_spec: None, // agent may have multiple specs
                     all_specs: if agent_specs.is_empty() {
@@ -7609,6 +7756,16 @@ impl Repository {
             diverged_branch_count: diverged.len(),
         })
     }
+}
+
+/// Result of `writ task` — spec + workspace creation bundle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskCreationResult {
+    pub spec_id: String,
+    pub title: String,
+    pub workspace_path: PathBuf,
+    pub workspace_name: String,
+    pub suggested_prompt: String,
 }
 
 /// Result of `writ init`.
@@ -27813,5 +27970,874 @@ mod workspace_tests {
         assert!(!report.is_clean, "conflicting edits should not be clean");
         assert!(!report.applied, "unclean merge should not apply");
         assert!(!report.escalations.is_empty(), "should have escalations");
+    }
+
+    // -----------------------------------------------------------------------
+    // WV.19: Gitignore management tests (Haris)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_wv19_gitignore_adds_workspaces_entry() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".writ/\n").unwrap();
+
+        ensure_workspaces_gitignored(dir.path(), "workspaces").unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains("workspaces/"));
+        assert!(content.contains("# writ workspace directories"));
+    }
+
+    #[test]
+    fn test_wv19_gitignore_idempotent() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".writ/\n").unwrap();
+
+        ensure_workspaces_gitignored(dir.path(), "workspaces").unwrap();
+        ensure_workspaces_gitignored(dir.path(), "workspaces").unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        let count = content.matches("workspaces/").count();
+        assert_eq!(count, 1, "should not duplicate the entry");
+    }
+
+    #[test]
+    fn test_wv19_gitignore_creates_file_if_missing() {
+        let dir = tempdir().unwrap();
+        assert!(!dir.path().join(".gitignore").exists());
+
+        ensure_workspaces_gitignored(dir.path(), "workspaces").unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains("workspaces/"));
+    }
+
+    #[test]
+    fn test_wv19_gitignore_custom_workspace_root() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), ".writ/\n").unwrap();
+
+        ensure_workspaces_gitignored(dir.path(), "agents").unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains("agents/"));
+        assert!(!content.contains("workspaces/"));
+    }
+
+    #[test]
+    fn test_wv19_gitignore_preserves_existing_content() {
+        let dir = tempdir().unwrap();
+        let original = ".writ/\nnode_modules/\n*.log\n";
+        std::fs::write(dir.path().join(".gitignore"), original).unwrap();
+
+        ensure_workspaces_gitignored(dir.path(), "workspaces").unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(content.contains(".writ/"));
+        assert!(content.contains("node_modules/"));
+        assert!(content.contains("*.log"));
+        assert!(content.contains("workspaces/"));
+    }
+
+    #[test]
+    fn test_wv19_gitignore_already_present_skips() {
+        let dir = tempdir().unwrap();
+        let original = ".writ/\nworkspaces/\n";
+        std::fs::write(dir.path().join(".gitignore"), original).unwrap();
+
+        ensure_workspaces_gitignored(dir.path(), "workspaces").unwrap();
+
+        let content = std::fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert_eq!(content, original, "should not modify when already present");
+    }
+
+    // ─── WV.12: create_task() tests ──────────────────────────────────
+
+    #[test]
+    fn test_create_task_happy_path() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.create_task("Backend API work".into(), None).unwrap();
+
+        assert_eq!(result.spec_id, "backend-api-work");
+        assert_eq!(result.title, "Backend API work");
+        assert_eq!(result.workspace_name, "backend-api-work");
+        assert!(result.workspace_path.exists());
+        assert!(!result.suggested_prompt.is_empty());
+    }
+
+    #[test]
+    fn test_create_task_creates_spec() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("My feature".into(), None).unwrap();
+
+        let spec = repo.load_spec("my-feature").unwrap();
+        assert_eq!(spec.title, "My feature");
+    }
+
+    #[test]
+    fn test_create_task_creates_workspace() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("Auth module".into(), None).unwrap();
+
+        let workspaces = repo.list_workspaces().unwrap();
+        let ws = workspaces.iter().find(|w| w.name == "auth-module");
+        assert!(ws.is_some(), "workspace 'auth-module' should exist");
+    }
+
+    #[test]
+    fn test_create_task_assigns_spec_to_workspace() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("Dashboard UI".into(), None).unwrap();
+
+        let spec = repo.load_spec("dashboard-ui").unwrap();
+        assert_eq!(
+            spec.workspace.as_deref(),
+            Some("dashboard-ui"),
+            "spec should be assigned to its workspace"
+        );
+    }
+
+    #[test]
+    fn test_create_task_workspace_at_project_root() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo
+            .create_task("Payment integration".into(), None)
+            .unwrap();
+
+        // Workspace dir should be at <root>/workspaces/<id>/, NOT .writ/workspaces/
+        assert!(
+            result
+                .workspace_path
+                .ends_with("workspaces/payment-integration"),
+            "workspace path should end with workspaces/payment-integration, got {:?}",
+            result.workspace_path
+        );
+        assert!(result.workspace_path.exists());
+    }
+
+    #[test]
+    fn test_create_task_gitignore_updated() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("Some task".into(), None).unwrap();
+
+        let gitignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        assert!(
+            gitignore.contains("workspaces/"),
+            ".gitignore should contain 'workspaces/'"
+        );
+    }
+
+    #[test]
+    fn test_create_task_gitignore_not_duplicated() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("Task one".into(), None).unwrap();
+        repo.create_task("Task two".into(), None).unwrap();
+
+        let gitignore = fs::read_to_string(dir.path().join(".gitignore")).unwrap();
+        let count = gitignore
+            .lines()
+            .filter(|l| l.trim() == "workspaces/")
+            .count();
+        assert_eq!(
+            count, 1,
+            "workspaces/ should appear exactly once in .gitignore"
+        );
+    }
+
+    #[test]
+    fn test_create_task_custom_id_override() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo
+            .create_task("Backend API work".into(), Some("api-v2".into()))
+            .unwrap();
+
+        assert_eq!(result.spec_id, "api-v2");
+        assert_eq!(result.workspace_name, "api-v2");
+        assert!(repo.load_spec("api-v2").is_ok());
+    }
+
+    #[test]
+    fn test_create_task_duplicate_title_fails() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("Same title".into(), None).unwrap();
+        let err = repo.create_task("Same title".into(), None);
+        assert!(err.is_err(), "duplicate task title should fail");
+    }
+
+    #[test]
+    fn test_create_task_suggested_prompt_capitalized() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.create_task("backend API work".into(), None).unwrap();
+        assert!(
+            result.suggested_prompt.starts_with('B'),
+            "prompt should capitalize first letter"
+        );
+        assert!(
+            result.suggested_prompt.ends_with('.'),
+            "prompt should end with period"
+        );
+        assert_eq!(result.suggested_prompt, "Backend API work.");
+    }
+
+    #[test]
+    fn test_create_task_suggested_prompt_already_has_period() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.create_task("Fix the login bug.".into(), None).unwrap();
+        assert_eq!(result.suggested_prompt, "Fix the login bug.");
+    }
+
+    #[test]
+    fn test_create_task_result_fields_complete() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.create_task("Test feature".into(), None).unwrap();
+
+        assert_eq!(result.spec_id, "test-feature");
+        assert_eq!(result.title, "Test feature");
+        assert_eq!(result.workspace_name, "test-feature");
+        assert!(result.workspace_path.ends_with("workspaces/test-feature"));
+        assert!(!result.suggested_prompt.is_empty());
+    }
+
+    // ─── WV.12: slugify_title() tests ────────────────────────────────
+
+    #[test]
+    fn test_slugify_spaces_to_hyphens() {
+        assert_eq!(slugify_title("Backend API work"), "backend-api-work");
+    }
+
+    #[test]
+    fn test_slugify_special_chars() {
+        assert_eq!(slugify_title("Fix bug #123!"), "fix-bug-123");
+    }
+
+    #[test]
+    fn test_slugify_consecutive_specials_collapsed() {
+        assert_eq!(slugify_title("hello---world"), "hello-world");
+        assert_eq!(slugify_title("a & b & c"), "a-b-c");
+    }
+
+    #[test]
+    fn test_slugify_leading_trailing_trimmed() {
+        assert_eq!(slugify_title("--hello--"), "hello");
+        assert_eq!(slugify_title("  spaces  "), "spaces");
+    }
+
+    #[test]
+    fn test_slugify_long_title_truncated() {
+        let long = "a".repeat(60);
+        let slug = slugify_title(&long);
+        assert!(slug.len() <= 50, "slug should be truncated to 50 chars");
+    }
+
+    #[test]
+    fn test_slugify_unicode() {
+        let slug = slugify_title("café résumé");
+        assert!(!slug.is_empty());
+        assert!(!slug.starts_with('-'));
+        assert!(!slug.ends_with('-'));
+    }
+
+    #[test]
+    fn test_slugify_mixed_case() {
+        assert_eq!(slugify_title("MyFeature"), "myfeature");
+        assert_eq!(slugify_title("API Endpoint"), "api-endpoint");
+    }
+
+    // ─── WV.13: finish auto-converge tests ─────────────────────────
+    //
+    // Tests the repo-level converge_workspaces() behavior that underpins
+    // the CLI cmd_finish() auto-converge flow. CLI-specific behavior
+    // (--cleanup/--no-cleanup flags, interactive prompts) tested via
+    // Python contract tests or CLI integration tests.
+
+    #[test]
+    fn test_finish_no_workspaces_converge_is_noop() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Seal some work in main — no extra workspaces.
+        fs::write(dir.path().join("main.py"), "print('hello')\n").unwrap();
+        repo.seal(
+            test_agent(),
+            "main work".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Converging an empty list is a no-op.
+        let report = repo
+            .converge_workspaces(&[], "three-way-merge", false)
+            .unwrap();
+        assert!(report.is_clean);
+        assert_eq!(report.total_auto_merged, 0);
+    }
+
+    #[test]
+    fn test_finish_with_workspaces_auto_converges() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline seal.
+        fs::write(dir.path().join("base.py"), "# base\n").unwrap();
+        let base_spec = crate::spec::Spec::new("setup".into(), "Setup".into(), "".into());
+        repo.add_spec(&base_spec).unwrap();
+        repo.seal(
+            test_agent(),
+            "baseline".into(),
+            Some("setup".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Create two tasks (spec + workspace each).
+        let t1 = repo.create_task("Feature A".into(), None).unwrap();
+        let t2 = repo.create_task("Feature B".into(), None).unwrap();
+
+        // Each workspace writes a different file.
+        let ws_a_state = dir.path().join(".writ/workspaces").join(&t1.workspace_name);
+        let mut a_idx = crate::index::Index::load(&ws_a_state.join("index.json")).unwrap();
+        let a_content = b"def feature_a(): pass\n";
+        let a_hash = repo.objects.store(a_content).unwrap();
+        a_idx.upsert("feature_a.py", a_hash, a_content.len() as u64);
+        a_idx.save(&ws_a_state.join("index.json")).unwrap();
+
+        let ws_b_state = dir.path().join(".writ/workspaces").join(&t2.workspace_name);
+        let mut b_idx = crate::index::Index::load(&ws_b_state.join("index.json")).unwrap();
+        let b_content = b"def feature_b(): pass\n";
+        let b_hash = repo.objects.store(b_content).unwrap();
+        b_idx.upsert("feature_b.py", b_hash, b_content.len() as u64);
+        b_idx.save(&ws_b_state.join("index.json")).unwrap();
+
+        // Converge both workspaces — should merge cleanly.
+        let ws_names = vec![t1.workspace_name.clone(), t2.workspace_name.clone()];
+        let report = repo
+            .converge_workspaces(&ws_names, "three-way-merge", false)
+            .unwrap();
+
+        assert!(
+            report.is_clean,
+            "non-overlapping files should merge cleanly"
+        );
+        assert!(report.applied, "changes should be applied");
+        assert!(report.escalations.is_empty());
+    }
+
+    #[test]
+    fn test_finish_clean_convergence_applies_files() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline.
+        fs::write(dir.path().join("app.py"), "# app\n").unwrap();
+        let base_spec = crate::spec::Spec::new("init".into(), "Init".into(), "".into());
+        repo.add_spec(&base_spec).unwrap();
+        repo.seal(
+            test_agent(),
+            "init".into(),
+            Some("init".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // One task with a new file.
+        let t1 = repo.create_task("Add utils".into(), None).unwrap();
+        let ws_state = dir.path().join(".writ/workspaces").join(&t1.workspace_name);
+        let mut idx = crate::index::Index::load(&ws_state.join("index.json")).unwrap();
+        let content = b"def helper(): return True\n";
+        let hash = repo.objects.store(content).unwrap();
+        idx.upsert("utils.py", hash, content.len() as u64);
+        idx.save(&ws_state.join("index.json")).unwrap();
+
+        let report = repo
+            .converge_workspaces(&[t1.workspace_name.clone()], "three-way-merge", false)
+            .unwrap();
+
+        assert!(report.is_clean);
+        assert!(report.applied);
+        // The new file should exist in working directory after convergence.
+        assert!(dir.path().join("utils.py").exists());
+    }
+
+    #[test]
+    fn test_finish_escalation_blocks_convergence() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline with a shared file.
+        fs::write(dir.path().join("config.py"), "setting = 1\n").unwrap();
+        let base_spec = crate::spec::Spec::new("init".into(), "Init".into(), "".into());
+        repo.add_spec(&base_spec).unwrap();
+        repo.seal(
+            test_agent(),
+            "init".into(),
+            Some("init".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Two tasks that modify the same file differently.
+        let t1 = repo.create_task("Config A".into(), None).unwrap();
+        let t2 = repo.create_task("Config B".into(), None).unwrap();
+
+        let ws_a = dir.path().join(".writ/workspaces").join(&t1.workspace_name);
+        let mut a_idx = crate::index::Index::load(&ws_a.join("index.json")).unwrap();
+        let a_content = b"setting = 100\n";
+        let a_hash = repo.objects.store(a_content).unwrap();
+        a_idx.upsert("config.py", a_hash, a_content.len() as u64);
+        a_idx.save(&ws_a.join("index.json")).unwrap();
+
+        let ws_b = dir.path().join(".writ/workspaces").join(&t2.workspace_name);
+        let mut b_idx = crate::index::Index::load(&ws_b.join("index.json")).unwrap();
+        let b_content = b"setting = 200\n";
+        let b_hash = repo.objects.store(b_content).unwrap();
+        b_idx.upsert("config.py", b_hash, b_content.len() as u64);
+        b_idx.save(&ws_b.join("index.json")).unwrap();
+
+        // Converge with escalate strategy — should report conflicts.
+        let ws_names = vec![t1.workspace_name.clone(), t2.workspace_name.clone()];
+        let report = repo
+            .converge_workspaces(&ws_names, "escalate", false)
+            .unwrap();
+
+        assert!(!report.is_clean, "conflicting edits should not be clean");
+        assert!(!report.escalations.is_empty(), "should have escalations");
+    }
+
+    #[test]
+    fn test_finish_cleanup_deletes_workspace_state() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let t1 = repo.create_task("Cleanup test".into(), None).unwrap();
+        assert!(dir
+            .path()
+            .join(".writ/workspaces")
+            .join(&t1.workspace_name)
+            .exists());
+
+        // delete_workspace removes the state dir and unassigns specs.
+        repo.delete_workspace(&t1.workspace_name, false).unwrap();
+
+        assert!(!dir
+            .path()
+            .join(".writ/workspaces")
+            .join(&t1.workspace_name)
+            .exists());
+        let spec = repo.load_spec(&t1.spec_id).unwrap();
+        assert_eq!(
+            spec.workspace, None,
+            "spec should be unassigned after delete"
+        );
+    }
+
+    #[test]
+    fn test_finish_cleanup_keep_files_preserves_dir() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let t1 = repo.create_task("Keep files test".into(), None).unwrap();
+        fs::write(t1.workspace_path.join("work.py"), "# work\n").unwrap();
+
+        // delete_workspace with keep_files=true removes state but preserves working dir.
+        repo.delete_workspace(&t1.workspace_name, true).unwrap();
+
+        assert!(!dir
+            .path()
+            .join(".writ/workspaces")
+            .join(&t1.workspace_name)
+            .exists());
+        assert!(
+            t1.workspace_path.exists(),
+            "working directory should be preserved with keep_files=true"
+        );
+    }
+
+    #[test]
+    fn test_finish_single_workspace_trivial_convergence() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline.
+        fs::write(dir.path().join("app.py"), "# app\n").unwrap();
+        let base_spec = crate::spec::Spec::new("init".into(), "Init".into(), "".into());
+        repo.add_spec(&base_spec).unwrap();
+        repo.seal(
+            test_agent(),
+            "init".into(),
+            Some("init".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let t1 = repo.create_task("Solo task".into(), None).unwrap();
+        let ws_state = dir.path().join(".writ/workspaces").join(&t1.workspace_name);
+        let mut idx = crate::index::Index::load(&ws_state.join("index.json")).unwrap();
+        let content = b"def solo(): pass\n";
+        let hash = repo.objects.store(content).unwrap();
+        idx.upsert("solo.py", hash, content.len() as u64);
+        idx.save(&ws_state.join("index.json")).unwrap();
+
+        let report = repo
+            .converge_workspaces(&[t1.workspace_name.clone()], "three-way-merge", false)
+            .unwrap();
+
+        assert!(report.is_clean);
+        assert!(report.applied);
+        assert!(report.escalations.is_empty());
+    }
+
+    #[test]
+    fn test_finish_convergence_report_fields() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline.
+        fs::write(dir.path().join("base.py"), "# base\n").unwrap();
+        let base_spec = crate::spec::Spec::new("init".into(), "Init".into(), "".into());
+        repo.add_spec(&base_spec).unwrap();
+        repo.seal(
+            test_agent(),
+            "init".into(),
+            Some("init".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let t1 = repo.create_task("Report test".into(), None).unwrap();
+        let ws_state = dir.path().join(".writ/workspaces").join(&t1.workspace_name);
+        let mut idx = crate::index::Index::load(&ws_state.join("index.json")).unwrap();
+        let content = b"def report(): pass\n";
+        let hash = repo.objects.store(content).unwrap();
+        idx.upsert("report.py", hash, content.len() as u64);
+        idx.save(&ws_state.join("index.json")).unwrap();
+
+        let report = repo
+            .converge_workspaces(&[t1.workspace_name.clone()], "three-way-merge", false)
+            .unwrap();
+
+        assert_eq!(report.strategy, "three-way-merge");
+        assert!(report.is_clean);
+        assert!(!report.files_changed.is_empty());
+        assert_eq!(report.total_conflicts, 0);
+    }
+
+    // ─── WV.14: context task display tests ─────────────────────────
+
+    #[test]
+    fn test_context_from_workspace_shows_task() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("Auth module".into(), None).unwrap();
+
+        let filter = crate::context::ContextFilter {
+            workspace: Some("auth-module".to_string()),
+            ..Default::default()
+        };
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        assert!(ctx.task.is_some(), "workspace context should include task");
+        let task = ctx.task.unwrap();
+        assert_eq!(task.id, "auth-module");
+    }
+
+    #[test]
+    fn test_context_from_main_omits_task() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("Auth module".into(), None).unwrap();
+
+        // Context with no workspace filter (main).
+        let filter = crate::context::ContextFilter::default();
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        assert!(ctx.task.is_none(), "main context should not include task");
+    }
+
+    #[test]
+    fn test_context_task_fields_correct() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("Backend API".into(), None).unwrap();
+
+        let filter = crate::context::ContextFilter {
+            workspace: Some("backend-api".to_string()),
+            ..Default::default()
+        };
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        let task = ctx.task.expect("task should be present");
+        assert_eq!(task.id, "backend-api");
+        assert_eq!(task.title, "Backend API");
+        // New spec defaults to Pending; Debug format lowercased.
+        assert_eq!(task.status, "pending");
+    }
+
+    #[test]
+    fn test_context_task_after_spec_done_shows_complete() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("Complete me".into(), None).unwrap();
+
+        // Mark the spec complete.
+        let mut spec = repo.load_spec("complete-me").unwrap();
+        spec.status = SpecStatus::Complete;
+        repo.save_spec(&spec).unwrap();
+
+        let filter = crate::context::ContextFilter {
+            workspace: Some("complete-me".to_string()),
+            ..Default::default()
+        };
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        let task = ctx.task.expect("task should be present");
+        assert_eq!(task.status, "complete");
+    }
+
+    #[test]
+    fn test_context_no_assigned_spec_omits_task() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a workspace manually (no spec assignment).
+        repo.create_workspace("bare-ws", None, None).unwrap();
+
+        let filter = crate::context::ContextFilter {
+            workspace: Some("bare-ws".to_string()),
+            ..Default::default()
+        };
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        assert!(
+            ctx.task.is_none(),
+            "workspace without assigned spec should not have task"
+        );
+    }
+
+    #[test]
+    fn test_context_task_appears_before_specs_in_output() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("Ordering test".into(), None).unwrap();
+
+        let filter = crate::context::ContextFilter {
+            workspace: Some("ordering-test".to_string()),
+            ..Default::default()
+        };
+        let ctx = repo
+            .context(crate::context::ContextScope::Full, 10, &filter)
+            .unwrap();
+
+        // Serialize to JSON and verify task appears before all_specs.
+        let json = serde_json::to_string(&ctx).unwrap();
+        let task_pos = json.find("\"task\"").expect("task field should be in JSON");
+        // all_specs may or may not be present; if present it should come after task.
+        if let Some(specs_pos) = json.find("\"all_specs\"") {
+            assert!(
+                task_pos < specs_pos,
+                "task should appear before all_specs in serialized output"
+            );
+        }
+        if let Some(seals_pos) = json.find("\"recent_seals\"") {
+            assert!(
+                task_pos < seals_pos,
+                "task should appear before recent_seals in serialized output"
+            );
+        }
+    }
+
+    // ─── WV.15: integration scenario tests ──────────────────────────
+
+    #[test]
+    fn test_integration_task_lifecycle() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create task
+        let task = repo.create_task("Auth module".into(), None).unwrap();
+        assert_eq!(task.spec_id, "auth-module");
+
+        // Write a file in the workspace directory
+        fs::write(task.workspace_path.join("auth.py"), "def login(): pass\n").unwrap();
+
+        // Seal work
+        repo.seal(
+            test_agent(),
+            "added auth module".into(),
+            Some("auth-module".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Mark spec complete
+        let mut spec = repo.load_spec("auth-module").unwrap();
+        spec.status = SpecStatus::Complete;
+        repo.save_spec(&spec).unwrap();
+
+        let spec = repo.load_spec("auth-module").unwrap();
+        assert_eq!(spec.status, SpecStatus::Complete);
+    }
+
+    #[test]
+    fn test_integration_duplicate_task_id_error() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.create_task("My feature".into(), None).unwrap();
+        let err = repo.create_task("Different title".into(), Some("my-feature".into()));
+        assert!(err.is_err(), "duplicate ID should error");
+    }
+
+    #[test]
+    fn test_integration_two_tasks_independent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let t1 = repo.create_task("Backend API".into(), None).unwrap();
+        let t2 = repo.create_task("Frontend UI".into(), None).unwrap();
+
+        // Both specs exist
+        assert!(repo.load_spec("backend-api").is_ok());
+        assert!(repo.load_spec("frontend-ui").is_ok());
+
+        // Both workspaces exist at project root
+        assert!(t1.workspace_path.exists());
+        assert!(t2.workspace_path.exists());
+        assert_ne!(t1.workspace_path, t2.workspace_path);
+
+        // Both workspaces listed
+        let workspaces = repo.list_workspaces().unwrap();
+        let ws_names: Vec<&str> = workspaces.iter().map(|w| w.name.as_str()).collect();
+        assert!(ws_names.contains(&"backend-api"));
+        assert!(ws_names.contains(&"frontend-ui"));
+    }
+
+    #[test]
+    fn test_integration_two_tasks_seal_converge_cleanup() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline seal.
+        fs::write(dir.path().join("readme.md"), "# Project\n").unwrap();
+        let base = crate::spec::Spec::new("init".into(), "Init".into(), "".into());
+        repo.add_spec(&base).unwrap();
+        repo.seal(
+            test_agent(),
+            "init".into(),
+            Some("init".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Create two tasks.
+        let t1 = repo.create_task("Backend API".into(), None).unwrap();
+        let t2 = repo.create_task("Frontend UI".into(), None).unwrap();
+
+        // Workspace A adds a file.
+        let ws_a = dir.path().join(".writ/workspaces").join(&t1.workspace_name);
+        let mut a_idx = crate::index::Index::load(&ws_a.join("index.json")).unwrap();
+        let a_content = b"def api(): pass\n";
+        let a_hash = repo.objects.store(a_content).unwrap();
+        a_idx.upsert("api.py", a_hash, a_content.len() as u64);
+        a_idx.save(&ws_a.join("index.json")).unwrap();
+
+        // Workspace B adds a different file.
+        let ws_b = dir.path().join(".writ/workspaces").join(&t2.workspace_name);
+        let mut b_idx = crate::index::Index::load(&ws_b.join("index.json")).unwrap();
+        let b_content = b"<div>UI</div>\n";
+        let b_hash = repo.objects.store(b_content).unwrap();
+        b_idx.upsert("index.html", b_hash, b_content.len() as u64);
+        b_idx.save(&ws_b.join("index.json")).unwrap();
+
+        // Converge both.
+        let ws_names = vec![t1.workspace_name.clone(), t2.workspace_name.clone()];
+        let report = repo
+            .converge_workspaces(&ws_names, "three-way-merge", false)
+            .unwrap();
+        assert!(
+            report.is_clean,
+            "non-overlapping changes should merge cleanly"
+        );
+        assert!(report.applied);
+
+        // Both files should now exist in the working directory.
+        assert!(dir.path().join("api.py").exists());
+        assert!(dir.path().join("index.html").exists());
+
+        // Cleanup: delete workspaces (simulates post-finish cleanup).
+        repo.delete_workspace(&t1.workspace_name, false).unwrap();
+        repo.delete_workspace(&t2.workspace_name, false).unwrap();
+
+        // Workspace state dirs should be gone.
+        assert!(!dir
+            .path()
+            .join(".writ/workspaces")
+            .join(&t1.workspace_name)
+            .exists());
+        assert!(!dir
+            .path()
+            .join(".writ/workspaces")
+            .join(&t2.workspace_name)
+            .exists());
+
+        // But main workspace and merged files remain.
+        assert!(dir.path().join(".writ/workspaces/main").exists());
+        assert!(dir.path().join("api.py").exists());
+        assert!(dir.path().join("index.html").exists());
     }
 }

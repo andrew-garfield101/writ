@@ -41,6 +41,46 @@ Options:
   --keep-writignore   Keep the .writignore file
 ```
 
+### `writ task`
+
+Create a task for an agent. One command that creates a spec, a workspace, and prints a launch command.
+
+```bash
+writ task <TITLE> [OPTIONS]
+
+Options:
+  --id <ID>              Override the auto-derived spec/workspace ID
+  --format <FORMAT>      Output: human (default), json
+```
+
+The title is slugified into a spec ID automatically (e.g. "backend API work" becomes `backend-api-work`). Use `--id` to override.
+
+Output:
+
+```
+task created: backend-api-work
+  workspace: workspaces/backend-api-work/
+
+  Launch an agent in this workspace:
+    cd workspaces/backend-api-work/
+
+  Suggested prompt: "Backend API work."
+  Or provide your own prompt for the agent.
+```
+
+The first `writ task` invocation adds `workspaces/` to `.gitignore` automatically. Running `writ task` from inside a workspace shows a warning — tasks should be created from the main project directory.
+
+### `writ task list`
+
+Show all active tasks and their status.
+
+```bash
+writ task list [OPTIONS]
+
+Options:
+  --format <FORMAT>      Output: human (default), json
+```
+
 ### `writ seal`
 
 Create a structured checkpoint from current changes.
@@ -78,6 +118,8 @@ Options:
   --format <FORMAT>          Output: json, toon, human, brief
 ```
 
+When called from inside a workspace created by `writ task`, the output includes a `task` field at the top with the assigned task ID, title, and status.
+
 ### `writ status`
 
 High level project overview. Agent activity, spec progress, commit readiness. Complements `writ state` (low level working directory state) with a fleet aware, progress oriented view.
@@ -92,11 +134,12 @@ Options:
   --spec <SPEC>            Detail view of one spec
   --watch                  Live-updating view (refreshes every 5s)
   --interval <SECONDS>     Refresh interval for --watch [default: 5]
-  --proposals              Show pending commit proposals (propose mode)
   --format <FORMAT>        Output: json, toon, json-compact
 ```
 
 The default view adapts automatically to project scale — expanding details for small projects, collapsing to summaries for large fleets. Use filter flags to drill down.
+
+When tasks exist (specs created via `writ task`), they appear under a "Tasks" header showing task name, agent, seal count, and status.
 
 ### `writ log`
 
@@ -179,7 +222,7 @@ Formats:
 
 ### `writ finish`
 
-Promote completed specs to git commits. Interactive spec selection, commit strategy options, and auto generated messages from seal history.
+Promote completed specs to git commits. When workspaces exist, auto-converges outstanding workspace changes before committing. Interactive spec selection, commit strategy options, and auto generated messages from seal history.
 
 ```bash
 writ finish [OPTIONS]
@@ -192,20 +235,21 @@ Options:
   --specs <LIST>           Comma-separated spec IDs to include
   --all                    Include all completed specs (no selection prompt)
   --dry-run                Preview what would be committed without doing it
-
-  # Propose mode (workflow.commit_mode = "propose")
-  --propose                Create a commit proposal (does not commit)
-  --accept <N>             Accept proposal number N
-  --accept-all             Accept all pending proposals
-  --reject <N>             Reject proposal number N
-  --review <N>             Review proposal number N in detail
-  --proposals              List pending proposals
+  --cleanup                Auto-clean workspace directories after commit (no prompt)
+  --no-cleanup             Keep workspace directories after commit (no prompt)
 
   # Auto mode (workflow.commit_mode = "auto")
   --auto                   Commit immediately without approval
   --verify                 Run verification command before committing
   --no-verify              Skip verification command
 ```
+
+When workspaces exist with changes, `writ finish` automatically:
+1. Detects all non-main workspaces
+2. Runs convergence (prints merge report)
+3. If convergence has unresolved escalations, errors out before committing
+4. If convergence is clean, proceeds to git commit
+5. After commit, prompts for workspace directory cleanup (default: yes)
 
 ## Convergence Commands
 
@@ -320,12 +364,12 @@ Remove a spec's workspace assignment. The spec becomes globally visible in all w
 writ spec unassign <SPEC-ID>
 ```
 
-### `writ reopen`
+### `writ spec reopen`
 
 Reopen a completed spec for continued work. Sets the spec back to active. Seal history is preserved.
 
 ```bash
-writ reopen --spec <ID>
+writ spec reopen <ID>
 ```
 
 ## Workspace Commands
@@ -338,7 +382,7 @@ Create a new isolated workspace with its own directory and files.
 writ workspace create <NAME> [OPTIONS]
 
 Options:
-  --path <DIR>          Directory for the workspace (default: .writ/ws/<name>/)
+  --path <DIR>          Directory for the workspace (default: workspaces/<name>/)
   --specs <FILTER>      Assign matching specs (glob or comma-separated IDs)
   --from <WORKSPACE>    Create from another workspace's state instead of main
 ```

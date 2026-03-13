@@ -108,6 +108,10 @@ pub struct ProjectConfig {
     /// Auto-mode configuration (project-level only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto: Option<AutoModeConfig>,
+
+    /// Workspace settings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceSettings>,
 }
 
 /// Project metadata section.
@@ -215,6 +219,27 @@ pub struct AutoModeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub webhook_url: Option<String>,
 }
+
+// ---------------------------------------------------------------------------
+// Workspace settings
+// ---------------------------------------------------------------------------
+
+/// Workspace settings — where workspace directories are created.
+///
+/// ```toml
+/// [workspace]
+/// root = "workspaces"   # default, relative to project root
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct WorkspaceSettings {
+    /// Root directory for workspace directories, relative to project root.
+    /// Defaults to `"workspaces"` if not set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+}
+
+/// Default workspace root directory.
+pub const DEFAULT_WORKSPACE_ROOT: &str = "workspaces";
 
 /// Valid commit modes.
 const VALID_COMMIT_MODES: &[&str] = &["user", "propose", "auto"];
@@ -353,6 +378,14 @@ impl ProjectConfig {
     /// Get the configured stale timeout, if set.
     pub fn stale_timeout(&self) -> Option<u64> {
         self.workflow.as_ref()?.stale_timeout
+    }
+
+    /// Get the configured workspace root directory, defaulting to "workspaces".
+    pub fn workspace_root(&self) -> &str {
+        self.workspace
+            .as_ref()
+            .and_then(|ws| ws.root.as_deref())
+            .unwrap_or(DEFAULT_WORKSPACE_ROOT)
     }
 
     /// Migrate values from `.writ/settings.json` into a new ProjectConfig.
@@ -579,6 +612,7 @@ mod tests {
             }),
             workflow: None,
             auto: None,
+            workspace: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: ProjectConfig = toml::from_str(&toml_str).unwrap();
@@ -1209,5 +1243,72 @@ commit_mode = "propose"
         assert_eq!(config.user.as_ref().unwrap().name.as_deref(), Some("Bri"));
         assert!(config.init.is_none());
         assert!(config.output.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // WV.18: Workspace root configuration tests (Haris)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_workspace_root_default() {
+        let config = ProjectConfig::default();
+        assert_eq!(config.workspace_root(), "workspaces");
+    }
+
+    #[test]
+    fn test_workspace_root_custom() {
+        let config = ProjectConfig {
+            workspace: Some(WorkspaceSettings {
+                root: Some("agents".into()),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(config.workspace_root(), "agents");
+    }
+
+    #[test]
+    fn test_workspace_root_none_falls_to_default() {
+        let config = ProjectConfig {
+            workspace: Some(WorkspaceSettings { root: None }),
+            ..Default::default()
+        };
+        assert_eq!(config.workspace_root(), "workspaces");
+    }
+
+    #[test]
+    fn test_workspace_settings_toml_roundtrip() {
+        let toml_str = "[workspace]\nroot = \"my-workspaces\"\n";
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.workspace_root(), "my-workspaces");
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let reparsed: ProjectConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.workspace_root(), "my-workspaces");
+    }
+
+    #[test]
+    fn test_workspace_settings_omitted_from_toml_when_none() {
+        let config = ProjectConfig::default();
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            !serialized.contains("workspace"),
+            "workspace section should not appear when None"
+        );
+    }
+
+    #[test]
+    fn test_workspace_root_save_and_load() {
+        let dir = TempDir::new().unwrap();
+        let writ_dir = dir.path().join(".writ");
+        std::fs::create_dir_all(&writ_dir).unwrap();
+
+        let mut config = ProjectConfig::default();
+        config.workspace = Some(WorkspaceSettings {
+            root: Some("ws-root".into()),
+        });
+        config.save(&writ_dir).unwrap();
+
+        let loaded = ProjectConfig::load(&writ_dir).unwrap();
+        assert_eq!(loaded.workspace_root(), "ws-root");
     }
 }

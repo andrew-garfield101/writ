@@ -81,7 +81,10 @@ impl fmt::Display for WritError {
             WritError::Json(e) => write!(f, "JSON error: {e}"),
             WritError::ObjectNotFound(hash) => write!(f, "object not found: {hash}"),
             WritError::NothingToSeal => {
-                write!(f, "no changes to seal — working directory matches last seal")
+                write!(
+                    f,
+                    "no changes to seal — working directory matches last seal"
+                )
             }
             WritError::SealNotFound(id) => write!(f, "seal not found: {id}"),
             WritError::SpecNotFound(id) => write!(f, "spec not found: {id}"),

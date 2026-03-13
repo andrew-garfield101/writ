@@ -220,6 +220,15 @@ pub struct WorkspaceDeleteParams {
     pub keep_files: Option<bool>,
 }
 
+/// Parameters for writ_task tool.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TaskParams {
+    /// Task description (used as spec title and prompt suggestion).
+    pub title: String,
+    /// Override the auto-derived spec/workspace ID.
+    pub id: Option<String>,
+}
+
 // ─── Server ──────────────────────────────────────────────────────
 
 /// The writ MCP server. Exposes writ CLI operations as native MCP tools.
@@ -357,9 +366,7 @@ impl WritMcpServer {
             })
             .unwrap_or_default();
 
-        let context_result = self.run_writ(&[
-            "spec", "status", "--format", "toon",
-        ])?;
+        let context_result = self.run_writ(&["spec", "status", "--format", "toon"])?;
         let context_text = context_result
             .content
             .first()
@@ -729,6 +736,24 @@ impl WritMcpServer {
         }
         self.run_writ_owned(&args)
     }
+
+    // ─── Task (one-shot spec + workspace) ───────────────────────
+
+    /// Create a task — a spec and isolated workspace in one command.
+    #[tool(
+        name = "writ_task",
+        description = "Create a task: spec + workspace + gitignore in one shot. Returns spec ID, workspace path, and a suggested agent prompt."
+    )]
+    async fn writ_task(
+        &self,
+        Parameters(params): Parameters<TaskParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut args = vec!["task".to_string(), params.title];
+        if let Some(id) = params.id {
+            args.extend(["--id".to_string(), id]);
+        }
+        self.run_writ_owned(&args)
+    }
 }
 
 // ─── CLI Bridge ──────────────────────────────────────────────────
@@ -853,7 +878,7 @@ mod tests {
     fn test_tool_count() {
         let server = WritMcpServer::new("writ".to_string(), ".".to_string());
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 21, "Expected 21 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 22, "Expected 22 tools, got {}", tools.len());
     }
 
     #[test]
@@ -884,6 +909,7 @@ mod tests {
             "writ_workspace_list",
             "writ_workspace_status",
             "writ_workspace_delete",
+            "writ_task",
         ];
 
         for name in &expected {
@@ -1746,5 +1772,50 @@ mod tests {
             names.contains(&"name"),
             "workspace_delete must require 'name'"
         );
+    }
+
+    // ─── Arg-building: Task ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_task_minimal() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_task(Parameters(TaskParams {
+                title: "Add login flow".to_string(),
+                id: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_eq!(text, "task Add login flow");
+    }
+
+    #[tokio::test]
+    async fn test_task_with_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_task(Parameters(TaskParams {
+                title: "Add login flow".to_string(),
+                id: Some("login-v2".to_string()),
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert_eq!(text, "task Add login flow --id login-v2");
+    }
+
+    // ─── Schema validation: Task ───────────────────────────────
+
+    #[test]
+    fn test_task_requires_title_in_schema() {
+        let server = WritMcpServer::new("writ".to_string(), ".".to_string());
+        let tools = server.tool_router.list_all();
+        let tool = tools.iter().find(|t| t.name == "writ_task").unwrap();
+        let schema = &tool.input_schema;
+        let required = schema.get("required").unwrap().as_array().unwrap();
+        let names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
+        assert!(names.contains(&"title"), "task must require 'title'");
     }
 }

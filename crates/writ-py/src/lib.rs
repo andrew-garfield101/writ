@@ -1357,6 +1357,31 @@ impl PyRepository {
     }
 
     // -------------------------------------------------------------------
+    // Task management
+    // -------------------------------------------------------------------
+
+    /// Create a task (spec + workspace) in one shot.
+    ///
+    /// This is the Python binding for `writ task "<title>"`. It creates a spec,
+    /// a workspace directory at `workspaces/<id>/`, assigns the spec to the
+    /// workspace, and ensures `workspaces/` is in `.gitignore`.
+    ///
+    /// Parameters:
+    /// - `title`: Task description (used as spec title and prompt suggestion).
+    /// - `id`: Optional override for the auto-derived spec/workspace ID.
+    ///
+    /// Returns a dict with spec_id, title, workspace_path, workspace_name,
+    /// suggested_prompt.
+    #[pyo3(signature = (title, id=None))]
+    fn create_task(&self, py: Python, title: &str, id: Option<String>) -> PyResult<PyObject> {
+        let result = self
+            .inner
+            .create_task(title.to_string(), id)
+            .map_err(writ_err)?;
+        to_pydict(py, &result)
+    }
+
+    // -------------------------------------------------------------------
     // Workspace management
     // -------------------------------------------------------------------
 

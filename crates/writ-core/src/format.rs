@@ -752,6 +752,7 @@ mod tests {
 
         ContextOutput {
             writ_version: "0.1.0".into(),
+            task: None,
             workspace: None,
             active_spec: None, // full context doesn't set active_spec
             all_specs: Some(specs),
@@ -1573,6 +1574,7 @@ mod tests {
         // Measure each section independently by formatting partial contexts
         let empty_ctx = ContextOutput {
             writ_version: "0.1.0".into(),
+            task: None,
             workspace: None,
             active_spec: None,
             all_specs: None,

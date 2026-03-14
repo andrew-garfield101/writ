@@ -118,6 +118,33 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - 4 new MCP tools: `writ_workspace_create`, `writ_workspace_list`, `writ_workspace_status`, `writ_workspace_delete`
 - 3 new slash commands: `/writ-workspace-create`, `/writ-workspace-list`, `/writ-workspace-status`
 
+**Spec-Scoped Sealing**
+- `writ seal --spec X` captures only the files that changed since this agent's last seal for spec X. Multiple agents work in the same directory without cross-contamination.
+- Per-agent, per-spec baselines: each (agent, spec) pair maintains its own baseline state
+- Genesis index: `writ spec add` snapshots the current file index for use as the first seal baseline
+- Auto-claiming: first `writ seal --spec X` auto-claims unclaimed spec X for this agent
+- Without `--spec`, seal captures the full working directory (backward compatible)
+
+**Writ Watch (Convergence Daemon)**
+- `writ watch`: long-running process that monitors for new seals and auto-converges overlapping changes in real time
+- Detects overlapping seals from different specs touching the same file, runs convergence automatically
+- Terminal mode (default): real-time output showing seal detection, convergence, and conflicts
+- Daemon mode (`--daemon`): background process with PID file and log output
+- Configuration via `.writ/config.toml` `[watch]` section: interval, auto_converge, max_retries
+- Conflict recording: unresolvable overlaps stored in `.writ/conflicts/` and surfaced via `writ status`
+
+**Writ Plan (Batch Task Definition)**
+- `writ plan "task1" "task2"`: batch spec creation from inline arguments
+- `writ plan -f tasks.txt`: one task per line from file
+- Stdin support: `cat tasks.txt | writ plan`
+- Titles auto-slugified to spec IDs (e.g. "Implement OAuth2 auth" becomes `implement-oauth2-auth`)
+
+**Spec Claiming**
+- `writ spec claim <id>`: explicitly claim an unclaimed spec for the current agent
+- Unclaimed specs visible in `writ context` output for agent discovery
+- First-claim-wins: second attempt returns actionable error with claiming agent's ID
+- Auto-claim on first `writ seal --spec X` if spec is unclaimed
+
 **Agent Adoption Enforcement**
 - C.13: `writ seal` without `--spec` in agent context (env var detected) returns exit 1 with actionable error. Human context warns but allows.
 - C.14: `writ context` writes timestamp to `.writ/.context_token`. `writ seal` checks freshness (4h window) and warns agents if stale or missing. Warning only, never blocks.

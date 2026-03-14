@@ -26,6 +26,10 @@ toon-format = { version = "0.4", default-features = false }
 hostname = "0.4"
 dirs = "5"
 git2 = { version = "0.19", optional = true }
+notify = "6"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

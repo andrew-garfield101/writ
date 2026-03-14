@@ -1491,6 +1491,8 @@ mod tests {
             commit_hash: None,
             committed_at: None,
             workspace: None,
+            claimed_by: None,
+            genesis_tree: None,
         }
     }
 

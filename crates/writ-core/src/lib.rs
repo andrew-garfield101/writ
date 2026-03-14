@@ -27,6 +27,7 @@ pub mod keystore;
 pub mod lock;
 pub mod migrate;
 pub mod object;
+pub mod platform;
 pub mod proposal;
 pub mod remote;
 pub mod repo;
@@ -37,6 +38,7 @@ pub mod slash_commands;
 pub mod spec;
 pub mod state;
 pub mod status;
+pub mod watch;
 pub mod workspace;
 
 pub use error::{WritError, WritResult};

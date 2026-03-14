@@ -140,6 +140,13 @@ pub struct Spec {
     /// Workspace this spec is assigned to. None = globally visible.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<String>,
+    /// Agent ID that has claimed this spec. None = unclaimed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_by: Option<String>,
+    /// Tree hash snapshot at spec creation time — used as baseline for
+    /// spec-scoped sealing when an agent has no previous seals for this spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genesis_tree: Option<String>,
 }
 
 impl std::str::FromStr for SpecStatus {
@@ -198,6 +205,8 @@ impl Spec {
             commit_hash: None,
             committed_at: None,
             workspace: None,
+            claimed_by: None,
+            genesis_tree: None,
         }
     }
 

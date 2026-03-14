@@ -79,31 +79,32 @@ The full round trip looks like this:
   # Human sets up the project
   writ init
 
-  # Human defines work and kicks off agents (your existing workflow)
-  writ spec add --id auth --title "Add auth module"
+  # Define tasks (optional — agents can also create their own specs)
+  writ plan "Add auth module" "Payment integration" "Dashboard UI"
+
+  # Start the convergence daemon (auto-merges overlapping work)
+  writ watch
+
   # Launch agents however you normally do — Claude Code, Codex, scripts, etc.
+  # Agents work in the same directory. No workspaces needed.
 
-  # Agents work — sealing checkpoints as they go
-  writ seal -s "added auth module" --agent implementer --spec auth
-  writ seal -s "tests passing" --agent tester --spec auth --tests-passed 42
-
-  # Agent marks its task complete
-  writ spec done auth
-
-  # One call gives agents everything they need
-  writ context --format toon # token-optimized for LLM agents
+  # Agents discover specs, claim them, and work
+  writ context --format toon    # agent sees unclaimed specs
+  writ spec claim auth          # agent claims a task
+  writ seal -s "auth endpoint" --spec auth    # checkpoint (only this spec's changes)
+  writ spec done auth           # agent marks task complete
 
   # Human checks in on progress from anywhere
   writ status
 
   # When ready, promote completed work to git
-  writ finish # stages, commits, marks specs committed
+  writ finish     # converges + commits
 
   # Standard git from here
   git push
 ```
 
-Every command in this workflow is available to agents by default after `writ init`. No additional configuration. No agent specific setup scripts. Agents seal checkpoints and mark tasks complete. The user checks in with `writ status` and promotes completed work to git with `writ finish`. Three commands for the user. The agents handle the rest. A full getting started guide with example workflows available https://andrew-garfield101.github.io/writ/getting-started/quickstart.html
+Every command in this workflow is available to agents by default after `writ init`. No additional configuration. No agent specific setup scripts. Agents discover specs via `writ context`, seal checkpoints with `--spec`, and mark tasks complete. The user starts `writ watch` for auto-convergence, checks in with `writ status`, and promotes completed work to git with `writ finish`. A full getting started guide with example workflows available https://andrew-garfield101.github.io/writ/getting-started/quickstart.html
 
 ```
  Human world                    Agent world                       Human world
@@ -135,6 +136,8 @@ Writ puts agent native metadata inside the VCS:
 | (nothing) | **File contention** | Which files are touched by which agents, sorted by risk |
 | (nothing) | **Session summary** | Auto-generated commit messages and PR descriptions from seal history |
 | `git verify-commit` | `writ verify --chain` | BLAKE3 hash chains + Ed25519 signatures — tamper-evident by default |
+| (nothing) | `writ watch` | Real time convergence daemon — auto-merges overlapping work as agents seal |
+| (nothing) | `writ plan` | Batch task definition — agents discover and claim specs via context |
 | (nothing) | `writ status` | Fleet overview — agent activity, spec progress, commit readiness |
 | (nothing) | `writ spec done` | Agent marks task complete with final seal — user finishes to git |
 
@@ -195,18 +198,20 @@ One `writ context` call replaces five git commands and delivers [25% more inform
 Context output is also adaptive. Solo agent with no divergence? Integration risk and convergence sections don't appear. No scope violations? That section is omitted. The output scales with complexity, not with a fixed schema. A single agent gets a lean response, a 50 agent fleet gets the full picture. Every token in the response carries information.
 
 ## Multi-Agent Workflow
-Three agents, different specs, one repository. No branches, no text level merge conflicts, no coordination overhead:
+Multiple agents, same project directory, zero ceremony. Spec-scoped sealing captures only each agent's changes. `writ watch` auto-converges overlapping work in real time:
 
 ```bash
-# Agent A: auth migration (sealing work in progress)
-writ seal -s "token refresh endpoint" --agent auth-dev --spec auth-migration
+# Setup: define tasks and start the convergence daemon
+writ plan "Auth migration" "Payments" "Test suite"
+writ watch
 
-# Agent B: payments (marking task complete)
-writ seal -s "stripe integration" --agent pay-dev --spec payments
-writ spec done payments
+# Agents work in the same directory — each seals only their own changes
+# Agent A: writ seal -s "token refresh endpoint" --spec auth-migration
+# Agent B: writ seal -s "stripe integration" --spec payments
+# Agent C: writ seal -s "42 tests passing" --spec test-suite --tests-passed 42
 
-# Agent C: testing (cross-cutting)
-writ seal -s "42 tests passing" --agent test-bot --spec test-suite --tests-passed 42
+# writ watch detects overlapping changes and auto-converges in real time
+# Agents never pause, never wait, never merge
 ```
 
 The human checks in with a single command:
@@ -220,6 +225,8 @@ $ writ status
   S-002  payments             pay-dev     5 seals    Complete
   S-001  auth-migration       auth-dev    3 seals    working
   S-003  test-suite           test-bot    1 seal     working
+
+  Auto-Convergence: 12 merges, 0 conflicts
 
   1 spec complete · run `writ finish` when ready
 ```
@@ -269,50 +276,27 @@ writ context --format human
 
 ## Workspaces
 
-Git worktrees give agents isolation — separate directories, separate files, no stepping on each other. They don't give agents convergence. When the work is done, you're back to `git merge` and line level conflicts.
-
-Writ gives agents both. One command creates everything an agent needs to work in isolation:
+Most multi-agent work happens in the same directory with spec-scoped sealing and `writ watch` handling convergence automatically. Workspaces exist for the rare case where agents need physical file isolation — competing rewrites of the same code, where each agent's changes would break the other's in-progress work.
 
 ```bash
-$ writ task "backend API work"
-
-  task created: backend-api-work
-    workspace: workspaces/backend-api-work/
-
-  Launch an agent in this workspace:
-    cd workspaces/backend-api-work/
+# Level 2: agents rewrite the same code in fundamentally different ways
+writ task "rewrite auth: PKCE approach"     # creates isolated workspace
+writ task "rewrite auth: implicit approach"  # creates isolated workspace
+# launch agents in workspace directories — each has their own copy
+writ finish                                  # auto-converges + commits
 ```
 
-`writ task` creates a spec, a workspace directory with a full project copy, and prints a launch command. The user's only job is to copy-paste the path into a terminal tab. The agent starts, runs `writ context`, sees its assigned task, and works.
-
-```bash
-# The full multi agent flow
-writ init
-writ task "backend API work"         # creates workspace + spec
-writ task "payment integration"      # creates workspace + spec
-writ task "dashboard UI"             # creates workspace + spec
-
-# Launch agents in the printed workspace paths
-# Agents use 3 commands: context, seal, spec done. That's it.
-
-# When ready
-writ finish                          # auto-converges workspaces, commits to git
-git push
-```
-
-The human gets 3 commands: `init`, `task`, `finish`. Each agent gets 3 commands: `context`, `seal`, `spec done`. Agents discover their task via `writ context` — the assigned task appears at the top of the output. They never create specs, never touch workspaces, never run git.
+`writ task` creates a spec, a workspace directory with a full project copy, and prints a launch command. Agents in workspaces use the same 3 commands: `context`, `seal`, `spec done`. `writ finish` auto-converges workspaces before committing to git.
 
 Same number of steps as the git workflow everyone already knows:
 
 | Git | Writ | What Improves |
 |-----|------|---------------|
-| `git checkout -b feature` | `writ task "description"` | Structured metadata: title, status, agent assignment |
-| `git add && git commit` | `writ seal` | Agent identity, spec linkage, immutable chain |
+| `git checkout -b feature` | Same directory (or `writ task` for Level 2) | No branches needed for most multi-agent work |
+| `git add && git commit` | `writ seal --spec` | Agent identity, spec linkage, immutable chain |
 | `git merge` | `writ finish` (auto-converges) | Structure aware, auto resolves independent changes |
 
-`writ finish` auto-converges outstanding workspaces before committing to git. If convergence is clean, it proceeds to commit and prompts to clean up workspace directories. If there are conflicts that need human attention, it stops and shows you what needs resolving.
-
-See the [workspaces guide](https://andrew-garfield101.github.io/writ/guides/workspaces.html) for the full architecture, advanced commands, and convergence workflow.
+When to use workspaces vs same-directory: if agents touch different files or add to the same file, same-directory works. If agents rewrite the same function body in different ways, use `writ task`. See the [workspaces guide](https://andrew-garfield101.github.io/writ/guides/workspaces.html) for the full architecture and advanced commands.
 
 ## Going Back
 
@@ -450,9 +434,12 @@ writ init                             # guided setup (git detect + bridge import
 writ init --yes                       # non-interactive setup (CI-safe, accept all defaults)
 writ init --profile production        # setup with a deployment profile (storage budgets, retention)
 writ uninit [--force]                 # clean removal of writ from the project
-writ task "description"              # create task: spec + workspace + launch command
+writ plan "task1" "task2" "task3"     # batch spec creation (or -f tasks.txt, or stdin)
+writ watch [--interval N]            # convergence daemon: auto-merges overlapping work
+writ watch --daemon                  # run as background process
+writ task "description"              # create task: spec + workspace (Level 2 isolation)
 writ task list                       # show all active tasks and status
-writ seal -s "..." --agent ID         # create a structured checkpoint
+writ seal -s "..." --spec ID          # create a structured checkpoint (spec-scoped)
 writ context [--spec ID] [--format]   # structured context dump (json, toon, human, brief)
 writ status [--watch] [--completed]   # fleet overview: agents, specs, progress
 writ log [--all] [--spec ID]          # seal history (--all includes diverged branches)
@@ -469,6 +456,7 @@ writ verify --chain                   # verify cryptographic integrity of the fu
 writ verify --seal SEAL_ID            # verify a specific seal's hash and signature
 writ security events [--severity]     # security audit log with filtering
 writ spec add --id ID --title "..."   # register a spec
+writ spec claim ID                    # claim an unclaimed spec (auto-claims on first seal)
 writ spec status [--state active]     # show specs, optionally filtered by lifecycle state
 writ spec done ID [-s "..."]          # mark spec complete (creates final seal)
 writ spec cancel ID                   # cancel a spec (lifecycle transition)

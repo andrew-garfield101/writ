@@ -567,47 +567,178 @@ impl Repository {
         let rules = self.ignore_rules();
         let working_state = state::compute_state(&self.root, &index, &rules);
 
-        if working_state.is_clean() && !allow_empty {
-            return Err(WritError::NothingToSeal);
-        }
-
-        let mut changes = Vec::new();
-
-        for file_state in &working_state.changes {
-            match file_state.status {
-                FileStatus::New | FileStatus::Modified => {
-                    let content = fs::read(self.root.join(&file_state.path))?;
-                    let new_hash = self.objects.store(&content)?;
-                    let old_hash = index.get_hash(&file_state.path).map(String::from);
-
-                    let change_type = if file_state.status == FileStatus::New {
-                        ChangeType::Added
-                    } else {
-                        ChangeType::Modified
-                    };
-
-                    changes.push(FileChange {
-                        path: file_state.path.clone(),
-                        change_type,
-                        old_hash,
-                        new_hash: Some(new_hash.clone()),
-                    });
-
-                    let size = content.len() as u64;
-                    index.upsert(&file_state.path, new_hash, size);
-                }
-                FileStatus::Deleted => {
-                    let old_hash = index.get_hash(&file_state.path).map(String::from);
-                    changes.push(FileChange {
-                        path: file_state.path.clone(),
-                        change_type: ChangeType::Deleted,
-                        old_hash,
-                        new_hash: None,
-                    });
-                    index.remove(&file_state.path);
+        // Branch based on spec-scoped vs full-directory sealing.
+        let changes = if let Some(ref sid) = spec_id {
+            // ── Spec-scoped sealing ──────────────────────────────────────
+            // Phase 1: Sync main index with disk (store new content, update index).
+            // This ensures the index reflects the current working directory state,
+            // regardless of which agent made the changes.
+            for file_state in &working_state.changes {
+                match file_state.status {
+                    FileStatus::New | FileStatus::Modified => {
+                        let content = fs::read(self.root.join(&file_state.path))?;
+                        let new_hash = self.objects.store(&content)?;
+                        let size = content.len() as u64;
+                        index.upsert(&file_state.path, new_hash, size);
+                    }
+                    FileStatus::Deleted => {
+                        index.remove(&file_state.path);
+                    }
                 }
             }
-        }
+
+            // Phase 2: Build spec-scoped changes list.
+            // Strategy: When working_state has changes, only consider those files
+            // against the baseline (avoids capturing other agents' files).
+            // When working_state is clean (another agent already synced the index),
+            // fall back to full index-vs-baseline comparison to avoid NothingToSeal.
+            let baseline = self.load_spec_baseline(sid, &agent.id)?;
+            let mut scoped = Vec::new();
+
+            if !working_state.changes.is_empty() {
+                // Primary path: only check files the agent actually changed on disk
+                for file_state in &working_state.changes {
+                    let path = &file_state.path;
+                    let baseline_hash = baseline.get_hash(path);
+                    match file_state.status {
+                        FileStatus::New | FileStatus::Modified => {
+                            let current_hash = index.get_hash(path);
+                            if current_hash != baseline_hash {
+                                let change_type = if baseline_hash.is_some() {
+                                    ChangeType::Modified
+                                } else {
+                                    ChangeType::Added
+                                };
+                                scoped.push(FileChange {
+                                    path: path.clone(),
+                                    change_type,
+                                    old_hash: baseline_hash.map(String::from),
+                                    new_hash: current_hash.map(String::from),
+                                });
+                            }
+                        }
+                        FileStatus::Deleted => {
+                            if baseline_hash.is_some() {
+                                scoped.push(FileChange {
+                                    path: path.clone(),
+                                    change_type: ChangeType::Deleted,
+                                    old_hash: baseline_hash.map(String::from),
+                                    new_hash: None,
+                                });
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Fallback path: working state is clean (another agent synced
+                // the index). Compare full index against baseline to recover
+                // this agent's changes that were already indexed.
+                for (path, entry) in &index.entries {
+                    let baseline_hash = baseline.get_hash(path);
+                    if baseline_hash != Some(&entry.hash) {
+                        let change_type = if baseline_hash.is_some() {
+                            ChangeType::Modified
+                        } else {
+                            ChangeType::Added
+                        };
+                        scoped.push(FileChange {
+                            path: path.clone(),
+                            change_type,
+                            old_hash: baseline_hash.map(String::from),
+                            new_hash: Some(entry.hash.clone()),
+                        });
+                    }
+                }
+
+                // Files in baseline but not in current index (deleted)
+                for path in baseline.entries.keys() {
+                    if !index.is_tracked(path) {
+                        scoped.push(FileChange {
+                            path: path.clone(),
+                            change_type: ChangeType::Deleted,
+                            old_hash: baseline.get_hash(path).map(String::from),
+                            new_hash: None,
+                        });
+                    }
+                }
+            }
+
+            // Phase 1b: Seal-chain subtraction — reduce over-capture.
+            // Only applies on SUBSEQUENT seals (when the agent already has a
+            // previous seal for this spec). First seals allow over-capture
+            // because we can't distinguish the agent's own files from others'.
+            // After the first round, baselines catch up and subtraction
+            // correctly identifies files that belong to other specs.
+            let has_previous_seal = self
+                .find_last_seal_for_spec_and_agent(sid, &agent.id)?
+                .is_some();
+            if has_previous_seal && !scoped.is_empty() {
+                let other_hashes = self.collect_other_spec_file_hashes(sid)?;
+                scoped.retain(|change| {
+                    if let Some(ref new_hash) = change.new_hash {
+                        // If another spec's latest seal has this file with the
+                        // same content hash, the change belongs to that spec.
+                        if let Some(other_hash) = other_hashes.get(&change.path) {
+                            if other_hash == new_hash {
+                                return false; // Skip — already captured by another spec
+                            }
+                        }
+                    }
+                    true
+                });
+            }
+
+            scoped.sort_by(|a, b| a.path.cmp(&b.path));
+
+            if scoped.is_empty() && !allow_empty {
+                return Err(WritError::NothingToSeal);
+            }
+            scoped
+        } else {
+            // ── Full-directory sealing (backward compat) ─────────────────
+            if working_state.is_clean() && !allow_empty {
+                return Err(WritError::NothingToSeal);
+            }
+
+            let mut changes = Vec::new();
+
+            for file_state in &working_state.changes {
+                match file_state.status {
+                    FileStatus::New | FileStatus::Modified => {
+                        let content = fs::read(self.root.join(&file_state.path))?;
+                        let new_hash = self.objects.store(&content)?;
+                        let old_hash = index.get_hash(&file_state.path).map(String::from);
+
+                        let change_type = if file_state.status == FileStatus::New {
+                            ChangeType::Added
+                        } else {
+                            ChangeType::Modified
+                        };
+
+                        changes.push(FileChange {
+                            path: file_state.path.clone(),
+                            change_type,
+                            old_hash,
+                            new_hash: Some(new_hash.clone()),
+                        });
+
+                        let size = content.len() as u64;
+                        index.upsert(&file_state.path, new_hash, size);
+                    }
+                    FileStatus::Deleted => {
+                        let old_hash = index.get_hash(&file_state.path).map(String::from);
+                        changes.push(FileChange {
+                            path: file_state.path.clone(),
+                            change_type: ChangeType::Deleted,
+                            old_hash,
+                            new_hash: None,
+                        });
+                        index.remove(&file_state.path);
+                    }
+                }
+            }
+            changes
+        };
 
         let tree_json = serde_json::to_string(&index.entries)?;
         let tree_hash = self.objects.store(tree_json.as_bytes())?;
@@ -724,6 +855,11 @@ impl Repository {
                 let now = chrono::Utc::now();
                 spec.updated_at = now;
                 spec.last_activity = now;
+
+                // Auto-claim on first seal: if spec is unclaimed, claim it for this agent.
+                if spec.claimed_by.is_none() {
+                    spec.claimed_by = Some(seal.agent.id.clone());
+                }
 
                 let promoted = self.auto_promote_spec_status(&mut spec, &seal.status);
                 self.save_spec(&spec)?;
@@ -1159,7 +1295,18 @@ impl Repository {
         if path.exists() {
             return Err(WritError::SpecAlreadyExists(spec.id.clone()));
         }
-        self.save_spec(spec)
+        // Snapshot current file index as genesis tree for spec-scoped sealing baseline
+        let mut spec_with_genesis = spec.clone();
+        if spec_with_genesis.genesis_tree.is_none() {
+            if let Ok(index) = self.load_index() {
+                if let Ok(tree_json) = serde_json::to_string(&index.entries) {
+                    if let Ok(hash) = self.objects.store(tree_json.as_bytes()) {
+                        spec_with_genesis.genesis_tree = Some(hash);
+                    }
+                }
+            }
+        }
+        self.save_spec(&spec_with_genesis)
     }
 
     /// List all specs.
@@ -1568,6 +1715,28 @@ impl Repository {
         Ok(())
     }
 
+    /// Claim a spec for an agent.
+    ///
+    /// Sets `spec.claimed_by = Some(agent_id)`. Returns an error if the spec
+    /// is already claimed by a different agent. Claiming the same spec by the
+    /// same agent is a no-op (idempotent).
+    pub fn spec_claim(&self, spec_id: &str, agent_id: &str) -> WritResult<()> {
+        let mut spec = self.load_spec(spec_id)?;
+        if let Some(ref existing) = spec.claimed_by {
+            if existing == agent_id {
+                return Ok(()); // idempotent — same agent re-claiming
+            }
+            return Err(WritError::SpecAlreadyClaimed {
+                spec_id: spec_id.to_string(),
+                claimed_by: existing.clone(),
+            });
+        }
+        spec.claimed_by = Some(agent_id.to_string());
+        spec.updated_at = chrono::Utc::now();
+        self.save_spec(&spec)?;
+        Ok(())
+    }
+
     /// Assign a spec to a workspace.
     ///
     /// Sets `spec.workspace = Some(workspace)`. Validates that both the spec
@@ -1719,6 +1888,24 @@ impl Repository {
             workspace_name: ws_info.name,
             suggested_prompt,
         })
+    }
+
+    /// Create specs in batch from a list of task descriptions.
+    ///
+    /// Each title is slugified into a spec ID. Returns the list of created
+    /// specs. Stops on the first error (duplicate ID, etc.).
+    pub fn plan(&self, tasks: Vec<String>) -> WritResult<Vec<PlanResult>> {
+        let mut results = Vec::new();
+        for task in tasks {
+            let id = slugify_title(&task);
+            let spec = crate::spec::Spec::new(id.clone(), task.clone(), String::new());
+            self.add_spec(&spec)?;
+            results.push(PlanResult {
+                spec_id: id,
+                title: task,
+            });
+        }
+        Ok(results)
     }
 
     // ─── Workspace Management ─────────────────────────────────────
@@ -2451,6 +2638,23 @@ impl Repository {
                 .collect()
         };
 
+        // Collect unclaimed specs for agent discoverability.
+        let unclaimed_specs: Vec<crate::context::UnclaimedSpec> = self
+            .list_specs()
+            .unwrap_or_default()
+            .iter()
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    crate::spec::SpecStatus::Pending | crate::spec::SpecStatus::InProgress
+                ) && s.claimed_by.is_none()
+            })
+            .map(|s| crate::context::UnclaimedSpec {
+                id: s.id.clone(),
+                title: s.title.clone(),
+            })
+            .collect();
+
         let apply_filter = |seal: &&Seal| -> bool {
             if let Some(ref status) = filter.status {
                 let status_str = match status {
@@ -2654,6 +2858,7 @@ impl Repository {
                     integration_risk,
                     chain_integrity: self.build_chain_integrity(),
                     stale_specs: stale_specs.clone(),
+                    unclaimed_specs: unclaimed_specs.clone(),
                     dependencies,
                     session_complete: false,
                     session_summary: None,
@@ -3003,6 +3208,7 @@ impl Repository {
                     integration_risk,
                     chain_integrity: self.build_chain_integrity(),
                     stale_specs: stale_specs.clone(),
+                    unclaimed_specs: unclaimed_specs.clone(),
                     dependencies: Vec::new(),
                     session_complete: false,
                     session_summary: None,
@@ -3284,6 +3490,7 @@ impl Repository {
                     integration_risk,
                     chain_integrity: self.build_chain_integrity(),
                     stale_specs,
+                    unclaimed_specs,
                     dependencies: Vec::new(),
                     session_complete: false, // agent scope is partial view
                     session_summary: None,
@@ -5373,6 +5580,84 @@ impl Repository {
     }
 
     // -------------------------------------------------------------------
+    // Same-directory overlap detection (MS.3)
+    // -------------------------------------------------------------------
+
+    /// Detect files that have been modified by multiple specs with different
+    /// content. Returns overlap groups suitable for triggering convergence.
+    ///
+    /// This scans all specs with sealed work, compares their latest seal trees,
+    /// and finds files where two or more specs have different content hashes.
+    pub fn detect_same_directory_overlaps(&self) -> WritResult<Vec<OverlapSet>> {
+        let specs = self.list_specs()?;
+        let specs_with_work: Vec<&Spec> =
+            specs.iter().filter(|s| !s.sealed_by.is_empty()).collect();
+
+        if specs_with_work.len() < 2 {
+            return Ok(Vec::new());
+        }
+
+        // Build a map: file_path → Vec<(spec_id, content_hash)>
+        // Only includes files each spec actually modified (via changes list).
+        let mut file_spec_map: HashMap<String, Vec<(String, String)>> = HashMap::new();
+
+        for spec in &specs_with_work {
+            let modified = self.spec_modified_files(spec)?;
+            if let Some(last_seal_id) = spec.sealed_by.last() {
+                let seal = self.load_seal(last_seal_id)?;
+                let tree_index = self.load_tree_index(&seal.tree)?;
+
+                for path in &modified {
+                    if let Some(hash) = tree_index.get_hash(path) {
+                        file_spec_map
+                            .entry(path.clone())
+                            .or_default()
+                            .push((spec.id.clone(), hash.to_string()));
+                    }
+                }
+            }
+        }
+
+        // Filter to files with 2+ specs that have DIFFERENT content hashes.
+        let mut overlapping_files: Vec<OverlapDetail> = Vec::new();
+        let mut involved_specs: HashSet<String> = HashSet::new();
+
+        for (path, spec_hashes) in &file_spec_map {
+            if spec_hashes.len() < 2 {
+                continue;
+            }
+            // Check if any hashes differ
+            let first_hash = &spec_hashes[0].1;
+            let has_conflict = spec_hashes.iter().any(|(_, h)| h != first_hash);
+            if has_conflict {
+                for (sid, _) in spec_hashes {
+                    involved_specs.insert(sid.clone());
+                }
+                overlapping_files.push(OverlapDetail {
+                    path: path.clone(),
+                    spec_hashes: spec_hashes.clone(),
+                });
+            }
+        }
+
+        if overlapping_files.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Group into a single OverlapSet (all overlapping files form one group
+        // since convergence merges everything together).
+        overlapping_files.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut specs_sorted: Vec<String> = involved_specs.into_iter().collect();
+        specs_sorted.sort();
+
+        Ok(vec![OverlapSet {
+            files: overlapping_files.iter().map(|d| d.path.clone()).collect(),
+            specs: specs_sorted,
+            details: overlapping_files,
+        }])
+    }
+
+    // -------------------------------------------------------------------
     // Convergence helpers
     // -------------------------------------------------------------------
 
@@ -6085,6 +6370,72 @@ impl Repository {
         let data = self.objects.retrieve(tree_hash)?;
         let entries: BTreeMap<String, IndexEntry> = serde_json::from_slice(&data)?;
         Ok(Index { entries })
+    }
+
+    /// Find the most recent seal for a given (spec_id, agent_id) pair.
+    ///
+    /// Walks the spec's seal chain and returns the first seal created by
+    /// the specified agent. Returns None if no matching seal exists.
+    pub fn find_last_seal_for_spec_and_agent(
+        &self,
+        spec_id: &str,
+        agent_id: &str,
+    ) -> WritResult<Option<Seal>> {
+        let mut current = self.read_spec_head(spec_id)?;
+        while let Some(seal_id) = current {
+            let seal = self.load_seal(&seal_id)?;
+            if seal.agent.id == agent_id && seal.spec_id.as_deref() == Some(spec_id) {
+                return Ok(Some(seal));
+            }
+            current = seal.parent.clone();
+        }
+        Ok(None)
+    }
+
+    /// Load the baseline index for spec-scoped sealing.
+    ///
+    /// Priority: last seal by this agent for this spec → spec's genesis tree → empty index.
+    fn load_spec_baseline(&self, spec_id: &str, agent_id: &str) -> WritResult<Index> {
+        // Try: last seal for this agent on this spec
+        if let Some(seal) = self.find_last_seal_for_spec_and_agent(spec_id, agent_id)? {
+            return self.load_tree_index(&seal.tree);
+        }
+        // Try: spec's genesis tree (snapshot at spec creation)
+        if let Ok(spec) = self.load_spec(spec_id) {
+            if let Some(ref genesis_tree) = spec.genesis_tree {
+                return self.load_tree_index(genesis_tree);
+            }
+        }
+        // Fallback: empty index (captures everything — safe default for legacy specs)
+        Ok(Index::default())
+    }
+
+    /// Collect file→content_hash from the latest seal of every spec except `exclude_spec`.
+    ///
+    /// Used by seal-chain subtraction (Phase 1b) to detect files already captured
+    /// by other specs, reducing over-capture on first seals.
+    fn collect_other_spec_file_hashes(
+        &self,
+        exclude_spec: &str,
+    ) -> WritResult<std::collections::HashMap<String, String>> {
+        let mut file_hashes = std::collections::HashMap::new();
+        let specs = self.list_specs()?;
+        for spec in &specs {
+            if spec.id == exclude_spec {
+                continue;
+            }
+            // Get the latest seal for this spec (the HEAD of its chain).
+            if let Some(seal_id) = self.read_spec_head(&spec.id)? {
+                if let Ok(seal) = self.load_seal(&seal_id) {
+                    for change in &seal.changes {
+                        if let Some(ref hash) = change.new_hash {
+                            file_hashes.insert(change.path.clone(), hash.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(file_hashes)
     }
 
     /// Resolve a potentially-short seal ID to a full seal ID.
@@ -7214,6 +7565,11 @@ impl Repository {
                 .or(incoming.commit_hash.clone()),
             committed_at: existing.committed_at.or(incoming.committed_at),
             workspace: existing.workspace.clone().or(incoming.workspace.clone()),
+            claimed_by: existing.claimed_by.clone().or(incoming.claimed_by.clone()),
+            genesis_tree: existing
+                .genesis_tree
+                .clone()
+                .or(incoming.genesis_tree.clone()),
         }
     }
 
@@ -7768,6 +8124,13 @@ pub struct TaskCreationResult {
     pub suggested_prompt: String,
 }
 
+/// Result of batch spec creation via `writ plan`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanResult {
+    pub spec_id: String,
+    pub title: String,
+}
+
 /// Result of `writ init`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InitResult {
@@ -7865,6 +8228,26 @@ pub struct DivergedBranch {
     pub seal_count: usize,
     /// Agent IDs that sealed on this branch.
     pub agents: Vec<String>,
+}
+
+/// A group of files that overlap between multiple specs in the same directory.
+/// Used by the watch engine to decide when to trigger convergence.
+#[derive(Debug, Clone)]
+pub struct OverlapSet {
+    /// Files with different content across specs
+    pub files: Vec<String>,
+    /// Specs that touch these files
+    pub specs: Vec<String>,
+    /// Per-file detail: which specs modified each file and their content hashes
+    pub details: Vec<OverlapDetail>,
+}
+
+/// Detail for a single overlapping file.
+#[derive(Debug, Clone)]
+pub struct OverlapDetail {
+    pub path: String,
+    /// (spec_id, content_hash) pairs for each spec that modified this file
+    pub spec_hashes: Vec<(String, String)>,
 }
 
 /// Convert a ConvergeStrategy to a human-readable string.
@@ -12475,6 +12858,8 @@ mod verify_all_chains_tests {
             commit_hash: None,
             committed_at: None,
             workspace: None,
+            claimed_by: None,
+            genesis_tree: None,
         };
         repo.add_spec(&spec).unwrap();
 
@@ -12538,6 +12923,8 @@ mod verify_all_chains_tests {
                 commit_hash: None,
                 committed_at: None,
                 workspace: None,
+                claimed_by: None,
+                genesis_tree: None,
             };
             repo.add_spec(&spec).unwrap();
         }
@@ -15073,6 +15460,8 @@ mod remote_tests {
             commit_hash: None,
             committed_at: None,
             workspace: None,
+            claimed_by: None,
+            genesis_tree: None,
         };
 
         let spec_in_progress = crate::spec::Spec {
@@ -21409,6 +21798,242 @@ mod convergence_integration_tests {
             "footer.css should exist"
         );
     }
+
+    #[test]
+    fn test_detect_overlaps_no_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let overlaps = repo.detect_same_directory_overlaps().unwrap();
+        assert!(overlaps.is_empty());
+    }
+
+    #[test]
+    fn test_detect_overlaps_single_spec() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("base.txt"), "base").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        repo.seal(
+            agent("a1"),
+            "add a".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        let overlaps = repo.detect_same_directory_overlaps().unwrap();
+        assert!(overlaps.is_empty(), "single spec cannot have overlaps");
+    }
+
+    #[test]
+    fn test_detect_overlaps_disjoint_files() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("base.txt"), "base").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        fs::write(dir.path().join("a.txt"), "agent-a work").unwrap();
+        repo.seal(
+            agent("a1"),
+            "a work".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("b.txt"), "agent-b work").unwrap();
+        repo.seal(
+            agent("b1"),
+            "b work".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let overlaps = repo.detect_same_directory_overlaps().unwrap();
+        assert!(
+            overlaps.is_empty(),
+            "disjoint files should not create overlaps"
+        );
+    }
+
+    #[test]
+    fn test_detect_overlaps_same_file_different_content() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("shared.txt"), "base content").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        // Spec 1 modifies shared.txt
+        fs::write(dir.path().join("shared.txt"), "version A").unwrap();
+        repo.seal(
+            agent("a1"),
+            "a changes".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Spec 2 modifies shared.txt differently
+        fs::write(dir.path().join("shared.txt"), "version B").unwrap();
+        repo.seal(
+            agent("b1"),
+            "b changes".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let overlaps = repo.detect_same_directory_overlaps().unwrap();
+        assert_eq!(overlaps.len(), 1, "should detect one overlap group");
+        assert!(overlaps[0].files.contains(&"shared.txt".to_string()));
+        assert_eq!(overlaps[0].specs.len(), 2);
+        assert!(overlaps[0].specs.contains(&"s1".to_string()));
+        assert!(overlaps[0].specs.contains(&"s2".to_string()));
+        assert_eq!(overlaps[0].details.len(), 1);
+        assert_eq!(overlaps[0].details[0].spec_hashes.len(), 2);
+        // Hashes should differ
+        let h1 = &overlaps[0].details[0].spec_hashes[0].1;
+        let h2 = &overlaps[0].details[0].spec_hashes[1].1;
+        assert_ne!(h1, h2, "content hashes should differ");
+    }
+
+    #[test]
+    fn test_detect_overlaps_same_content_no_conflict() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("shared.txt"), "base").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        // Both specs write the SAME content to shared.txt
+        fs::write(dir.path().join("shared.txt"), "identical content").unwrap();
+        repo.seal(
+            agent("a1"),
+            "a".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "identical content").unwrap();
+        repo.seal(
+            agent("b1"),
+            "b".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let overlaps = repo.detect_same_directory_overlaps().unwrap();
+        assert!(
+            overlaps.is_empty(),
+            "same content should NOT trigger overlap detection"
+        );
+    }
+
+    #[test]
+    fn test_detect_overlaps_three_specs_one_shared_file() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("config.toml"), "[base]").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s3".into(), "S3".into(), "".into()))
+            .unwrap();
+
+        for (i, sid) in ["s1", "s2", "s3"].iter().enumerate() {
+            fs::write(
+                dir.path().join("config.toml"),
+                format!("[version-{}]", i + 1),
+            )
+            .unwrap();
+            repo.seal(
+                agent(&format!("agent-{}", i + 1)),
+                format!("agent {} changes", i + 1),
+                Some(sid.to_string()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        }
+
+        let overlaps = repo.detect_same_directory_overlaps().unwrap();
+        assert_eq!(overlaps.len(), 1);
+        assert_eq!(overlaps[0].specs.len(), 3);
+        assert_eq!(overlaps[0].details[0].spec_hashes.len(), 3);
+    }
 }
 
 #[cfg(test)]
@@ -21931,7 +22556,11 @@ mod converge_all_tests {
         )
         .unwrap();
 
-        fs::write(dir.path().join("app.py"), a_py).unwrap();
+        // Agent A seals again with updated content (adds pathlib import).
+        // This must differ from agent-a's previous seal to create a meaningful
+        // divergence for convergence testing.
+        let a_py_v2 = "import os\nimport json\nimport pathlib\n\ndef main():\n    pass\n";
+        fs::write(dir.path().join("app.py"), a_py_v2).unwrap();
         repo.seal(
             agent_a,
             "finalize".into(),
@@ -21967,6 +22596,10 @@ mod converge_all_tests {
         assert!(
             merged.contains("import os"),
             "os import lost! merged:\n{merged}"
+        );
+        assert!(
+            merged.contains("import pathlib"),
+            "pathlib import lost! merged:\n{merged}"
         );
 
         let has_pipeline_tag = report.merges.iter().any(|m| {
@@ -23195,10 +23828,12 @@ export default App;
         .unwrap();
 
         // Advance HEAD so charts is on HEAD chain, sidebar+header diverge.
+        // Content must differ from charts-dev's first seal to avoid NothingToSeal
+        // (spec-scoped baseline comparison).
         fs::write(dir.path().join("src/App.tsx"), charts_app).unwrap();
         fs::write(
             dir.path().join("src/Charts.tsx"),
-            "export default function Charts() { return <div>Charts</div>; }\n",
+            "export default function Charts() { return <div>Charts v2</div>; }\n",
         )
         .unwrap();
         repo.seal(
@@ -28839,5 +29474,1028 @@ mod workspace_tests {
         assert!(dir.path().join(".writ/workspaces/main").exists());
         assert!(dir.path().join("api.py").exists());
         assert!(dir.path().join("index.html").exists());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // MS.5: Phase 1 — Spec-Scoped Sealing Tests (Magic Sprint)
+    //
+    // Tests for spec-scoped change detection (MS.1), updated seal
+    // creation (MS.2), same-directory convergence (MS.3), and spec
+    // claiming (MS.4).
+    //
+    // All blocked on implementation. Remove #[ignore] as code lands.
+    // ═══════════════════════════════════════════════════════════════════
+
+    /// Helper: create an agent identity with a specific ID.
+    fn agent(id: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: id.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    // ─── MS.5 Basic Scoping (5 tests) ────────────────────────────────
+
+    #[test]
+    fn test_seal_with_spec_captures_only_spec_files() {
+        // Agent-1 creates files and seals for spec "auth".
+        // Then agent-2 creates different files.
+        // Agent-1 seals again → only agent-1's NEW changes since last seal.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create spec with genesis at current (empty) state
+        let spec = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        // Agent-1 creates auth.rs and seals for spec "auth"
+        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
+        let seal1 = repo
+            .seal(
+                agent("agent-1"),
+                "auth work".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        assert!(
+            seal1.changes.iter().any(|c| c.path == "auth.rs"),
+            "first seal should capture auth.rs"
+        );
+
+        // Agent-2 creates dashboard.rs (no seal yet — just writes to disk)
+        fs::write(dir.path().join("dashboard.rs"), "fn dashboard() {}").unwrap();
+
+        // Agent-1 creates config.rs and seals again for spec "auth"
+        fs::write(dir.path().join("config.rs"), "const KEY: &str = \"abc\";").unwrap();
+        let seal2 = repo
+            .seal(
+                agent("agent-1"),
+                "auth config".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Agent-1's second seal should capture config.rs (new since agent-1's last seal)
+        // and dashboard.rs (new since agent-1's last seal — over-capture, but safe).
+        // It should NOT capture auth.rs (unchanged since agent-1's last seal).
+        let seal2_paths: Vec<&str> = seal2.changes.iter().map(|c| c.path.as_str()).collect();
+        assert!(
+            seal2_paths.contains(&"config.rs"),
+            "second seal should capture config.rs"
+        );
+        assert!(
+            !seal2_paths.contains(&"auth.rs"),
+            "auth.rs unchanged since last seal — should not appear"
+        );
+    }
+
+    #[test]
+    fn test_seal_without_spec_captures_full_directory() {
+        // Backward compat: seal without --spec captures everything.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("a.rs"), "fn a() {}").unwrap();
+        fs::write(dir.path().join("b.rs"), "fn b() {}").unwrap();
+
+        let seal = repo
+            .seal(
+                agent("agent-1"),
+                "all files".into(),
+                None, // no spec — full directory
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(seal.changes.len(), 2, "should capture all changed files");
+    }
+
+    #[test]
+    fn test_seal_uses_genesis_index_for_first_seal() {
+        // Create files, THEN create spec. Genesis captures current state.
+        // New files after spec creation should be captured; pre-existing should not.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a file and seal it (so it's in the index)
+        fs::write(dir.path().join("existing.rs"), "fn existing() {}").unwrap();
+        repo.seal(
+            agent("setup"),
+            "setup".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Now create spec — genesis captures existing.rs in the index
+        let spec = crate::spec::Spec::new("feature".into(), "Feature".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        // Verify genesis tree was captured
+        let loaded_spec = repo.load_spec("feature").unwrap();
+        assert!(
+            loaded_spec.genesis_tree.is_some(),
+            "spec should have genesis_tree"
+        );
+
+        // Add new file and seal for the spec
+        fs::write(dir.path().join("new_feature.rs"), "fn feature() {}").unwrap();
+        let seal = repo
+            .seal(
+                agent("agent-1"),
+                "feature work".into(),
+                Some("feature".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Should capture new_feature.rs but NOT existing.rs (in genesis)
+        let paths: Vec<&str> = seal.changes.iter().map(|c| c.path.as_str()).collect();
+        assert!(paths.contains(&"new_feature.rs"), "should capture new file");
+        assert!(
+            !paths.contains(&"existing.rs"),
+            "existing.rs was in genesis — should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_seal_uses_last_agent_seal_as_baseline() {
+        // Second seal by same agent for same spec uses previous seal as baseline.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        // First seal: create file
+        fs::write(dir.path().join("auth.rs"), "v1").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "v1".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Second seal: modify file
+        fs::write(dir.path().join("auth.rs"), "v2").unwrap();
+        let seal2 = repo
+            .seal(
+                agent("agent-1"),
+                "v2".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Should capture auth.rs (modified since last seal)
+        assert_eq!(seal2.changes.len(), 1);
+        assert_eq!(seal2.changes[0].path, "auth.rs");
+    }
+
+    #[test]
+    fn test_find_last_seal_for_spec_and_agent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        // Agent-1 seals for spec "auth".
+        fs::write(dir.path().join("auth.py"), "def login(): pass\n").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "auth work".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent-2 seals for same spec (different agent).
+        fs::write(dir.path().join("auth.py"), "def login(): return True\n").unwrap();
+        repo.seal(
+            agent("agent-2"),
+            "more auth".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Find agent-1's last seal for "auth".
+        let result = repo
+            .find_last_seal_for_spec_and_agent("auth", "agent-1")
+            .unwrap();
+        assert!(result.is_some(), "should find agent-1's seal");
+        let seal = result.unwrap();
+        assert_eq!(seal.agent.id, "agent-1");
+        assert_eq!(seal.summary, "auth work");
+
+        // Non-existent agent returns None.
+        let none = repo
+            .find_last_seal_for_spec_and_agent("auth", "agent-99")
+            .unwrap();
+        assert!(none.is_none());
+    }
+
+    // ─── MS.5 Over-Capture Behavior (2 tests) ───────────────────────
+
+    #[test]
+    fn test_first_seal_may_over_capture_safely() {
+        // Both agents write files before either seals. First seal captures
+        // all changes since genesis (including the other agent's files).
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec_a = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        let spec_b = crate::spec::Spec::new("pay".into(), "Pay".into(), "".into());
+        repo.add_spec(&spec_a).unwrap();
+        repo.add_spec(&spec_b).unwrap();
+
+        // Both agents write before sealing
+        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
+        fs::write(dir.path().join("pay.rs"), "fn charge() {}").unwrap();
+
+        // Agent-1 seals for auth — captures both files (over-capture)
+        let seal_a = repo
+            .seal(
+                agent("agent-1"),
+                "auth".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        assert!(
+            seal_a.changes.len() >= 1,
+            "should capture at least auth.rs (may over-capture pay.rs)"
+        );
+
+        // Agent-2 seals for pay — also captures both files (over-capture)
+        let seal_b = repo
+            .seal(
+                agent("agent-2"),
+                "pay".into(),
+                Some("pay".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        assert!(
+            seal_b.changes.len() >= 1,
+            "should capture at least pay.rs (may over-capture auth.rs)"
+        );
+        // Key: both agents CAN seal. No "no changes" error.
+    }
+
+    #[test]
+    fn test_over_capture_resolves_after_first_round() {
+        // After both agents seal once, subsequent seals are precise.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec_a = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        let spec_b = crate::spec::Spec::new("pay".into(), "Pay".into(), "".into());
+        repo.add_spec(&spec_a).unwrap();
+        repo.add_spec(&spec_b).unwrap();
+
+        // Both write and seal (first round — may over-capture)
+        fs::write(dir.path().join("auth.rs"), "v1").unwrap();
+        fs::write(dir.path().join("pay.rs"), "v1").unwrap();
+
+        repo.seal(
+            agent("agent-1"),
+            "round1".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-2"),
+            "round1".into(),
+            Some("pay".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Second round: each agent modifies only its own file
+        fs::write(dir.path().join("auth.rs"), "v2").unwrap();
+        let seal_a2 = repo
+            .seal(
+                agent("agent-1"),
+                "round2".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Agent-1's second seal should ONLY contain auth.rs
+        let paths: Vec<&str> = seal_a2.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, vec!["auth.rs"], "second round should be precise");
+    }
+
+    // ─── MS.5 Edge Cases (7 tests) ──────────────────────────────────
+
+    #[test]
+    fn test_seal_spec_scoped_no_changes() {
+        // Seal with --spec when agent has no changes since baseline.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        // Create and seal a file
+        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "initial".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Try to seal again with no changes — should fail
+        let result = repo.seal(
+            agent("agent-1"),
+            "no changes".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        );
+        assert!(result.is_err(), "should fail with NothingToSeal");
+    }
+
+    #[test]
+    fn test_seal_two_agents_same_file_both_captured() {
+        // Two agents modify same file → BOTH seals capture it.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec_a = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        let spec_b = crate::spec::Spec::new("oauth".into(), "OAuth".into(), "".into());
+        repo.add_spec(&spec_a).unwrap();
+        repo.add_spec(&spec_b).unwrap();
+
+        // Agent-1 writes to shared file
+        fs::write(dir.path().join("auth.rs"), "fn login_google() {}").unwrap();
+        let seal_a = repo
+            .seal(
+                agent("agent-1"),
+                "google auth".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        assert!(seal_a.changes.iter().any(|c| c.path == "auth.rs"));
+
+        // Agent-2 modifies same file differently
+        fs::write(
+            dir.path().join("auth.rs"),
+            "fn login_google() {}\nfn login_github() {}",
+        )
+        .unwrap();
+        let seal_b = repo
+            .seal(
+                agent("agent-2"),
+                "github auth".into(),
+                Some("oauth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        // Agent-2's seal also captures auth.rs (different content from genesis)
+        assert!(seal_b.changes.iter().any(|c| c.path == "auth.rs"));
+    }
+
+    #[test]
+    fn test_seal_new_file_attributed_to_creator() {
+        // Brand-new file after spec creation belongs to the sealing agent.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("feat".into(), "Feat".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        fs::write(dir.path().join("brand_new.rs"), "fn new() {}").unwrap();
+        let seal = repo
+            .seal(
+                agent("agent-1"),
+                "new file".into(),
+                Some("feat".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(seal.changes.len(), 1);
+        assert_eq!(seal.changes[0].path, "brand_new.rs");
+        assert_eq!(seal.changes[0].change_type, ChangeType::Added);
+    }
+
+    #[test]
+    fn test_seal_deleted_file_attributed_to_deleter() {
+        // Agent creates file, seals, deletes it, seals again.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("clean".into(), "Clean".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        // Create and seal
+        fs::write(dir.path().join("temp.rs"), "fn temp() {}").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "create".into(),
+            Some("clean".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Delete and seal
+        fs::remove_file(dir.path().join("temp.rs")).unwrap();
+        let seal2 = repo
+            .seal(
+                agent("agent-1"),
+                "delete".into(),
+                Some("clean".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(seal2.changes.len(), 1);
+        assert_eq!(seal2.changes[0].path, "temp.rs");
+        assert_eq!(seal2.changes[0].change_type, ChangeType::Deleted);
+    }
+
+    #[test]
+    fn test_seal_race_two_agents_seal_simultaneously() {
+        // Sequential seals (simulating near-simultaneous) — both succeed.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec_a = crate::spec::Spec::new("a".into(), "A".into(), "".into());
+        let spec_b = crate::spec::Spec::new("b".into(), "B".into(), "".into());
+        repo.add_spec(&spec_a).unwrap();
+        repo.add_spec(&spec_b).unwrap();
+
+        fs::write(dir.path().join("a.rs"), "a").unwrap();
+        fs::write(dir.path().join("b.rs"), "b").unwrap();
+
+        let seal_a = repo.seal(
+            agent("agent-1"),
+            "a work".into(),
+            Some("a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        );
+        let seal_b = repo.seal(
+            agent("agent-2"),
+            "b work".into(),
+            Some("b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        );
+
+        assert!(seal_a.is_ok(), "agent-1 should seal successfully");
+        assert!(seal_b.is_ok(), "agent-2 should seal successfully");
+    }
+
+    #[test]
+    fn test_seal_genesis_snapshot_at_spec_creation() {
+        // Genesis index captured when spec is created via add_spec.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create a file and seal it so index is populated
+        fs::write(dir.path().join("existing.rs"), "fn existing() {}").unwrap();
+        repo.seal(
+            agent("setup"),
+            "setup".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Create spec — should snapshot current index
+        let spec = crate::spec::Spec::new("feat".into(), "Feat".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        let loaded = repo.load_spec("feat").unwrap();
+        assert!(loaded.genesis_tree.is_some(), "should have genesis_tree");
+
+        // Load genesis index and verify it contains existing.rs
+        let genesis = repo
+            .load_tree_index(loaded.genesis_tree.as_ref().unwrap())
+            .unwrap();
+        assert!(
+            genesis.is_tracked("existing.rs"),
+            "genesis should track existing.rs"
+        );
+    }
+
+    #[test]
+    fn test_seal_legacy_spec_without_genesis_uses_empty() {
+        // Manually create a spec file without genesis_tree (simulating legacy).
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Write spec JSON directly without genesis_tree field (legacy format)
+        let spec = crate::spec::Spec::new("legacy".into(), "Legacy".into(), "".into());
+        let json = serde_json::to_string_pretty(&spec).unwrap();
+        let spec_path = dir.path().join(".writ/specs/legacy.json");
+        fs::write(&spec_path, json).unwrap();
+
+        // Create a file and seal — should capture it (empty baseline → everything is new)
+        fs::write(dir.path().join("new.rs"), "fn new() {}").unwrap();
+        let seal = repo
+            .seal(
+                agent("agent-1"),
+                "legacy seal".into(),
+                Some("legacy".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        assert!(
+            seal.changes.iter().any(|c| c.path == "new.rs"),
+            "should capture new file with empty baseline"
+        );
+    }
+
+    // ─── MS.5 Integration (3 tests) ─────────────────────────────────
+
+    #[test]
+    fn test_four_agents_same_directory_independent_seals() {
+        // Alpha-11 scenario: 4 agents, same directory, different files.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Create 4 specs
+        for name in &["auth", "payments", "ui", "docs"] {
+            let spec = crate::spec::Spec::new(name.to_string(), name.to_string(), "".into());
+            repo.add_spec(&spec).unwrap();
+        }
+
+        // Each agent creates its own file
+        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
+        fs::write(dir.path().join("payments.rs"), "fn charge() {}").unwrap();
+        fs::write(dir.path().join("ui.rs"), "fn render() {}").unwrap();
+        fs::write(dir.path().join("docs.md"), "# Docs").unwrap();
+
+        // Each agent seals for its own spec
+        let seal1 = repo
+            .seal(
+                agent("agent-1"),
+                "auth".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        let seal2 = repo
+            .seal(
+                agent("agent-2"),
+                "payments".into(),
+                Some("payments".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        let seal3 = repo
+            .seal(
+                agent("agent-3"),
+                "ui".into(),
+                Some("ui".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        let seal4 = repo
+            .seal(
+                agent("agent-4"),
+                "docs".into(),
+                Some("docs".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // All four agents successfully sealed — zero "no changes" errors
+        assert!(!seal1.changes.is_empty(), "agent-1 should have changes");
+        assert!(!seal2.changes.is_empty(), "agent-2 should have changes");
+        assert!(!seal3.changes.is_empty(), "agent-3 should have changes");
+        assert!(!seal4.changes.is_empty(), "agent-4 should have changes");
+
+        // After first round, each agent modifies ONLY its own file
+        fs::write(dir.path().join("auth.rs"), "fn login_v2() {}").unwrap();
+        fs::write(dir.path().join("payments.rs"), "fn charge_v2() {}").unwrap();
+
+        let seal1b = repo
+            .seal(
+                agent("agent-1"),
+                "auth v2".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        let seal2b = repo
+            .seal(
+                agent("agent-2"),
+                "payments v2".into(),
+                Some("payments".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Second round: agent-1's seal includes auth.rs (its own change).
+        // It may also include payments.rs if agent-2 changed it since agent-1's
+        // baseline — this is expected over-capture, safe because convergence handles it.
+        let s1_paths: Vec<&str> = seal1b.changes.iter().map(|c| c.path.as_str()).collect();
+        let s2_paths: Vec<&str> = seal2b.changes.iter().map(|c| c.path.as_str()).collect();
+        assert!(
+            s1_paths.contains(&"auth.rs"),
+            "agent-1 second seal must include auth.rs"
+        );
+        assert!(
+            s2_paths.contains(&"payments.rs"),
+            "agent-2 second seal must include payments.rs"
+        );
+    }
+
+    #[test]
+    fn test_convergence_on_same_directory_seals() {
+        // Convergence works without workspaces (same-directory mode).
+        // Two specs with sealed work → converge_all reconciles.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec_a = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        let spec_b = crate::spec::Spec::new("pay".into(), "Pay".into(), "".into());
+        repo.add_spec(&spec_a).unwrap();
+        repo.add_spec(&spec_b).unwrap();
+
+        // Two agents seal different files (same directory, no workspaces).
+        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "auth work".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("pay.rs"), "fn charge() {}").unwrap();
+        repo.seal(
+            agent("agent-2"),
+            "pay work".into(),
+            Some("pay".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Converge — should succeed (non-overlapping files).
+        let report = repo.converge_all(crate::convergence::ConvergeStrategy::Manual, true);
+        // converge_all may return clean (no diverged branches since seals
+        // are sequential on HEAD) — that's fine. The key is no error.
+        assert!(
+            report.is_ok(),
+            "converge_all should not error on same-directory seals"
+        );
+    }
+
+    #[test]
+    fn test_backward_compat_single_agent_no_spec() {
+        // Single agent, no --spec, no workspaces = legacy behavior.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("app.py"), "# app\n").unwrap();
+        let seal = repo.seal(
+            agent("solo-agent"),
+            "work".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        );
+        assert!(seal.is_ok(), "legacy seal without spec should still work");
+        let seal = seal.unwrap();
+        assert!(!seal.changes.is_empty(), "should capture all changed files");
+    }
+
+    // ─── MS.5 Spec Claiming (3 tests) ───────────────────────────────
+
+    #[test]
+    fn test_spec_claim_success() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        repo.spec_claim("auth", "agent-1").unwrap();
+
+        let loaded = repo.load_spec("auth").unwrap();
+        assert_eq!(loaded.claimed_by.as_deref(), Some("agent-1"));
+    }
+
+    #[test]
+    fn test_spec_claim_already_claimed_fails() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        repo.spec_claim("auth", "agent-1").unwrap();
+        let err = repo.spec_claim("auth", "agent-2");
+        assert!(err.is_err(), "second agent should not be able to claim");
+    }
+
+    #[test]
+    fn test_spec_claim_idempotent_same_agent() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        repo.spec_claim("auth", "agent-1").unwrap();
+        // Same agent re-claiming should be a no-op.
+        repo.spec_claim("auth", "agent-1").unwrap();
+
+        let loaded = repo.load_spec("auth").unwrap();
+        assert_eq!(loaded.claimed_by.as_deref(), Some("agent-1"));
+    }
+
+    #[test]
+    fn test_spec_auto_claim_on_first_seal() {
+        // First seal for a spec auto-claims it for the sealing agent.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        // Verify spec is unclaimed.
+        let loaded = repo.load_spec("auth").unwrap();
+        assert!(loaded.claimed_by.is_none(), "spec should start unclaimed");
+
+        // Seal for spec — should auto-claim.
+        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "auth work".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Spec should now be claimed by agent-1.
+        let loaded = repo.load_spec("auth").unwrap();
+        assert_eq!(
+            loaded.claimed_by.as_deref(),
+            Some("agent-1"),
+            "first seal should auto-claim spec"
+        );
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // MS.23: Seal-Chain Subtraction Tests (Phase 1b Optimization)
+    //
+    // Tests for is_change_attributable_to_agent() — excludes files
+    // already captured by another agent's seal from current seal.
+    // ═══════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn test_chain_subtraction_excludes_other_agents_changes() {
+        // Scenario: Agent-1 and Agent-2 each seal once (first round, over-capture allowed).
+        // Then Agent-2 modifies pay.rs. Agent-1 seals again (second round).
+        // Subtraction should filter out pay.rs from Agent-1's seal because
+        // spec "pay" already captured it with the same hash.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec_a = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        let spec_b = crate::spec::Spec::new("pay".into(), "Pay".into(), "".into());
+        repo.add_spec(&spec_a).unwrap();
+        repo.add_spec(&spec_b).unwrap();
+
+        // Both agents write and seal (first round — over-capture allowed)
+        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
+        fs::write(dir.path().join("pay.rs"), "fn charge() {}").unwrap();
+
+        repo.seal(
+            agent("agent-1"),
+            "round 1".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-2"),
+            "round 1".into(),
+            Some("pay".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent-1 modifies auth.rs. pay.rs is unchanged.
+        fs::write(dir.path().join("auth.rs"), "fn login_v2() {}").unwrap();
+
+        let seal_a2 = repo
+            .seal(
+                agent("agent-1"),
+                "round 2".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Subtraction: pay.rs should be excluded because spec "pay" has it
+        // with the same content hash. Only auth.rs should remain.
+        let paths: Vec<&str> = seal_a2.changes.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec!["auth.rs"],
+            "subtraction should exclude pay.rs (already captured by spec 'pay')"
+        );
+    }
+
+    #[test]
+    fn test_chain_subtraction_keeps_same_file_different_content() {
+        // Both agents modify the same file with different content.
+        // Subtraction should NOT filter it out because the content hashes differ.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec_a = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        let spec_b = crate::spec::Spec::new("pay".into(), "Pay".into(), "".into());
+        repo.add_spec(&spec_a).unwrap();
+        repo.add_spec(&spec_b).unwrap();
+
+        // First round: both seal
+        fs::write(dir.path().join("shared.rs"), "v1").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "round 1".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-2"),
+            "round 1".into(),
+            Some("pay".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent-2 modifies shared.rs to "v2" and seals
+        fs::write(dir.path().join("shared.rs"), "v2-by-agent2").unwrap();
+        repo.seal(
+            agent("agent-2"),
+            "round 2".into(),
+            Some("pay".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent-1 modifies shared.rs to a DIFFERENT value
+        fs::write(dir.path().join("shared.rs"), "v2-by-agent1").unwrap();
+        let seal_a2 = repo
+            .seal(
+                agent("agent-1"),
+                "round 2".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Subtraction should NOT filter shared.rs — different content hashes.
+        let paths: Vec<&str> = seal_a2.changes.iter().map(|c| c.path.as_str()).collect();
+        assert!(
+            paths.contains(&"shared.rs"),
+            "subtraction must keep file when content differs from other spec's seal"
+        );
+    }
+
+    #[test]
+    fn test_chain_subtraction_fallback_no_recent_seals() {
+        // Only one spec exists — no other spec seals to compare against.
+        // Subtraction has nothing to subtract, includes everything.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let spec = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
+        repo.add_spec(&spec).unwrap();
+
+        // Agent writes and seals (first round)
+        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
+        fs::write(dir.path().join("config.rs"), "const X: u32 = 1;").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "round 1".into(),
+            Some("auth".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent modifies both files
+        fs::write(dir.path().join("auth.rs"), "fn login_v2() {}").unwrap();
+        fs::write(dir.path().join("config.rs"), "const X: u32 = 2;").unwrap();
+
+        let seal2 = repo
+            .seal(
+                agent("agent-1"),
+                "round 2".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // No other specs → nothing subtracted → both files included.
+        assert_eq!(
+            seal2.changes.len(),
+            2,
+            "with no other specs, subtraction should not filter anything"
+        );
     }
 }

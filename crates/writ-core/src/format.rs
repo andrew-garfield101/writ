@@ -788,6 +788,7 @@ mod tests {
             chain_integrity: None,
             stale_specs: vec![],
             dependencies: vec![],
+            unclaimed_specs: vec![],
             available_operations: vec![
                 "seal".into(),
                 "context".into(),
@@ -1608,6 +1609,7 @@ mod tests {
             chain_integrity: None,
             stale_specs: vec![],
             dependencies: vec![],
+            unclaimed_specs: vec![],
             available_operations: vec![],
         };
 

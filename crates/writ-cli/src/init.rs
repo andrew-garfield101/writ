@@ -102,6 +102,7 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
                 commit_strategy: None,
                 stale_timeout: None,
             }),
+            watch: None,
         };
         if let Err(e) = config.save() {
             eprintln!("warning: could not save global config: {}", e);
@@ -196,6 +197,7 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
             commit_strategy: None,
             stale_timeout: None,
         }),
+        watch: None,
     };
 
     if let Err(e) = config.save() {
@@ -348,6 +350,7 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
         }),
         auto: None,
         workspace: None,
+        watch: None,
     };
 
     // Summary and confirmation (I.10)

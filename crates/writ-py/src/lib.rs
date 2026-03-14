@@ -1236,6 +1236,19 @@ impl PyRepository {
         Ok(())
     }
 
+    /// Claim a spec for an agent, preventing duplicate work.
+    ///
+    /// Parameters:
+    /// - `spec_id`: ID of the spec to claim.
+    /// - `agent_id`: Agent ID claiming the spec.
+    ///
+    /// Raises WritError if the spec is already claimed by a different agent.
+    /// Idempotent if the same agent re-claims.
+    fn spec_claim(&self, spec_id: &str, agent_id: &str) -> PyResult<()> {
+        self.inner.spec_claim(spec_id, agent_id).map_err(writ_err)?;
+        Ok(())
+    }
+
     // -- Propose mode (W.31) --
 
     /// Create a commit proposal for review (propose mode).
@@ -1379,6 +1392,19 @@ impl PyRepository {
             .create_task(title.to_string(), id)
             .map_err(writ_err)?;
         to_pydict(py, &result)
+    }
+
+    /// Create multiple specs from a list of task descriptions.
+    ///
+    /// Each task string becomes a spec with an auto-derived ID (slugified title).
+    ///
+    /// Parameters:
+    /// - `tasks`: List of task description strings.
+    ///
+    /// Returns a list of dicts, each with `spec_id` and `title`.
+    fn plan(&self, py: Python, tasks: Vec<String>) -> PyResult<PyObject> {
+        let results = self.inner.plan(tasks).map_err(writ_err)?;
+        to_pydict(py, &results)
     }
 
     // -------------------------------------------------------------------

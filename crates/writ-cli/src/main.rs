@@ -1,6 +1,7 @@
 //! writ CLI — the human (and agent) interface to writ.
 
 mod init;
+mod watch_ui;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -169,6 +170,21 @@ enum Commands {
 
         #[command(subcommand)]
         action: Option<TaskCommands>,
+    },
+
+    /// Create specs in batch from a list of task descriptions.
+    /// Accepts inline arguments, -f file (one task per line), or stdin.
+    Plan {
+        /// Task descriptions (inline). Each becomes a spec.
+        tasks: Vec<String>,
+
+        /// Read tasks from a file (one per line).
+        #[arg(short, long)]
+        file: Option<String>,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
     },
 
     /// Show working directory state.
@@ -629,6 +645,32 @@ enum Commands {
         action: WorkspaceCommands,
     },
 
+    /// Monitor for new seals and auto-converge overlapping changes in real-time.
+    ///
+    /// Runs as a foreground terminal process by default, showing live seal activity
+    /// and convergence events. Use --daemon for background mode.
+    Watch {
+        /// Polling interval in seconds (default: 5, or from config).
+        #[arg(long)]
+        interval: Option<u64>,
+
+        /// Disable auto-convergence (watch and report only, don't merge).
+        #[arg(long)]
+        no_auto_converge: bool,
+
+        /// Run as a background daemon process.
+        #[arg(long)]
+        daemon: bool,
+
+        /// Stop a running daemon.
+        #[arg(long)]
+        stop: bool,
+
+        /// Show daemon status and recent activity.
+        #[arg(long, name = "watch_status")]
+        status: bool,
+    },
+
     /// Check repository health and schema version.
     Doctor {
         /// Output as JSON instead of human-readable.
@@ -856,6 +898,17 @@ enum SpecCommands {
     Reopen {
         /// Spec ID to reopen.
         id: String,
+    },
+
+    /// Claim a spec for an agent. Prevents other agents from working on it.
+    /// On first seal with --spec, the spec is auto-claimed.
+    Claim {
+        /// Spec ID to claim.
+        id: String,
+
+        /// Agent ID claiming this spec (auto-detected if omitted).
+        #[arg(long)]
+        agent: Option<String>,
     },
 
     /// Assign a spec to a workspace. Scopes the spec to that workspace's context.
@@ -1207,6 +1260,11 @@ fn main() {
                 }
             },
         },
+        Commands::Plan {
+            tasks,
+            file,
+            format,
+        } => cmd_plan(&cwd, tasks, file, &format),
         Commands::State { format } => {
             let format = resolve_format(format.as_deref(), &cwd, "human");
             cmd_state(&cwd, &format)
@@ -1415,6 +1473,7 @@ fn main() {
                 &format,
             ),
             SpecCommands::Reopen { id } => cmd_spec_reopen(&cwd, &id),
+            SpecCommands::Claim { id, agent } => cmd_spec_claim(&cwd, &id, agent.as_deref()),
             SpecCommands::Assign { id, workspace } => cmd_spec_assign(&cwd, &id, &workspace),
             SpecCommands::Unassign { id } => cmd_spec_unassign(&cwd, &id),
         },
@@ -1537,6 +1596,13 @@ fn main() {
         },
         Commands::McpServe => cmd_mcp_serve(&cwd),
         Commands::McpInstall { desktop } => cmd_mcp_install(&cwd, desktop),
+        Commands::Watch {
+            interval,
+            no_auto_converge,
+            daemon,
+            stop,
+            status,
+        } => cmd_watch(&cwd, interval, no_auto_converge, daemon, stop, status),
         Commands::Doctor { json, fix } => cmd_doctor(&cwd, json, fix),
     };
 
@@ -1859,6 +1925,9 @@ fn cmd_init(
     // Save the project config from the interactive flow.
     plan.project_config.save(&cwd.join(".writ"))?;
 
+    // MS.30: Append commented [watch] section to config.toml for discoverability.
+    append_watch_config_comment(&cwd.join(".writ").join("config.toml"));
+
     // Install framework hooks based on user selections (not just auto-detection).
     // LE-7: Collect and display hook errors instead of silently discarding them.
     if !opts.bare {
@@ -1957,6 +2026,11 @@ fn cmd_init(
                         "→".green()
                     );
                 }
+                println!(
+                    "  {} Tip: run {} for auto-convergence when multiple agents work in the same directory",
+                    "→".green(),
+                    "writ watch".bold()
+                );
             }
             if plan.enable_codex {
                 println!("{} Codex / OpenAI integration configured", "✓".green());
@@ -2215,6 +2289,72 @@ fn cmd_task_create(
                 result.suggested_prompt
             );
             println!("  {}", "Or provide your own prompt for the agent.".dimmed());
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_plan(
+    cwd: &PathBuf,
+    inline_tasks: Vec<String>,
+    file: Option<String>,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+    use std::io::{self, BufRead};
+
+    // Collect tasks from inline args, file, or stdin.
+    let tasks: Vec<String> = if !inline_tasks.is_empty() {
+        inline_tasks
+    } else if let Some(path) = file {
+        let content = std::fs::read_to_string(&path)?;
+        content
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    } else {
+        // Read from stdin.
+        let stdin = io::stdin();
+        stdin
+            .lock()
+            .lines()
+            .map(|l| l.unwrap_or_default().trim().to_string())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect()
+    };
+
+    if tasks.is_empty() {
+        eprintln!("error: no tasks provided");
+        eprintln!("  usage: writ plan \"Task A\" \"Task B\"");
+        eprintln!("  or:    writ plan -f tasks.txt");
+        eprintln!("  or:    cat tasks.txt | writ plan");
+        std::process::exit(1);
+    }
+
+    let repo = Repository::open_from_dir(cwd)?;
+    let results = repo.plan(tasks)?;
+
+    match format {
+        "json" => {
+            let json = serde_json::to_string_pretty(&results)?;
+            println!("{json}");
+        }
+        _ => {
+            println!("\n  {} specs created:", results.len().to_string().bold());
+            for r in &results {
+                println!("    {}  \"{}\"", r.spec_id.cyan(), r.title);
+            }
+            println!();
+            println!(
+                "  Next: launch your agents. They discover specs via {}.",
+                "writ context".cyan()
+            );
+            println!(
+                "  Run {} to enable automatic convergence.",
+                "writ watch".cyan()
+            );
         }
     }
 
@@ -5107,6 +5247,18 @@ fn cmd_spec_reopen(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+fn cmd_spec_claim(
+    cwd: &PathBuf,
+    id: &str,
+    agent: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open_from_dir(cwd)?;
+    let agent_id = agent.unwrap_or("claude-code");
+    repo.spec_claim(id, agent_id)?;
+    println!("Claimed spec '{}' for agent '{}'.", id, agent_id);
+    Ok(())
+}
+
 fn cmd_spec_assign(
     cwd: &PathBuf,
     id: &str,
@@ -7685,6 +7837,26 @@ fn cmd_config_unset(
 
 /// Generate .mcp.json for Claude Code MCP discovery.
 /// Only writes if file doesn't exist or content differs (idempotent).
+/// MS.30: Append a commented `[watch]` section to config.toml so users
+/// can discover and customize watch daemon settings.
+fn append_watch_config_comment(config_path: &std::path::Path) {
+    let comment = r#"
+
+# Watch daemon configuration (uncomment to customize)
+# Run `writ watch` to start the convergence daemon.
+# [watch]
+# interval = 5              # seconds between polls (min: 1)
+# auto_converge = true       # auto-converge overlapping seals
+# max_retries = 3            # max convergence retries (min: 1)
+# log_file = ".writ/watch.log"  # log file, relative to project root
+"#;
+    if let Ok(existing) = std::fs::read_to_string(config_path) {
+        if !existing.contains("[watch]") {
+            let _ = std::fs::write(config_path, format!("{}{}", existing, comment));
+        }
+    }
+}
+
 fn generate_mcp_json(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let mcp_path = cwd.join(".mcp.json");
     let config = serde_json::json!({
@@ -8088,6 +8260,70 @@ fn cmd_doctor(cwd: &PathBuf, json: bool, fix: bool) -> Result<(), Box<dyn std::e
 }
 
 // ---------------------------------------------------------------------------
+// Watch command
+// ---------------------------------------------------------------------------
+
+fn cmd_watch(
+    cwd: &PathBuf,
+    interval: Option<u64>,
+    no_auto_converge: bool,
+    daemon: bool,
+    stop: bool,
+    status: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Verify writ is initialized.
+    let _repo = Repository::open_from_dir(cwd)?;
+
+    // Resolve watch config: CLI flags > project config > global config > defaults.
+    // Uses Haris's config resolution chain (MS.18).
+    let project_config = config::ProjectConfig::load(cwd).unwrap_or_default();
+    let global_config = config::GlobalConfig::load().unwrap_or_default();
+    let resolved = config::resolve_watch_config(&project_config, &global_config)?;
+
+    // CLI flags override resolved config.
+    let effective_interval = interval.unwrap_or(resolved.interval);
+    let auto_converge = if no_auto_converge {
+        false
+    } else {
+        resolved.auto_converge
+    };
+
+    if stop {
+        // MS.17: Daemon stop — requires Lee's platform primitives (MS.19).
+        return watch_ui::cmd_watch_stop(cwd);
+    }
+
+    if status {
+        // MS.17: Daemon status — requires Lee's platform primitives (MS.19).
+        return watch_ui::cmd_watch_status(cwd);
+    }
+
+    // Wire resolved max_retries and log_file through to the watch loop (Amis review fix).
+    let effective_max_retries = resolved.max_retries;
+    let effective_log_file = resolved.log_file.clone();
+
+    if daemon {
+        // MS.17: Daemon start — requires Lee's platform primitives (MS.19).
+        return watch_ui::cmd_watch_daemon(
+            cwd,
+            effective_interval,
+            auto_converge,
+            effective_max_retries,
+            &effective_log_file,
+        );
+    }
+
+    // Foreground terminal mode (default).
+    watch_ui::cmd_watch_foreground(
+        cwd,
+        effective_interval,
+        auto_converge,
+        effective_max_retries,
+        &effective_log_file,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -8184,6 +8420,8 @@ mod tests {
             commit_hash: None,
             committed_at: None,
             workspace: None,
+            claimed_by: None,
+            genesis_tree: None,
         }
     }
 

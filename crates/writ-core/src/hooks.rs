@@ -1036,6 +1036,12 @@ Do NOT run `git commit`, `git add`, `git push`, or `writ finish`.
 - You MUST include meaningful summaries in seals so other agents understand your work
 - Do NOT run `git add`, `git commit`, or `git push` — the user manages the git round-trip via `writ finish`
 - Do NOT run `writ finish` — this is the git integration command managed by the user or orchestrator
+
+### Multi-Agent (Same Directory)
+- Multiple agents can work in the same directory simultaneously
+- Each agent seals with `--spec <spec-id>` to scope changes
+- Run `writ watch` in the background for auto-convergence of overlapping work
+- Check `writ context` to see other agents' activity and convergence state
 "#.to_string()
 }
 

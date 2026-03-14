@@ -349,6 +349,15 @@ pub struct TaskContext {
     pub status: String,
 }
 
+/// An active spec that has not yet been claimed by any agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnclaimedSpec {
+    /// Spec ID.
+    pub id: String,
+    /// Human-readable title.
+    pub title: String,
+}
+
 /// The full context output, optimized for LLM consumption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextOutput {
@@ -458,6 +467,11 @@ pub struct ContextOutput {
     /// Populated by lazy stale detection during `context()`.
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub stale_specs: Vec<String>,
+
+    /// Specs that are active but not yet claimed by any agent.
+    /// Agents should claim one of these before starting work.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub unclaimed_specs: Vec<UnclaimedSpec>,
 
     /// Cross-workspace dependency specs. When context is workspace-scoped,
     /// this shows specs from other workspaces that our specs depend on.

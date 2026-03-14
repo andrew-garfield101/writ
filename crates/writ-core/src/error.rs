@@ -24,6 +24,8 @@ pub enum WritError {
     SpecNotFound(String),
     /// A spec with this ID already exists.
     SpecAlreadyExists(String),
+    /// A spec is already claimed by another agent.
+    SpecAlreadyClaimed { spec_id: String, claimed_by: String },
     /// A seal with this ID already exists (immutable store).
     SealAlreadyExists(String),
     /// Spec has no seals — cannot converge.
@@ -92,6 +94,15 @@ impl fmt::Display for WritError {
                 write!(
                     f,
                     "spec '{id}' already exists (use 'writ spec update' to modify)"
+                )
+            }
+            WritError::SpecAlreadyClaimed {
+                spec_id,
+                claimed_by,
+            } => {
+                write!(
+                    f,
+                    "spec '{spec_id}' is already claimed by agent '{claimed_by}'. Use `writ context` to find unclaimed specs."
                 )
             }
             WritError::SealAlreadyExists(id) => {

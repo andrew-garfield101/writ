@@ -136,8 +136,8 @@ class TestSealEnforcementC13:
         )
         assert result.returncode == 0
 
-    def test_human_no_spec_warns_but_succeeds(self, writ_repo):
-        """No agent env + no --spec = warning printed, seal succeeds."""
+    def test_human_no_spec_rejected(self, writ_repo):
+        """No agent env + no --spec = error (C.13 enforces spec for all seals)."""
         path = writ_repo
         (path / "app.py").write_text("print('hello')\n")
 
@@ -146,9 +146,9 @@ class TestSealEnforcementC13:
             str(path),
             env=clean_env(),
         )
-        assert result.returncode == 0
+        assert result.returncode != 0
         combined = result.stdout + result.stderr
-        assert "warning" in combined.lower()
+        assert "spec" in combined.lower()
 
     def test_human_with_spec_no_warning(self, writ_repo):
         """No agent env + spec provided = no warning, seal succeeds."""
@@ -169,8 +169,8 @@ class TestSealEnforcementC13:
         # Should not have the no-spec warning
         assert "no spec" not in combined.lower() or "no active spec" not in combined.lower()
 
-    def test_explicit_agent_flag_alone_no_enforcement(self, writ_repo):
-        """--agent flag without env var does NOT trigger enforcement."""
+    def test_explicit_agent_flag_alone_still_enforces(self, writ_repo):
+        """--agent flag without --spec still enforces (C.13: all seals need spec)."""
         path = writ_repo
         (path / "app.py").write_text("print('hello')\n")
 
@@ -179,8 +179,10 @@ class TestSealEnforcementC13:
             str(path),
             env=clean_env(),
         )
-        # Should succeed (warning only, not error) because no agent env var
-        assert result.returncode == 0
+        # C.13 enforces spec for all seals regardless of agent env
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "spec" in combined.lower()
 
     def test_agent_error_message_is_actionable(self, writ_repo):
         """Error message includes the exact command to run."""
@@ -284,8 +286,8 @@ class TestContextTokenC14:
         combined = result.stdout + result.stderr
         assert "context" in combined.lower()
 
-    def test_seal_with_missing_token_human_no_warning(self, writ_repo):
-        """Seal with no token + no agent env = no warning."""
+    def test_seal_with_missing_token_human_shows_warning(self, writ_repo):
+        """Seal with no token + no agent env = context warning shown."""
         path = writ_repo
         run_writ(
             ["spec", "add", "--id", "feat-6", "--title", "Feature 6"],
@@ -303,6 +305,5 @@ class TestContextTokenC14:
             str(path),
             env=clean_env(),
         )
+        # Seal succeeds but now warns everyone (not just agents) about missing context
         assert result.returncode == 0
-        combined = result.stdout + result.stderr
-        assert "no `writ context`" not in combined.lower()

@@ -39,6 +39,10 @@ pub struct GlobalConfig {
     /// Workflow settings (commit mode, strategy).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowConfig>,
+
+    /// Watch daemon defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchConfig>,
 }
 
 /// User identity section.
@@ -112,6 +116,10 @@ pub struct ProjectConfig {
     /// Workspace settings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceSettings>,
+
+    /// Watch daemon configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<WatchConfig>,
 }
 
 /// Project metadata section.
@@ -221,6 +229,82 @@ pub struct AutoModeConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Watch config
+// ---------------------------------------------------------------------------
+
+/// Watch daemon configuration — controls `writ watch` polling behavior.
+///
+/// ```toml
+/// [watch]
+/// interval = 5            # seconds between polls (default: 5, min: 1)
+/// auto_converge = true     # auto-converge overlapping seals (default: true)
+/// max_retries = 3          # max convergence retries (default: 3, min: 1)
+/// log_file = ".writ/watch.log"  # log file path, relative to project root
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchConfig {
+    /// Polling interval in seconds. Must be >= 1.
+    #[serde(default = "default_watch_interval")]
+    pub interval: u64,
+
+    /// Whether to automatically converge overlapping seals.
+    #[serde(default = "default_true")]
+    pub auto_converge: bool,
+
+    /// Maximum number of convergence retries before giving up. Must be >= 1.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+
+    /// Log file path, relative to project root.
+    #[serde(default = "default_watch_log_file")]
+    pub log_file: String,
+}
+
+fn default_watch_interval() -> u64 {
+    5
+}
+fn default_true() -> bool {
+    true
+}
+fn default_max_retries() -> u32 {
+    3
+}
+fn default_watch_log_file() -> String {
+    ".writ/watch.log".to_string()
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            interval: default_watch_interval(),
+            auto_converge: default_true(),
+            max_retries: default_max_retries(),
+            log_file: default_watch_log_file(),
+        }
+    }
+}
+
+/// Validate a `WatchConfig`, returning an error if values are out of range.
+pub fn validate_watch_config(config: &WatchConfig) -> WritResult<()> {
+    if config.interval < 1 {
+        return Err(WritError::Other(
+            "watch interval must be >= 1 second".to_string(),
+        ));
+    }
+    if config.max_retries < 1 {
+        return Err(WritError::Other(
+            "watch max_retries must be >= 1".to_string(),
+        ));
+    }
+    if config.log_file.starts_with('/') {
+        return Err(WritError::Other(
+            "watch log_file must be a relative path (relative to project root)".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Workspace settings
 // ---------------------------------------------------------------------------
 
@@ -319,6 +403,11 @@ impl GlobalConfig {
     pub fn stale_timeout(&self) -> Option<u64> {
         self.workflow.as_ref()?.stale_timeout
     }
+
+    /// Get the configured watch settings, if set.
+    pub fn watch_config(&self) -> Option<&WatchConfig> {
+        self.watch.as_ref()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -386,6 +475,11 @@ impl ProjectConfig {
             .as_ref()
             .and_then(|ws| ws.root.as_deref())
             .unwrap_or(DEFAULT_WORKSPACE_ROOT)
+    }
+
+    /// Get the configured watch settings, if set.
+    pub fn watch_config(&self) -> Option<&WatchConfig> {
+        self.watch.as_ref()
     }
 
     /// Migrate values from `.writ/settings.json` into a new ProjectConfig.
@@ -514,6 +608,46 @@ pub fn resolve_stale_timeout(project: &ProjectConfig, global: &GlobalConfig) -> 
 }
 
 // ---------------------------------------------------------------------------
+// Watch config resolution (MS.18)
+// ---------------------------------------------------------------------------
+
+/// Resolve the watch configuration using the priority chain:
+/// project config > global config > defaults.
+///
+/// Field-level merging: each field is resolved independently so a project
+/// config can override just `interval` while inheriting `auto_converge`
+/// from global or defaults.
+pub fn resolve_watch_config(
+    project: &ProjectConfig,
+    global: &GlobalConfig,
+) -> WritResult<WatchConfig> {
+    let proj = project.watch_config();
+    let glob = global.watch_config();
+
+    let resolved = WatchConfig {
+        interval: proj
+            .map(|w| w.interval)
+            .or_else(|| glob.map(|w| w.interval))
+            .unwrap_or_else(default_watch_interval),
+        auto_converge: proj
+            .map(|w| w.auto_converge)
+            .or_else(|| glob.map(|w| w.auto_converge))
+            .unwrap_or_else(default_true),
+        max_retries: proj
+            .map(|w| w.max_retries)
+            .or_else(|| glob.map(|w| w.max_retries))
+            .unwrap_or_else(default_max_retries),
+        log_file: proj
+            .map(|w| w.log_file.clone())
+            .or_else(|| glob.map(|w| w.log_file.clone()))
+            .unwrap_or_else(default_watch_log_file),
+    };
+
+    validate_watch_config(&resolved)?;
+    Ok(resolved)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -548,6 +682,7 @@ mod tests {
                 format: Some("toon".into()),
             }),
             workflow: None,
+            watch: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: GlobalConfig = toml::from_str(&toml_str).unwrap();
@@ -613,6 +748,7 @@ mod tests {
             workflow: None,
             auto: None,
             workspace: None,
+            watch: None,
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: ProjectConfig = toml::from_str(&toml_str).unwrap();
@@ -1310,5 +1446,212 @@ commit_mode = "propose"
 
         let loaded = ProjectConfig::load(&writ_dir).unwrap();
         assert_eq!(loaded.workspace_root(), "ws-root");
+    }
+
+    // -----------------------------------------------------------------------
+    // MS.18: Watch config tests (Haris)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_watch_config_defaults() {
+        let wc = WatchConfig::default();
+        assert_eq!(wc.interval, 5);
+        assert!(wc.auto_converge);
+        assert_eq!(wc.max_retries, 3);
+        assert_eq!(wc.log_file, ".writ/watch.log");
+    }
+
+    #[test]
+    fn test_watch_config_toml_roundtrip() {
+        let toml_str = r#"
+[watch]
+interval = 10
+auto_converge = false
+max_retries = 5
+log_file = ".writ/logs/watch.log"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let wc = config.watch_config().unwrap();
+        assert_eq!(wc.interval, 10);
+        assert!(!wc.auto_converge);
+        assert_eq!(wc.max_retries, 5);
+        assert_eq!(wc.log_file, ".writ/logs/watch.log");
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let reparsed: ProjectConfig = toml::from_str(&serialized).unwrap();
+        let wc2 = reparsed.watch_config().unwrap();
+        assert_eq!(wc2.interval, 10);
+        assert!(!wc2.auto_converge);
+    }
+
+    #[test]
+    fn test_watch_config_partial_fields_use_defaults() {
+        // Only interval set — others should get defaults via serde
+        let toml_str = r#"
+[watch]
+interval = 15
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let wc = config.watch_config().unwrap();
+        assert_eq!(wc.interval, 15);
+        assert!(wc.auto_converge); // default true
+        assert_eq!(wc.max_retries, 3); // default
+        assert_eq!(wc.log_file, ".writ/watch.log"); // default
+    }
+
+    #[test]
+    fn test_watch_config_omitted_from_toml_when_none() {
+        let config = ProjectConfig::default();
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(
+            !serialized.contains("[watch]"),
+            "watch section should not appear when None"
+        );
+    }
+
+    #[test]
+    fn test_watch_config_validation_interval_zero() {
+        let wc = WatchConfig {
+            interval: 0,
+            ..Default::default()
+        };
+        let result = validate_watch_config(&wc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("interval"));
+    }
+
+    #[test]
+    fn test_watch_config_validation_max_retries_zero() {
+        let wc = WatchConfig {
+            max_retries: 0,
+            ..Default::default()
+        };
+        let result = validate_watch_config(&wc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("max_retries"));
+    }
+
+    #[test]
+    fn test_watch_config_validation_absolute_log_path() {
+        let wc = WatchConfig {
+            log_file: "/var/log/watch.log".to_string(),
+            ..Default::default()
+        };
+        let result = validate_watch_config(&wc);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("relative path"));
+    }
+
+    #[test]
+    fn test_watch_config_validation_valid() {
+        let wc = WatchConfig::default();
+        assert!(validate_watch_config(&wc).is_ok());
+    }
+
+    #[test]
+    fn test_watch_config_save_and_load() {
+        let dir = TempDir::new().unwrap();
+        let writ_dir = dir.path().join(".writ");
+        std::fs::create_dir_all(&writ_dir).unwrap();
+
+        let mut config = ProjectConfig::default();
+        config.watch = Some(WatchConfig {
+            interval: 10,
+            auto_converge: false,
+            max_retries: 5,
+            log_file: ".writ/custom.log".to_string(),
+        });
+        config.save(&writ_dir).unwrap();
+
+        let loaded = ProjectConfig::load(&writ_dir).unwrap();
+        let wc = loaded.watch_config().unwrap();
+        assert_eq!(wc.interval, 10);
+        assert!(!wc.auto_converge);
+        assert_eq!(wc.max_retries, 5);
+        assert_eq!(wc.log_file, ".writ/custom.log");
+    }
+
+    #[test]
+    fn test_resolve_watch_config_defaults() {
+        let project = ProjectConfig::default();
+        let global = GlobalConfig::default();
+        let resolved = resolve_watch_config(&project, &global).unwrap();
+        assert_eq!(resolved.interval, 5);
+        assert!(resolved.auto_converge);
+        assert_eq!(resolved.max_retries, 3);
+        assert_eq!(resolved.log_file, ".writ/watch.log");
+    }
+
+    #[test]
+    fn test_resolve_watch_config_project_over_global() {
+        let project = ProjectConfig {
+            watch: Some(WatchConfig {
+                interval: 10,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let global = GlobalConfig {
+            watch: Some(WatchConfig {
+                interval: 30,
+                auto_converge: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_watch_config(&project, &global).unwrap();
+        // Project interval wins
+        assert_eq!(resolved.interval, 10);
+        // Project auto_converge (default true) wins over global false
+        assert!(resolved.auto_converge);
+    }
+
+    #[test]
+    fn test_resolve_watch_config_global_over_default() {
+        let project = ProjectConfig::default();
+        let global = GlobalConfig {
+            watch: Some(WatchConfig {
+                interval: 20,
+                auto_converge: false,
+                max_retries: 7,
+                log_file: ".writ/global-watch.log".to_string(),
+            }),
+            ..Default::default()
+        };
+        let resolved = resolve_watch_config(&project, &global).unwrap();
+        assert_eq!(resolved.interval, 20);
+        assert!(!resolved.auto_converge);
+        assert_eq!(resolved.max_retries, 7);
+        assert_eq!(resolved.log_file, ".writ/global-watch.log");
+    }
+
+    #[test]
+    fn test_resolve_watch_config_rejects_invalid() {
+        let project = ProjectConfig {
+            watch: Some(WatchConfig {
+                interval: 0, // invalid
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let global = GlobalConfig::default();
+        let result = resolve_watch_config(&project, &global);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_watch_config_in_global_config_toml() {
+        let toml_str = r#"
+[watch]
+interval = 15
+auto_converge = true
+max_retries = 2
+log_file = ".writ/watch.log"
+"#;
+        let config: GlobalConfig = toml::from_str(toml_str).unwrap();
+        let wc = config.watch_config().unwrap();
+        assert_eq!(wc.interval, 15);
+        assert!(wc.auto_converge);
+        assert_eq!(wc.max_retries, 2);
     }
 }

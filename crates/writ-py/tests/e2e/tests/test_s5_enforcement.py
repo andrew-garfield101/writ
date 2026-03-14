@@ -111,13 +111,17 @@ class TestAgentIdentity:
         self, writ_project: Path, writ_bin: str,
     ):
         """5.4.1: CLAUDE_CODE_SESSION_ID sets agent automatically."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "auto-work",
+                 "--title", "Auto Detection Work")
         (writ_project / "auto.py").write_text("# auto-detected\n")
 
         env = os.environ.copy()
         env["CLAUDE_CODE_SESSION_ID"] = "test-session-e2e-123"
 
         result = subprocess.run(
-            [writ_bin, "seal", "-s", "auto-detect test"],
+            [writ_bin, "seal", "-s", "auto-detect test",
+             "--spec", "auto-work"],
             cwd=writ_project, capture_output=True, text=True, env=env,
         )
         if result.returncode != 0:
@@ -147,6 +151,9 @@ class TestAgentIdentity:
         self, writ_project: Path, writ_bin: str,
     ):
         """5.4.2: Without session env var, agent defaults to human."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "human-work",
+                 "--title", "Human Work")
         (writ_project / "human.py").write_text("# human\n")
 
         # Strip all session env vars
@@ -159,7 +166,7 @@ class TestAgentIdentity:
             env.pop(key, None)
 
         result = subprocess.run(
-            [writ_bin, "seal", "-s", "human seal"],
+            [writ_bin, "seal", "-s", "human seal", "--spec", "human-work"],
             cwd=writ_project, capture_output=True, text=True, env=env,
         )
         assert result.returncode == 0

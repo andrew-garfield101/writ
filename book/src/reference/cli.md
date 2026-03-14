@@ -81,9 +81,34 @@ Options:
   --format <FORMAT>      Output: human (default), json
 ```
 
+### `writ plan`
+
+Batch spec creation from a list of tasks.
+
+```bash
+writ plan [TASKS]... [OPTIONS]
+
+Options:
+  -f, --file <PATH>        Read tasks from a file (one per line)
+```
+
+Reads from inline arguments, a file, or stdin. Titles are slugified into spec IDs automatically (e.g. "Implement OAuth2 auth" becomes `implement-oauth2-auth`).
+
+Output:
+
+```
+3 specs created:
+  implement-oauth2-auth     "Implement OAuth2 auth"
+  add-stripe-payments       "Add Stripe payments"
+  build-admin-dashboard     "Build admin dashboard"
+
+Next: launch your agents. They discover specs via `writ context`.
+Run `writ watch` to enable automatic convergence.
+```
+
 ### `writ seal`
 
-Create a structured checkpoint from current changes.
+Create a structured checkpoint from current changes. When `--spec` is provided, the seal captures only the files that changed since this agent's last seal for this spec (spec-scoped sealing). Without `--spec`, the seal captures all changes in the working directory.
 
 ```bash
 writ seal -s <SUMMARY> [OPTIONS]
@@ -91,7 +116,7 @@ writ seal -s <SUMMARY> [OPTIONS]
 Options:
   -s, --summary <SUMMARY>       Summary of what changed and why (required)
   --agent <AGENT>                Agent identifier [default: human]
-  --spec <SPEC>                  Linked spec ID
+  --spec <SPEC>                  Linked spec ID (enables spec-scoped change detection)
   --status <STATUS>              Task status: in-progress, complete, blocked [default: in-progress]
   --paths <PATHS>                Seal only these paths (comma-separated)
   --tests-passed <N>             Number of tests that passed
@@ -101,6 +126,8 @@ Options:
   --expected-head <SEAL_ID>      Optimistic conflict detection
   --enforce-scope                Reject out of scope file changes
 ```
+
+When `--spec` is used with an unclaimed spec, the spec is auto-claimed by this agent on first seal.
 
 ### `writ context`
 
@@ -119,6 +146,39 @@ Options:
 ```
 
 When called from inside a workspace created by `writ task`, the output includes a `task` field at the top with the assigned task ID, title, and status.
+
+When unclaimed specs exist (created via `writ plan` or `writ spec add` but not yet claimed by an agent), the output includes an `unclaimed_specs` section listing available tasks.
+
+### `writ watch`
+
+Convergence daemon that monitors for new seals and auto-converges overlapping work in real time.
+
+```bash
+writ watch [OPTIONS]
+
+Options:
+  --interval <SECONDS>       Polling interval [default: 5]
+  --no-auto-converge         Watch and report without auto-merging
+  --daemon                   Run as background process
+  --stop                     Stop running daemon
+  --status                   Show daemon status and recent activity
+```
+
+By default, runs in the foreground showing real-time output. Press `q` to quit.
+
+When overlap is detected between seals from different specs touching the same file, the convergence engine runs automatically. If convergence succeeds, the merged result is written to the working directory and a convergence seal is created. If convergence cannot auto-resolve, the conflict is recorded and surfaced via `writ status`.
+
+Daemon mode (`--daemon`) runs the watcher as a background process with output logged to `.writ/watch.log` and PID stored in `.writ/watch.pid`.
+
+Configuration via `.writ/config.toml`:
+
+```toml
+[watch]
+interval = 5              # polling interval in seconds
+auto_converge = true      # auto-converge on overlap detection
+max_retries = 3           # convergence retry limit before escalating
+log_file = ".writ/watch.log"
+```
 
 ### `writ status`
 
@@ -222,7 +282,7 @@ Formats:
 
 ### `writ finish`
 
-Promote completed specs to git commits. When workspaces exist, auto-converges outstanding workspace changes before committing. Interactive spec selection, commit strategy options, and auto generated messages from seal history.
+Promote completed specs to git commits. Auto-converges outstanding changes before committing (both same-directory overlaps and workspace changes). Interactive spec selection, commit strategy options, and auto generated messages from seal history.
 
 ```bash
 writ finish [OPTIONS]
@@ -318,6 +378,21 @@ writ spec status [OPTIONS]
 Options:
   --state <STATE>   Filter: active, stale, completed, cancelled, archived
 ```
+
+### `writ spec claim`
+
+Claim an unclaimed spec for the current agent. Prevents other agents from picking up the same task.
+
+```bash
+writ spec claim <ID> [OPTIONS]
+
+Options:
+  --agent <AGENT>    Agent identifier (auto-detected if not provided)
+```
+
+If the spec is already claimed by another agent, returns an error with the claiming agent's ID.
+
+Specs are also auto-claimed on first seal: when `writ seal --spec X` runs and spec X has no owner, it is automatically claimed by the sealing agent.
 
 ### `writ spec done`
 

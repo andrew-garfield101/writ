@@ -35,9 +35,13 @@ class TestEmptyProject:
 
     def test_seal_no_changes(self, writ_project: Path, writ_bin: str):
         """6.1.2: Seal with no file changes handles gracefully."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "empty-spec",
+                 "--title", "Empty Spec")
         result = writ_cmd(
             writ_bin, writ_project,
             "seal", "-s", "empty seal", "--agent", "tester",
+            "--spec", "empty-spec",
             check=False,
         )
         # Should either succeed (empty seal) or fail cleanly
@@ -89,21 +93,28 @@ class TestSpecialCharacters:
         self, writ_project: Path, writ_bin: str,
     ):
         """6.2.4: Seal summary with unicode handled correctly."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "unicode-spec",
+                 "--title", "Unicode Support")
         (writ_project / "unicode.py").write_text("# unicode test\n")
         result = writ_cmd(
             writ_bin, writ_project,
             "seal", "-s", "added unicode support for donnees",
-            "--agent", "tester",
+            "--agent", "tester", "--spec", "unicode-spec",
             check=False,
         )
         assert result.returncode == 0
 
     def test_file_with_spaces(self, writ_project: Path, writ_bin: str):
         """6.2.1: File with spaces in name handled by seal."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "spaces-spec",
+                 "--title", "Spaces Test")
         (writ_project / "my file.py").write_text("# spaces\n")
         result = writ_cmd(
             writ_bin, writ_project,
             "seal", "-s", "file with spaces", "--agent", "tester",
+            "--spec", "spaces-spec",
             check=False,
         )
         assert result.returncode == 0
@@ -125,10 +136,17 @@ class TestConcurrency:
         for i in range(5):
             (writ_project / f"concurrent_{i}.py").write_text(f"# file {i}\n")
 
+        # Create specs for concurrent seals (C.13 enforcement)
+        for i in range(3):
+            writ_cmd(writ_bin, writ_project,
+                     "spec", "add", "--id", f"concurrent-{i}",
+                     "--title", f"Concurrent {i}", check=False)
+
         def do_seal(idx: int):
             return subprocess.run(
                 [writ_bin, "seal", "-s", f"concurrent seal {idx}",
-                 "--agent", f"agent-{idx}"],
+                 "--agent", f"agent-{idx}",
+                 "--spec", f"concurrent-{idx}"],
                 cwd=writ_project, capture_output=True, text=True,
             )
 
@@ -291,9 +309,13 @@ class TestGitCoexistence:
     def test_git_branch_switch(self, writ_project: Path, writ_bin: str):
         """6.8.3: Git branch switch doesn't break writ."""
         # Seal some work
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "branch-test",
+                 "--title", "Branch Test")
         (writ_project / "branch_test.py").write_text("# main\n")
         writ_cmd(writ_bin, writ_project,
-                 "seal", "-s", "main work", "--agent", "tester")
+                 "seal", "-s", "main work", "--agent", "tester",
+                 "--spec", "branch-test")
 
         # Create and switch branches
         subprocess.run(

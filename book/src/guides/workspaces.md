@@ -1,6 +1,10 @@
 # Workspaces
 
-Workspaces are isolated working directories for agents. When you run `writ task`, writ creates a workspace automatically — a full copy of your project where an agent works without stepping on anyone else's files. When the work is done, `writ finish` converges everything back together and commits to git. You never interact with workspaces directly. You think in tasks. Writ handles the rest.
+Workspaces provide physical file isolation for agents. Most multi-agent work does not need workspaces — agents work in the same directory and [spec-scoped sealing](multi-agent-workflow.md) keeps their changes separate. Workspaces exist for Level 2 scenarios where agents make competing rewrites to the same file and need separate copies to work from.
+
+When you run `writ task`, writ creates a workspace automatically — a full copy of your project where an agent works without stepping on anyone else's files. When the work is done, `writ finish` converges everything back together and commits to git. You never interact with workspaces directly. You think in tasks. Writ handles the rest.
+
+> **When to use workspaces:** Two agents need to rewrite the same function in fundamentally different ways. One agent takes the PKCE approach, another takes the implicit flow approach. They need separate copies of the file. For everything else — different files, additive changes to the same file — use the [same-directory workflow](multi-agent-workflow.md) instead.
 
 ## The Flow
 
@@ -223,13 +227,14 @@ writ workspace delete custom-workspace
 
 Most users will never need these. `writ task` and `writ finish` handle the full lifecycle.
 
-## When to Use Tasks
+## When to Use Workspaces
 
 | Scenario | Recommendation |
 |----------|---------------|
-| Single agent, single task | No task needed. Work directly in the project. |
-| Multiple agents, same codebase | `writ task` per agent. Isolation + convergence. |
-| Multiple agents, disjoint files | `writ task` still recommended. Isolation is cheap, convergence is free for non-overlapping changes. |
+| Single agent | No workspace needed. Work directly in the project. |
+| Multiple agents, different files | No workspace needed. Same directory, spec-scoped sealing. See [Multi Agent Workflow](multi-agent-workflow.md). |
+| Multiple agents, additive changes to same file | No workspace needed. `writ watch` auto-converges additions. |
+| Multiple agents, competing rewrites of same code | `writ task` per approach. Physical isolation prevents in-progress breakage. |
 | CI pipeline with parallel jobs | `writ task` per job. Each gets isolation with shared history. |
 
-Running `writ task` IS the multi agent signal. If you never run it, you never see workspaces. The moment you need isolation, one command creates it.
+Most multi-agent work is Level 0 (different files) or Level 1 (additive changes). Workspaces are the Level 2 tool for the rare case where agents rewrite the same code in incompatible ways.

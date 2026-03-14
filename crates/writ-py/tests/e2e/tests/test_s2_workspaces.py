@@ -49,10 +49,14 @@ class TestS2WorkspaceCreation:
         self, writ_project: Path, writ_bin: str,
     ):
         """2.1.4: Workspace has copies of main project files."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "config-setup",
+                 "--title", "Config Setup")
         (writ_project / "src").mkdir(exist_ok=True)
         (writ_project / "src" / "config.py").write_text("CONFIG = True\n")
         writ_cmd(writ_bin, writ_project,
-                 "seal", "-s", "add config", "--agent", "setup")
+                 "seal", "-s", "add config", "--agent", "setup",
+                 "--spec", "config-setup")
 
         _run_writ(writ_bin, writ_project, "workspace", "create", "gamma")
         ws_dir = writ_project / ".writ" / "ws" / "gamma"
@@ -81,9 +85,13 @@ class TestS2WorkspaceIsolation:
 
     def test_changes_isolated(self, writ_project: Path, writ_bin: str):
         """2.2.11: Changes in one workspace not visible in another."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "baseline-setup",
+                 "--title", "Baseline Setup")
         (writ_project / "shared.py").write_text("original\n")
         writ_cmd(writ_bin, writ_project,
-                 "seal", "-s", "baseline", "--agent", "setup")
+                 "seal", "-s", "baseline", "--agent", "setup",
+                 "--spec", "baseline-setup")
 
         _run_writ(writ_bin, writ_project, "workspace", "create", "ws-a")
         _run_writ(writ_bin, writ_project, "workspace", "create", "ws-b")
@@ -105,9 +113,13 @@ class TestS2WorkspaceIsolation:
         _run_writ(writ_bin, writ_project, "workspace", "create", "tagged")
         ws_dir = writ_project / ".writ" / "ws" / "tagged"
 
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "tagged-spec",
+                 "--title", "Tagged Spec")
         (ws_dir / "test.py").write_text("# tagged\n")
         writ_cmd(writ_bin, ws_dir,
-                 "seal", "-s", "tagged seal", "--agent", "tester")
+                 "seal", "-s", "tagged seal", "--agent", "tester",
+                 "--spec", "tagged-spec")
 
         log = writ_log(writ_bin, ws_dir)
         if log:
@@ -154,14 +166,20 @@ class TestS2WorkspaceConvergence:
 
     def _setup_two_workspaces(self, writ_project: Path, writ_bin: str):
         """Create two workspaces with sealed changes."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "baseline-spec",
+                 "--title", "Baseline")
         (writ_project / "src").mkdir(exist_ok=True)
         (writ_project / "src" / "auth.py").write_text("# auth\n")
         (writ_project / "src" / "payments.py").write_text("# payments\n")
         writ_cmd(writ_bin, writ_project,
-                 "seal", "-s", "baseline", "--agent", "setup")
+                 "seal", "-s", "baseline", "--agent", "setup",
+                 "--spec", "baseline-spec")
 
         writ_cmd(writ_bin, writ_project,
                  "spec", "add", "--id", "auth-feat", "--title", "Auth")
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "pay-feat", "--title", "Payments")
 
         _run_writ(writ_bin, writ_project, "workspace", "create", "auth-ws")
         _run_writ(writ_bin, writ_project, "workspace", "create", "pay-ws")
@@ -173,24 +191,17 @@ class TestS2WorkspaceConvergence:
         (auth / "src" / "auth.py").write_text(
             "class AuthManager:\n    pass\n",
         )
-        result = _run_writ(writ_bin, auth,
-                           "seal", "-s", "auth impl", "--agent", "auth-dev",
-                           "--spec", "auth-feat")
-        if result.returncode != 0:
-            # Try without --spec (C.13 may block cross-workspace spec refs)
-            _run_writ(writ_bin, auth,
-                      "seal", "-s", "auth impl", "--agent", "auth-dev")
+        _run_writ(writ_bin, auth,
+                  "seal", "-s", "auth impl", "--agent", "auth-dev",
+                  "--spec", "auth-feat")
 
         # Payments workspace changes payments.py
         (pay / "src" / "payments.py").write_text(
             "class PaymentProcessor:\n    pass\n",
         )
-        result = _run_writ(writ_bin, pay,
-                           "seal", "-s", "pay impl", "--agent", "pay-dev",
-                           "--spec", "auth-feat")
-        if result.returncode != 0:
-            _run_writ(writ_bin, pay,
-                      "seal", "-s", "pay impl", "--agent", "pay-dev")
+        _run_writ(writ_bin, pay,
+                  "seal", "-s", "pay impl", "--agent", "pay-dev",
+                  "--spec", "pay-feat")
 
         return auth, pay
 
@@ -270,17 +281,11 @@ class TestS2WorkspaceCleanup:
         ws_dir = writ_project / ".writ" / "ws" / "ephemeral"
 
         (ws_dir / "data.py").write_text("# ephemeral\n")
-        seal_result = _run_writ(
+        _run_writ(
             writ_bin, ws_dir,
             "seal", "-s", "ephemeral work", "--agent", "temp",
             "--spec", "ephemeral-spec",
         )
-        if seal_result.returncode != 0:
-            # Spec may not be visible — try without
-            seal_result = _run_writ(
-                writ_bin, ws_dir,
-                "seal", "-s", "ephemeral work", "--agent", "temp",
-            )
 
         _run_writ(
             writ_bin, writ_project,
@@ -322,12 +327,16 @@ class TestS2GoldenPath:
 
     def test_workspace_golden_path(self, writ_project: Path, writ_bin: str):
         """Create → assign → work → seal → done → converge."""
-        # Setup files
+        # Setup baseline with spec
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "baseline-gp",
+                 "--title", "Baseline Golden Path")
         (writ_project / "src").mkdir(exist_ok=True)
         (writ_project / "src" / "api.py").write_text("# api\n")
         (writ_project / "src" / "ui.py").write_text("# ui\n")
         writ_cmd(writ_bin, writ_project,
-                 "seal", "-s", "baseline", "--agent", "setup")
+                 "seal", "-s", "baseline", "--agent", "setup",
+                 "--spec", "baseline-gp")
 
         # Create specs
         writ_cmd(writ_bin, writ_project,
@@ -352,23 +361,16 @@ class TestS2GoldenPath:
         (api_dir / "src" / "api.py").write_text(
             "from flask import Flask\napp = Flask(__name__)\n",
         )
-        result = _run_writ(writ_bin, api_dir,
-                           "seal", "-s", "api routes", "--agent", "api-dev",
-                           "--spec", "api-work")
-        if result.returncode != 0:
-            # Spec may not be visible from workspace — seal without spec
-            _run_writ(writ_bin, api_dir,
-                      "seal", "-s", "api routes", "--agent", "api-dev")
+        _run_writ(writ_bin, api_dir,
+                  "seal", "-s", "api routes", "--agent", "api-dev",
+                  "--spec", "api-work")
 
         (ui_dir / "src" / "ui.py").write_text(
             "function App() { return <div>App</div> }\n",
         )
-        result = _run_writ(writ_bin, ui_dir,
-                           "seal", "-s", "ui components", "--agent", "ui-dev",
-                           "--spec", "ui-work")
-        if result.returncode != 0:
-            _run_writ(writ_bin, ui_dir,
-                      "seal", "-s", "ui components", "--agent", "ui-dev")
+        _run_writ(writ_bin, ui_dir,
+                  "seal", "-s", "ui components", "--agent", "ui-dev",
+                  "--spec", "ui-work")
 
         # Mark specs done
         _run_writ(writ_bin, api_dir, "spec", "done", "api-work")

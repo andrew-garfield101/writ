@@ -100,12 +100,15 @@ class TestHumanOnlyWorkflow:
         """Seal work, then finish creates a git commit."""
         path = git_writ_repo
 
+        # Create spec (C.13: seals require a spec)
+        run_writ(["spec", "add", "--id", "app", "--title", "App Module"], str(path))
+
         # Do some work
         (path / "app.py").write_text("def main(): print('hello')\n")
 
         # Seal the work
         run_writ(
-            ["seal", "-s", "added app module", "--agent", "human-dev"],
+            ["seal", "-s", "added app module", "--agent", "human-dev", "--spec", "app"],
             str(path),
         )
 
@@ -124,9 +127,10 @@ class TestHumanOnlyWorkflow:
         """finish --full uses the complete summary as commit message."""
         path = git_writ_repo
 
+        run_writ(["spec", "add", "--id", "models", "--title", "User Model"], str(path))
         (path / "models.py").write_text("class User: pass\n")
         run_writ(
-            ["seal", "-s", "added user model", "--agent", "human-dev"],
+            ["seal", "-s", "added user model", "--agent", "human-dev", "--spec", "models"],
             str(path),
         )
 
@@ -287,8 +291,9 @@ class TestFinishEdgeCases:
         """Dry run with no completed specs shows nothing-to-commit message."""
         path = git_writ_repo
         # Seal something but don't mark any spec done
+        run_writ(["spec", "add", "--id", "wip", "--title", "WIP"], str(path))
         run_writ(
-            ["seal", "-s", "checkpoint", "--agent", "human-dev"],
+            ["seal", "-s", "checkpoint", "--agent", "human-dev", "--spec", "wip"],
             str(path),
         )
         result = run_writ(["finish", "--dry-run"], str(path))

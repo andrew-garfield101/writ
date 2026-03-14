@@ -113,20 +113,26 @@ class TestS1SealAndContext:
 
     def test_first_seal(self, writ_project: Path, writ_bin: str):
         """1.4.5: First seal succeeds."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "app", "--title", "App Module")
         (writ_project / "app.py").write_text('print("hello")\n')
         result = writ_cmd(
             writ_bin, writ_project,
             "seal", "-s", "initial app", "--agent", "e2e-tester",
+            "--spec", "app",
             check=False,
         )
         assert result.returncode == 0, f"Seal failed: {result.stderr}"
 
     def test_seal_shows_output(self, writ_project: Path, writ_bin: str):
         """1.4.6: Seal output shows hash and summary."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "app", "--title", "App Module")
         (writ_project / "app.py").write_text('print("hello")\n')
         result = writ_cmd(
             writ_bin, writ_project,
             "seal", "-s", "initial app", "--agent", "e2e-tester",
+            "--spec", "app",
         )
         output = result.stdout + result.stderr
         # Should show either a hash or a success indicator
@@ -134,12 +140,14 @@ class TestS1SealAndContext:
 
     def test_log_shows_seals(self, writ_project: Path, writ_bin: str):
         """1.4.8: writ log shows seals."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "app", "--title", "App Module")
         (writ_project / "app.py").write_text("v1\n")
         writ_cmd(writ_bin, writ_project,
-                 "seal", "-s", "v1", "--agent", "tester")
+                 "seal", "-s", "v1", "--agent", "tester", "--spec", "app")
         (writ_project / "app.py").write_text("v2\n")
         writ_cmd(writ_bin, writ_project,
-                 "seal", "-s", "v2", "--agent", "tester")
+                 "seal", "-s", "v2", "--agent", "tester", "--spec", "app")
 
         log = writ_log(writ_bin, writ_project)
         # At least 2 seals (may have bridge import too)
@@ -163,9 +171,12 @@ class TestS1SealAndContext:
 
     def test_diff_shows_changes(self, writ_project: Path, writ_bin: str):
         """1.4.12: writ diff shows changes."""
+        writ_cmd(writ_bin, writ_project,
+                 "spec", "add", "--id", "app", "--title", "App Module")
         (writ_project / "app.py").write_text("# new file\n")
         writ_cmd(writ_bin, writ_project,
-                 "seal", "-s", "added app", "--agent", "tester")
+                 "seal", "-s", "added app", "--agent", "tester",
+                 "--spec", "app")
 
         result = writ_cmd(writ_bin, writ_project, "diff", check=False)
         # diff may show nothing if we're clean, or show the diff

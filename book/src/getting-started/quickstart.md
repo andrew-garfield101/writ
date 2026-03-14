@@ -171,9 +171,26 @@ repo.seal(
 )
 ```
 
+## Multiple Agents
+
+Everything above works with multiple agents in the same project directory. Each agent seals with `--spec`, and writ keeps their changes separate. For multi-agent work:
+
+```bash
+# Define tasks in batch
+writ plan "Implement auth" "Add payments" "Build dashboard"
+
+# Start the convergence daemon (auto-merges overlapping work)
+writ watch
+
+# Launch agents — they discover specs via writ context, claim one, and work
+```
+
+No workspaces, no branches, no path management. Agents work in the same directory. `writ watch` auto-converges overlapping changes in real time. See the [Multi Agent Workflow](../guides/multi-agent-workflow.md) guide for the full walkthrough.
+
 ## Next Steps
 
-- **[Your First Convergence](your-first-convergence.md)** to see what happens when multiple agents work in parallel
+- **[Multi Agent Workflow](../guides/multi-agent-workflow.md)** for running multiple agents in the same directory
+- **[Your First Convergence](your-first-convergence.md)** to see what happens when agents' work overlaps
 - **[Output Formats](../concepts/output-formats.md)** for TOON benchmarks and format configuration
 - **[Seals vs Commits](../concepts/seals-vs-commits.md)** to understand the data model
 - **[Configuration](../reference/configuration.md)** for workflow modes, format config, and deployment profiles

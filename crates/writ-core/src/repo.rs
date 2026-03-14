@@ -5037,8 +5037,18 @@ impl Repository {
                             total_resolutions += 1;
                         }
 
-                        accumulated.insert(path.clone(), content);
-                        accumulated_modified.insert(path.clone());
+                        // Defense #3: sanity-check merged output size.
+                        if merge_output_sane(base, left, right, &content) {
+                            accumulated.insert(path.clone(), content);
+                            accumulated_modified.insert(path.clone());
+                        } else {
+                            warnings.push(format!(
+                                "{}: merged output suspiciously large (possible stacking) — skipped",
+                                path
+                            ));
+                            step_clean = false;
+                            step_degraded = true;
+                        }
                     } else {
                         // v2 pipeline could not fully resolve. Fall back to the
                         // v1 text-level resolver which has robust import detection
@@ -5061,8 +5071,18 @@ impl Repository {
                         };
 
                         if v1_result.fully_resolved {
-                            accumulated.insert(path.clone(), v1_result.content.clone());
-                            accumulated_modified.insert(path.clone());
+                            // Defense #3: sanity-check v1 merged output size.
+                            if merge_output_sane(base, left, right, &v1_result.content) {
+                                accumulated.insert(path.clone(), v1_result.content.clone());
+                                accumulated_modified.insert(path.clone());
+                            } else {
+                                warnings.push(format!(
+                                    "{}: v1 merged output suspiciously large (possible stacking) — skipped",
+                                    path
+                                ));
+                                step_clean = false;
+                                step_degraded = true;
+                            }
 
                             all_escalations.extend(v1_result.escalation_records);
 
@@ -5347,6 +5367,14 @@ impl Repository {
                     error: Some(e),
                 });
             }
+
+            // NOTE: We intentionally keep base_content_map as the original
+            // common ancestor for ALL pairwise merges.  In writ's fan-out
+            // topology (all specs branch from the same point), the common
+            // ancestor is the correct base.  Refreshing it to accumulated
+            // would cause diff3 to misinterpret content added by earlier
+            // merges as "removed" by later specs that branched before those
+            // additions existed.
         }
 
         // ── Layer 5: Post-merge cleanup on all accumulated files ──────
@@ -5367,6 +5395,19 @@ impl Repository {
 
             for (path, content) in &accumulated {
                 let file_path = self.validate_path(path)?;
+
+                // Defense #1: Disk content guard — skip writing when the
+                // merged content is identical to what's already on disk.
+                // This makes convergence idempotent at the output layer and
+                // prevents stacking even if convergence is re-triggered.
+                if file_path.exists() {
+                    if let Ok(existing) = fs::read_to_string(&file_path) {
+                        if existing == *content {
+                            continue;
+                        }
+                    }
+                }
+
                 if let Some(parent) = file_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -8248,6 +8289,35 @@ pub struct OverlapDetail {
     pub path: String,
     /// (spec_id, content_hash) pairs for each spec that modified this file
     pub spec_hashes: Vec<(String, String)>,
+}
+
+/// Defense #3: Merge output sanity check.
+///
+/// Returns true if the merged content looks reasonable relative to its inputs.
+/// A legitimate merge can grow (non-overlapping additions from both sides) but
+/// should never be dramatically larger than max(left, right).  If the merged
+/// output exceeds 2× the larger input's line count, something went wrong
+/// (likely re-convergence stacking).
+fn merge_output_sane(_base: &str, left: &str, right: &str, merged: &str) -> bool {
+    let left_lines = left.lines().count();
+    let right_lines = right.lines().count();
+    let merged_lines = merged.lines().count();
+
+    // Small files (< 20 lines total input) get a free pass — composition
+    // patterns can legitimately add structural separators, blank lines, etc.
+    let total_input = left_lines + right_lines;
+    if total_input < 20 {
+        return true;
+    }
+
+    // For stacking detection: real stacking duplicates content, producing
+    // merged output roughly 2×-3× the larger input.  Legitimate composition
+    // merges both sides and adds structural separators, so output can exceed
+    // left + right but should never hit 2× that combined total.
+    //
+    // Threshold: merged ≤ (left + right) * 2.  This is very generous for
+    // normal merges while catching the doubling that stacking produces.
+    merged_lines <= total_input * 2
 }
 
 /// Convert a ConvergeStrategy to a human-readable string.

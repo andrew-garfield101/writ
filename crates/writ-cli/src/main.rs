@@ -1341,7 +1341,12 @@ fn main() {
             agent,
             format,
         } => {
-            let format = resolve_format(format.as_deref(), &cwd, "json");
+            let format = if format.is_none() && std::io::stdout().is_terminal() {
+                // No explicit --format and stdout is a terminal → human-readable
+                "human".to_string()
+            } else {
+                resolve_format(format.as_deref(), &cwd, "json")
+            };
             cmd_context(&cwd, spec, for_agent, seal_limit, status, agent, &format)
         }
         Commands::Summary { format } => {
@@ -3033,158 +3038,245 @@ fn cmd_context(
             );
         }
         "human" => {
-            println!("{}\n", "=== writ context ===".bold());
-
-            if let Some(ref ss) = ctx.session_summary {
-                println!("  {} {}", "SESSION COMPLETE:".green().bold(), ss.headline);
-                println!("     {} file(s) changed. {}", ss.files_changed, ss.message);
-                println!();
-            }
-
-            if let Some(ref spec) = ctx.active_spec {
-                println!("{} {} — {}", "spec:".bold(), spec.id.cyan(), spec.title);
-                let status_str = format!("{:?}", spec.status);
-                let colored_status = match spec.status {
-                    writ_core::spec::SpecStatus::Complete => status_str.green(),
-                    writ_core::spec::SpecStatus::Blocked => status_str.red(),
-                    writ_core::spec::SpecStatus::InProgress => status_str.yellow(),
-                    writ_core::spec::SpecStatus::Pending => status_str.dimmed(),
-                };
-                println!("  status: {colored_status}");
-                println!();
-            }
-
-            println!("{}:", "working state".bold());
-            if ctx.working_state.clean {
-                println!(
-                    "  {} ({} tracked)",
-                    "clean".green(),
-                    ctx.working_state.tracked_count
-                );
-            } else {
-                for f in &ctx.working_state.new_files {
-                    println!("  {}  {}", "+  new".green(), f.green());
-                }
-                for f in &ctx.working_state.modified_files {
-                    println!("  {}  {}", "~  mod".yellow(), f.yellow());
-                }
-                for f in &ctx.working_state.deleted_files {
-                    println!("  {}  {}", "-  del".red(), f.red());
-                }
+            // ── Header ──────────────────────────────────────────────────
+            let project_name = ctx
+                .workspace
+                .as_deref()
+                .filter(|w| *w != "main")
+                .unwrap_or("project");
+            let spec_count = ctx.all_specs.as_ref().map(|s| s.len()).unwrap_or(0);
+            println!();
+            print!(
+                "  {} {}",
+                "writ context".green().bold(),
+                format!("| {} | {} tracked", project_name, ctx.tracked_files).dimmed(),
+            );
+            if spec_count > 0 {
+                print!(" | {} spec{}", spec_count, if spec_count == 1 { "" } else { "s" });
             }
             println!();
 
-            if let Some(ref nudge) = ctx.seal_nudge {
-                println!("  {} {}", "WARNING:".yellow().bold(), nudge.message);
+            // ── Session complete banner ─────────────────────────────────
+            if let Some(ref ss) = ctx.session_summary {
                 println!();
-            }
-
-            if let Some(ref pc) = ctx.pending_changes {
                 println!(
-                    "{} {} file(s), {}, {}",
-                    "pending:".bold(),
-                    pc.files_changed,
-                    format!("+{}", pc.total_additions).green(),
-                    format!("-{}", pc.total_deletions).red()
+                    "  {} {}",
+                    "SESSION COMPLETE".green().bold(),
+                    ss.headline,
                 );
-                println!();
+                println!(
+                    "  {} file(s) changed. {}",
+                    ss.files_changed, ss.message
+                );
             }
 
+            // ── Active spec (spec-scoped view) ─────────────────────────
+            if let Some(ref spec) = ctx.active_spec {
+                println!();
+                println!(
+                    "  {} {} {}",
+                    "spec:".bold(),
+                    spec.id.cyan(),
+                    format!("({})", format!("{:?}", spec.status).to_lowercase()).dimmed(),
+                );
+                if !spec.title.is_empty() {
+                    println!("        {}", spec.title);
+                }
+            }
+
+            // ── Specs table ─────────────────────────────────────────────
+            if let Some(ref specs) = ctx.all_specs {
+                if !specs.is_empty() && ctx.active_spec.is_none() {
+                    println!();
+                    println!(
+                        "  {}",
+                        "Specs".bold(),
+                    );
+                    println!(
+                        "  {}",
+                        "─".repeat(60).dimmed(),
+                    );
+                    for spec in specs {
+                        let status_str = format!("{:?}", spec.status).to_lowercase();
+                        let colored_status = match spec.status {
+                            writ_core::spec::SpecStatus::Complete => status_str.green(),
+                            writ_core::spec::SpecStatus::Blocked => status_str.red(),
+                            writ_core::spec::SpecStatus::InProgress => status_str.yellow(),
+                            writ_core::spec::SpecStatus::Pending => status_str.dimmed(),
+                        };
+                        let claimed = spec
+                            .claimed_by
+                            .as_deref()
+                            .unwrap_or("unclaimed");
+                        let seal_count = spec.sealed_by.len();
+                        let seal_info = if seal_count > 0 {
+                            format!("{} seal{}", seal_count, if seal_count == 1 { "" } else { "s" })
+                        } else {
+                            String::new()
+                        };
+                        println!(
+                            "  {:<30} {:<14} {:<16} {}",
+                            spec.id,
+                            colored_status,
+                            claimed.dimmed(),
+                            seal_info.dimmed(),
+                        );
+                    }
+                }
+            }
+
+            // ── Unclaimed specs ─────────────────────────────────────────
+            if !ctx.unclaimed_specs.is_empty() {
+                println!();
+                println!(
+                    "  {} {}",
+                    "Unclaimed".bold(),
+                    format!("({} available)", ctx.unclaimed_specs.len()).dimmed(),
+                );
+                for us in &ctx.unclaimed_specs {
+                    println!(
+                        "    {} {}",
+                        us.id.cyan(),
+                        us.title.dimmed(),
+                    );
+                }
+            }
+
+            // ── Working state ───────────────────────────────────────────
+            println!();
+            if ctx.working_state.clean {
+                println!(
+                    "  {} {}",
+                    "Working state:".bold(),
+                    "clean".green(),
+                );
+            } else {
+                let new_count = ctx.working_state.new_files.len();
+                let mod_count = ctx.working_state.modified_files.len();
+                let del_count = ctx.working_state.deleted_files.len();
+                let mut parts = Vec::new();
+                if new_count > 0 {
+                    parts.push(format!("+{new_count} new").green().to_string());
+                }
+                if mod_count > 0 {
+                    parts.push(format!("~{mod_count} modified").yellow().to_string());
+                }
+                if del_count > 0 {
+                    parts.push(format!("-{del_count} deleted").red().to_string());
+                }
+                println!(
+                    "  {} {}",
+                    "Working state:".bold(),
+                    parts.join(", "),
+                );
+            }
+
+            // ── Pending changes summary ─────────────────────────────────
+            if let Some(ref pc) = ctx.pending_changes {
+                if pc.files_changed > 0 {
+                    println!(
+                        "  {} {} file(s) changed ({}, {})",
+                        "Pending:".bold(),
+                        pc.files_changed,
+                        format!("+{}", pc.total_additions).green(),
+                        format!("-{}", pc.total_deletions).red(),
+                    );
+                }
+            }
+
+            // ── Seal nudge ──────────────────────────────────────────────
+            if let Some(ref nudge) = ctx.seal_nudge {
+                println!(
+                    "  {} {}",
+                    "Nudge:".yellow().bold(),
+                    nudge.message,
+                );
+            }
+
+            // ── Recent seals ────────────────────────────────────────────
             if !ctx.recent_seals.is_empty() {
-                println!("{}:", "recent seals".bold());
+                println!();
+                println!(
+                    "  {}",
+                    "Recent Seals".bold(),
+                );
+                println!(
+                    "  {}",
+                    "─".repeat(60).dimmed(),
+                );
                 for s in &ctx.recent_seals {
                     let spec_part = s
                         .spec_id
                         .as_deref()
-                        .map(|id| format!(" spec:{}", id.cyan()))
+                        .map(|id| format!("  {}", id.dimmed()))
                         .unwrap_or_default();
-                    let verify_part = match &s.verification {
-                        Some(v) => {
-                            let mut parts = Vec::new();
-                            if let Some(p) = v.tests_passed {
-                                parts.push(format!("{p}ok"));
-                            }
-                            if let Some(f) = v.tests_failed {
-                                parts.push(format!("{f}fail"));
-                            }
-                            if v.linted {
-                                parts.push("lint".to_string());
-                            }
-                            format!(" [{}]", parts.join(","))
-                        }
-                        None => String::new(),
-                    };
-                    let status_colored = match s.status.as_str() {
-                        "Complete" | "complete" => s.status.green(),
-                        "Blocked" | "blocked" => s.status.red(),
-                        _ => s.status.yellow(),
-                    };
                     println!(
-                        "  {} {} [{}] — {}{}{}",
-                        s.id.yellow(),
+                        "  {}  {}  {}  {} file{}{}",
+                        s.id[..8.min(s.id.len())].yellow(),
                         s.agent.cyan(),
-                        status_colored,
                         s.summary,
+                        s.files_changed,
+                        if s.files_changed == 1 { "" } else { "s" },
                         spec_part,
-                        verify_part
                     );
-                    for p in &s.changed_paths {
-                        println!("    {} {p}", "→".dimmed());
-                    }
-                }
-                println!();
-            }
-
-            println!("tracked: {} file(s)", ctx.tracked_files);
-
-            if !ctx.available_operations.is_empty() {
-                println!();
-                println!("{}:", "available operations".bold());
-                for op in &ctx.available_operations {
-                    println!("  {}", op.dimmed());
                 }
             }
 
-            if !ctx.file_scope_violations.is_empty() {
-                println!();
-                println!("{}:", "file scope violations".red().bold());
-                for v in &ctx.file_scope_violations {
-                    println!(
-                        "  seal {} ({}) — {} file(s) outside spec '{}' scope:",
-                        v.seal_id.yellow(),
-                        v.agent_id.cyan(),
-                        v.out_of_scope_files.len(),
-                        v.spec_id
-                    );
-                    for f in &v.out_of_scope_files {
-                        println!("    {} {}", "!".red(), f.red());
-                    }
-                }
-            }
-
-            {
-                let risk = &ctx.integration_risk;
+            // ── Integration risk (only if not low) ──────────────────────
+            if !ctx.integration_risk.is_low() {
                 println!();
                 println!(
                     "  {} {} (score: {})",
-                    "INTEGRATION RISK:".bold(),
-                    color_risk_level(&risk.level),
-                    risk.score
+                    "Risk:".bold(),
+                    color_risk_level(&ctx.integration_risk.level),
+                    ctx.integration_risk.score,
                 );
-                for f in &risk.factors {
+                for f in &ctx.integration_risk.factors {
                     println!("    {} {f}", "-".dimmed());
                 }
             }
 
+            // ── Convergence warning ─────────────────────────────────────
             if ctx.convergence_recommended {
                 println!();
-                println!("  {}", "*** CONVERGENCE RECOMMENDED ***".yellow().bold());
                 println!(
-                    "  Diverged branches detected — run {} to merge them.",
-                    "`writ converge`".cyan()
+                    "  {} Diverged branches detected. Run {}.",
+                    "CONVERGE:".yellow().bold(),
+                    "writ converge-all".cyan(),
                 );
             }
 
+            // ── Stale specs ─────────────────────────────────────────────
+            if !ctx.stale_specs.is_empty() {
+                println!();
+                println!(
+                    "  {} {}",
+                    "Stale:".yellow().bold(),
+                    format!("{} spec(s) inactive", ctx.stale_specs.len()).dimmed(),
+                );
+            }
+
+            // ── Scope violations ────────────────────────────────────────
+            if !ctx.file_scope_violations.is_empty() {
+                println!();
+                println!(
+                    "  {} {} violation(s)",
+                    "Scope:".red().bold(),
+                    ctx.file_scope_violations.len(),
+                );
+            }
+
+            // ── Recommended action ──────────────────────────────────────
+            if let Some(ref action) = ctx.recommended_action {
+                println!();
+                println!(
+                    "  {} {}",
+                    "Next:".bold(),
+                    action.message,
+                );
+            }
+
+            println!();
             print_diverged_branch_warnings(&repo);
         }
         other => {

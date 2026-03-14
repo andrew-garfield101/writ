@@ -188,14 +188,61 @@ pub fn run_single_cycle(
 pub struct WatchState {
     /// Set of known seal IDs (already seen).
     pub known_seals: HashSet<String>,
+    /// Fingerprints of overlaps that have already been converged.
+    /// Each fingerprint is built from the sorted spec IDs and their latest
+    /// seal IDs at convergence time. If an overlap's fingerprint matches one
+    /// already in this set, we skip re-convergence — the same seal state was
+    /// already merged.  A new seal from any participating spec changes the
+    /// fingerprint and allows convergence to re-trigger.
+    pub converged_fingerprints: HashSet<String>,
+}
+
+/// Persisted portion of watch state (survives process restarts).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct PersistedWatchState {
+    converged_fingerprints: Vec<String>,
 }
 
 impl WatchState {
     /// Initialize watch state from the current repository.
+    /// Loads persisted convergence fingerprints from `.writ/watch_state.json`
+    /// so the watch doesn't re-converge already-merged overlaps after restart.
     pub fn new(repo: &Repository) -> WritResult<Self> {
         let seals = repo.log()?;
         let known_seals: HashSet<String> = seals.iter().map(|s| s.id.clone()).collect();
-        Ok(Self { known_seals })
+
+        // Load persisted fingerprints if available (Defense #2).
+        let persisted = Self::load_persisted(repo);
+        let converged_fingerprints: HashSet<String> =
+            persisted.converged_fingerprints.into_iter().collect();
+
+        Ok(Self {
+            known_seals,
+            converged_fingerprints,
+        })
+    }
+
+    /// Save convergence fingerprints to `.writ/watch_state.json`.
+    pub fn save(&self, repo: &Repository) -> WritResult<()> {
+        let persisted = PersistedWatchState {
+            converged_fingerprints: self.converged_fingerprints.iter().cloned().collect(),
+        };
+        let path = repo.writ_dir().join("watch_state.json");
+        let json = serde_json::to_string_pretty(&persisted)?;
+        fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Load persisted state, returning default if not found or corrupt.
+    fn load_persisted(repo: &Repository) -> PersistedWatchState {
+        let path = repo.writ_dir().join("watch_state.json");
+        if !path.exists() {
+            return PersistedWatchState::default();
+        }
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
     }
 }
 
@@ -249,6 +296,13 @@ fn run_cycle(
         return Ok(());
     }
 
+    // Build a fingerprint from the overlapping specs' latest seal IDs.
+    // If this fingerprint was already converged, skip — no new seal content
+    // to merge.  This prevents the stacking bug where re-convergence of
+    // the same unchanged overlap doubles/triples content.
+    let fingerprint = build_overlap_fingerprint(repo, &overlaps);
+    let already_converged = state.converged_fingerprints.contains(&fingerprint);
+
     // Collect all overlapping files/specs for reporting.
     let mut all_overlap_files: Vec<String> = Vec::new();
     for overlap in &overlaps {
@@ -265,7 +319,8 @@ fn run_cycle(
 
     // Step 3: Auto-converge if enabled (MS.8).
     // Run converge_all ONCE for all overlaps — it handles all specs in a single pass.
-    if config.auto_converge {
+    // Skip if we already converged this exact overlap state (same specs, same seals).
+    if config.auto_converge && !already_converged {
         let _ = event_tx.send(WatchEvent {
             timestamp: Utc::now(),
             kind: WatchEventKind::ConvergenceStarted {
@@ -347,6 +402,13 @@ fn run_cycle(
                     }
                 }
 
+                // Record this overlap fingerprint so we don't re-converge
+                // the same unchanged overlap on subsequent cycles.
+                state.converged_fingerprints.insert(fingerprint.clone());
+
+                // Defense #2: Persist to disk so restarts don't re-converge.
+                let _ = state.save(repo);
+
                 // Re-snapshot seals after convergence (it may create new seals).
                 if let Ok(post_seals) = repo.log() {
                     for s in &post_seals {
@@ -368,6 +430,40 @@ fn run_cycle(
     }
 
     Ok(())
+}
+
+/// Build a deterministic fingerprint for a set of overlaps.
+///
+/// The fingerprint encodes which specs are involved and their latest seal IDs.
+/// If any spec gets a new seal, the fingerprint changes, allowing re-convergence.
+/// If nothing has changed, the fingerprint stays the same, preventing the
+/// stacking bug where the watch re-converges already-merged content.
+fn build_overlap_fingerprint(
+    repo: &Repository,
+    overlaps: &[crate::repo::OverlapSet],
+) -> String {
+    let mut spec_seals: Vec<(String, String)> = Vec::new();
+    let mut seen = HashSet::new();
+
+    for overlap in overlaps {
+        for spec_id in &overlap.specs {
+            if seen.insert(spec_id.clone()) {
+                let seal_id = repo
+                    .load_spec(spec_id)
+                    .ok()
+                    .and_then(|s| s.sealed_by.last().cloned())
+                    .unwrap_or_default();
+                spec_seals.push((spec_id.clone(), seal_id));
+            }
+        }
+    }
+
+    spec_seals.sort_by(|a, b| a.0.cmp(&b.0));
+    spec_seals
+        .iter()
+        .map(|(sid, seal)| format!("{sid}:{seal}"))
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// Look up the last agent and seal ID for a spec. Returns (agent_id, seal_id)
@@ -994,6 +1090,196 @@ mod tests {
         assert!(!events
             .iter()
             .any(|e| matches!(e.kind, WatchEventKind::ConvergenceStarted { .. })));
+    }
+
+    #[test]
+    fn test_watch_no_re_convergence_on_same_overlap() {
+        // Regression test for the convergence stacking bug:
+        // after converging an overlap, a subsequent cycle with a NEW seal
+        // (from a different spec or unrelated file) should NOT re-converge
+        // the same overlap if the participating specs' seals haven't changed.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let base = "line1\nline2\nline3\nline4\nline5\n";
+        fs::write(dir.path().join("shared.txt"), base).unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s3".into(), "S3".into(), "".into()))
+            .unwrap();
+
+        let mut state = WatchState::new(&repo).unwrap();
+
+        // Agent 1 changes line 1.
+        fs::write(
+            dir.path().join("shared.txt"),
+            "CHANGED_A\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a1"),
+            "change top".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent 2 changes line 5.
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nline4\nCHANGED_B\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("b1"),
+            "change bottom".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let config = WatchConfig {
+            auto_converge: true,
+            strategy: ConvergeStrategy::MostRecent,
+            ..Default::default()
+        };
+        let mut summary = WatchSummary::default();
+        let (tx, _rx) = mpsc::channel();
+
+        // Cycle 1: should detect overlap and converge.
+        run_single_cycle(&repo, &config, &mut state, &mut summary, &tx).unwrap();
+        assert_eq!(summary.convergences_triggered, 1);
+
+        // Now a third spec creates an unrelated seal — this triggers a new cycle
+        // with new seals detected, but the s1/s2 overlap hasn't changed.
+        fs::write(dir.path().join("unrelated.txt"), "something else").unwrap();
+        repo.seal(
+            agent("c1"),
+            "unrelated work".into(),
+            Some("s3".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Cycle 2: should detect new seal, see the same overlap, but skip
+        // re-convergence because the fingerprint is unchanged.
+        run_single_cycle(&repo, &config, &mut state, &mut summary, &tx).unwrap();
+        assert_eq!(
+            summary.convergences_triggered, 1,
+            "should NOT re-converge the same overlap"
+        );
+    }
+
+    #[test]
+    fn test_watch_re_converges_on_new_seal_from_participant() {
+        // When a participating spec creates a NEW seal, the fingerprint
+        // changes and convergence should re-trigger.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let base = "line1\nline2\nline3\nline4\nline5\n";
+        fs::write(dir.path().join("shared.txt"), base).unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        let mut state = WatchState::new(&repo).unwrap();
+
+        // Agent 1 changes line 1.
+        fs::write(
+            dir.path().join("shared.txt"),
+            "CHANGED_A\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a1"),
+            "change top".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Agent 2 changes line 5.
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nline4\nCHANGED_B\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("b1"),
+            "change bottom".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let config = WatchConfig {
+            auto_converge: true,
+            strategy: ConvergeStrategy::MostRecent,
+            ..Default::default()
+        };
+        let mut summary = WatchSummary::default();
+        let (tx, _rx) = mpsc::channel();
+
+        // Cycle 1: converge.
+        run_single_cycle(&repo, &config, &mut state, &mut summary, &tx).unwrap();
+        assert_eq!(summary.convergences_triggered, 1);
+
+        // Agent 1 makes another change to the same file — new seal for s1.
+        fs::write(
+            dir.path().join("shared.txt"),
+            "CHANGED_A_V2\nline2\nline3\nline4\nCHANGED_B\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a1"),
+            "second edit".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Cycle 2: s1 has a new seal → fingerprint changed → should re-converge.
+        run_single_cycle(&repo, &config, &mut state, &mut summary, &tx).unwrap();
+        assert_eq!(
+            summary.convergences_triggered, 2,
+            "should re-converge when a participating spec has a new seal"
+        );
     }
 
     #[test]

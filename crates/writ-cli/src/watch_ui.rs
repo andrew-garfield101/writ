@@ -361,11 +361,7 @@ pub fn cmd_watch_stop(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
                 // Stale PID — stop_daemon already cleaned it up.
                 println!("  {} {}", "note:".dimmed(), msg);
             } else if msg.contains("did not stop") {
-                eprintln!(
-                    "{} {}",
-                    "warning:".yellow().bold(),
-                    msg
-                );
+                eprintln!("{} {}", "warning:".yellow().bold(), msg);
             } else {
                 eprintln!("{} {}", "error:".red().bold(), msg);
             }

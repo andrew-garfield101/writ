@@ -28,6 +28,10 @@ pub struct StatusOutput {
     pub stale_specs: Vec<SpecBrief>,
     /// Configured workflow commit mode (user/propose/auto).
     pub commit_mode: String,
+    /// Files with unsaved working directory changes not captured in any spec's
+    /// seal chain. These are on disk but have no writ attribution.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untracked_changes: Vec<String>,
 }
 
 /// Summary of agent counts by activity state.
@@ -86,6 +90,7 @@ mod tests {
             total_files_changed: 0,
             stale_specs: vec![],
             commit_mode: "user".into(),
+            untracked_changes: vec![],
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("test-project"));
@@ -152,6 +157,7 @@ mod tests {
             total_files_changed: 2,
             stale_specs: vec![],
             commit_mode: "propose".into(),
+            untracked_changes: vec![],
         };
         let json = serde_json::to_string_pretty(&status).unwrap();
         let parsed: StatusOutput = serde_json::from_str(&json).unwrap();

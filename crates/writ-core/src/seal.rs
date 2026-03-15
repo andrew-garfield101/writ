@@ -117,10 +117,39 @@ pub struct Seal {
     /// backward compatibility with pre-workspace seals.
     #[serde(default = "default_workspace")]
     pub workspace: String,
+
+    // -- Seal-triggered convergence result --
+    /// Result of post-seal convergence, if overlaps were detected and
+    /// convergence was attempted. None when no overlaps exist or when
+    /// convergence-on-seal is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub convergence: Option<SealConvergenceResult>,
 }
 
 fn default_workspace() -> String {
     "main".to_string()
+}
+
+/// Result of seal-triggered convergence (best-effort, never blocks seal).
+///
+/// When a seal detects overlapping file changes across specs, it runs
+/// convergence inline. This struct carries the result. The seal is always
+/// committed first — convergence cannot block or corrupt it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SealConvergenceResult {
+    /// Whether convergence was attempted.
+    pub attempted: bool,
+    /// Whether convergence completed successfully.
+    pub succeeded: bool,
+    /// Number of files merged.
+    pub files_merged: usize,
+    /// Number of overlapping files detected.
+    pub overlaps_detected: usize,
+    /// Specs involved in the convergence.
+    pub specs_involved: Vec<String>,
+    /// Warning/error message if convergence failed or had escalations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 impl Seal {
@@ -162,6 +191,7 @@ impl Seal {
             chain_hash: None,
             signature: None,
             workspace: default_workspace(),
+            convergence: None,
         };
 
         // Compute the seal's ID from its content

@@ -873,6 +873,31 @@ impl Repository {
         // GC.3.3c: Lightweight storage pressure check (best-effort, never blocks seal).
         self.check_storage_pressure(&seal);
 
+        // Release the repo lock BEFORE convergence. The seal is fully
+        // committed at this point (written to disk, chain/spec updated).
+        // Convergence needs its own lock via converge_all(), so we must
+        // drop the seal lock first to avoid re-entrancy deadlock.
+        drop(_lock);
+
+        // Seal-triggered convergence: if this seal has a spec and there are
+        // overlapping file changes across specs, run convergence inline.
+        // The seal is already committed — convergence is best-effort and
+        // never blocks or rolls back the seal.
+        //
+        // Respects `auto_converge_on_seal` config flag (default: true).
+        // Set to false in .writ/config.toml [watch] section to disable.
+        if spec_id.is_some() {
+            let auto_converge_on_seal = crate::config::ProjectConfig::load(&self.writ_dir)
+                .unwrap_or_default()
+                .watch
+                .map(|w| w.auto_converge_on_seal)
+                .unwrap_or(true);
+
+            if auto_converge_on_seal {
+                seal.convergence = Some(self.try_post_seal_convergence());
+            }
+        }
+
         Ok(seal)
     }
 
@@ -1553,6 +1578,29 @@ impl Repository {
         completed.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
         in_progress.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
 
+        // Detect untracked changes: files modified on disk but not captured
+        // in any spec's seal chain. These have no writ attribution.
+        let mut untracked_changes = Vec::new();
+        let index = self.load_index()?;
+        let rules = self.ignore_rules();
+        let working = crate::state::compute_state(&self.root, &index, &rules);
+
+        if !working.changes.is_empty() {
+            // Build set of all file paths captured across all spec seals.
+            let sealed_files: HashSet<String> = all_seals
+                .iter()
+                .filter(|s| s.spec_id.is_some())
+                .flat_map(|s| s.changes.iter().map(|c| c.path.clone()))
+                .collect();
+
+            for change in &working.changes {
+                if !sealed_files.contains(&change.path) {
+                    untracked_changes.push(change.path.clone());
+                }
+            }
+            untracked_changes.sort();
+        }
+
         Ok(StatusOutput {
             project_name,
             timestamp: now,
@@ -1568,6 +1616,7 @@ impl Repository {
             total_files_changed,
             stale_specs: stale,
             commit_mode,
+            untracked_changes,
         })
     }
 
@@ -5966,6 +6015,60 @@ impl Repository {
                     &seal.id[..12.min(seal.id.len())]
                 ),
             });
+        }
+    }
+
+    /// Post-seal convergence: check for overlapping file changes across specs
+    /// and merge if needed. This runs AFTER the seal is committed — convergence
+    /// is best-effort and never blocks or rolls back the seal.
+    ///
+    /// Returns a `SealConvergenceResult` describing what happened (or didn't).
+    fn try_post_seal_convergence(&self) -> crate::seal::SealConvergenceResult {
+        use crate::seal::SealConvergenceResult;
+
+        // Detect overlapping file changes across specs.
+        let overlaps = match self.detect_same_directory_overlaps() {
+            Ok(o) => o,
+            Err(_) => return SealConvergenceResult::default(),
+        };
+
+        if overlaps.is_empty() {
+            return SealConvergenceResult::default();
+        }
+
+        let specs: Vec<String> = overlaps
+            .iter()
+            .flat_map(|o| o.specs.iter().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let overlaps_detected: usize = overlaps.iter().map(|o| o.files.len()).sum();
+
+        // Run convergence with Escalate strategy (safest — never silently
+        // discards content, escalates genuine conflicts for human review).
+        match self.converge_all(ConvergeStrategy::Escalate, true) {
+            Ok(report) => SealConvergenceResult {
+                attempted: true,
+                succeeded: report.is_clean,
+                files_merged: report.total_auto_merged + report.total_resolutions,
+                overlaps_detected,
+                specs_involved: specs,
+                message: if report.is_clean {
+                    None
+                } else if !report.escalations.is_empty() {
+                    Some(format!("{} escalations", report.escalations.len()))
+                } else {
+                    Some("convergence completed with warnings".to_string())
+                },
+            },
+            Err(e) => SealConvergenceResult {
+                attempted: true,
+                succeeded: false,
+                files_merged: 0,
+                overlaps_detected,
+                specs_involved: specs,
+                message: Some(format!("convergence failed: {}", e)),
+            },
         }
     }
 
@@ -17901,6 +18004,13 @@ mod context_stress_tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
 
+        // Disable seal-triggered convergence so divergence persists for testing.
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+
         // ── Step 1: Setup specs with dependencies and file scopes ──
 
         let mut database_spec = Spec::new("database".into(), "Database schema".into(), "".into());
@@ -21274,6 +21384,13 @@ mod convergence_integration_tests {
     fn setup_diverged_repo() -> (tempfile::TempDir, Repository) {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
+
+        // Disable seal-triggered convergence so divergence persists for testing.
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
 
         let base_content = "\
 <html>
@@ -30566,6 +30683,566 @@ mod workspace_tests {
             seal2.changes.len(),
             2,
             "with no other specs, subtraction should not filter anything"
+        );
+    }
+
+    // ─── Seal-Triggered Convergence Tests ────────────────────────────
+
+    /// Helper: set up a repo with a baseline seal and two specs, both modifying
+    /// the same file with different content (creates divergence / overlap).
+    fn setup_overlapping_specs(
+        dir: &tempfile::TempDir,
+    ) -> (Repository, crate::seal::Seal, crate::seal::Seal) {
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Baseline seal so specs have a common ancestor.
+        fs::write(dir.path().join("shared.rs"), "// base\nfn hello() {}\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("feat-a".into(), "Feature A".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("feat-b".into(), "Feature B".into(), "".into()))
+            .unwrap();
+
+        // Spec A modifies the shared file.
+        fs::write(
+            dir.path().join("shared.rs"),
+            "// base\nfn hello() {}\nfn feature_a() {}\n",
+        )
+        .unwrap();
+        let seal_a = repo
+            .seal(
+                agent("agent-a"),
+                "add feature_a".into(),
+                Some("feat-a".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Spec B modifies the same file differently.
+        fs::write(
+            dir.path().join("shared.rs"),
+            "// base\nfn hello() {}\nfn feature_b() {}\n",
+        )
+        .unwrap();
+        let seal_b = repo
+            .seal(
+                agent("agent-b"),
+                "add feature_b".into(),
+                Some("feat-b".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        (repo, seal_a, seal_b)
+    }
+
+    #[test]
+    fn test_seal_triggers_convergence_on_overlap() {
+        // When two specs overlap on the same file, the second seal should
+        // trigger inline convergence and populate the convergence field.
+        let dir = tempdir().unwrap();
+        let (_repo, _seal_a, seal_b) = setup_overlapping_specs(&dir);
+
+        let conv = seal_b
+            .convergence
+            .as_ref()
+            .expect("seal_b should have convergence result");
+        assert!(conv.attempted, "convergence should have been attempted");
+        assert!(conv.overlaps_detected > 0, "should detect overlaps");
+        assert!(!conv.specs_involved.is_empty(), "should list specs");
+    }
+
+    #[test]
+    fn test_seal_no_convergence_without_overlap() {
+        // Two specs with disjoint files should not trigger convergence.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("base.txt"), "base").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        fs::write(dir.path().join("a.txt"), "a work").unwrap();
+        repo.seal(
+            agent("a1"),
+            "a".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("b.txt"), "b work").unwrap();
+        let seal_b = repo
+            .seal(
+                agent("b1"),
+                "b".into(),
+                Some("s2".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // No overlaps → convergence not attempted (or attempted with nothing to do).
+        if let Some(ref conv) = seal_b.convergence {
+            // If convergence was attempted, it should have found no overlaps.
+            assert_eq!(
+                conv.overlaps_detected, 0,
+                "disjoint files should have zero overlaps"
+            );
+        }
+    }
+
+    #[test]
+    fn test_seal_no_convergence_without_spec() {
+        // Unscoped seals (no --spec) should never trigger convergence.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("file.txt"), "content").unwrap();
+        let seal = repo
+            .seal(
+                agent("solo"),
+                "unscoped work".into(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        assert!(
+            seal.convergence.is_none(),
+            "unscoped seal should not have convergence field"
+        );
+    }
+
+    #[test]
+    fn test_seal_convergence_failure_does_not_block_seal() {
+        // Even if convergence somehow fails, the seal itself must succeed.
+        // We verify this by ensuring the seal has a valid ID and is written.
+        let dir = tempdir().unwrap();
+        let (_repo, _seal_a, seal_b) = setup_overlapping_specs(&dir);
+
+        // The seal must always succeed regardless of convergence outcome.
+        assert!(!seal_b.id.is_empty(), "seal must have an ID");
+        assert!(
+            !seal_b.summary.is_empty(),
+            "seal must have its summary intact"
+        );
+        assert_eq!(seal_b.spec_id.as_deref(), Some("feat-b"));
+    }
+
+    #[test]
+    fn test_seal_convergence_result_in_seal_struct() {
+        // Verify all SealConvergenceResult fields are populated correctly.
+        let dir = tempdir().unwrap();
+        let (_repo, _seal_a, seal_b) = setup_overlapping_specs(&dir);
+
+        let conv = seal_b
+            .convergence
+            .as_ref()
+            .expect("convergence result should exist");
+
+        assert!(conv.attempted);
+        // overlaps_detected should be at least 1 (shared.rs).
+        assert!(
+            conv.overlaps_detected >= 1,
+            "should detect at least one overlapping file"
+        );
+        // specs_involved should include both specs.
+        assert!(
+            conv.specs_involved.len() >= 2,
+            "should involve at least 2 specs, got {:?}",
+            conv.specs_involved
+        );
+    }
+
+    #[test]
+    fn test_seal_convergence_idempotent() {
+        // A subsequent seal with the same overlaps should not re-converge
+        // (disk content guard makes it idempotent).
+        let dir = tempdir().unwrap();
+        let (repo, _seal_a, seal_b) = setup_overlapping_specs(&dir);
+
+        // Read the merged content after first convergence.
+        let content_after_first =
+            fs::read_to_string(dir.path().join("shared.rs")).unwrap();
+
+        // Spec A seals again (no file changes — just another seal).
+        fs::write(dir.path().join("unique_a.txt"), "extra").unwrap();
+        let seal_a2 = repo
+            .seal(
+                agent("agent-a"),
+                "second a seal".into(),
+                Some("feat-a".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // Content on disk should be unchanged (idempotent).
+        let content_after_second =
+            fs::read_to_string(dir.path().join("shared.rs")).unwrap();
+        assert_eq!(
+            content_after_first, content_after_second,
+            "disk content should not change on re-convergence"
+        );
+
+        // The seal itself always succeeds.
+        assert!(!seal_a2.id.is_empty());
+
+        // Convergence may or may not be attempted again, but if it was,
+        // disk content guard should prevent re-writing.
+        // Either way, the first convergence result stands.
+        let _ = seal_b; // keep seal_b in scope for clarity
+    }
+
+    #[test]
+    fn test_seal_convergence_with_three_specs() {
+        // Three specs all modifying the same file should trigger convergence
+        // involving all three.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        fs::write(dir.path().join("shared.rs"), "// base\nfn hello() {}\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s3".into(), "S3".into(), "".into()))
+            .unwrap();
+
+        fs::write(
+            dir.path().join("shared.rs"),
+            "// base\nfn hello() {}\nfn s1_work() {}\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a1"),
+            "s1 work".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(
+            dir.path().join("shared.rs"),
+            "// base\nfn hello() {}\nfn s2_work() {}\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a2"),
+            "s2 work".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(
+            dir.path().join("shared.rs"),
+            "// base\nfn hello() {}\nfn s3_work() {}\n",
+        )
+        .unwrap();
+        let seal_3 = repo
+            .seal(
+                agent("a3"),
+                "s3 work".into(),
+                Some("s3".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        let conv = seal_3
+            .convergence
+            .as_ref()
+            .expect("convergence result should exist for 3-spec overlap");
+        assert!(conv.attempted, "convergence should be attempted");
+        // At least 2 specs should be involved (overlap detection groups them).
+        assert!(
+            conv.specs_involved.len() >= 2,
+            "should involve multiple specs, got {:?}",
+            conv.specs_involved
+        );
+    }
+
+    #[test]
+    fn test_seal_convergence_serialization_roundtrip() {
+        // SealConvergenceResult must serialize/deserialize cleanly as part
+        // of the Seal JSON — backward compatible with pre-convergence seals.
+        let dir = tempdir().unwrap();
+        let (_repo, _seal_a, seal_b) = setup_overlapping_specs(&dir);
+
+        // Serialize and deserialize the seal.
+        let json = serde_json::to_string(&seal_b).unwrap();
+        let deserialized: crate::seal::Seal = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.id, seal_b.id);
+        assert_eq!(
+            deserialized.convergence.is_some(),
+            seal_b.convergence.is_some()
+        );
+        if let (Some(orig), Some(deser)) =
+            (&seal_b.convergence, &deserialized.convergence)
+        {
+            assert_eq!(orig.attempted, deser.attempted);
+            assert_eq!(orig.succeeded, deser.succeeded);
+            assert_eq!(orig.files_merged, deser.files_merged);
+            assert_eq!(orig.overlaps_detected, deser.overlaps_detected);
+        }
+    }
+
+    #[test]
+    fn test_seal_backward_compat_no_convergence_field() {
+        // Pre-convergence seals (no `convergence` field in JSON) should
+        // deserialize cleanly with convergence = None.
+        let json = r#"{
+            "id": "abc123",
+            "parent": null,
+            "timestamp": "2026-03-15T00:00:00Z",
+            "tree": "tree-hash",
+            "agent": {"id": "human-test", "agent_type": "human"},
+            "spec_id": null,
+            "status": "in-progress",
+            "changes": [],
+            "verification": {"tests_passed": null, "tests_failed": null, "linted": false},
+            "summary": "test seal",
+            "warnings": []
+        }"#;
+        let seal: crate::seal::Seal = serde_json::from_str(json).unwrap();
+        assert!(
+            seal.convergence.is_none(),
+            "old seals without convergence field should deserialize with None"
+        );
+    }
+
+    #[test]
+    fn test_seal_convergence_preserves_seal_integrity() {
+        // The seal's core fields (id, parent, tree, changes) must be
+        // computed and committed BEFORE convergence runs. Verify that
+        // convergence does not corrupt the seal.
+        let dir = tempdir().unwrap();
+        let (repo, _seal_a, seal_b) = setup_overlapping_specs(&dir);
+
+        // Seal should be loadable from disk (it was committed before convergence).
+        let log = repo.log().unwrap();
+        let found = log.iter().any(|s| s.id == seal_b.id);
+        assert!(
+            found,
+            "seal_b should exist in the log (committed before convergence)"
+        );
+
+        // Verify the seal's spec_id is intact.
+        assert_eq!(seal_b.spec_id.as_deref(), Some("feat-b"));
+
+        // Verify the seal has changes (the file write was captured).
+        assert!(
+            !seal_b.changes.is_empty(),
+            "seal should have captured file changes"
+        );
+    }
+
+    #[test]
+    fn test_seal_convergence_config_disabled() {
+        // When auto_converge_on_seal = false in config, seal should NOT
+        // trigger inline convergence even with overlapping specs.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Write config with auto_converge_on_seal = false.
+        let config_toml = "[watch]\nauto_converge_on_seal = false\n";
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            config_toml,
+        )
+        .unwrap();
+
+        // Set up overlapping specs.
+        fs::write(dir.path().join("shared.rs"), "// base\nfn hello() {}\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        fs::write(
+            dir.path().join("shared.rs"),
+            "// base\nfn hello() {}\nfn s1_work() {}\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a1"),
+            "s1 work".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(
+            dir.path().join("shared.rs"),
+            "// base\nfn hello() {}\nfn s2_work() {}\n",
+        )
+        .unwrap();
+        let seal_b = repo
+            .seal(
+                agent("a2"),
+                "s2 work".into(),
+                Some("s2".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+
+        // With auto_converge_on_seal = false, convergence should NOT be triggered.
+        assert!(
+            seal_b.convergence.is_none(),
+            "convergence should be None when auto_converge_on_seal is disabled"
+        );
+
+        // The seal itself must still succeed.
+        assert!(!seal_b.id.is_empty());
+        assert_eq!(seal_b.spec_id.as_deref(), Some("s2"));
+    }
+
+    // ─── Untracked Change Detection Tests ────────────────────────────
+
+    #[test]
+    fn test_status_detects_untracked_file_changes() {
+        // A file modified on disk that is NOT captured by any spec seal
+        // should appear in status.untracked_changes.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Disable seal-triggered convergence for clarity.
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+
+        // Create a spec and seal some work.
+        repo.add_spec(&Spec::new("feat".into(), "Feature".into(), "".into()))
+            .unwrap();
+        fs::write(dir.path().join("tracked.rs"), "fn tracked() {}").unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "tracked work".into(),
+            Some("feat".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Now a rogue agent modifies a file without sealing.
+        fs::write(dir.path().join("rogue.rs"), "fn rogue() {}").unwrap();
+
+        let status = repo.status().unwrap();
+        assert!(
+            status.untracked_changes.contains(&"rogue.rs".to_string()),
+            "rogue.rs should appear as untracked, got: {:?}",
+            status.untracked_changes
+        );
+        assert!(
+            !status.untracked_changes.contains(&"tracked.rs".to_string()),
+            "tracked.rs should NOT appear as untracked"
+        );
+    }
+
+    #[test]
+    fn test_status_no_untracked_when_all_sealed() {
+        // When all file changes are captured in seals, untracked_changes
+        // should be empty.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        repo.add_spec(&Spec::new("feat".into(), "Feature".into(), "".into()))
+            .unwrap();
+        fs::write(dir.path().join("app.rs"), "fn main() {}").unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "sealed work".into(),
+            Some("feat".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let status = repo.status().unwrap();
+        assert!(
+            status.untracked_changes.is_empty(),
+            "all changes sealed — nothing should be untracked, got: {:?}",
+            status.untracked_changes
+        );
+    }
+
+    #[test]
+    fn test_status_no_untracked_on_clean_working_dir() {
+        // No changes on disk = no untracked changes.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let status = repo.status().unwrap();
+        assert!(
+            status.untracked_changes.is_empty(),
+            "clean working dir should have no untracked changes"
         );
     }
 }

@@ -2212,6 +2212,7 @@ mod tests {
             chain_hash: None,
             signature: None,
             workspace: "main".to_string(),
+            convergence: None,
         }
     }
 

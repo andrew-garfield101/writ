@@ -232,6 +232,22 @@ fn render_watch_event(event: &WatchEvent) {
                 );
             }
         }
+
+        WatchEventKind::SealConvergenceHandled {
+            seal_id,
+            files_merged,
+            specs,
+        } => {
+            print!(
+                "\r  {}          → {} seal {} already converged {} file{} ({})\r\n",
+                " ".repeat(12),
+                "handled:".green(),
+                seal_id,
+                files_merged,
+                if *files_merged == 1 { "" } else { "s" },
+                specs.join(", "),
+            );
+        }
     }
     let _ = std::io::stdout().flush();
 }

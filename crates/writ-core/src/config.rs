@@ -238,6 +238,7 @@ pub struct AutoModeConfig {
 /// [watch]
 /// interval = 5            # seconds between polls (default: 5, min: 1)
 /// auto_converge = true     # auto-converge overlapping seals (default: true)
+/// auto_converge_on_seal = true  # seal() triggers convergence inline (default: true)
 /// max_retries = 3          # max convergence retries (default: 3, min: 1)
 /// log_file = ".writ/watch.log"  # log file path, relative to project root
 /// ```
@@ -247,9 +248,15 @@ pub struct WatchConfig {
     #[serde(default = "default_watch_interval")]
     pub interval: u64,
 
-    /// Whether to automatically converge overlapping seals.
+    /// Whether to automatically converge overlapping seals via `writ watch`.
     #[serde(default = "default_true")]
     pub auto_converge: bool,
+
+    /// Whether seal() automatically triggers convergence inline when overlaps
+    /// are detected. Default: true. Set to false for benchmarking or when
+    /// using `writ watch` exclusively for convergence.
+    #[serde(default = "default_true")]
+    pub auto_converge_on_seal: bool,
 
     /// Maximum number of convergence retries before giving up. Must be >= 1.
     #[serde(default = "default_max_retries")]
@@ -278,6 +285,7 @@ impl Default for WatchConfig {
         Self {
             interval: default_watch_interval(),
             auto_converge: default_true(),
+            auto_converge_on_seal: default_true(),
             max_retries: default_max_retries(),
             log_file: default_watch_log_file(),
         }
@@ -632,6 +640,10 @@ pub fn resolve_watch_config(
         auto_converge: proj
             .map(|w| w.auto_converge)
             .or_else(|| glob.map(|w| w.auto_converge))
+            .unwrap_or_else(default_true),
+        auto_converge_on_seal: proj
+            .map(|w| w.auto_converge_on_seal)
+            .or_else(|| glob.map(|w| w.auto_converge_on_seal))
             .unwrap_or_else(default_true),
         max_retries: proj
             .map(|w| w.max_retries)
@@ -1558,6 +1570,7 @@ interval = 15
         config.watch = Some(WatchConfig {
             interval: 10,
             auto_converge: false,
+            auto_converge_on_seal: true,
             max_retries: 5,
             log_file: ".writ/custom.log".to_string(),
         });
@@ -1613,6 +1626,7 @@ interval = 15
             watch: Some(WatchConfig {
                 interval: 20,
                 auto_converge: false,
+                auto_converge_on_seal: true,
                 max_retries: 7,
                 log_file: ".writ/global-watch.log".to_string(),
             }),

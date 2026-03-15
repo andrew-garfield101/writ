@@ -2588,6 +2588,26 @@ fn cmd_seal(
         println!("    {marker} {}", c.path);
     }
 
+    // Show seal-triggered convergence result if convergence was attempted.
+    if let Some(ref conv) = seal.convergence {
+        if conv.attempted {
+            if conv.succeeded {
+                println!(
+                    "  {} merged {} file(s) across {} specs",
+                    "converged:".green().bold(),
+                    conv.files_merged,
+                    conv.specs_involved.len()
+                );
+            } else {
+                println!(
+                    "  {} {}",
+                    "convergence:".yellow().bold(),
+                    conv.message.as_deref().unwrap_or("incomplete")
+                );
+            }
+        }
+    }
+
     if seal.changes.is_empty() && !seal.summary.is_empty() && !allow_empty {
         println!(
             "  {} 0 file changes but summary is non-empty.",
@@ -3655,6 +3675,32 @@ fn cmd_status(
         }
     }
 
+    // Untracked changes: files modified on disk but not in any spec's seals.
+    if !status.untracked_changes.is_empty() {
+        println!();
+        println!(
+            "{}",
+            "── Untracked Changes ───────────────────────────────".dimmed()
+        );
+        for f in &status.untracked_changes {
+            println!(
+                "  {}  {}  {}",
+                "⚠".yellow(),
+                f,
+                "(not in any seal)".dimmed()
+            );
+        }
+        println!();
+        println!(
+            "  {}",
+            "These changes have no writ attribution.".dimmed()
+        );
+        println!(
+            "  {}",
+            "They will be included in `writ finish` but are not tracked by any spec.".dimmed()
+        );
+    }
+
     // WV.7: Tasks section — specs with associated workspaces.
     let all_specs = repo.list_specs()?;
     let task_specs: Vec<_> = all_specs.iter().filter(|s| s.workspace.is_some()).collect();
@@ -4119,7 +4165,17 @@ fn cmd_finish(
         println!();
         println!("{}", "In-progress specs (not included):".dimmed());
         for s in &in_progress {
-            println!("  {} {}", "·".dimmed(), s.id.dimmed());
+            let seal_count = s.sealed_by.len();
+            if seal_count == 0 {
+                println!(
+                    "  {} {} {}",
+                    "⚠".yellow(),
+                    s.id.yellow(),
+                    "(0 seals — possibly abandoned)".dimmed()
+                );
+            } else {
+                println!("  {} {}", "·".dimmed(), s.id.dimmed());
+            }
         }
     }
 
@@ -4145,6 +4201,35 @@ fn cmd_finish(
         }
     }
     println!("Strategy: {}", strategy);
+
+    // Check for unattributed files: changes in working tree not captured
+    // in any spec's seal chain. These will be committed but have no writ tracking.
+    let status_output = repo.status()?;
+    if !status_output.untracked_changes.is_empty() {
+        println!();
+        println!(
+            "{}",
+            format!(
+                "Warning: {} file{} changed but not captured in any seal:",
+                status_output.untracked_changes.len(),
+                if status_output.untracked_changes.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            )
+            .yellow()
+            .bold()
+        );
+        for f in &status_output.untracked_changes {
+            println!("  {}  {}", "·".yellow(), f);
+        }
+        println!(
+            "  {}",
+            "These will be included in the git commit but have no writ attribution."
+                .dimmed()
+        );
+    }
 
     if dry_run {
         println!();

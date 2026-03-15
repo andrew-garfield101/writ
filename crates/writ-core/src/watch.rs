@@ -92,6 +92,13 @@ pub enum WatchEventKind {
         agents: Vec<String>,
         reason: String,
     },
+    /// Seal-triggered convergence already handled these overlaps.
+    /// Watch detected overlaps but the seal's inline convergence resolved them.
+    SealConvergenceHandled {
+        seal_id: String,
+        files_merged: usize,
+        specs: Vec<String>,
+    },
 }
 
 /// Summary statistics for a completed watch session.
@@ -195,6 +202,9 @@ pub struct WatchState {
     /// already merged.  A new seal from any participating spec changes the
     /// fingerprint and allows convergence to re-trigger.
     pub converged_fingerprints: HashSet<String>,
+    /// True on the very first cycle. Enables retroactive overlap scanning
+    /// so a late-started watch catches pre-existing unconverged overlaps.
+    pub first_cycle: bool,
 }
 
 /// Persisted portion of watch state (survives process restarts).
@@ -219,6 +229,7 @@ impl WatchState {
         Ok(Self {
             known_seals,
             converged_fingerprints,
+            first_cycle: true,
         })
     }
 
@@ -284,9 +295,38 @@ fn run_cycle(
         }
     }
 
-    // If no new seals, nothing more to do this cycle.
-    if new_seal_ids.is_empty() {
+    // If no new seals AND not the first cycle, nothing more to do.
+    // On the first cycle, we do a retroactive scan for pre-existing
+    // unconverged overlaps — this handles the "late start" scenario
+    // where agents sealed work before watch was started.
+    let retroactive = state.first_cycle;
+    if state.first_cycle {
+        state.first_cycle = false;
+    }
+    if new_seal_ids.is_empty() && !retroactive {
         return Ok(());
+    }
+
+    // Check if any of the new seals already handled convergence inline.
+    // If seal-triggered convergence succeeded, emit an event and mark the
+    // fingerprint as converged so watch doesn't re-converge the same state.
+    let mut seal_handled_convergence = false;
+    for seal in &current_seals {
+        if new_seal_ids.contains(&seal.id) {
+            if let Some(ref conv) = seal.convergence {
+                if conv.attempted && conv.succeeded {
+                    seal_handled_convergence = true;
+                    let _ = event_tx.send(WatchEvent {
+                        timestamp: Utc::now(),
+                        kind: WatchEventKind::SealConvergenceHandled {
+                            seal_id: seal.id[..12.min(seal.id.len())].to_string(),
+                            files_merged: conv.files_merged,
+                            specs: conv.specs_involved.clone(),
+                        },
+                    });
+                }
+            }
+        }
     }
 
     // Step 2: Detect overlaps (MS.7).
@@ -302,6 +342,12 @@ fn run_cycle(
     // the same unchanged overlap doubles/triples content.
     let fingerprint = build_overlap_fingerprint(repo, &overlaps);
     let already_converged = state.converged_fingerprints.contains(&fingerprint);
+
+    // If seal-triggered convergence already handled these overlaps, mark
+    // the fingerprint as converged so watch doesn't redo the work.
+    if seal_handled_convergence {
+        state.converged_fingerprints.insert(fingerprint.clone());
+    }
 
     // Collect all overlapping files/specs for reporting.
     let mut all_overlap_files: Vec<String> = Vec::new();
@@ -1093,6 +1139,98 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn test_watch_retroactive_scan_on_first_cycle() {
+        // Regression test for the "late start" scenario:
+        // agents seal work BEFORE watch starts. On the first cycle,
+        // watch should detect and converge pre-existing overlaps
+        // even though all seals are marked as "already known."
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let base = "line1\nline2\nline3\nline4\nline5\n";
+        fs::write(dir.path().join("shared.txt"), base).unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        // Agents seal BEFORE watch starts.
+        fs::write(
+            dir.path().join("shared.txt"),
+            "CHANGED_A\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a1"),
+            "change top".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nline4\nCHANGED_B\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("b1"),
+            "change bottom".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // NOW start the watch — all seals are pre-existing.
+        let mut state = WatchState::new(&repo).unwrap();
+        assert!(state.first_cycle, "first_cycle should be true on init");
+
+        let config = WatchConfig {
+            auto_converge: true,
+            strategy: ConvergeStrategy::MostRecent,
+            ..Default::default()
+        };
+        let mut summary = WatchSummary::default();
+        let (tx, _rx) = mpsc::channel();
+
+        // First cycle: no new seals, but retroactive scan should find
+        // the pre-existing overlap and converge it.
+        run_single_cycle(&repo, &config, &mut state, &mut summary, &tx).unwrap();
+
+        assert!(!state.first_cycle, "first_cycle should be false after first run");
+        assert_eq!(summary.seals_detected, 0, "no NEW seals detected");
+        assert!(
+            summary.overlaps_detected > 0,
+            "retroactive scan should find pre-existing overlaps"
+        );
+        assert!(
+            summary.convergences_triggered > 0,
+            "should converge pre-existing overlaps on first cycle"
+        );
+
+        // Second cycle: no new seals, not first cycle — should be a no-op.
+        run_single_cycle(&repo, &config, &mut state, &mut summary, &tx).unwrap();
+        assert_eq!(
+            summary.convergences_triggered, 1,
+            "should NOT re-converge on second cycle"
+        );
+    }
+
     fn test_watch_no_re_convergence_on_same_overlap() {
         // Regression test for the convergence stacking bug:
         // after converging an overlap, a subsequent cycle with a NEW seal

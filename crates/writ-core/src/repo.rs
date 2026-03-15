@@ -30893,8 +30893,7 @@ mod workspace_tests {
         let (repo, _seal_a, seal_b) = setup_overlapping_specs(&dir);
 
         // Read the merged content after first convergence.
-        let content_after_first =
-            fs::read_to_string(dir.path().join("shared.rs")).unwrap();
+        let content_after_first = fs::read_to_string(dir.path().join("shared.rs")).unwrap();
 
         // Spec A seals again (no file changes — just another seal).
         fs::write(dir.path().join("unique_a.txt"), "extra").unwrap();
@@ -30910,8 +30909,7 @@ mod workspace_tests {
             .unwrap();
 
         // Content on disk should be unchanged (idempotent).
-        let content_after_second =
-            fs::read_to_string(dir.path().join("shared.rs")).unwrap();
+        let content_after_second = fs::read_to_string(dir.path().join("shared.rs")).unwrap();
         assert_eq!(
             content_after_first, content_after_second,
             "disk content should not change on re-convergence"
@@ -31026,9 +31024,7 @@ mod workspace_tests {
             deserialized.convergence.is_some(),
             seal_b.convergence.is_some()
         );
-        if let (Some(orig), Some(deser)) =
-            (&seal_b.convergence, &deserialized.convergence)
-        {
+        if let (Some(orig), Some(deser)) = (&seal_b.convergence, &deserialized.convergence) {
             assert_eq!(orig.attempted, deser.attempted);
             assert_eq!(orig.succeeded, deser.succeeded);
             assert_eq!(orig.files_merged, deser.files_merged);
@@ -31095,11 +31091,7 @@ mod workspace_tests {
 
         // Write config with auto_converge_on_seal = false.
         let config_toml = "[watch]\nauto_converge_on_seal = false\n";
-        fs::write(
-            dir.path().join(".writ").join("config.toml"),
-            config_toml,
-        )
-        .unwrap();
+        fs::write(dir.path().join(".writ").join("config.toml"), config_toml).unwrap();
 
         // Set up overlapping specs.
         fs::write(dir.path().join("shared.rs"), "// base\nfn hello() {}\n").unwrap();

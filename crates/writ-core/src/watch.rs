@@ -484,10 +484,7 @@ fn run_cycle(
 /// If any spec gets a new seal, the fingerprint changes, allowing re-convergence.
 /// If nothing has changed, the fingerprint stays the same, preventing the
 /// stacking bug where the watch re-converges already-merged content.
-fn build_overlap_fingerprint(
-    repo: &Repository,
-    overlaps: &[crate::repo::OverlapSet],
-) -> String {
+fn build_overlap_fingerprint(repo: &Repository, overlaps: &[crate::repo::OverlapSet]) -> String {
     let mut spec_seals: Vec<(String, String)> = Vec::new();
     let mut seen = HashSet::new();
 
@@ -1212,7 +1209,10 @@ mod tests {
         // the pre-existing overlap and converge it.
         run_single_cycle(&repo, &config, &mut state, &mut summary, &tx).unwrap();
 
-        assert!(!state.first_cycle, "first_cycle should be false after first run");
+        assert!(
+            !state.first_cycle,
+            "first_cycle should be false after first run"
+        );
         assert_eq!(summary.seals_detected, 0, "no NEW seals detected");
         assert!(
             summary.overlaps_detected > 0,

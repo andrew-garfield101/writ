@@ -3072,22 +3072,19 @@ fn cmd_context(
                 format!("| {} | {} tracked", project_name, ctx.tracked_files).dimmed(),
             );
             if spec_count > 0 {
-                print!(" | {} spec{}", spec_count, if spec_count == 1 { "" } else { "s" });
+                print!(
+                    " | {} spec{}",
+                    spec_count,
+                    if spec_count == 1 { "" } else { "s" }
+                );
             }
             println!();
 
             // ── Session complete banner ─────────────────────────────────
             if let Some(ref ss) = ctx.session_summary {
                 println!();
-                println!(
-                    "  {} {}",
-                    "SESSION COMPLETE".green().bold(),
-                    ss.headline,
-                );
-                println!(
-                    "  {} file(s) changed. {}",
-                    ss.files_changed, ss.message
-                );
+                println!("  {} {}", "SESSION COMPLETE".green().bold(), ss.headline,);
+                println!("  {} file(s) changed. {}", ss.files_changed, ss.message);
             }
 
             // ── Active spec (spec-scoped view) ─────────────────────────
@@ -3108,14 +3105,8 @@ fn cmd_context(
             if let Some(ref specs) = ctx.all_specs {
                 if !specs.is_empty() && ctx.active_spec.is_none() {
                     println!();
-                    println!(
-                        "  {}",
-                        "Specs".bold(),
-                    );
-                    println!(
-                        "  {}",
-                        "─".repeat(60).dimmed(),
-                    );
+                    println!("  {}", "Specs".bold(),);
+                    println!("  {}", "─".repeat(60).dimmed(),);
                     for spec in specs {
                         let status_str = format!("{:?}", spec.status).to_lowercase();
                         let colored_status = match spec.status {
@@ -3124,13 +3115,14 @@ fn cmd_context(
                             writ_core::spec::SpecStatus::InProgress => status_str.yellow(),
                             writ_core::spec::SpecStatus::Pending => status_str.dimmed(),
                         };
-                        let claimed = spec
-                            .claimed_by
-                            .as_deref()
-                            .unwrap_or("unclaimed");
+                        let claimed = spec.claimed_by.as_deref().unwrap_or("unclaimed");
                         let seal_count = spec.sealed_by.len();
                         let seal_info = if seal_count > 0 {
-                            format!("{} seal{}", seal_count, if seal_count == 1 { "" } else { "s" })
+                            format!(
+                                "{} seal{}",
+                                seal_count,
+                                if seal_count == 1 { "" } else { "s" }
+                            )
                         } else {
                             String::new()
                         };
@@ -3154,22 +3146,14 @@ fn cmd_context(
                     format!("({} available)", ctx.unclaimed_specs.len()).dimmed(),
                 );
                 for us in &ctx.unclaimed_specs {
-                    println!(
-                        "    {} {}",
-                        us.id.cyan(),
-                        us.title.dimmed(),
-                    );
+                    println!("    {} {}", us.id.cyan(), us.title.dimmed(),);
                 }
             }
 
             // ── Working state ───────────────────────────────────────────
             println!();
             if ctx.working_state.clean {
-                println!(
-                    "  {} {}",
-                    "Working state:".bold(),
-                    "clean".green(),
-                );
+                println!("  {} {}", "Working state:".bold(), "clean".green(),);
             } else {
                 let new_count = ctx.working_state.new_files.len();
                 let mod_count = ctx.working_state.modified_files.len();
@@ -3184,11 +3168,7 @@ fn cmd_context(
                 if del_count > 0 {
                     parts.push(format!("-{del_count} deleted").red().to_string());
                 }
-                println!(
-                    "  {} {}",
-                    "Working state:".bold(),
-                    parts.join(", "),
-                );
+                println!("  {} {}", "Working state:".bold(), parts.join(", "),);
             }
 
             // ── Pending changes summary ─────────────────────────────────
@@ -3206,24 +3186,14 @@ fn cmd_context(
 
             // ── Seal nudge ──────────────────────────────────────────────
             if let Some(ref nudge) = ctx.seal_nudge {
-                println!(
-                    "  {} {}",
-                    "Nudge:".yellow().bold(),
-                    nudge.message,
-                );
+                println!("  {} {}", "Nudge:".yellow().bold(), nudge.message,);
             }
 
             // ── Recent seals ────────────────────────────────────────────
             if !ctx.recent_seals.is_empty() {
                 println!();
-                println!(
-                    "  {}",
-                    "Recent Seals".bold(),
-                );
-                println!(
-                    "  {}",
-                    "─".repeat(60).dimmed(),
-                );
+                println!("  {}", "Recent Seals".bold(),);
+                println!("  {}", "─".repeat(60).dimmed(),);
                 for s in &ctx.recent_seals {
                     let spec_part = s
                         .spec_id
@@ -3289,11 +3259,7 @@ fn cmd_context(
             // ── Recommended action ──────────────────────────────────────
             if let Some(ref action) = ctx.recommended_action {
                 println!();
-                println!(
-                    "  {} {}",
-                    "Next:".bold(),
-                    action.message,
-                );
+                println!("  {} {}", "Next:".bold(), action.message,);
             }
 
             println!();
@@ -3691,10 +3657,7 @@ fn cmd_status(
             );
         }
         println!();
-        println!(
-            "  {}",
-            "These changes have no writ attribution.".dimmed()
-        );
+        println!("  {}", "These changes have no writ attribution.".dimmed());
         println!(
             "  {}",
             "They will be included in `writ finish` but are not tracked by any spec.".dimmed()
@@ -4226,8 +4189,7 @@ fn cmd_finish(
         }
         println!(
             "  {}",
-            "These will be included in the git commit but have no writ attribution."
-                .dimmed()
+            "These will be included in the git commit but have no writ attribution.".dimmed()
         );
     }
 

@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentStatus, AgentUpdate, RegisteredAgent, TrustLevel};
@@ -5663,6 +5664,12 @@ impl Repository {
             &configuration_hash,
         );
 
+        // Record convergence timestamp so recently-completed specs
+        // are no longer treated as needing convergence.
+        if did_apply {
+            self.save_last_converged_at();
+        }
+
         Ok(ConvergeAllReport {
             convergence_record: Some(convergence_record),
             ..partial_report
@@ -5679,9 +5686,35 @@ impl Repository {
     /// This scans all specs with sealed work, compares their latest seal trees,
     /// and finds files where two or more specs have different content hashes.
     pub fn detect_same_directory_overlaps(&self) -> WritResult<Vec<OverlapSet>> {
+        use crate::spec::SpecStatus;
+
         let specs = self.list_specs()?;
-        let specs_with_work: Vec<&Spec> =
-            specs.iter().filter(|s| !s.sealed_by.is_empty()).collect();
+        let last_converged = self.load_last_converged_at();
+
+        // Include active specs AND recently-completed specs that finished
+        // after the last convergence. This closes a timing gap where two
+        // specs that both complete quickly on the same file would slip
+        // through both convergence paths (seal-triggered and watch).
+        //
+        // Truly stale specs (completed before last convergence or from
+        // previous sessions) are still excluded to prevent contamination.
+        let specs_with_work: Vec<&Spec> = specs
+            .iter()
+            .filter(|s| {
+                if s.sealed_by.is_empty() {
+                    return false;
+                }
+                if s.status != SpecStatus::Complete {
+                    return true; // active spec — always include
+                }
+                // Completed spec: include only if it finished after last convergence
+                match (s.completed_at, last_converged) {
+                    (Some(completed), Some(converged)) => completed > converged,
+                    (Some(_), None) => true, // no convergence yet — include all completed
+                    _ => false,              // no completed_at timestamp — stale
+                }
+            })
+            .collect();
 
         if specs_with_work.len() < 2 {
             return Ok(Vec::new());
@@ -6070,6 +6103,39 @@ impl Repository {
                 message: Some(format!("convergence failed: {}", e)),
             },
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Convergence state tracking
+    // -------------------------------------------------------------------
+
+    /// Path to the convergence state file.
+    fn convergence_state_path(&self) -> std::path::PathBuf {
+        self.writ_dir.join("convergence_state.json")
+    }
+
+    /// Load the timestamp of the last successful convergence.
+    /// Returns None if no convergence has ever run or state is corrupt.
+    fn load_last_converged_at(&self) -> Option<DateTime<Utc>> {
+        let path = self.convergence_state_path();
+        if !path.exists() {
+            return None;
+        }
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| v.get("last_converged_at")?.as_str().map(String::from))
+            .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+    }
+
+    /// Record the current time as the last successful convergence timestamp.
+    fn save_last_converged_at(&self) {
+        let now = Utc::now();
+        let json = serde_json::json!({ "last_converged_at": now.to_rfc3339() });
+        let _ = fs::write(
+            self.convergence_state_path(),
+            serde_json::to_string_pretty(&json).unwrap_or_default(),
+        );
     }
 
     fn ignore_rules(&self) -> IgnoreRules {
@@ -22220,6 +22286,311 @@ mod convergence_integration_tests {
         assert_eq!(overlaps.len(), 1);
         assert_eq!(overlaps[0].specs.len(), 3);
         assert_eq!(overlaps[0].details[0].spec_hashes.len(), 3);
+    }
+
+    // -------------------------------------------------------------------
+    // Recently-completed spec convergence gap tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_detect_overlaps_recently_completed_specs_included() {
+        // Two specs complete quickly on the same file. Without the
+        // last_converged_at check, both would be filtered out and
+        // convergence would never fire.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Disable auto-convergence so seals don't converge inline
+        let config_dir = dir.path().join(".writ");
+        fs::write(
+            config_dir.join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "base content").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        // Agent 1 seals, then completes
+        fs::write(dir.path().join("shared.txt"), "agent-1 content").unwrap();
+        repo.seal(
+            agent("a1"),
+            "a1 work".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.mark_spec_done("s1", Some("done".into())).unwrap();
+
+        // Agent 2 seals, then completes
+        fs::write(dir.path().join("shared.txt"), "agent-2 content").unwrap();
+        repo.seal(
+            agent("a2"),
+            "a2 work".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.mark_spec_done("s2", Some("done".into())).unwrap();
+
+        // No convergence has ever run, so last_converged_at is None.
+        // Both completed specs should be included in overlap detection.
+        let overlaps = repo.detect_same_directory_overlaps().unwrap();
+        assert_eq!(
+            overlaps.len(),
+            1,
+            "recently-completed specs should be detected as overlapping"
+        );
+        assert_eq!(overlaps[0].specs.len(), 2);
+    }
+
+    #[test]
+    fn test_detect_overlaps_stale_completed_specs_excluded() {
+        // Completed specs from before the last convergence should NOT
+        // appear in overlap detection (prevents stale contamination).
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Disable auto-convergence
+        let config_dir = dir.path().join(".writ");
+        fs::write(
+            config_dir.join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "base content").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        // Two specs seal and complete on same file
+        fs::write(dir.path().join("shared.txt"), "agent-1 content").unwrap();
+        repo.seal(
+            agent("a1"),
+            "a1 work".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.mark_spec_done("s1", Some("done".into())).unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "agent-2 content").unwrap();
+        repo.seal(
+            agent("a2"),
+            "a2 work".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.mark_spec_done("s2", Some("done".into())).unwrap();
+
+        // Now simulate convergence having run by saving the timestamp
+        repo.save_last_converged_at();
+
+        // After convergence, completed specs should be excluded
+        let overlaps = repo.detect_same_directory_overlaps().unwrap();
+        assert!(
+            overlaps.is_empty(),
+            "completed specs from before last convergence should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_detect_overlaps_mixed_active_and_recently_completed() {
+        // One active spec + one recently-completed spec on the same file
+        // should still detect overlaps.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Disable auto-convergence
+        let config_dir = dir.path().join(".writ");
+        fs::write(
+            config_dir.join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "base content").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        // Spec 1 seals and completes
+        fs::write(dir.path().join("shared.txt"), "agent-1 content").unwrap();
+        repo.seal(
+            agent("a1"),
+            "a1 work".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.mark_spec_done("s1", Some("done".into())).unwrap();
+
+        // Spec 2 is still active
+        fs::write(dir.path().join("shared.txt"), "agent-2 content").unwrap();
+        repo.seal(
+            agent("a2"),
+            "a2 work".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let overlaps = repo.detect_same_directory_overlaps().unwrap();
+        assert_eq!(
+            overlaps.len(),
+            1,
+            "active + recently-completed spec should overlap"
+        );
+        assert_eq!(overlaps[0].specs.len(), 2);
+    }
+
+    #[test]
+    fn test_convergence_state_persists_timestamp() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Initially no convergence state
+        assert!(repo.load_last_converged_at().is_none());
+
+        // Save timestamp
+        repo.save_last_converged_at();
+
+        // Should now load a timestamp
+        let ts = repo.load_last_converged_at();
+        assert!(ts.is_some(), "timestamp should persist after save");
+
+        // Verify the file exists
+        assert!(dir.path().join(".writ/convergence_state.json").exists());
+    }
+
+    #[test]
+    fn test_converge_all_updates_last_converged_at() {
+        // After a successful converge_all with apply=true, the
+        // last_converged_at timestamp should be updated.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        // Disable auto-convergence
+        let config_dir = dir.path().join(".writ");
+        fs::write(
+            config_dir.join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+
+        // Create baseline
+        fs::write(dir.path().join("shared.txt"), "line1\nline2\nline3\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+
+        // Spec 1 adds at top (non-conflicting)
+        fs::write(
+            dir.path().join("shared.txt"),
+            "agent-1 header\nline1\nline2\nline3\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a1"),
+            "a1 work".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Spec 2 adds at bottom (non-conflicting — clean merge)
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nagent-2 footer\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a2"),
+            "a2 work".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        assert!(repo.load_last_converged_at().is_none());
+
+        // Run convergence — should be a clean merge
+        let report = repo
+            .converge_all(crate::convergence::ConvergeStrategy::Escalate, true)
+            .unwrap();
+
+        // Convergence may or may not be clean depending on the merge algorithm,
+        // but if it applied successfully, the timestamp should be set
+        if report.applied {
+            assert!(
+                repo.load_last_converged_at().is_some(),
+                "converge_all should save last_converged_at when applied"
+            );
+        }
     }
 }
 

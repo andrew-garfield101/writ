@@ -337,6 +337,12 @@ impl WritMcpServer {
         Parameters(params): Parameters<SpecAddParams>,
     ) -> Result<CallToolResult, McpError> {
         let spec_id = params.id.clone();
+
+        // Check for unclaimed specs before creating a new one.
+        // This nudges agents to claim existing specs from `writ plan` instead
+        // of creating duplicates.
+        let unclaimed_warning = self.check_unclaimed_specs();
+
         let mut args = vec![
             "spec".to_string(),
             "add".to_string(),
@@ -376,12 +382,18 @@ impl WritMcpServer {
             })
             .unwrap_or_default();
 
-        let combined = format!(
+        let mut combined = format!(
             "{}\n\nspec created: {}\n\nproject specs:\n{}",
             add_text.trim(),
             spec_id,
             context_text.trim(),
         );
+
+        // Append unclaimed spec warning if any exist
+        if let Some(warning) = unclaimed_warning {
+            combined = format!("{}\n\n{}", combined, warning);
+        }
+
         Ok(CallToolResult::success(vec![Content::text(combined)]))
     }
 
@@ -788,6 +800,44 @@ impl WritMcpServer {
     pub fn run_writ_owned(&self, args: &[String]) -> Result<CallToolResult, McpError> {
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         self.run_writ(&refs)
+    }
+
+    /// Check for unclaimed specs and return a warning message if any exist.
+    /// Best-effort — returns None on any error.
+    fn check_unclaimed_specs(&self) -> Option<String> {
+        let output = Command::new(&self.writ_binary)
+            .args(["spec", "status", "--format", "json"])
+            .current_dir(&self.project_dir)
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            return None;
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let specs: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).ok()?;
+
+        let unclaimed: Vec<&str> = specs
+            .iter()
+            .filter(|s| {
+                let status = s.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                let claimed = s.get("claimed_by").and_then(|v| v.as_str());
+                (status == "pending" || status == "in-progress") && claimed.is_none()
+            })
+            .filter_map(|s| s.get("id").and_then(|v| v.as_str()))
+            .collect();
+
+        if unclaimed.is_empty() {
+            return None;
+        }
+
+        Some(format!(
+            "WARNING: {} unclaimed spec(s) already exist: [{}]. \
+             Did you mean to use `writ spec claim <id>` instead of creating a new spec?",
+            unclaimed.len(),
+            unclaimed.join(", ")
+        ))
     }
 }
 

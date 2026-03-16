@@ -5296,8 +5296,21 @@ fn cmd_spec_done(
         }
     };
 
-    // Create final seal — use resolve_agent for auto-detect support
-    let agent_id = resolve_agent(agent, cwd);
+    // Create final seal — prefer the spec's claimed agent over fallback "human".
+    // This prevents paired "human" seals when an agent runs `writ spec done`
+    // from CLI without an explicit --agent flag. The seal inherits the spec's
+    // agent identity for proper attribution.
+    let resolved_id = resolve_agent(agent, cwd);
+    let spec_data = repo.load_spec(&spec_id)?;
+    let agent_id = if resolved_id == "human" {
+        // If resolve_agent fell back to "human", check if spec has a claimed agent
+        spec_data
+            .claimed_by
+            .clone()
+            .unwrap_or_else(|| resolved_id.clone())
+    } else {
+        resolved_id
+    };
     let seal_summary = summary.as_deref().unwrap_or("Spec completed").to_string();
 
     let seal_agent = AgentIdentity {

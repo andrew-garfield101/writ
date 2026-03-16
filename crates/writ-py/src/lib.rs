@@ -753,6 +753,35 @@ impl PyRepository {
         to_pydict(py, &report)
     }
 
+    /// V3 seal-tree convergence for specific specs.
+    #[pyo3(signature = (spec_ids, strategy="escalate"))]
+    fn converge_from_seal_trees(&self, py: Python, spec_ids: Vec<String>, strategy: &str) -> PyResult<PyObject> {
+        let strat = match strategy {
+            "escalate" => writ_core::convergence::ConvergeStrategy::Escalate,
+            "orchestrator" => writ_core::convergence::ConvergeStrategy::Orchestrator,
+            "manual" => writ_core::convergence::ConvergeStrategy::Manual,
+            "most-recent" => { #[allow(deprecated)] writ_core::convergence::ConvergeStrategy::MostRecent }
+            _ => writ_core::convergence::ConvergeStrategy::Escalate,
+        };
+        let report = self.inner.converge_from_seal_trees(&spec_ids, strat).map_err(writ_err)?;
+        to_pydict(py, &report)
+    }
+
+    /// Finalize pending shadow convergence into a seal.
+    fn finalize_convergence(&self, py: Python) -> PyResult<PyObject> {
+        let report = self.inner.finalize_convergence().map_err(writ_err)?;
+        to_pydict(py, &report)
+    }
+
+    /// Materialize convergence shadow results to disk.
+    fn materialize_convergence(&self, report: PyObject, py: Python) -> PyResult<()> {
+        let report_val: writ_core::repo::SealTreeConvergenceReport = pythonize::depythonize(report.bind(py)).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!("failed to deserialize convergence report: {e}"))
+        })?;
+        self.inner.materialize_convergence(&report_val).map_err(writ_err)?;
+        Ok(())
+    }
+
     /// Import git state as a writ baseline seal.
     #[pyo3(signature = (git_ref="HEAD", agent_id="bridge", agent_type="agent"))]
     fn bridge_import(

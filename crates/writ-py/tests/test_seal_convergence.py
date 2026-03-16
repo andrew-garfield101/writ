@@ -51,6 +51,10 @@ def make_overlapping_repo(tmp_path: Path):
     """
     repo = writ.Repository.init(str(tmp_path))
 
+    # V3: on-seal convergence defaults to false. Opt in for these tests.
+    config_path = tmp_path / ".writ" / "config.toml"
+    config_path.write_text("[watch]\nauto_converge_on_seal = true\n")
+
     # Baseline seal with shared file
     (tmp_path / "shared.rs").write_text("// base\nfn hello() {}\n")
     repo.seal(
@@ -376,6 +380,10 @@ class TestFiveAgentsSealTriggeredConvergence:
         without requiring writ watch. Each seal commits successfully.
         """
         repo = writ.Repository.init(str(tmp_path))
+
+        # V3: on-seal convergence defaults to false. Opt in for this test.
+        config_path = tmp_path / ".writ" / "config.toml"
+        config_path.write_text("[watch]\nauto_converge_on_seal = true\n")
 
         # Baseline
         (tmp_path / "shared.rs").write_text("// shared base\n")

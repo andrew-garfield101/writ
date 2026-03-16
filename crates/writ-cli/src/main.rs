@@ -4075,6 +4075,62 @@ fn cmd_finish(
         }
     }
 
+    // V3: Finalize seal-tree convergence (backstop).
+    // Runs convergence for any completed specs with overlapping files that
+    // haven't been converged yet. Then materializes the shadow results to disk.
+    match repo.finalize_convergence() {
+        Ok(conv_report) => {
+            if !conv_report.merged_files.is_empty() {
+                if !conv_report.escalations.is_empty() {
+                    eprintln!();
+                    eprintln!(
+                        "{} Seal-tree convergence found {} unresolved conflict{}:",
+                        "error:".red().bold(),
+                        conv_report.escalations.len(),
+                        if conv_report.escalations.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        }
+                    );
+                    for esc in &conv_report.escalations {
+                        eprintln!("  {} {}: {}", "·".red(), esc.file_path, esc.reason);
+                    }
+                    eprintln!();
+                    eprintln!(
+                        "  Resolve conflicts before finishing. Run {} to preview.",
+                        "`writ converge-all --dry-run`".bold()
+                    );
+                    return Err("convergence has unresolved conflicts".into());
+                }
+
+                if !dry_run {
+                    repo.materialize_convergence(&conv_report)?;
+                }
+
+                println!(
+                    "  {} Seal-tree convergence: {} file{} merged across {} specs.",
+                    "✓".green(),
+                    conv_report.merged_files.len(),
+                    if conv_report.merged_files.len() == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    conv_report.specs_converged.len(),
+                );
+            }
+        }
+        Err(e) => {
+            // Convergence is best-effort — warn but don't block finish.
+            eprintln!(
+                "  {} Seal-tree convergence check failed: {}",
+                "⚠".yellow(),
+                e
+            );
+        }
+    }
+
     // Gather completed specs for display
     let specs = repo.list_specs()?;
     let committable: Vec<_> = specs.iter().filter(|s| s.is_committable()).collect();
@@ -7989,10 +8045,10 @@ fn cmd_config_unset(
 
 /// Generate .mcp.json for Claude Code MCP discovery.
 /// Only writes if file doesn't exist or content differs (idempotent).
-/// MS.30: Append a commented `[watch]` section to config.toml so users
-/// can discover and customize watch daemon settings.
+/// MS.30 + V3.7: Append commented `[watch]` and `[convergence]` sections
+/// to config.toml so users can discover and customize settings.
 fn append_watch_config_comment(config_path: &std::path::Path) {
-    let comment = r#"
+    let watch_comment = r#"
 
 # Watch daemon configuration (uncomment to customize)
 # Run `writ watch` to start the convergence daemon.
@@ -8002,10 +8058,23 @@ fn append_watch_config_comment(config_path: &std::path::Path) {
 # max_retries = 3            # max convergence retries (min: 1)
 # log_file = ".writ/watch.log"  # log file, relative to project root
 "#;
+    let convergence_comment = r#"
+# Convergence configuration (uncomment to customize)
+# Controls how seal-tree convergence fires when specs complete.
+# [convergence]
+# trigger = "incremental"       # "incremental" (on each spec completion) or "deferred" (only at finish)
+# surface_conflicts = true      # show conflicts immediately in watch output
+# strategy = "escalate"         # "escalate" (safe), "three-way-merge", or "most-recent" (lossy)
+"#;
     if let Ok(existing) = std::fs::read_to_string(config_path) {
-        if !existing.contains("[watch]") {
-            let _ = std::fs::write(config_path, format!("{}{}", existing, comment));
+        let mut content = existing;
+        if !content.contains("[watch]") {
+            content.push_str(watch_comment);
         }
+        if !content.contains("[convergence]") {
+            content.push_str(convergence_comment);
+        }
+        let _ = std::fs::write(config_path, content);
     }
 }
 

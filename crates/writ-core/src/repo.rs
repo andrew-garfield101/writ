@@ -880,19 +880,17 @@ impl Repository {
         // drop the seal lock first to avoid re-entrancy deadlock.
         drop(_lock);
 
-        // Seal-triggered convergence: if this seal has a spec and there are
-        // overlapping file changes across specs, run convergence inline.
-        // The seal is already committed — convergence is best-effort and
-        // never blocks or rolls back the seal.
+        // V3: On-seal convergence is disabled by default. Convergence now
+        // fires from mark_spec_done() (completion-triggered). The seal.convergence
+        // field is retained for backward compatibility but will be None for new seals.
         //
-        // Respects `auto_converge_on_seal` config flag (default: true).
-        // Set to false in .writ/config.toml [watch] section to disable.
+        // Users can opt back in via `auto_converge_on_seal = true` in config.toml.
         if spec_id.is_some() {
             let auto_converge_on_seal = crate::config::ProjectConfig::load(&self.writ_dir)
                 .unwrap_or_default()
                 .watch
                 .map(|w| w.auto_converge_on_seal)
-                .unwrap_or(true);
+                .unwrap_or(false); // V3: default changed from true to false
 
             if auto_converge_on_seal {
                 seal.convergence = Some(self.try_post_seal_convergence());
@@ -3715,7 +3713,108 @@ impl Repository {
         spec.completed_at = Some(now);
         spec.updated_at = now;
         self.save_spec(&spec)?;
+
+        // V3: Trigger seal-tree convergence check on spec completion.
+        // Best-effort — convergence failures never block spec completion.
+        let _ = self.try_completion_convergence(spec_id);
+
         Ok(spec)
+    }
+
+    /// Check if convergence is needed after a spec completes.
+    ///
+    /// Finds all completed specs with overlapping files and runs
+    /// `converge_from_seal_trees()` if 2+ completed specs overlap.
+    /// Returns the report if convergence fired, None otherwise.
+    ///
+    /// This is best-effort: errors are logged but never propagated.
+    fn try_completion_convergence(
+        &self,
+        completed_spec_id: &str,
+    ) -> Option<SealTreeConvergenceReport> {
+        // Respect convergence trigger config: "deferred" skips completion
+        // convergence entirely (everything deferred to writ finish).
+        // Reads [convergence] trigger from config.toml directly to avoid
+        // dependency on Haris's V3.7 ConvergenceConfig struct (not yet merged).
+        let config_path = self.writ_dir.join("config.toml");
+        if let Ok(config_str) = fs::read_to_string(&config_path) {
+            if let Ok(table) = config_str.parse::<toml::Value>() {
+                if let Some(trigger) = table
+                    .get("convergence")
+                    .and_then(|c| c.get("trigger"))
+                    .and_then(|t| t.as_str())
+                {
+                    if trigger == "deferred" {
+                        return None;
+                    }
+                }
+            }
+        }
+
+        let specs = self.list_specs().ok()?;
+        let completed: Vec<&Spec> = specs
+            .iter()
+            .filter(|s| matches!(s.status, SpecStatus::Complete) && !s.sealed_by.is_empty())
+            .collect();
+
+        if completed.len() < 2 {
+            return None;
+        }
+
+        let completed_spec = completed.iter().find(|s| s.id == completed_spec_id)?;
+        let completed_files = self.spec_modified_files(completed_spec).ok()?;
+
+        let mut overlapping_spec_ids: Vec<String> = Vec::new();
+        overlapping_spec_ids.push(completed_spec_id.to_string());
+
+        for other in &completed {
+            if other.id == completed_spec_id {
+                continue;
+            }
+            let other_files = self.spec_modified_files(other).ok()?;
+            if completed_files.intersection(&other_files).next().is_some() {
+                overlapping_spec_ids.push(other.id.clone());
+            }
+        }
+
+        if overlapping_spec_ids.len() < 2 {
+            return None;
+        }
+
+        match self.converge_from_seal_trees(&overlapping_spec_ids, ConvergeStrategy::Escalate) {
+            Ok(report) => {
+                let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+                let severity = if report.is_clean {
+                    crate::security::Severity::Info
+                } else {
+                    crate::security::Severity::Warning
+                };
+                let _ = logger.emit_convergence_event(
+                    "completion_convergence",
+                    severity,
+                    &format!(
+                        "Spec '{}' completed, convergence fired: {} files merged, {} escalations, clean={}",
+                        completed_spec_id,
+                        report.merged_files.len(),
+                        report.escalations.len(),
+                        report.is_clean,
+                    ),
+                );
+                Some(report)
+            }
+            Err(e) => {
+                let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+                let _ = logger.emit_convergence_event(
+                    "completion_convergence_error",
+                    crate::security::Severity::Warning,
+                    &format!(
+                        "Convergence failed after spec '{}' completed: {}",
+                        completed_spec_id, e
+                    ),
+                );
+                None
+            }
+        }
     }
 
     /// Record that a spec's work was committed to git.
@@ -6138,6 +6237,313 @@ impl Repository {
         );
     }
 
+    // -------------------------------------------------------------------
+    // Seal-tree convergence (v3)
+    // -------------------------------------------------------------------
+
+    /// Converge completed specs by reading from their seal trees instead of
+    /// disk. Uses genesis tree as the common ancestor for all merges.
+    pub fn converge_from_seal_trees(
+        &self,
+        spec_ids: &[String],
+        _strategy: ConvergeStrategy,
+    ) -> WritResult<SealTreeConvergenceReport> {
+        if spec_ids.len() < 2 {
+            return Ok(SealTreeConvergenceReport {
+                merged_files: Vec::new(),
+                escalations: Vec::new(),
+                convergence_seal_id: None,
+                is_clean: true,
+                specs_converged: spec_ids.to_vec(),
+                shadow_results: Vec::new(),
+            });
+        }
+
+        // Load specs and sort by creation time (deterministic merge order).
+        let mut specs: Vec<Spec> = Vec::new();
+        for id in spec_ids {
+            specs.push(self.load_spec(id)?);
+        }
+        specs.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        // Load genesis tree (common ancestor).
+        let genesis_tree_hash = specs
+            .iter()
+            .find_map(|s| s.genesis_tree.as_ref())
+            .ok_or_else(|| WritError::Other("No genesis tree found for any spec".to_string()))?
+            .clone();
+        let genesis_index = self.load_tree_index(&genesis_tree_hash)?;
+
+        // Load each spec's latest seal tree.
+        let mut spec_trees: Vec<(String, Index)> = Vec::new();
+        for spec in &specs {
+            if spec.sealed_by.is_empty() {
+                continue;
+            }
+            let last_seal_id = spec.sealed_by.last().unwrap();
+            let seal = self.load_seal(last_seal_id)?;
+            let idx = self.load_tree_index(&seal.tree)?;
+            spec_trees.push((spec.id.clone(), idx));
+        }
+
+        if spec_trees.len() < 2 {
+            return Ok(SealTreeConvergenceReport {
+                merged_files: Vec::new(),
+                escalations: Vec::new(),
+                convergence_seal_id: None,
+                is_clean: true,
+                specs_converged: spec_ids.to_vec(),
+                shadow_results: Vec::new(),
+            });
+        }
+
+        // Find files modified by each spec using seal change records.
+        let mut spec_modified: Vec<(String, HashSet<String>)> = Vec::new();
+        for spec in &specs {
+            if spec.sealed_by.is_empty() {
+                continue;
+            }
+            let modified = self.spec_modified_files(spec)?;
+            spec_modified.push((spec.id.clone(), modified));
+        }
+
+        // Find overlapping files (modified by 2+ specs).
+        let mut file_to_specs: HashMap<String, Vec<String>> = HashMap::new();
+        for (spec_id, files) in &spec_modified {
+            for file in files {
+                file_to_specs
+                    .entry(file.clone())
+                    .or_default()
+                    .push(spec_id.clone());
+            }
+        }
+        let overlapping_files: Vec<String> = file_to_specs
+            .iter()
+            .filter(|(_, specs)| specs.len() >= 2)
+            .map(|(path, _)| path.clone())
+            .collect();
+
+        if overlapping_files.is_empty() {
+            return Ok(SealTreeConvergenceReport {
+                merged_files: Vec::new(),
+                escalations: Vec::new(),
+                convergence_seal_id: None,
+                is_clean: true,
+                specs_converged: spec_ids.to_vec(),
+                shadow_results: Vec::new(),
+            });
+        }
+
+        // Build spec tree lookup.
+        let spec_tree_map: HashMap<&str, &Index> = spec_trees
+            .iter()
+            .map(|(id, idx)| (id.as_str(), idx))
+            .collect();
+
+        let mut merged_files = Vec::new();
+        let mut all_escalations: Vec<convergence::PipelineEscalation> = Vec::new();
+        let mut shadow_results: Vec<(String, String)> = Vec::new();
+        let mut all_clean = true;
+
+        for path in &overlapping_files {
+            let touching_specs = &file_to_specs[path];
+
+            let base_content = self
+                .file_content_at_tree(&genesis_index, path)?
+                .unwrap_or_default();
+            let base_hash = genesis_index
+                .entries
+                .get(path)
+                .map(|e| e.hash.clone())
+                .unwrap_or_default();
+
+            // Collect each spec's version.
+            let mut spec_versions: Vec<(String, String, String)> = Vec::new();
+            for spec_id in touching_specs {
+                if let Some(tree) = spec_tree_map.get(spec_id.as_str()) {
+                    let content = self.file_content_at_tree(tree, path)?.unwrap_or_default();
+                    let hash = tree
+                        .entries
+                        .get(path)
+                        .map(|e| e.hash.clone())
+                        .unwrap_or_default();
+                    spec_versions.push((spec_id.clone(), content, hash));
+                }
+            }
+
+            // N-way merge: sequential pairwise, genesis as base.
+            let mut current_merged = spec_versions[0].1.clone();
+            let mut file_clean = true;
+            let mut version_pairs: Vec<(String, String)> = Vec::new();
+            for (spec_id, _, hash) in &spec_versions {
+                version_pairs.push((spec_id.clone(), hash.clone()));
+            }
+
+            for i in 1..spec_versions.len() {
+                let right_content = &spec_versions[i].1;
+                if current_merged == *right_content {
+                    continue;
+                }
+
+                let merge_result =
+                    convergence::three_way_merge(&base_content, &current_merged, right_content);
+                match merge_result {
+                    FileMergeResult::Clean(merged) => {
+                        current_merged = merged;
+                    }
+                    FileMergeResult::Conflict(regions) => {
+                        file_clean = false;
+                        all_clean = false;
+
+                        let left_spec = if i == 1 {
+                            spec_versions[0].0.clone()
+                        } else {
+                            format!(
+                                "accumulated({})",
+                                spec_versions[..i]
+                                    .iter()
+                                    .map(|s| s.0.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("+")
+                            )
+                        };
+
+                        let conflict_desc = regions
+                            .iter()
+                            .map(|r| {
+                                format!(
+                                    "base@{}: {} lines vs {} lines",
+                                    r.base_start,
+                                    r.left_lines.len(),
+                                    r.right_lines.len()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
+
+                        all_escalations.push(convergence::PipelineEscalation {
+                            file_path: path.clone(),
+                            reason: format!("True conflict in seal-tree merge: {}", conflict_desc),
+                            conflict_class: "seal_tree_conflict".to_string(),
+                            left_spec: left_spec.clone(),
+                            right_spec: spec_versions[i].0.clone(),
+                            recommended_action:
+                                "Manual resolution required — both specs modified the same region"
+                                    .to_string(),
+                            left_content: Some(current_merged.clone()),
+                            right_content: Some(right_content.clone()),
+                            suggested_content: None,
+                            suggestion_confidence: None,
+                        });
+                    }
+                }
+            }
+
+            let merged_hash = self.objects.store(current_merged.as_bytes())?;
+            shadow_results.push((path.clone(), merged_hash.clone()));
+
+            merged_files.push(SealTreeMergeResult {
+                path: path.clone(),
+                base_hash,
+                spec_versions: version_pairs,
+                merged_hash,
+                confidence: if file_clean { 1.0 } else { 0.0 },
+                clean: file_clean,
+            });
+        }
+
+        // Create convergence seal recording the merge.
+        let convergence_seal_id = if !merged_files.is_empty() {
+            let seal_data = serde_json::json!({
+                "type": "convergence_v3",
+                "specs": spec_ids,
+                "merged_files": merged_files.iter().map(|f| &f.path).collect::<Vec<_>>(),
+                "is_clean": all_clean,
+                "timestamp": Utc::now().to_rfc3339(),
+            });
+            let seal_bytes = serde_json::to_vec(&seal_data).unwrap_or_default();
+            let hash = self.objects.store(&seal_bytes)?;
+            let record_path = self.writ_dir.join("convergence_v3_pending.json");
+            let _ = fs::write(
+                &record_path,
+                serde_json::to_string_pretty(&seal_data).unwrap_or_default(),
+            );
+            Some(hash)
+        } else {
+            None
+        };
+
+        Ok(SealTreeConvergenceReport {
+            merged_files,
+            escalations: all_escalations,
+            convergence_seal_id,
+            is_clean: all_clean,
+            specs_converged: spec_trees.iter().map(|(id, _)| id.clone()).collect(),
+            shadow_results,
+        })
+    }
+
+    /// Finalize all pending convergence for completed specs.
+    pub fn finalize_convergence(&self) -> WritResult<SealTreeConvergenceReport> {
+        let specs = self.list_specs()?;
+        let completed_ids: Vec<String> = specs
+            .iter()
+            .filter(|s| matches!(s.status, SpecStatus::Complete) && !s.sealed_by.is_empty())
+            .map(|s| s.id.clone())
+            .collect();
+
+        if completed_ids.len() < 2 {
+            return Ok(SealTreeConvergenceReport {
+                merged_files: Vec::new(),
+                escalations: Vec::new(),
+                convergence_seal_id: None,
+                is_clean: true,
+                specs_converged: completed_ids,
+                shadow_results: Vec::new(),
+            });
+        }
+
+        self.converge_from_seal_trees(&completed_ids, ConvergeStrategy::Escalate)
+    }
+
+    /// Write converged file content from object store to working directory.
+    pub fn materialize_convergence(&self, report: &SealTreeConvergenceReport) -> WritResult<()> {
+        for (path, hash) in &report.shadow_results {
+            let bytes = self.objects.retrieve(hash)?;
+            let content = String::from_utf8_lossy(&bytes);
+            let full_path = self.root.join(path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&full_path, content.as_bytes())?;
+        }
+
+        // Update the index.
+        if !report.shadow_results.is_empty() {
+            let mut index = self.load_index().unwrap_or_default();
+            for (path, hash) in &report.shadow_results {
+                let bytes = self.objects.retrieve(hash)?;
+                index.entries.insert(
+                    path.clone(),
+                    IndexEntry {
+                        hash: hash.clone(),
+                        size: bytes.len() as u64,
+                    },
+                );
+            }
+            index.save(&self.workspace_dir().join("index.json"))?;
+        }
+
+        let pending_path = self.writ_dir.join("convergence_v3_pending.json");
+        let _ = fs::remove_file(&pending_path);
+
+        Ok(())
+    }
+
     fn ignore_rules(&self) -> IgnoreRules {
         IgnoreRules::load(&self.root)
     }
@@ -8458,6 +8864,46 @@ pub struct OverlapDetail {
     pub path: String,
     /// (spec_id, content_hash) pairs for each spec that modified this file
     pub spec_hashes: Vec<(String, String)>,
+}
+
+// ---------------------------------------------------------------------------
+// Seal-Tree Convergence Types (v3)
+// ---------------------------------------------------------------------------
+
+/// Report from seal-tree convergence: reads from each spec's sealed file
+/// versions using genesis as common ancestor, instead of reading from disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealTreeConvergenceReport {
+    /// Per-file merge results.
+    pub merged_files: Vec<SealTreeMergeResult>,
+    /// Escalations for files with true conflicts.
+    pub escalations: Vec<convergence::PipelineEscalation>,
+    /// ID of the convergence seal recording this merge (if created).
+    pub convergence_seal_id: Option<String>,
+    /// True if all files merged cleanly (no escalations).
+    pub is_clean: bool,
+    /// Specs that participated in this convergence.
+    pub specs_converged: Vec<String>,
+    /// Merged file content stored in object store: (path, content_hash).
+    /// Used by `materialize_convergence()` to write to disk at finish time.
+    pub shadow_results: Vec<(String, String)>,
+}
+
+/// Result of merging a single file from seal trees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealTreeMergeResult {
+    /// Relative file path.
+    pub path: String,
+    /// Content hash of the genesis (base) version.
+    pub base_hash: String,
+    /// (spec_id, content_hash) for each spec's sealed version.
+    pub spec_versions: Vec<(String, String)>,
+    /// Content hash of the merged result in the object store.
+    pub merged_hash: String,
+    /// Merge confidence (1.0 = clean three-way merge, lower = heuristic).
+    pub confidence: f64,
+    /// True if this file merged without conflicts.
+    pub clean: bool,
 }
 
 /// Defense #3: Merge output sanity check.
@@ -22595,6 +23041,609 @@ mod convergence_integration_tests {
 }
 
 #[cfg(test)]
+mod seal_tree_convergence_tests {
+    use super::*;
+    use crate::convergence::ConvergeStrategy;
+    use crate::seal::AgentType;
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    fn setup_seal_tree_repo() -> (tempfile::TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("only-a.txt"), "original-a\n").unwrap();
+        fs::write(dir.path().join("only-b.txt"), "original-b\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.add_spec(&Spec::new("spec-a".into(), "Spec A".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("spec-b".into(), "Spec B".into(), "".into()))
+            .unwrap();
+        (dir, repo)
+    }
+
+    #[test]
+    fn test_seal_tree_2spec_clean_merge() {
+        let (dir, repo) = setup_seal_tree_repo();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "HEADER-A\nline1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "add header".into(),
+            Some("spec-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nline4\nline5\nFOOTER-B\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-b"),
+            "add footer".into(),
+            Some("spec-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_from_seal_trees(
+                &["spec-a".into(), "spec-b".into()],
+                ConvergeStrategy::Escalate,
+            )
+            .unwrap();
+        assert!(
+            report.is_clean,
+            "Non-overlapping edits should merge cleanly"
+        );
+        assert_eq!(report.merged_files.len(), 1);
+        assert_eq!(report.escalations.len(), 0);
+        let merged_bytes = repo
+            .objects
+            .retrieve(&report.merged_files[0].merged_hash)
+            .unwrap();
+        let merged = String::from_utf8_lossy(&merged_bytes);
+        assert!(merged.contains("HEADER-A"));
+        assert!(merged.contains("FOOTER-B"));
+    }
+
+    #[test]
+    fn test_seal_tree_2spec_conflict_detection() {
+        let (dir, repo) = setup_seal_tree_repo();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "CHANGED-BY-A\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "change line 1".into(),
+            Some("spec-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "CHANGED-BY-B\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-b"),
+            "also change line 1".into(),
+            Some("spec-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_from_seal_trees(
+                &["spec-a".into(), "spec-b".into()],
+                ConvergeStrategy::Escalate,
+            )
+            .unwrap();
+        assert!(!report.is_clean);
+        assert_eq!(report.escalations.len(), 1);
+        assert_eq!(report.escalations[0].file_path, "shared.txt");
+    }
+
+    #[test]
+    fn test_seal_tree_disjoint_files_no_merge() {
+        let (dir, repo) = setup_seal_tree_repo();
+        fs::write(dir.path().join("only-a.txt"), "modified-a\n").unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "a work".into(),
+            Some("spec-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(dir.path().join("only-b.txt"), "modified-b\n").unwrap();
+        repo.seal(
+            agent("agent-b"),
+            "b work".into(),
+            Some("spec-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_from_seal_trees(
+                &["spec-a".into(), "spec-b".into()],
+                ConvergeStrategy::Escalate,
+            )
+            .unwrap();
+        assert!(report.is_clean);
+        assert_eq!(report.merged_files.len(), 0);
+    }
+
+    #[test]
+    fn test_seal_tree_single_spec_returns_clean() {
+        let (dir, repo) = setup_seal_tree_repo();
+        fs::write(dir.path().join("shared.txt"), "modified\n").unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "a work".into(),
+            Some("spec-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        let report = repo
+            .converge_from_seal_trees(&["spec-a".into()], ConvergeStrategy::Escalate)
+            .unwrap();
+        assert!(report.is_clean);
+        assert_eq!(report.merged_files.len(), 0);
+    }
+
+    #[test]
+    fn test_seal_tree_shadow_results_in_object_store() {
+        let (dir, repo) = setup_seal_tree_repo();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "TOP-A\nline1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "header".into(),
+            Some("spec-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nline4\nline5\nBOTTOM-B\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-b"),
+            "footer".into(),
+            Some("spec-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_from_seal_trees(
+                &["spec-a".into(), "spec-b".into()],
+                ConvergeStrategy::Escalate,
+            )
+            .unwrap();
+        assert_eq!(report.shadow_results.len(), 1);
+        assert!(repo.objects.exists(&report.shadow_results[0].1));
+    }
+
+    #[test]
+    fn test_seal_tree_3spec_nway_merge() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("app.txt"),
+            "header\nline1\nline2\nline3\nline4\nline5\nfooter\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.add_spec(&Spec::new("s1".into(), "S1".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s2".into(), "S2".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("s3".into(), "S3".into(), "".into()))
+            .unwrap();
+
+        fs::write(
+            dir.path().join("app.txt"),
+            "NEW-HEADER\nline1\nline2\nline3\nline4\nline5\nfooter\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a1"),
+            "s1 header".into(),
+            Some("s1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("app.txt"),
+            "header\nline1\nline2\nline3\nline4\nline5\nNEW-FOOTER\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a2"),
+            "s2 footer".into(),
+            Some("s2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("app.txt"),
+            "header\nline1\nline2\nMIDDLE-INSERT\nline3\nline4\nline5\nfooter\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a3"),
+            "s3 middle".into(),
+            Some("s3".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_from_seal_trees(
+                &["s1".into(), "s2".into(), "s3".into()],
+                ConvergeStrategy::Escalate,
+            )
+            .unwrap();
+        assert!(report.is_clean);
+        let merged_bytes = repo
+            .objects
+            .retrieve(&report.merged_files[0].merged_hash)
+            .unwrap();
+        let merged = String::from_utf8_lossy(&merged_bytes);
+        assert!(merged.contains("NEW-HEADER"));
+        assert!(merged.contains("NEW-FOOTER"));
+        assert!(merged.contains("MIDDLE-INSERT"));
+    }
+
+    #[test]
+    fn test_seal_tree_contaminated_inputs_same_result() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.add_spec(&Spec::new("sa".into(), "SA".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("sb".into(), "SB".into(), "".into()))
+            .unwrap();
+
+        // Agent A writes header.
+        fs::write(
+            dir.path().join("shared.txt"),
+            "A-HEADER\nline1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("a"),
+            "a header".into(),
+            Some("sa".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        // Agent B reads disk (sees A's header — contaminated) and adds footer.
+        fs::write(
+            dir.path().join("shared.txt"),
+            "A-HEADER\nline1\nline2\nline3\nline4\nline5\nB-FOOTER\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("b"),
+            "b footer (contaminated)".into(),
+            Some("sb".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_from_seal_trees(&["sa".into(), "sb".into()], ConvergeStrategy::Escalate)
+            .unwrap();
+        assert!(report.is_clean, "Contaminated merge should still be clean");
+        let merged_bytes = repo
+            .objects
+            .retrieve(&report.merged_files[0].merged_hash)
+            .unwrap();
+        let merged = String::from_utf8_lossy(&merged_bytes);
+        assert!(merged.contains("A-HEADER"));
+        assert!(merged.contains("B-FOOTER"));
+        assert_eq!(merged.matches("A-HEADER").count(), 1, "No stacking");
+    }
+
+    #[test]
+    fn test_seal_tree_deterministic_ordering() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("f.txt"),
+            "line1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.add_spec(&Spec::new("x".into(), "X".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("y".into(), "Y".into(), "".into()))
+            .unwrap();
+
+        fs::write(
+            dir.path().join("f.txt"),
+            "X-TOP\nline1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("ax"),
+            "x top".into(),
+            Some("x".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("f.txt"),
+            "line1\nline2\nline3\nline4\nline5\nY-BOTTOM\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("ay"),
+            "y bottom".into(),
+            Some("y".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let r1 = repo
+            .converge_from_seal_trees(&["x".into(), "y".into()], ConvergeStrategy::Escalate)
+            .unwrap();
+        let r2 = repo
+            .converge_from_seal_trees(&["y".into(), "x".into()], ConvergeStrategy::Escalate)
+            .unwrap();
+        assert_eq!(
+            r1.merged_files[0].merged_hash, r2.merged_files[0].merged_hash,
+            "Must be deterministic"
+        );
+    }
+
+    #[test]
+    fn test_seal_tree_genesis_always_used_as_base() {
+        let (dir, repo) = setup_seal_tree_repo();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "A-ADDED\nline1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "a adds header".into(),
+            Some("spec-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nline4\nline5\nB-ADDED\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-b"),
+            "b adds footer".into(),
+            Some("spec-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_from_seal_trees(
+                &["spec-a".into(), "spec-b".into()],
+                ConvergeStrategy::Escalate,
+            )
+            .unwrap();
+        assert!(report.is_clean);
+        let genesis = repo.load_spec("spec-a").unwrap().genesis_tree.unwrap();
+        let genesis_idx = repo.load_tree_index(&genesis).unwrap();
+        let genesis_hash = genesis_idx
+            .entries
+            .get("shared.txt")
+            .map(|e| e.hash.clone())
+            .unwrap_or_default();
+        assert_eq!(report.merged_files[0].base_hash, genesis_hash);
+    }
+
+    #[test]
+    fn test_materialize_convergence_writes_to_disk() {
+        let (dir, repo) = setup_seal_tree_repo();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "MAT-A\nline1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "a".into(),
+            Some("spec-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nline4\nline5\nMAT-B\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-b"),
+            "b".into(),
+            Some("spec-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let report = repo
+            .converge_from_seal_trees(
+                &["spec-a".into(), "spec-b".into()],
+                ConvergeStrategy::Escalate,
+            )
+            .unwrap();
+        assert!(report.is_clean);
+        repo.materialize_convergence(&report).unwrap();
+        let on_disk = fs::read_to_string(dir.path().join("shared.txt")).unwrap();
+        assert!(on_disk.contains("MAT-A"));
+        assert!(on_disk.contains("MAT-B"));
+    }
+
+    #[test]
+    fn test_finalize_convergence_backstop() {
+        let (dir, repo) = setup_seal_tree_repo();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "FINAL-A\nline1\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "a".into(),
+            Some("spec-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nline4\nline5\nFINAL-B\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-b"),
+            "b".into(),
+            Some("spec-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.mark_spec_done("spec-a", Some("done".into())).unwrap();
+        repo.mark_spec_done("spec-b", Some("done".into())).unwrap();
+
+        let report = repo.finalize_convergence().unwrap();
+        assert!(report.is_clean);
+        assert_eq!(report.merged_files.len(), 1);
+    }
+}
+
+#[cfg(test)]
 #[allow(deprecated)]
 mod converge_all_tests {
     use super::*;
@@ -31066,6 +32115,13 @@ mod workspace_tests {
     ) -> (Repository, crate::seal::Seal, crate::seal::Seal) {
         let repo = Repository::init(dir.path()).unwrap();
 
+        // Enable on-seal convergence (V3 default is off).
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            "[watch]\nauto_converge_on_seal = true\n",
+        )
+        .unwrap();
+
         // Baseline seal so specs have a common ancestor.
         fs::write(dir.path().join("shared.rs"), "// base\nfn hello() {}\n").unwrap();
         repo.seal(
@@ -31301,6 +32357,13 @@ mod workspace_tests {
         // involving all three.
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
+
+        // Enable on-seal convergence (V3 default is off).
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            "[watch]\nauto_converge_on_seal = true\n",
+        )
+        .unwrap();
 
         fs::write(dir.path().join("shared.rs"), "// base\nfn hello() {}\n").unwrap();
         repo.seal(

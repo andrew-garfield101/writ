@@ -3751,10 +3751,15 @@ impl Repository {
             }
         }
 
+        let epoch = self.convergence_epoch();
         let specs = self.list_specs().ok()?;
         let completed: Vec<&Spec> = specs
             .iter()
-            .filter(|s| matches!(s.status, SpecStatus::Complete) && !s.sealed_by.is_empty())
+            .filter(|s| {
+                matches!(s.status, SpecStatus::Complete)
+                    && !s.sealed_by.is_empty()
+                    && epoch.map_or(true, |e| s.created_at > e)
+            })
             .collect();
 
         if completed.len() < 2 {
@@ -6487,12 +6492,30 @@ impl Repository {
         })
     }
 
+    /// Find the timestamp of the latest bridge import seal.
+    /// This serves as an epoch boundary: only specs created after this
+    /// timestamp should participate in convergence (earlier ones were
+    /// already committed via a previous `writ finish`).
+    fn convergence_epoch(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let seals = self.log().ok()?;
+        seals
+            .iter()
+            .filter(|s| s.agent.id == "writ-bridge")
+            .map(|s| s.timestamp)
+            .max()
+    }
+
     /// Finalize all pending convergence for completed specs.
     pub fn finalize_convergence(&self) -> WritResult<SealTreeConvergenceReport> {
+        let epoch = self.convergence_epoch();
         let specs = self.list_specs()?;
         let completed_ids: Vec<String> = specs
             .iter()
-            .filter(|s| matches!(s.status, SpecStatus::Complete) && !s.sealed_by.is_empty())
+            .filter(|s| {
+                matches!(s.status, SpecStatus::Complete)
+                    && !s.sealed_by.is_empty()
+                    && epoch.map_or(true, |e| s.created_at > e)
+            })
             .map(|s| s.id.clone())
             .collect();
 
@@ -23640,6 +23663,183 @@ mod seal_tree_convergence_tests {
         let report = repo.finalize_convergence().unwrap();
         assert!(report.is_clean);
         assert_eq!(report.merged_files.len(), 1);
+    }
+
+    /// T1-BUG-1: Specs created before the latest bridge import seal should
+    /// be excluded from convergence. Without this filter, `writ finish` on a
+    /// repo with prior history produces false conflicts from already-committed specs.
+    #[test]
+    fn test_epoch_boundary_excludes_pre_bridge_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+
+        // --- Pre-epoch: simulate specs from a previous session ---
+        fs::write(dir.path().join("shared.txt"), "original\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Old specs (pre-epoch)
+        repo.add_spec(&Spec::new("old-a".into(), "Old A".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("old-b".into(), "Old B".into(), "".into()))
+            .unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "old-a-version\n").unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "old a work".into(),
+            Some("old-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(dir.path().join("shared.txt"), "old-b-version\n").unwrap();
+        repo.seal(
+            agent("agent-b"),
+            "old b work".into(),
+            Some("old-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.mark_spec_done("old-a", Some("done".into())).unwrap();
+        repo.mark_spec_done("old-b", Some("done".into())).unwrap();
+
+        // --- Bridge import seal (epoch boundary) ---
+        // Simulates `writ init` re-importing from git after `writ finish`
+        let bridge_agent = AgentIdentity {
+            id: "writ-bridge".into(),
+            agent_type: crate::seal::AgentType::Agent,
+        };
+        fs::write(dir.path().join("shared.txt"), "committed-state\n").unwrap();
+        repo.seal(
+            bridge_agent,
+            "bridge import from git abc123".into(),
+            None,
+            TaskStatus::Complete,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // --- Post-epoch: new specs from current session ---
+        repo.add_spec(&Spec::new("new-a".into(), "New A".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("new-b".into(), "New B".into(), "".into()))
+            .unwrap();
+
+        fs::write(
+            dir.path().join("shared.txt"),
+            "NEW-A-TOP\ncommitted-state\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "new a work".into(),
+            Some("new-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "committed-state\nNEW-B-BOTTOM\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-b"),
+            "new b work".into(),
+            Some("new-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.mark_spec_done("new-a", Some("done".into())).unwrap();
+        repo.mark_spec_done("new-b", Some("done".into())).unwrap();
+
+        // finalize_convergence should ONLY include new-a and new-b
+        let report = repo.finalize_convergence().unwrap();
+        assert_eq!(
+            report.specs_converged.len(),
+            2,
+            "should only converge 2 post-epoch specs, got: {:?}",
+            report.specs_converged
+        );
+        assert!(
+            report.specs_converged.contains(&"new-a".to_string()),
+            "new-a should be in converged specs"
+        );
+        assert!(
+            report.specs_converged.contains(&"new-b".to_string()),
+            "new-b should be in converged specs"
+        );
+        assert!(
+            !report.specs_converged.contains(&"old-a".to_string()),
+            "old-a should be excluded (pre-epoch)"
+        );
+        assert!(
+            !report.specs_converged.contains(&"old-b".to_string()),
+            "old-b should be excluded (pre-epoch)"
+        );
+    }
+
+    /// Verify that convergence_epoch returns None when there are no bridge seals,
+    /// meaning all specs participate (fresh repo, no prior history).
+    #[test]
+    fn test_no_bridge_seal_includes_all_specs() {
+        let (dir, repo) = setup_seal_tree_repo();
+        // No bridge seal exists → epoch is None → all specs included
+        assert!(repo.convergence_epoch().is_none());
+
+        fs::write(
+            dir.path().join("shared.txt"),
+            "SPEC-A\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "a".into(),
+            Some("spec-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "line1\nline2\nline3\nline4\nSPEC-B\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-b"),
+            "b".into(),
+            Some("spec-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.mark_spec_done("spec-a", Some("done".into())).unwrap();
+        repo.mark_spec_done("spec-b", Some("done".into())).unwrap();
+
+        let report = repo.finalize_convergence().unwrap();
+        assert_eq!(report.specs_converged.len(), 2);
     }
 }
 

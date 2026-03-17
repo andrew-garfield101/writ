@@ -24,6 +24,11 @@ pub enum WritError {
     SpecNotFound(String),
     /// A spec with this ID already exists.
     SpecAlreadyExists(String),
+    /// Multiple specs match the given input (ambiguous slug or ID prefix).
+    AmbiguousSpec {
+        input: String,
+        candidates: Vec<(String, String, String)>, // (id, slug, title)
+    },
     /// A spec is already claimed by another agent.
     SpecAlreadyClaimed { spec_id: String, claimed_by: String },
     /// A seal with this ID already exists (immutable store).
@@ -95,6 +100,13 @@ impl fmt::Display for WritError {
                     f,
                     "spec '{id}' already exists (use 'writ spec update' to modify)"
                 )
+            }
+            WritError::AmbiguousSpec { input, candidates } => {
+                write!(f, "multiple specs match '{input}':")?;
+                for (id, slug, title) in candidates {
+                    write!(f, "\n  {id}  {slug}  \"{title}\"")?;
+                }
+                write!(f, "\nhint: use the full spec ID to disambiguate")
             }
             WritError::SpecAlreadyClaimed {
                 spec_id,

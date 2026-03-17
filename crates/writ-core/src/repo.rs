@@ -148,6 +148,27 @@ fn slugify_title(title: &str) -> String {
     }
 }
 
+/// Generate a unique spec ID from the title.
+///
+/// The ID is 12 hex chars derived from BLAKE3(title + timestamp_nanos + 8 random bytes).
+/// This guarantees uniqueness even for identical titles created at the same nanosecond
+/// across different agents, because the 8 random bytes provide sufficient entropy.
+fn generate_spec_id(title: &str) -> String {
+    use rand::Rng;
+
+    let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let random_bytes: [u8; 8] = rand::thread_rng().gen();
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(title.as_bytes());
+    hasher.update(&timestamp.to_le_bytes());
+    hasher.update(&random_bytes);
+
+    let hash = hasher.finalize();
+    let bytes = &hash.as_bytes()[..6];
+    bytes.iter().map(|b| format!("{:02x}", b)).collect() // 12 hex chars = 48 bits
+}
+
 /// Ensure the workspace root directory is listed in the project `.gitignore`.
 ///
 /// Called by `create_task()` on first invocation. Idempotent — safe to call
@@ -987,8 +1008,9 @@ impl Repository {
 
     /// Get the seal chain for a specific spec, walking from its tip.
     pub fn spec_log(&self, spec_id: &str) -> WritResult<Vec<Seal>> {
+        let resolved = self.resolve_spec(spec_id)?;
         let mut seals = Vec::new();
-        let mut current = self.read_spec_head(spec_id)?;
+        let mut current = self.read_spec_head(&resolved.id)?;
 
         while let Some(seal_id) = current {
             let seal = self.load_seal(&seal_id)?;
@@ -1626,8 +1648,95 @@ impl Repository {
             return Err(WritError::SpecNotFound(id.to_string()));
         }
         let data = fs::read_to_string(&path)?;
-        let spec: Spec = serde_json::from_str(&data)?;
+        let mut spec: Spec = serde_json::from_str(&data)?;
+        // Backfill slug for legacy specs that predate the slug field.
+        if spec.slug.is_empty() {
+            spec.slug = slugify_title(&spec.title);
+        }
         Ok(spec)
+    }
+
+    /// Resolve a spec from user input, which can be an exact ID, ID prefix,
+    /// exact slug, or slug prefix. Returns the spec if unambiguous, or an
+    /// `AmbiguousSpec` error listing candidates.
+    pub fn resolve_spec(&self, input: &str) -> WritResult<Spec> {
+        let input = input.trim();
+        if input.is_empty() {
+            return Err(WritError::InvalidInput("spec ID cannot be empty".into()));
+        }
+
+        // Try exact ID match first (fast path, no listing needed).
+        if let Ok(spec) = self.load_spec(input) {
+            return Ok(spec);
+        }
+
+        // Load all specs for prefix/slug matching.
+        let specs = self.list_specs()?;
+
+        // ID prefix match.
+        let id_prefix_matches: Vec<&Spec> =
+            specs.iter().filter(|s| s.id.starts_with(input)).collect();
+        if id_prefix_matches.len() == 1 {
+            return Ok(id_prefix_matches[0].clone());
+        }
+
+        // Exact slug match.
+        let input_lower = input.to_lowercase();
+        let slug_exact: Vec<&Spec> = specs
+            .iter()
+            .filter(|s| {
+                let slug = if s.slug.is_empty() {
+                    slugify_title(&s.title)
+                } else {
+                    s.slug.clone()
+                };
+                slug == input_lower
+            })
+            .collect();
+        if slug_exact.len() == 1 {
+            return Ok(slug_exact[0].clone());
+        }
+
+        // Slug prefix match.
+        let slug_prefix: Vec<&Spec> = specs
+            .iter()
+            .filter(|s| {
+                let slug = if s.slug.is_empty() {
+                    slugify_title(&s.title)
+                } else {
+                    s.slug.clone()
+                };
+                slug.starts_with(&input_lower)
+            })
+            .collect();
+        if slug_prefix.len() == 1 {
+            return Ok(slug_prefix[0].clone());
+        }
+
+        // Collect all candidates for disambiguation (union of all match types).
+        let mut seen = std::collections::HashSet::new();
+        let mut candidates: Vec<(String, String, String)> = Vec::new();
+        for matches in [&id_prefix_matches, &slug_exact, &slug_prefix] {
+            for s in matches {
+                if seen.insert(s.id.clone()) {
+                    let slug = if s.slug.is_empty() {
+                        slugify_title(&s.title)
+                    } else {
+                        s.slug.clone()
+                    };
+                    candidates.push((s.id.clone(), slug, s.title.clone()));
+                }
+            }
+        }
+
+        if candidates.is_empty() {
+            Err(WritError::SpecNotFound(input.to_string()))
+        } else {
+            Err(WritError::AmbiguousSpec {
+                input: input.to_string(),
+                candidates,
+            })
+        }
     }
 
     // --- Spec lifecycle management (GC.1.2) ---
@@ -1684,7 +1793,7 @@ impl Repository {
     pub fn cancel_spec(&self, spec_id: &str) -> WritResult<()> {
         use crate::spec::LifecycleState;
 
-        let spec = self.load_spec(spec_id)?;
+        let spec = self.resolve_spec(spec_id)?;
         match spec.lifecycle_state {
             LifecycleState::Active | LifecycleState::Stale => {
                 self.transition_spec_lifecycle(spec_id, LifecycleState::Cancelled)
@@ -1732,7 +1841,7 @@ impl Repository {
     pub fn reopen_spec(&self, spec_id: &str) -> WritResult<()> {
         use crate::spec::{CommitState, LifecycleState, SpecStatus};
 
-        let mut spec = self.load_spec(spec_id)?;
+        let mut spec = self.resolve_spec(spec_id)?;
 
         // Only completed specs can be reopened.
         if spec.status != SpecStatus::Complete {
@@ -1769,7 +1878,7 @@ impl Repository {
     /// is already claimed by a different agent. Claiming the same spec by the
     /// same agent is a no-op (idempotent).
     pub fn spec_claim(&self, spec_id: &str, agent_id: &str) -> WritResult<()> {
-        let mut spec = self.load_spec(spec_id)?;
+        let mut spec = self.resolve_spec(spec_id)?;
         if let Some(ref existing) = spec.claimed_by {
             if existing == agent_id {
                 return Ok(()); // idempotent — same agent re-claiming
@@ -1810,7 +1919,7 @@ impl Repository {
     /// Sets `spec.workspace = None`. The spec remains intact; only the
     /// workspace association is cleared.
     pub fn unassign_spec_from_workspace(&self, spec_id: &str) -> WritResult<()> {
-        let mut spec = self.load_spec(spec_id)?;
+        let mut spec = self.resolve_spec(spec_id)?;
         spec.workspace = None;
         self.save_spec(&spec)?;
         Ok(())
@@ -1887,13 +1996,20 @@ impl Repository {
         title: String,
         id_override: Option<String>,
     ) -> WritResult<TaskCreationResult> {
+        let slug = slugify_title(&title);
         let spec_id = match id_override {
-            Some(id) => id,
-            None => slugify_title(&title),
+            Some(ref id) => id.clone(),
+            None => generate_spec_id(&title),
+        };
+        // Use slug for workspace naming (human-readable), or the override ID if provided.
+        let ws_name = match id_override {
+            Some(ref id) => id.clone(),
+            None => slug.clone(),
         };
 
         // Create the spec.
-        let spec = crate::spec::Spec::new(spec_id.clone(), title.clone(), String::new());
+        let spec =
+            crate::spec::Spec::with_slug(spec_id.clone(), slug, title.clone(), String::new());
         self.add_spec(&spec)?;
 
         // Resolve workspace root from config (default: "workspaces").
@@ -1901,12 +2017,12 @@ impl Repository {
             .map(|c| c.workspace_root().to_string())
             .unwrap_or_else(|_| crate::config::DEFAULT_WORKSPACE_ROOT.to_string());
 
-        // Create workspace at project root <ws_root>/<id>/ (not .writ/ws/).
-        let ws_path = self.root.join(&ws_root).join(&spec_id);
-        let ws_info = self.create_workspace(&spec_id, Some(ws_path.as_path()), None)?;
+        // Create workspace at project root <ws_root>/<slug>/ (human-readable paths).
+        let ws_path = self.root.join(&ws_root).join(&ws_name);
+        let ws_info = self.create_workspace(&ws_name, Some(ws_path.as_path()), None)?;
 
         // Assign the spec to the workspace.
-        self.assign_spec_to_workspace(&spec_id, &spec_id)?;
+        self.assign_spec_to_workspace(&spec_id, &ws_name)?;
 
         // Ensure workspace root is in .gitignore.
         ensure_workspaces_gitignored(&self.root, &ws_root)?;
@@ -1940,16 +2056,18 @@ impl Repository {
 
     /// Create specs in batch from a list of task descriptions.
     ///
-    /// Each title is slugified into a spec ID. Returns the list of created
-    /// specs. Stops on the first error (duplicate ID, etc.).
+    /// Each title gets a unique hash-based ID and a human-readable slug.
+    /// Stops on the first error.
     pub fn plan(&self, tasks: Vec<String>) -> WritResult<Vec<PlanResult>> {
         let mut results = Vec::new();
         for task in tasks {
-            let id = slugify_title(&task);
-            let spec = crate::spec::Spec::new(id.clone(), task.clone(), String::new());
+            let id = generate_spec_id(&task);
+            let slug = slugify_title(&task);
+            let spec = crate::spec::Spec::with_slug(id.clone(), slug.clone(), task.clone(), String::new());
             self.add_spec(&spec)?;
             results.push(PlanResult {
                 spec_id: id,
+                slug,
                 title: task,
             });
         }
@@ -3643,7 +3761,7 @@ impl Repository {
 
     /// Update a spec's mutable fields. Bumps `updated_at`.
     pub fn update_spec(&self, id: &str, update: SpecUpdate) -> WritResult<Spec> {
-        let mut spec = self.load_spec(id)?;
+        let mut spec = self.resolve_spec(id)?;
 
         if let Some(status) = update.status {
             spec.status = status;
@@ -3693,7 +3811,7 @@ impl Repository {
     /// This is the round-trip workflow entry point (distinct from GC's
     /// `complete_spec` which transitions lifecycle_state).
     pub fn mark_spec_done(&self, spec_id: &str, summary: Option<String>) -> WritResult<Spec> {
-        let mut spec = self.load_spec(spec_id)?;
+        let mut spec = self.resolve_spec(spec_id)?;
 
         // Idempotent: if already complete, update summary if provided and return success.
         // This prevents errors when seal() auto-promotes the spec via auto_promote_spec_status
@@ -8179,6 +8297,11 @@ impl Repository {
 
         crate::spec::Spec {
             id: existing.id.clone(),
+            slug: if existing.slug.is_empty() {
+                incoming.slug.clone()
+            } else {
+                existing.slug.clone()
+            },
             title,
             description,
             status,
@@ -8767,6 +8890,7 @@ pub struct TaskCreationResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanResult {
     pub spec_id: String,
+    pub slug: String,
     pub title: String,
 }
 
@@ -13547,6 +13671,7 @@ mod verify_all_chains_tests {
         // Create a spec
         let spec = Spec {
             id: "test-spec".to_string(),
+            slug: String::new(),
             title: "Test spec".to_string(),
             description: "testing".to_string(),
             status: SpecStatus::InProgress,
@@ -13612,6 +13737,7 @@ mod verify_all_chains_tests {
         for name in &["alpha", "beta"] {
             let spec = Spec {
                 id: name.to_string(),
+                slug: String::new(),
                 title: name.to_string(),
                 description: "testing".to_string(),
                 status: SpecStatus::InProgress,
@@ -16149,6 +16275,7 @@ mod remote_tests {
         let now = chrono::Utc::now();
         let spec_pending = crate::spec::Spec {
             id: "spec-1".to_string(),
+            slug: String::new(),
             title: "Test".to_string(),
             description: "Test spec".to_string(),
             status: SpecStatus::Pending,
@@ -30502,7 +30629,7 @@ mod workspace_tests {
 
         let result = repo.create_task("Backend API work".into(), None).unwrap();
 
-        assert_eq!(result.spec_id, "backend-api-work");
+        assert_eq!(result.spec_id.len(), 12, "spec ID should be 12 hex chars");
         assert_eq!(result.title, "Backend API work");
         assert_eq!(result.workspace_name, "backend-api-work");
         assert!(result.workspace_path.exists());
@@ -30514,10 +30641,12 @@ mod workspace_tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
 
-        repo.create_task("My feature".into(), None).unwrap();
+        let result = repo.create_task("My feature".into(), None).unwrap();
 
-        let spec = repo.load_spec("my-feature").unwrap();
+        let spec = repo.load_spec(&result.spec_id).unwrap();
         assert_eq!(spec.title, "My feature");
+        assert_eq!(spec.slug, "my-feature");
+        assert_eq!(spec.id.len(), 12); // hash-based ID is 12 hex chars
     }
 
     #[test]
@@ -30537,9 +30666,9 @@ mod workspace_tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
 
-        repo.create_task("Dashboard UI".into(), None).unwrap();
+        let result = repo.create_task("Dashboard UI".into(), None).unwrap();
 
-        let spec = repo.load_spec("dashboard-ui").unwrap();
+        let spec = repo.load_spec(&result.spec_id).unwrap();
         assert_eq!(
             spec.workspace.as_deref(),
             Some("dashboard-ui"),
@@ -30556,7 +30685,7 @@ mod workspace_tests {
             .create_task("Payment integration".into(), None)
             .unwrap();
 
-        // Workspace dir should be at <root>/workspaces/<id>/, NOT .writ/workspaces/
+        // Workspace dir should be at <root>/workspaces/<slug>/, NOT .writ/workspaces/
         assert!(
             result
                 .workspace_path
@@ -30615,13 +30744,18 @@ mod workspace_tests {
     }
 
     #[test]
-    fn test_create_task_duplicate_title_fails() {
+    fn test_create_task_duplicate_title_allowed_different_ids() {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
 
-        repo.create_task("Same title".into(), None).unwrap();
-        let err = repo.create_task("Same title".into(), None);
-        assert!(err.is_err(), "duplicate task title should fail");
+        // Same title now gets different hash-based IDs (no collision).
+        // But workspace slug collision will still block the second create_task.
+        let result1 = repo.create_task("Same title".into(), None).unwrap();
+        let result2 = repo.create_task("Same title".into(), None);
+
+        // Spec IDs are different (hash-based), but workspace slug collides.
+        assert!(result2.is_err(), "duplicate workspace slug should fail");
+        assert_ne!(result1.spec_id.len(), 0);
     }
 
     #[test]
@@ -30657,11 +30791,187 @@ mod workspace_tests {
 
         let result = repo.create_task("Test feature".into(), None).unwrap();
 
-        assert_eq!(result.spec_id, "test-feature");
+        assert_eq!(result.spec_id.len(), 12, "spec ID should be 12 hex chars");
         assert_eq!(result.title, "Test feature");
         assert_eq!(result.workspace_name, "test-feature");
         assert!(result.workspace_path.ends_with("workspaces/test-feature"));
         assert!(!result.suggested_prompt.is_empty());
+    }
+
+    // ─── S.1: generate_spec_id() tests ────────────────────────────────
+
+    #[test]
+    fn test_generate_spec_id_format() {
+        let id = generate_spec_id("My feature");
+        assert_eq!(id.len(), 12, "spec ID should be 12 hex chars");
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "spec ID should be valid hex, got: {id}"
+        );
+    }
+
+    #[test]
+    fn test_generate_spec_id_uniqueness() {
+        let id1 = generate_spec_id("Same title");
+        let id2 = generate_spec_id("Same title");
+        assert_ne!(id1, id2, "same title should produce different IDs");
+    }
+
+    #[test]
+    fn test_generate_spec_id_different_titles() {
+        let id1 = generate_spec_id("Add header");
+        let id2 = generate_spec_id("Add footer");
+        assert_ne!(id1, id2);
+    }
+
+    #[test]
+    fn test_plan_creates_hash_ids_with_slugs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let results = repo
+            .plan(vec!["Add auth module".into(), "Fix login bug".into()])
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        for r in &results {
+            assert_eq!(r.spec_id.len(), 12, "plan spec IDs should be 12 hex chars");
+            assert!(r.spec_id.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+        assert_ne!(results[0].spec_id, results[1].spec_id);
+
+        // Verify slugs stored on specs
+        let spec0 = repo.load_spec(&results[0].spec_id).unwrap();
+        assert_eq!(spec0.slug, "add-auth-module");
+        let spec1 = repo.load_spec(&results[1].spec_id).unwrap();
+        assert_eq!(spec1.slug, "fix-login-bug");
+    }
+
+    #[test]
+    fn test_plan_same_title_twice_succeeds() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let results = repo
+            .plan(vec!["Debug source code".into(), "Debug source code".into()])
+            .unwrap();
+
+        assert_eq!(results.len(), 2);
+        assert_ne!(
+            results[0].spec_id, results[1].spec_id,
+            "same title should get different hash IDs"
+        );
+    }
+
+    // ─── S.2: resolve_spec() tests ─────────────────────────────────────
+
+    #[test]
+    fn test_resolve_spec_exact_id() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let results = repo.plan(vec!["Auth feature".into()]).unwrap();
+        let id = &results[0].spec_id;
+
+        let spec = repo.resolve_spec(id).unwrap();
+        assert_eq!(spec.id, *id);
+    }
+
+    #[test]
+    fn test_resolve_spec_id_prefix() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let results = repo.plan(vec!["Auth feature".into()]).unwrap();
+        let id = &results[0].spec_id;
+        let prefix = &id[..6];
+
+        let spec = repo.resolve_spec(prefix).unwrap();
+        assert_eq!(spec.id, *id);
+    }
+
+    #[test]
+    fn test_resolve_spec_exact_slug() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.plan(vec!["Auth feature".into()]).unwrap();
+
+        let spec = repo.resolve_spec("auth-feature").unwrap();
+        assert_eq!(spec.slug, "auth-feature");
+    }
+
+    #[test]
+    fn test_resolve_spec_slug_prefix() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.plan(vec!["Auth feature".into()]).unwrap();
+
+        let spec = repo.resolve_spec("auth-feat").unwrap();
+        assert_eq!(spec.slug, "auth-feature");
+    }
+
+    #[test]
+    fn test_resolve_spec_ambiguous_slug() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        // Same title twice → same slug, different IDs
+        repo.plan(vec![
+            "Debug source code".into(),
+            "Debug source code".into(),
+        ])
+        .unwrap();
+
+        let err = repo.resolve_spec("debug-source-code");
+        assert!(err.is_err());
+        match err.unwrap_err() {
+            WritError::AmbiguousSpec { input, candidates } => {
+                assert_eq!(input, "debug-source-code");
+                assert_eq!(candidates.len(), 2);
+            }
+            other => panic!("expected AmbiguousSpec, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_spec_not_found() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let err = repo.resolve_spec("nonexistent");
+        assert!(matches!(err, Err(WritError::SpecNotFound(_))));
+    }
+
+    #[test]
+    fn test_resolve_spec_empty_input() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let err = repo.resolve_spec("");
+        assert!(matches!(err, Err(WritError::InvalidInput(_))));
+    }
+
+    #[test]
+    fn test_resolve_spec_legacy_spec_no_slug() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        // Create a legacy-style spec (ID == slug, no slug field)
+        let spec = Spec::new("my-old-spec".into(), "My old spec".into(), String::new());
+        repo.add_spec(&spec).unwrap();
+
+        // Should resolve by the old ID directly
+        let resolved = repo.resolve_spec("my-old-spec").unwrap();
+        assert_eq!(resolved.id, "my-old-spec");
+        // Slug should be backfilled from title on load
+        assert_eq!(resolved.slug, "my-old-spec");
+    }
+
+    #[test]
+    fn test_resolve_spec_case_insensitive_slug() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.plan(vec!["Auth Feature".into()]).unwrap();
+
+        // Slug is "auth-feature" (lowercase), input with uppercase should still match
+        let spec = repo.resolve_spec("auth-feature").unwrap();
+        assert_eq!(spec.title, "Auth Feature");
     }
 
     // ─── WV.12: slugify_title() tests ────────────────────────────────
@@ -31007,7 +31317,7 @@ mod workspace_tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
 
-        repo.create_task("Auth module".into(), None).unwrap();
+        let result = repo.create_task("Auth module".into(), None).unwrap();
 
         let filter = crate::context::ContextFilter {
             workspace: Some("auth-module".to_string()),
@@ -31019,7 +31329,7 @@ mod workspace_tests {
 
         assert!(ctx.task.is_some(), "workspace context should include task");
         let task = ctx.task.unwrap();
-        assert_eq!(task.id, "auth-module");
+        assert_eq!(task.id, result.spec_id);
     }
 
     #[test]
@@ -31043,7 +31353,7 @@ mod workspace_tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
 
-        repo.create_task("Backend API".into(), None).unwrap();
+        let result = repo.create_task("Backend API".into(), None).unwrap();
 
         let filter = crate::context::ContextFilter {
             workspace: Some("backend-api".to_string()),
@@ -31054,7 +31364,8 @@ mod workspace_tests {
             .unwrap();
 
         let task = ctx.task.expect("task should be present");
-        assert_eq!(task.id, "backend-api");
+        assert_eq!(task.id, result.spec_id);
+        assert_eq!(task.id.len(), 12, "spec ID should be 12 hex chars");
         assert_eq!(task.title, "Backend API");
         // New spec defaults to Pending; Debug format lowercased.
         assert_eq!(task.status, "pending");
@@ -31065,10 +31376,10 @@ mod workspace_tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
 
-        repo.create_task("Complete me".into(), None).unwrap();
+        let result = repo.create_task("Complete me".into(), None).unwrap();
 
         // Mark the spec complete.
-        let mut spec = repo.load_spec("complete-me").unwrap();
+        let mut spec = repo.resolve_spec("complete-me").unwrap();
         spec.status = SpecStatus::Complete;
         repo.save_spec(&spec).unwrap();
 
@@ -31148,28 +31459,28 @@ mod workspace_tests {
 
         // Create task
         let task = repo.create_task("Auth module".into(), None).unwrap();
-        assert_eq!(task.spec_id, "auth-module");
+        assert_eq!(task.spec_id.len(), 12, "spec ID should be 12 hex chars");
 
         // Write a file in the workspace directory
         fs::write(task.workspace_path.join("auth.py"), "def login(): pass\n").unwrap();
 
-        // Seal work
+        // Seal work using the hash-based spec ID
         repo.seal(
             test_agent(),
             "added auth module".into(),
-            Some("auth-module".into()),
+            Some(task.spec_id.clone()),
             TaskStatus::InProgress,
             Verification::default(),
             false,
         )
         .unwrap();
 
-        // Mark spec complete
-        let mut spec = repo.load_spec("auth-module").unwrap();
+        // Mark spec complete (resolve by slug)
+        let mut spec = repo.resolve_spec("auth-module").unwrap();
         spec.status = SpecStatus::Complete;
         repo.save_spec(&spec).unwrap();
 
-        let spec = repo.load_spec("auth-module").unwrap();
+        let spec = repo.resolve_spec("auth-module").unwrap();
         assert_eq!(spec.status, SpecStatus::Complete);
     }
 
@@ -31191,9 +31502,9 @@ mod workspace_tests {
         let t1 = repo.create_task("Backend API".into(), None).unwrap();
         let t2 = repo.create_task("Frontend UI".into(), None).unwrap();
 
-        // Both specs exist
-        assert!(repo.load_spec("backend-api").is_ok());
-        assert!(repo.load_spec("frontend-ui").is_ok());
+        // Both specs exist (resolve by slug)
+        assert!(repo.resolve_spec("backend-api").is_ok());
+        assert!(repo.resolve_spec("frontend-ui").is_ok());
 
         // Both workspaces exist at project root
         assert!(t1.workspace_path.exists());

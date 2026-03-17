@@ -84,8 +84,13 @@ impl CommitState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
-    /// Unique spec identifier (e.g. "auth-migration").
+    /// Unique spec identifier — hash-based (12 hex chars) for new specs,
+    /// or legacy slug-based for pre-sprint-S specs.
     pub id: String,
+    /// Human-readable slug derived from the title, used as a CLI shortcut.
+    /// Empty for legacy specs (derived from title on load).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub slug: String,
     /// Human-readable title.
     pub title: String,
     /// Detailed description of the requirement.
@@ -181,11 +186,17 @@ pub struct SpecUpdate {
 }
 
 impl Spec {
-    /// Create a new spec with the given ID and title.
+    /// Create a new spec with the given ID, slug, and title.
     pub fn new(id: String, title: String, description: String) -> Self {
+        Self::with_slug(id, String::new(), title, description)
+    }
+
+    /// Create a new spec with an explicit slug.
+    pub fn with_slug(id: String, slug: String, title: String, description: String) -> Self {
         let now = Utc::now();
         Self {
             id,
+            slug,
             title,
             description,
             status: SpecStatus::Pending,

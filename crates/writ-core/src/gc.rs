@@ -1472,6 +1472,7 @@ mod tests {
         let ts = now - Duration::hours(hours_ago);
         Spec {
             id: id.into(),
+            slug: String::new(),
             title: id.into(),
             description: String::new(),
             status: SpecStatus::Pending,

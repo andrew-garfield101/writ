@@ -18,7 +18,7 @@ use std::process::Command;
 /// Parameters for writ_context tool.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ContextParams {
-    /// Optional spec ID to scope context to a specific task.
+    /// Optional spec ID or slug to scope context to a specific task.
     pub spec: Option<String>,
     /// Output format: 'toon' (token-optimized, default) or 'json'.
     pub format: Option<String>,
@@ -29,7 +29,7 @@ pub struct ContextParams {
 pub struct SealParams {
     /// Clear description of what you accomplished.
     pub summary: String,
-    /// The spec ID this work belongs to (required).
+    /// The spec ID or slug this work belongs to (required).
     pub spec: String,
     /// Your agent identity (defaults to 'claude-code').
     pub agent: Option<String>,
@@ -53,7 +53,7 @@ pub struct SpecAddParams {
 /// Parameters for writ_spec_done tool.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SpecDoneParams {
-    /// The spec ID to complete (auto-detected if only one active).
+    /// The spec ID or slug to complete (auto-detected if only one active).
     pub id: Option<String>,
     /// Optional completion summary.
     pub summary: Option<String>,
@@ -117,14 +117,14 @@ pub struct SpecStatusParams {
 /// Parameters for writ_spec_show tool.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SpecShowParams {
-    /// The spec ID to inspect.
+    /// The spec ID or slug to inspect.
     pub id: String,
 }
 
 /// Parameters for writ_spec_reopen tool.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SpecReopenParams {
-    /// The spec ID to reopen.
+    /// The spec ID or slug to reopen.
     pub id: String,
 }
 

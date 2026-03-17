@@ -1802,7 +1802,10 @@ fn error_hint(err: &dyn std::error::Error) -> Option<String> {
         return Some("use `writ log` to see available seal IDs (prefix match supported)".into());
     }
     if msg.contains("spec not found") {
-        return Some("use `writ spec status` to see available specs".into());
+        return Some("use `writ spec status` to see available specs, or try a different slug/ID prefix".into());
+    }
+    if msg.contains("multiple specs match") {
+        return Some("use the full spec ID (12 hex chars) to disambiguate".into());
     }
     if msg.contains("agent not found") {
         return Some("use `writ agent list` to see registered agents".into());
@@ -2011,6 +2014,38 @@ fn cmd_init(
                 println!("{} Git baseline already synced", "✓".green());
             }
 
+            // Warn if working directory has changes not in git (stale from a
+            // previous failed session). Only on reinit — fresh init won't have
+            // this problem.
+            if !result.initialized {
+                if let Ok(output) = std::process::Command::new("git")
+                    .args(["diff", "--stat", "HEAD"])
+                    .current_dir(&cwd)
+                    .output()
+                {
+                    let diff_output = String::from_utf8_lossy(&output.stdout);
+                    if !diff_output.trim().is_empty() {
+                        let line_count = diff_output.lines().count();
+                        // Last line of git diff --stat is the summary; file lines are above it.
+                        let file_count = if line_count > 1 {
+                            line_count - 1
+                        } else {
+                            line_count
+                        };
+                        println!(
+                            "{} Working directory has {} file(s) changed since last git commit",
+                            "⚠".yellow(),
+                            file_count
+                        );
+                        println!(
+                            "  {} These may be stale changes from a previous session",
+                            "→".yellow()
+                        );
+                        println!("  {} To reset: git checkout -- .", "→".yellow());
+                    }
+                }
+            }
+
             if plan.enable_claude {
                 println!("{} Claude Code integration configured", "✓".green());
                 println!(
@@ -2078,11 +2113,14 @@ fn cmd_init(
     }
 
     // Create a spec if --spec was provided.
+    // When creating via --spec, the user-supplied ID is used as-is (legacy path).
+    // The slug is set to the same value for backward compatibility.
     if let Some(ref id) = spec_id {
         let repo = Repository::open_from_dir(cwd)?;
         let title = spec_title.as_deref().unwrap_or(id);
         let desc = spec_description.as_deref().unwrap_or("");
-        repo.add_spec(&Spec::new(id.clone(), title.to_string(), desc.to_string()))?;
+        let spec = Spec::with_slug(id.clone(), id.clone(), title.to_string(), desc.to_string());
+        repo.add_spec(&spec)?;
         if format != "json" {
             println!("spec: created '{}' ({})", id, title);
         }
@@ -2349,7 +2387,7 @@ fn cmd_plan(
         _ => {
             println!("\n  {} specs created:", results.len().to_string().bold());
             for r in &results {
-                println!("    {}  \"{}\"", r.spec_id.cyan(), r.title);
+                println!("    {}  {}  \"{}\"", r.spec_id.cyan(), r.slug.dimmed(), r.title);
             }
             println!();
             println!(
@@ -2479,6 +2517,14 @@ fn cmd_seal(
     let mut repo = Repository::open_from_dir(cwd)?;
     repo.set_enforce_scope(enforce_scope);
 
+    // S.5: Resolve spec_id via slug/prefix if provided
+    let spec_id = if let Some(ref input) = spec_id {
+        let spec = repo.resolve_spec(input)?;
+        Some(spec.id.clone())
+    } else {
+        None
+    };
+
     let agent = AgentIdentity {
         id: agent_id.to_string(),
         agent_type: if agent_id == "human" {
@@ -2537,7 +2583,13 @@ fn cmd_seal(
         (s, None)
     };
 
-    println!("{} {}", "sealed".green().bold(), &seal.id[..12].cyan());
+    let spec_slug_display = seal.spec_id.as_deref()
+        .and_then(|sid| repo.load_spec(sid).ok())
+        .filter(|s| !s.slug.is_empty())
+        .map(|s| format!("  spec: {} ({})", s.id.cyan(), s.slug.dimmed()))
+        .or_else(|| seal.spec_id.as_deref().map(|sid| format!("  spec: {}", sid.cyan())))
+        .unwrap_or_default();
+    println!("{} {}{}", "sealed".green().bold(), &seal.id[..12].cyan(), spec_slug_display);
 
     if let Some(ref w) = conflict_warning {
         if w.is_clean {
@@ -2683,7 +2735,17 @@ fn cmd_log(
                 let spec_part = seal
                     .spec_id
                     .as_deref()
-                    .map(|s| format!(" spec:{s}"))
+                    .map(|s| {
+                        let slug = repo.load_spec(s).ok()
+                            .filter(|sp| !sp.slug.is_empty())
+                            .map(|sp| sp.slug.clone())
+                            .unwrap_or_default();
+                        if slug.is_empty() {
+                            format!(" spec:{s}")
+                        } else {
+                            format!(" spec:{s} ({slug})")
+                        }
+                    })
                     .unwrap_or_default();
                 println!(
                     "{} {} {}{}",
@@ -2713,8 +2775,13 @@ fn cmd_log(
                         .to_string()
                         .dimmed()
                 );
-                if let Some(ref spec) = seal.spec_id {
-                    println!("  spec:    {}", spec.cyan());
+                if let Some(ref spec_id) = seal.spec_id {
+                    // Try to load the spec to show slug alongside ID
+                    let slug_part = repo.load_spec(spec_id).ok()
+                        .filter(|s| !s.slug.is_empty())
+                        .map(|s| format!("  {}", s.slug))
+                        .unwrap_or_default();
+                    println!("  spec:    {}{}", spec_id.cyan(), slug_part.dimmed());
                 }
                 let status_str = format!("{:?}", seal.status);
                 let colored_status = match seal.status {
@@ -3090,10 +3157,16 @@ fn cmd_context(
             // ── Active spec (spec-scoped view) ─────────────────────────
             if let Some(ref spec) = ctx.active_spec {
                 println!();
+                let slug_part = if !spec.slug.is_empty() {
+                    format!("  {}", spec.slug.dimmed())
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  {} {} {}",
+                    "  {} {}{} {}",
                     "spec:".bold(),
                     spec.id.cyan(),
+                    slug_part,
                     format!("({})", format!("{:?}", spec.status).to_lowercase()).dimmed(),
                 );
                 if !spec.title.is_empty() {
@@ -3126,9 +3199,14 @@ fn cmd_context(
                         } else {
                             String::new()
                         };
+                        let id_slug = if !spec.slug.is_empty() {
+                            format!("{} {}", spec.id, spec.slug)
+                        } else {
+                            spec.id.clone()
+                        };
                         println!(
                             "  {:<30} {:<14} {:<16} {}",
-                            spec.id,
+                            id_slug.cyan(),
                             colored_status,
                             claimed.dimmed(),
                             seal_info.dimmed(),
@@ -5217,7 +5295,12 @@ fn cmd_spec_add(
     tech_stack: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
-    let mut spec = Spec::new(id.to_string(), title.to_string(), description.to_string());
+    let mut spec = Spec::with_slug(
+        id.to_string(),
+        id.to_string(),
+        title.to_string(),
+        description.to_string(),
+    );
     if let Some(ac) = acceptance_criteria {
         spec.acceptance_criteria = ac;
     }
@@ -5295,9 +5378,10 @@ fn cmd_spec_status(
         };
         let seal_count = spec.sealed_by.len();
         let lifecycle = format!("{:?}", spec.lifecycle_state);
+        let slug_display = if spec.slug.is_empty() { &spec.id } else { &spec.slug };
         println!(
-            "  {status_marker}{:<20} {:?}  [{lifecycle}]  ({seal_count} seal(s))",
-            spec.id, spec.status
+            "  {status_marker}{}  {}  {:?}  [{lifecycle}]  ({seal_count} seal(s))",
+            spec.id.cyan(), slug_display.dimmed(), spec.status
         );
     }
 
@@ -5357,7 +5441,8 @@ fn cmd_spec_done(
     // from CLI without an explicit --agent flag. The seal inherits the spec's
     // agent identity for proper attribution.
     let resolved_id = resolve_agent(agent, cwd);
-    let spec_data = repo.load_spec(&spec_id)?;
+    let spec_data = repo.resolve_spec(&spec_id)?;
+    let spec_id = spec_data.id.clone();
     let agent_id = if resolved_id == "human" {
         // If resolve_agent fell back to "human", check if spec has a claimed agent
         spec_data
@@ -5428,8 +5513,10 @@ fn cmd_spec_cancel(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Er
 
 fn cmd_spec_complete(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
-    repo.complete_spec(id)?;
-    println!("spec '{}' lifecycle completed", id);
+    let spec = repo.resolve_spec(id)?;
+    let resolved_id = spec.id.clone();
+    repo.complete_spec(&resolved_id)?;
+    println!("spec '{}' lifecycle completed", resolved_id);
     Ok(())
 }
 
@@ -5437,11 +5524,12 @@ fn cmd_spec_reopen(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Er
     let repo = Repository::open_from_dir(cwd)?;
 
     // Load spec for display info before reopening.
-    let spec = repo.load_spec(id)?;
+    let spec = repo.resolve_spec(id)?;
+    let resolved_id = spec.id.clone();
     let title = spec.title.clone();
-    let seal_count = repo.spec_log(id).map(|l| l.len()).unwrap_or(0);
+    let seal_count = repo.spec_log(&resolved_id).map(|l| l.len()).unwrap_or(0);
 
-    repo.reopen_spec(id)?;
+    repo.reopen_spec(&resolved_id)?;
 
     println!("Spec {} \"{}\" reopened.", id, title);
     println!("Status: completed → active");
@@ -5461,9 +5549,11 @@ fn cmd_spec_claim(
     agent: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
+    let spec = repo.resolve_spec(id)?;
+    let resolved_id = spec.id.clone();
     let agent_id = agent.unwrap_or("claude-code");
-    repo.spec_claim(id, agent_id)?;
-    println!("Claimed spec '{}' for agent '{}'.", id, agent_id);
+    repo.spec_claim(&resolved_id, agent_id)?;
+    println!("Claimed spec '{}' for agent '{}'.", resolved_id, agent_id);
     Ok(())
 }
 
@@ -5473,14 +5563,15 @@ fn cmd_spec_assign(
     workspace: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
-    let spec = repo.load_spec(id)?;
+    let spec = repo.resolve_spec(id)?;
+    let resolved_id = spec.id.clone();
     let old_ws = spec.workspace.as_deref().unwrap_or("(global)");
 
-    repo.assign_spec_to_workspace(id, workspace)?;
+    repo.assign_spec_to_workspace(&resolved_id, workspace)?;
 
     println!(
         "Spec {} \"{}\" assigned to workspace '{}'.",
-        id, spec.title, workspace
+        resolved_id, spec.title, workspace
     );
     if old_ws != "(global)" && old_ws != workspace {
         println!("  (was: '{}')", old_ws);
@@ -5491,22 +5582,23 @@ fn cmd_spec_assign(
 
 fn cmd_spec_unassign(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
-    let spec = repo.load_spec(id)?;
+    let spec = repo.resolve_spec(id)?;
+    let resolved_id = spec.id.clone();
 
     if spec.workspace.is_none() {
         println!(
             "Spec {} \"{}\" is already globally visible.",
-            id, spec.title
+            resolved_id, spec.title
         );
         return Ok(());
     }
 
     let old_ws = spec.workspace.as_deref().unwrap_or("unknown");
-    repo.unassign_spec_from_workspace(id)?;
+    repo.unassign_spec_from_workspace(&resolved_id)?;
 
     println!(
         "Spec {} \"{}\" unassigned from workspace '{}'. Now globally visible.",
-        id, spec.title, old_ws
+        resolved_id, spec.title, old_ws
     );
 
     Ok(())
@@ -5520,7 +5612,11 @@ fn cmd_converge(
     apply: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
-    let report = repo.converge(left_spec, right_spec)?;
+
+    // S.5: Resolve spec inputs via slug/prefix
+    let left_resolved = repo.resolve_spec(left_spec)?;
+    let right_resolved = repo.resolve_spec(right_spec)?;
+    let report = repo.converge(&left_resolved.id, &right_resolved.id)?;
 
     match format {
         "json" => {
@@ -6443,7 +6539,7 @@ fn resolve_single(
 
 fn cmd_spec_show(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
-    let spec = repo.load_spec(id)?;
+    let spec = repo.resolve_spec(id)?;
 
     println!("spec: {}", spec.id);
     println!("  title:       {}", spec.title);
@@ -8622,6 +8718,7 @@ mod tests {
     fn make_test_spec(id: &str, files: Vec<&str>) -> writ_core::spec::Spec {
         writ_core::spec::Spec {
             id: id.to_string(),
+            slug: String::new(),
             title: format!("Test spec {}", id),
             description: String::new(),
             status: writ_core::spec::SpecStatus::Complete,

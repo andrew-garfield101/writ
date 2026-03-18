@@ -4551,6 +4551,18 @@ fn cmd_finish(
         }
     }
 
+    // Clean up orphaned specs (created by writ plan but never used).
+    match repo.archive_orphaned_specs() {
+        Ok(archived) if !archived.is_empty() => {
+            println!(
+                "  {} {} orphaned spec(s) archived (created but never claimed).",
+                "✓".green().bold(),
+                archived.len()
+            );
+        }
+        _ => {}
+    }
+
     println!();
     println!("  {} Run `git push` when ready.", "→".dimmed());
 

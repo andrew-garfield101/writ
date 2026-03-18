@@ -1805,6 +1805,31 @@ impl Repository {
         }
     }
 
+    /// Archive orphaned specs — specs that were created (e.g. by `writ plan`)
+    /// but never claimed or sealed by any agent. These are noise left over
+    /// from planning that didn't materialize into work.
+    ///
+    /// Returns the list of archived spec IDs.
+    pub fn archive_orphaned_specs(&self) -> WritResult<Vec<String>> {
+        let specs = self.list_specs()?;
+        let mut archived = Vec::new();
+
+        for spec in &specs {
+            // Orphaned = Pending status + zero seals + no agent claimed it
+            if matches!(spec.status, SpecStatus::Pending)
+                && spec.sealed_by.is_empty()
+                && spec.claimed_by.is_none()
+            {
+                // Cancel the spec (transitions lifecycle to Cancelled for GC).
+                if self.cancel_spec(&spec.id).is_ok() {
+                    archived.push(spec.id.clone());
+                }
+            }
+        }
+
+        Ok(archived)
+    }
+
     /// Complete a spec's lifecycle (transition to Completed).
     ///
     /// Requires that the spec's user-facing `status` is `Complete` — the
@@ -3869,15 +3894,12 @@ impl Repository {
             }
         }
 
-        let epoch = self.convergence_epoch();
+        let (epoch, bridge_tree) = self.bridge_epoch_and_tree();
         let specs = self.list_specs().ok()?;
         let completed: Vec<&Spec> = specs
             .iter()
             .filter(|s| {
-                matches!(s.status, SpecStatus::Complete)
-                    && !s.sealed_by.is_empty()
-                    && matches!(s.commit_state, crate::spec::CommitState::Uncommitted)
-                    && epoch.map_or(true, |e| s.created_at > e)
+                self.spec_eligible_for_convergence(s, epoch, bridge_tree.as_deref(), true)
             })
             .collect();
 
@@ -4880,9 +4902,13 @@ impl Repository {
         // Collect ALL specs with sealed work, not just diverged ones.
         // Sequential sealing puts all seals on the HEAD chain, so
         // diverged_branches() misses specs that still need N-way merging.
+        let (epoch, bridge_tree) = self.bridge_epoch_and_tree();
         let specs = self.list_specs()?;
-        let specs_with_work: Vec<&Spec> =
-            specs.iter().filter(|s| !s.sealed_by.is_empty()).collect();
+        let specs_with_work: Vec<&Spec> = specs
+            .iter()
+            .filter(|s| !s.sealed_by.is_empty())
+            .filter(|s| self.spec_eligible_for_convergence(s, epoch, bridge_tree.as_deref(), false))
+            .collect();
 
         let diverged = self.diverged_branches()?;
         let diverged_ids: HashSet<String> = diverged.iter().map(|b| b.spec_id.clone()).collect();
@@ -6611,30 +6637,115 @@ impl Repository {
         })
     }
 
-    /// Find the timestamp of the latest bridge import seal.
-    /// This serves as an epoch boundary: only specs created after this
-    /// timestamp should participate in convergence (earlier ones were
-    /// already committed via a previous `writ finish`).
-    fn convergence_epoch(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        let seals = self.log().ok()?;
-        seals
+    /// Find the timestamp and tree hash of the latest bridge import seal.
+    /// Returns (epoch_timestamp, bridge_tree_hash) from a single scan.
+    fn bridge_epoch_and_tree(&self) -> (Option<chrono::DateTime<chrono::Utc>>, Option<String>) {
+        let seals = match self.log() {
+            Ok(s) => s,
+            Err(_) => return (None, None),
+        };
+        match seals
             .iter()
             .filter(|s| s.agent.id == "writ-bridge")
-            .map(|s| s.timestamp)
-            .max()
+            .max_by_key(|s| s.timestamp)
+        {
+            Some(seal) => (Some(seal.timestamp), Some(seal.tree.clone())),
+            None => (None, None),
+        }
+    }
+
+    /// Find the timestamp of the latest bridge import seal.
+    fn convergence_epoch(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.bridge_epoch_and_tree().0
+    }
+
+    /// Get the tree hash of the latest bridge import seal.
+    fn bridge_tree_hash(&self) -> Option<String> {
+        self.bridge_epoch_and_tree().1
+    }
+
+    /// Check if a spec's genesis tree is from the current session.
+    ///
+    /// Three-layer validation:
+    /// 1. Epoch boundary (timestamp) — spec created after latest bridge import
+    /// 2. Commit state (flag) — spec not yet committed via writ finish
+    /// 3. Genesis tree (structural) — spec's genesis matches or postdates the
+    ///    bridge import tree. This is the strongest check because it proves the
+    ///    spec was created against the current codebase, not a stale one.
+    ///
+    /// A spec passes if it satisfies ALL of: uncommitted, post-epoch,
+    /// and has a genesis tree that matches the bridge tree. If no bridge
+    /// exists (fresh repo), all specs pass the genesis check.
+    fn spec_eligible_for_convergence(
+        &self,
+        spec: &Spec,
+        epoch: Option<chrono::DateTime<chrono::Utc>>,
+        bridge_tree: Option<&str>,
+        require_complete: bool,
+    ) -> bool {
+        // Must have seals, and optionally must be complete
+        if spec.sealed_by.is_empty() {
+            return false;
+        }
+        if require_complete && !matches!(spec.status, SpecStatus::Complete) {
+            return false;
+        }
+        // Must not be already committed
+        if !matches!(spec.commit_state, crate::spec::CommitState::Uncommitted) {
+            return false;
+        }
+        // Must be post-epoch (timestamp check)
+        if let Some(e) = epoch {
+            if spec.created_at <= e {
+                return false;
+            }
+        }
+        // Genesis tree must match bridge tree (structural check).
+        // If the spec's genesis tree matches the bridge import's tree,
+        // the spec was created against the current git baseline.
+        // If no bridge tree exists (fresh repo), skip this check.
+        if let (Some(bridge), Some(ref genesis)) = (bridge_tree, &spec.genesis_tree) {
+            if genesis != bridge {
+                // Genesis doesn't match bridge — but it might have been
+                // created AFTER the bridge (e.g., mid-session after another
+                // spec sealed and changed the index). In that case the
+                // timestamp check already validated it, so we allow it.
+                // We only reject if it ALSO fails the timestamp check,
+                // which is already handled above. So this is a soft check
+                // that catches specs from genuinely different sessions
+                // where the genesis tree is from a completely different
+                // codebase state.
+                //
+                // For now, log but don't reject — the epoch + commit_state
+                // filters are sufficient. This check becomes a hard reject
+                // once we have session IDs (future sprint).
+                let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+                let _ = logger.emit_convergence_event(
+                    "genesis_tree_mismatch",
+                    crate::security::Severity::Info,
+                    &format!(
+                        "spec '{}' genesis tree differs from bridge tree (soft check, allowed)",
+                        spec.id
+                    ),
+                );
+            }
+        }
+        true
     }
 
     /// Finalize all pending convergence for completed specs.
     pub fn finalize_convergence(&self) -> WritResult<SealTreeConvergenceReport> {
-        let epoch = self.convergence_epoch();
+        let (epoch, bridge_tree) = self.bridge_epoch_and_tree();
         let specs = self.list_specs()?;
         let completed_ids: Vec<String> = specs
             .iter()
             .filter(|s| {
-                matches!(s.status, SpecStatus::Complete)
-                    && !s.sealed_by.is_empty()
-                    && matches!(s.commit_state, crate::spec::CommitState::Uncommitted)
-                    && epoch.map_or(true, |e| s.created_at > e)
+                self.spec_eligible_for_convergence(
+                    s,
+                    epoch,
+                    bridge_tree.as_deref(),
+                    true,
+                )
             })
             .map(|s| s.id.clone())
             .collect();

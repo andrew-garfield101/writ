@@ -1820,7 +1820,7 @@ fn error_hint(err: &dyn std::error::Error) -> Option<String> {
     }
     if msg.contains("unresolved conflicts") {
         return Some(
-            "use `writ resolve` to review and fix, or re-run with `--auto-resolve`".into(),
+            "use `writ resolve` to review and fix, or re-run with `--auto`".into(),
         );
     }
     if msg.contains("push rejected") || msg.contains("Push rejected") {

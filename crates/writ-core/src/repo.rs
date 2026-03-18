@@ -3876,6 +3876,7 @@ impl Repository {
             .filter(|s| {
                 matches!(s.status, SpecStatus::Complete)
                     && !s.sealed_by.is_empty()
+                    && matches!(s.commit_state, crate::spec::CommitState::Uncommitted)
                     && epoch.map_or(true, |e| s.created_at > e)
             })
             .collect();
@@ -6632,6 +6633,7 @@ impl Repository {
             .filter(|s| {
                 matches!(s.status, SpecStatus::Complete)
                     && !s.sealed_by.is_empty()
+                    && matches!(s.commit_state, crate::spec::CommitState::Uncommitted)
                     && epoch.map_or(true, |e| s.created_at > e)
             })
             .map(|s| s.id.clone())
@@ -23967,6 +23969,105 @@ mod seal_tree_convergence_tests {
 
         let report = repo.finalize_convergence().unwrap();
         assert_eq!(report.specs_converged.len(), 2);
+    }
+
+    /// T1-BUG-5: Specs that have been committed to git should be excluded
+    /// from convergence, even if they're post-epoch. This prevents old
+    /// committed work from accumulating in the convergence pool across sessions.
+    #[test]
+    fn test_committed_specs_excluded_from_convergence() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".writ").join("config.toml"),
+            "[watch]\nauto_converge_on_seal = false\n",
+        )
+        .unwrap();
+
+        fs::write(dir.path().join("shared.txt"), "original\n").unwrap();
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Create 3 specs, all complete
+        for name in &["spec-old-a", "spec-old-b", "spec-new"] {
+            repo.add_spec(&Spec::new(name.to_string(), name.to_string(), "".into()))
+                .unwrap();
+        }
+
+        // Seal work for all 3
+        fs::write(dir.path().join("shared.txt"), "OLD-A\noriginal\n").unwrap();
+        repo.seal(
+            agent("agent"),
+            "old a".into(),
+            Some("spec-old-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "original\nOLD-B\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent"),
+            "old b".into(),
+            Some("spec-old-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "original\nline2\nNEW\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent"),
+            "new work".into(),
+            Some("spec-new".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Mark all complete
+        repo.mark_spec_done("spec-old-a", Some("done".into()))
+            .unwrap();
+        repo.mark_spec_done("spec-old-b", Some("done".into()))
+            .unwrap();
+        repo.mark_spec_done("spec-new", Some("done".into()))
+            .unwrap();
+
+        // Mark old specs as committed (simulates previous writ finish)
+        repo.mark_spec_committed("spec-old-a", "abc123").unwrap();
+        repo.mark_spec_committed("spec-old-b", "abc123").unwrap();
+
+        // Only spec-new should be in the convergence pool
+        let report = repo.finalize_convergence().unwrap();
+        assert!(
+            !report.specs_converged.contains(&"spec-old-a".to_string()),
+            "committed spec-old-a should be excluded"
+        );
+        assert!(
+            !report.specs_converged.contains(&"spec-old-b".to_string()),
+            "committed spec-old-b should be excluded"
+        );
+        // With only 1 uncommitted spec, convergence returns early (< 2 specs)
+        assert!(
+            report.merged_files.is_empty(),
+            "single uncommitted spec should not trigger convergence"
+        );
     }
 }
 

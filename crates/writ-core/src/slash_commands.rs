@@ -2,7 +2,15 @@
 //!
 //! Generates markdown files in `.claude/commands/` that expose writ workflow
 //! commands as discoverable slash commands in Claude Code's command palette.
-//! All 17 commands are thin wrappers around the CLI — no business logic here.
+//! All commands are thin wrappers around the CLI — no business logic here.
+//!
+//! Slash commands coexist with skills (`.claude/skills/`, see [`crate::skills`]).
+//! Both are generated during `writ init` for maximum compatibility:
+//! - **Slash commands** work in all Claude Code versions (user-invoked via `/writ-*`)
+//! - **Skills** add auto-invocation and supporting files (newer Claude Code feature)
+//!
+//! Neither replaces the other. Both layers remain for beta and beyond until
+//! adoption data (SK.16) confirms whether one layer can be simplified.
 
 use std::fs;
 use std::path::Path;

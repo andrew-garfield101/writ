@@ -118,7 +118,7 @@ fn query_git_state(root: &Path) -> Option<GitStateSnapshot> {
 ///
 /// Rules: lowercase, replace non-alphanumeric with hyphens, collapse runs,
 /// trim leading/trailing hyphens, truncate at 50 characters.
-fn slugify_title(title: &str) -> String {
+pub fn slugify_title(title: &str) -> String {
     let slug: String = title
         .to_lowercase()
         .chars()
@@ -153,7 +153,7 @@ fn slugify_title(title: &str) -> String {
 /// The ID is 12 hex chars derived from BLAKE3(title + timestamp_nanos + 8 random bytes).
 /// This guarantees uniqueness even for identical titles created at the same nanosecond
 /// across different agents, because the 8 random bytes provide sufficient entropy.
-fn generate_spec_id(title: &str) -> String {
+pub fn generate_spec_id(title: &str) -> String {
     use rand::Rng;
 
     let timestamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
@@ -1739,6 +1739,50 @@ impl Repository {
         }
     }
 
+    /// Resolve the spec for an agent when `--spec` is omitted.
+    ///
+    /// If `explicit_spec` is provided, resolves it normally. Otherwise,
+    /// finds the agent's single claimed in-progress spec. This enables
+    /// the agent-first flow where agents don't need to pass `--spec`
+    /// on every seal and spec-done call.
+    ///
+    /// Returns an error if the agent has 0 or 2+ claimed in-progress specs.
+    pub fn resolve_spec_for_agent(
+        &self,
+        explicit_spec: Option<&str>,
+        agent_id: &str,
+    ) -> WritResult<String> {
+        if let Some(spec_id) = explicit_spec {
+            // Explicit spec provided — resolve it normally.
+            let spec = self.resolve_spec(spec_id)?;
+            return Ok(spec.id);
+        }
+
+        let specs = self.list_specs()?;
+        let claimed: Vec<&Spec> = specs
+            .iter()
+            .filter(|s| s.claimed_by.as_deref() == Some(agent_id))
+            .filter(|s| matches!(s.status, SpecStatus::InProgress))
+            .collect();
+
+        match claimed.len() {
+            0 => Err(WritError::Other(
+                "no spec claimed — create one with `writ spec add \"your task\"`".into(),
+            )),
+            1 => Ok(claimed[0].id.clone()),
+            n => Err(WritError::Other(format!(
+                "{} specs claimed by '{}' — use --spec to specify: {}",
+                n,
+                agent_id,
+                claimed
+                    .iter()
+                    .map(|s| s.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
     // --- Spec lifecycle management (GC.1.2) ---
 
     /// Transition a spec's lifecycle state, validating legal transitions.
@@ -1828,6 +1872,20 @@ impl Repository {
         }
 
         Ok(archived)
+    }
+
+    /// Return specs eligible for convergence (uncommitted, post-epoch, have seals).
+    ///
+    /// Useful for debugging convergence pool issues — shows which specs would
+    /// participate if convergence ran right now.
+    pub fn convergence_eligible_specs(&self) -> WritResult<Vec<Spec>> {
+        let specs = self.list_specs()?;
+        let (epoch, bridge_tree) = self.bridge_epoch_and_tree();
+        let bt = bridge_tree.as_deref();
+        Ok(specs
+            .into_iter()
+            .filter(|s| self.spec_eligible_for_convergence(s, epoch, bt, false))
+            .collect())
     }
 
     /// Complete a spec's lifecycle (transition to Completed).
@@ -31165,6 +31223,166 @@ mod workspace_tests {
         // Slug is "auth-feature" (lowercase), input with uppercase should still match
         let spec = repo.resolve_spec("auth-feature").unwrap();
         assert_eq!(spec.title, "Auth Feature");
+    }
+
+    // ─── SK.3b: resolve_spec_for_agent() tests ────────────────────────
+
+    #[test]
+    fn test_auto_scope_single_claimed_spec() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("spec-1".into(), "Auth work".into(), "".into()))
+            .unwrap();
+        repo.spec_claim("spec-1", "agent-1").unwrap();
+
+        // Mark as InProgress via seal.
+        fs::write(dir.path().join("auth.rs"), "fn login() {}\n").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "auth work".into(),
+            Some("spec-1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let result = repo.resolve_spec_for_agent(None, "agent-1").unwrap();
+        assert_eq!(result, "spec-1");
+    }
+
+    #[test]
+    fn test_auto_scope_zero_claimed_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+
+        let result = repo.resolve_spec_for_agent(None, "agent-1");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("no spec claimed"),
+            "should suggest creating a spec"
+        );
+    }
+
+    #[test]
+    fn test_auto_scope_multiple_claimed_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("spec-1".into(), "Auth".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("spec-2".into(), "Payments".into(), "".into()))
+            .unwrap();
+        repo.spec_claim("spec-1", "agent-1").unwrap();
+        repo.spec_claim("spec-2", "agent-1").unwrap();
+
+        // Seal both to make them InProgress.
+        fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "work 1".into(),
+            Some("spec-1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "work 2".into(),
+            Some("spec-2".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        let result = repo.resolve_spec_for_agent(None, "agent-1");
+        assert!(result.is_err());
+        assert!(
+            result.unwrap_err().to_string().contains("--spec"),
+            "should tell agent to use --spec"
+        );
+    }
+
+    #[test]
+    fn test_auto_scope_explicit_overrides() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("spec-1".into(), "Auth".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("spec-2".into(), "Payments".into(), "".into()))
+            .unwrap();
+
+        // Explicit spec provided — should resolve it regardless of claims.
+        let result = repo
+            .resolve_spec_for_agent(Some("spec-2"), "agent-1")
+            .unwrap();
+        assert_eq!(result, "spec-2");
+    }
+
+    #[test]
+    fn test_auto_scope_ignores_completed_specs() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("spec-done".into(), "Done".into(), "".into()))
+            .unwrap();
+        repo.add_spec(&Spec::new("spec-active".into(), "Active".into(), "".into()))
+            .unwrap();
+        repo.spec_claim("spec-done", "agent-1").unwrap();
+        repo.spec_claim("spec-active", "agent-1").unwrap();
+
+        // Seal both, then mark one complete.
+        fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "done work".into(),
+            Some("spec-done".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "active work".into(),
+            Some("spec-active".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        repo.mark_spec_done("spec-done", Some("finished".into()))
+            .unwrap();
+
+        // Only spec-active should be found (spec-done is Complete, not InProgress).
+        let result = repo.resolve_spec_for_agent(None, "agent-1").unwrap();
+        assert_eq!(result, "spec-active");
+    }
+
+    #[test]
+    fn test_auto_scope_different_agent_not_found() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("spec-1".into(), "Auth".into(), "".into()))
+            .unwrap();
+        repo.spec_claim("spec-1", "agent-1").unwrap();
+
+        fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        repo.seal(
+            agent("agent-1"),
+            "work".into(),
+            Some("spec-1".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Different agent should not find agent-1's spec.
+        let result = repo.resolve_spec_for_agent(None, "agent-2");
+        assert!(result.is_err());
     }
 
     // ─── WV.12: slugify_title() tests ────────────────────────────────

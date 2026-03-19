@@ -94,7 +94,9 @@ class TestTaskCLI:
             str(writ_repo),
         )
         data = json.loads(result.stdout)
-        assert data["spec_id"] == "add-user-login"
+        # spec_id is now a 12-char hex hash (auto-generated from title)
+        assert len(data["spec_id"]) == 12
+        assert all(c in "0123456789abcdef" for c in data["spec_id"])
         assert data["title"] == "Add user login"
         assert data["workspace_name"] == "add-user-login"
         assert "workspace_path" in data
@@ -184,7 +186,9 @@ class TestTaskPythonBindings:
         repo = writ.Repository.open(str(writ_repo))
         result = repo.create_task("Add search feature")
 
-        assert result["spec_id"] == "add-search-feature"
+        # spec_id is now a 12-char hex hash (auto-generated from title)
+        assert len(result["spec_id"]) == 12
+        assert all(c in "0123456789abcdef" for c in result["spec_id"])
         assert result["title"] == "Add search feature"
         assert result["workspace_name"] == "add-search-feature"
         assert "workspace_path" in result

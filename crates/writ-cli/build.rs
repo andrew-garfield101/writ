@@ -1,14 +1,9 @@
 /// Build script for writ-cli.
 ///
-/// Embeds alpha build number into the version string when WRIT_ALPHA is set.
-/// This is temporary for alpha testing — remove before release.
+/// Exposes CARGO_PKG_VERSION as WRIT_VERSION_FULL for compile-time embedding.
+/// Version is controlled by the workspace Cargo.toml. Alpha/pre-release
+/// numbering is handled by the release pipeline, not build-time env vars.
 fn main() {
-    let base = std::env::var("CARGO_PKG_VERSION").unwrap();
-    let version = match std::env::var("WRIT_ALPHA") {
-        Ok(a) if !a.is_empty() => format!("{}-alpha.{}", base, a),
-        _ => base,
-    };
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
     println!("cargo:rustc-env=WRIT_VERSION_FULL={}", version);
-    // Only re-run if the alpha number changes.
-    println!("cargo:rerun-if-env-changed=WRIT_ALPHA");
 }

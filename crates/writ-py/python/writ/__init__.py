@@ -28,6 +28,8 @@ from writ._native import (
     WritError,
     detect_frameworks,
     install_hooks,
+    generate_skills,
+    remove_skills,
 )
 
 __version__ = "0.1.0"
@@ -40,6 +42,8 @@ __all__ = [
     "WritError",
     "detect_frameworks",
     "install_hooks",
+    "generate_skills",
+    "remove_skills",
     "__version__",
     "sdk",
 ]

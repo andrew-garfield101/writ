@@ -823,7 +823,13 @@ fn display_summary(
 
     if claude {
         println!(
-            "  {:<40} {} Claude Code slash commands",
+            "  {:<40} {} skills ({} auto-invoke)",
+            ".claude/skills/writ-*/",
+            writ_core::skills::SKILL_TEMPLATES.len(),
+            writ_core::skills::auto_invoke_count()
+        );
+        println!(
+            "  {:<40} {} slash commands",
             ".claude/commands/writ-*.md",
             writ_core::slash_commands::SLASH_COMMAND_TEMPLATES.len()
         );

@@ -297,6 +297,13 @@ impl PyRepository {
             linted,
         };
 
+        // SK.3b: Auto-scope spec_id when omitted and agent is not "human".
+        let spec_id = match spec_id {
+            Some(id) => Some(id),
+            None if agent_id != "human" => self.inner.resolve_spec_for_agent(None, agent_id).ok(),
+            None => None,
+        };
+
         // Check if context() recorded a HEAD for automatic conflict detection.
         let tracked_head = self.inner.last_context_head();
 
@@ -606,18 +613,44 @@ impl PyRepository {
     }
 
     /// Register a new spec. Returns the created spec as a dict.
-    #[pyo3(signature = (id, title, description="", acceptance_criteria=None, design_notes=None, tech_stack=None))]
+    ///
+    /// If `id` is omitted (or None), a hash-based ID is auto-generated from the title.
+    /// A human-readable `slug` is always derived from the title.
+    ///
+    /// Supports three calling patterns:
+    ///   add_spec(id="my-id", title="My Title")   — explicit ID (keyword)
+    ///   add_spec("my-id", "My Title")             — explicit ID (positional, backward compat)
+    ///   add_spec(title="OAuth2 auth")             — auto-generated ID
+    #[pyo3(signature = (id=None, title="", description="", acceptance_criteria=None, design_notes=None, tech_stack=None))]
     fn add_spec(
         &self,
         py: Python,
-        id: &str,
+        id: Option<&str>,
         title: &str,
         description: &str,
         acceptance_criteria: Option<Vec<String>>,
         design_notes: Option<Vec<String>>,
         tech_stack: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
-        let mut spec = Spec::new(id.to_string(), title.to_string(), description.to_string());
+        let (final_id, final_title) = match (id, title.is_empty()) {
+            // add_spec(title="OAuth2 auth") — auto-generate ID from title
+            (None, false) => (writ_core::repo::generate_spec_id(title), title.to_string()),
+            // add_spec(id="my-id", title="My Title") or positional add_spec("id", "title")
+            (Some(id), false) => (id.to_string(), title.to_string()),
+            // add_spec(id="my-id") with no title — error, title is required
+            (Some(_), true) => {
+                return Err(WritError::new_err(
+                    "add_spec requires a title — use add_spec(id=\"my-id\", title=\"My Title\") \
+                     or add_spec(title=\"My Title\") for auto-generated ID",
+                ));
+            }
+            // add_spec() — nothing provided
+            (None, true) => {
+                return Err(WritError::new_err("add_spec requires at least a title"));
+            }
+        };
+        let slug = writ_core::repo::slugify_title(&final_title);
+        let mut spec = Spec::with_slug(final_id, slug, final_title, description.to_string());
         if let Some(ac) = acceptance_criteria {
             spec.acceptance_criteria = ac;
         }
@@ -631,7 +664,13 @@ impl PyRepository {
         to_pydict(py, &spec)
     }
 
-    /// Load a spec by ID.
+    /// Resolve a spec by ID, ID prefix, slug, or slug prefix.
+    fn resolve_spec(&self, py: Python, input: &str) -> PyResult<PyObject> {
+        let spec = self.inner.resolve_spec(input).map_err(writ_err)?;
+        to_pydict(py, &spec)
+    }
+
+    /// Load a spec by exact ID.
     fn get_spec(&self, py: Python, id: &str) -> PyResult<PyObject> {
         let spec = self.inner.load_spec(id).map_err(writ_err)?;
         to_pydict(py, &spec)
@@ -797,6 +836,25 @@ impl PyRepository {
             .materialize_convergence(&report_val)
             .map_err(writ_err)?;
         Ok(())
+    }
+
+    /// Archive orphaned specs (Pending, no seals, no agent).
+    ///
+    /// Returns a list of spec IDs that were archived (cancelled for GC).
+    fn archive_orphaned_specs(&self, py: Python) -> PyResult<PyObject> {
+        let archived = self.inner.archive_orphaned_specs().map_err(writ_err)?;
+        to_pydict(py, &archived)
+    }
+
+    /// Return specs eligible for convergence right now.
+    ///
+    /// Useful for debugging convergence pool issues — shows which specs
+    /// would participate if convergence ran. Includes any spec that has
+    /// seals, is uncommitted, and is post-epoch.
+    #[pyo3(signature = (format="dict"))]
+    fn convergence_eligible_specs(&self, py: Python, format: &str) -> PyResult<PyObject> {
+        let specs = self.inner.convergence_eligible_specs().map_err(writ_err)?;
+        format_specs(py, &specs, format)
     }
 
     /// Import git state as a writ baseline seal.
@@ -1259,16 +1317,52 @@ impl PyRepository {
         to_pydict(py, &result)
     }
 
+    /// Resolve the spec for an agent when spec_id is omitted.
+    ///
+    /// If spec_id is provided, resolves it normally (by ID, slug, or prefix).
+    /// Otherwise, finds the agent's single claimed in-progress spec.
+    /// Returns the spec ID string.
+    ///
+    /// Raises an error if the agent has 0 or 2+ claimed in-progress specs
+    /// and no explicit spec was given.
+    #[pyo3(signature = (agent_id, spec_id=None))]
+    fn resolve_spec_for_agent(&self, agent_id: &str, spec_id: Option<&str>) -> PyResult<String> {
+        self.inner
+            .resolve_spec_for_agent(spec_id, agent_id)
+            .map_err(writ_err)
+    }
+
     /// Mark a spec as done: sets status to Complete, stores the optional
     /// completion summary, and records the completion timestamp.
     ///
-    /// This is the Python binding for `writ spec done <id>`.
+    /// If spec_id is omitted and agent_id is provided, auto-scopes to the
+    /// agent's single claimed in-progress spec (agent-first flow).
     /// Returns the updated spec as a dict.
-    #[pyo3(signature = (spec_id, summary=None))]
-    fn spec_done(&self, py: Python, spec_id: &str, summary: Option<String>) -> PyResult<PyObject> {
+    #[pyo3(signature = (spec_id=None, summary=None, agent_id=None))]
+    fn spec_done(
+        &self,
+        py: Python,
+        spec_id: Option<&str>,
+        summary: Option<String>,
+        agent_id: Option<&str>,
+    ) -> PyResult<PyObject> {
+        let resolved_id = match spec_id {
+            Some(id) => id.to_string(),
+            None => {
+                let aid = agent_id.unwrap_or("human");
+                if aid == "human" {
+                    return Err(WritError::new_err(
+                        "spec_id required for human agents — pass the spec ID or use agent_id for auto-scoping",
+                    ));
+                }
+                self.inner
+                    .resolve_spec_for_agent(None, aid)
+                    .map_err(writ_err)?
+            }
+        };
         let spec = self
             .inner
-            .mark_spec_done(spec_id, summary)
+            .mark_spec_done(&resolved_id, summary)
             .map_err(writ_err)?;
         to_pydict(py, &spec)
     }
@@ -1645,6 +1739,25 @@ fn py_install_hooks(py: Python, path: &str) -> PyResult<PyObject> {
     to_pydict(py, &results)
 }
 
+/// Generate writ skill directories in `.claude/skills/`.
+#[pyfunction]
+#[pyo3(name = "generate_skills")]
+fn py_generate_skills(py: Python, path: &str) -> PyResult<PyObject> {
+    let p = PathBuf::from(path);
+    let result = writ_core::skills::generate_skills(&p).map_err(writ_err)?;
+    to_pydict(py, &result)
+}
+
+/// Remove writ skill directories from `.claude/skills/`.
+/// Returns a list of removed skill directory names.
+#[pyfunction]
+#[pyo3(name = "remove_skills")]
+fn py_remove_skills(path: &str) -> PyResult<Vec<String>> {
+    let p = PathBuf::from(path);
+    let removed = writ_core::skills::remove_skills(&p).map_err(writ_err)?;
+    Ok(removed)
+}
+
 #[pymodule]
 #[pyo3(name = "_native")]
 fn writ_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -1655,5 +1768,7 @@ fn writ_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("WritError", m.py().get_type::<WritError>())?;
     m.add_function(wrap_pyfunction!(py_detect_frameworks, m)?)?;
     m.add_function(wrap_pyfunction!(py_install_hooks, m)?)?;
+    m.add_function(wrap_pyfunction!(py_generate_skills, m)?)?;
+    m.add_function(wrap_pyfunction!(py_remove_skills, m)?)?;
     Ok(())
 }

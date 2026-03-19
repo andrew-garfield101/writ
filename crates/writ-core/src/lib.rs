@@ -34,6 +34,7 @@ pub mod repo;
 pub mod seal;
 pub mod security;
 pub mod settings;
+pub mod skills;
 pub mod slash_commands;
 pub mod spec;
 pub mod state;

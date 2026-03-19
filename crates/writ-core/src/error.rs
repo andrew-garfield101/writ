@@ -82,7 +82,10 @@ pub enum WritError {
 impl fmt::Display for WritError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            WritError::NotARepo => write!(f, "not a writ repository (missing .writ/)"),
+            WritError::NotARepo => write!(
+                f,
+                "not a writ repository (missing .writ/) — run `writ init` to initialize"
+            ),
             WritError::AlreadyExists => write!(f, ".writ/ already exists"),
             WritError::Io(e) => write!(f, "I/O error: {e}"),
             WritError::Json(e) => write!(f, "JSON error: {e}"),
@@ -93,8 +96,14 @@ impl fmt::Display for WritError {
                     "no changes to seal — working directory matches last seal"
                 )
             }
-            WritError::SealNotFound(id) => write!(f, "seal not found: {id}"),
-            WritError::SpecNotFound(id) => write!(f, "spec not found: {id}"),
+            WritError::SealNotFound(id) => write!(
+                f,
+                "seal not found: '{id}' — run `writ log` to see available seals"
+            ),
+            WritError::SpecNotFound(id) => write!(
+                f,
+                "spec not found: '{id}' — run `writ context` to see available specs"
+            ),
             WritError::SpecAlreadyExists(id) => {
                 write!(
                     f,
@@ -120,7 +129,10 @@ impl fmt::Display for WritError {
             WritError::SealAlreadyExists(id) => {
                 write!(f, "seal '{id}' already exists (immutable)")
             }
-            WritError::SpecHasNoSeals(id) => write!(f, "spec has no seals: {id}"),
+            WritError::SpecHasNoSeals(id) => write!(
+                f,
+                "spec '{id}' has no seals — seal some work first with `writ seal --spec {id}`"
+            ),
             WritError::UnresolvedConflicts(n) => {
                 write!(
                     f,

@@ -787,14 +787,22 @@ enum AgentCommands {
 #[derive(Subcommand)]
 enum SpecCommands {
     /// Register a new spec.
+    ///
+    /// Usage:
+    ///   writ spec add "brief task description"         (auto-generates hash ID)
+    ///   writ spec add --id my-id --title "My task"     (explicit ID, backward compat)
     Add {
-        /// Unique spec identifier.
-        #[arg(long)]
-        id: String,
+        /// Task summary (positional). Auto-generates a hash ID and uses this as the title.
+        #[arg(value_name = "SUMMARY")]
+        summary: Option<String>,
 
-        /// Spec title.
+        /// Explicit spec identifier (overrides auto-generation).
         #[arg(long)]
-        title: String,
+        id: Option<String>,
+
+        /// Spec title (overrides summary when used with --id).
+        #[arg(long)]
+        title: Option<String>,
 
         /// Spec description.
         #[arg(long, default_value = "")]
@@ -1433,6 +1441,7 @@ fn main() {
         }
         Commands::Spec { action } => match action {
             SpecCommands::Add {
+                summary,
                 id,
                 title,
                 description,
@@ -1441,8 +1450,9 @@ fn main() {
                 tech_stack,
             } => cmd_spec_add(
                 &cwd,
-                &id,
-                &title,
+                summary.as_deref(),
+                id.as_deref(),
+                title.as_deref(),
                 &description,
                 acceptance_criteria,
                 design_notes,
@@ -2493,23 +2503,6 @@ fn cmd_seal(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let is_agent = detect_agent_from_env().is_some();
 
-    // C.13: Seal enforcement — agents must link seals to specs.
-    if spec_id.is_none() {
-        if is_agent {
-            eprintln!("{} No active spec for this seal.", "ERROR:".red().bold());
-            eprintln!("  Run: writ spec add --id <id> --title \"<title>\"");
-            eprintln!("  Then retry your seal.");
-            eprintln!();
-            eprintln!("  Agents must link seals to specs for tracking and coordination.");
-            process::exit(1);
-        } else {
-            eprintln!(
-                "{} This seal has no spec. Run `writ spec add` for tracking.",
-                "warning:".yellow().bold()
-            );
-        }
-    }
-
     // C.14: Context token check — warn if writ context wasn't run recently.
     if is_agent && !check_context_token(cwd) {
         eprintln!(
@@ -2523,12 +2516,35 @@ fn cmd_seal(
     let mut repo = Repository::open_from_dir(cwd)?;
     repo.set_enforce_scope(enforce_scope);
 
-    // S.5: Resolve spec_id via slug/prefix if provided
+    // SK.3b: Auto-scope spec for agents. If --spec is omitted, try to find
+    // the agent's single claimed in-progress spec. Falls back to C.13
+    // enforcement if auto-scoping fails.
     let spec_id = if let Some(ref input) = spec_id {
+        // Explicit --spec provided — resolve via slug/prefix.
         let spec = repo.resolve_spec(input)?;
         Some(spec.id.clone())
     } else {
-        None
+        // Try auto-scoping from agent's claimed spec.
+        match repo.resolve_spec_for_agent(None, agent_id) {
+            Ok(id) => Some(id),
+            Err(_) => {
+                // C.13: No auto-scope available — enforce spec for agents.
+                if is_agent {
+                    eprintln!("{} No active spec for this seal.", "ERROR:".red().bold());
+                    eprintln!("  Create one: writ spec add \"brief description of your task\"");
+                    eprintln!("  Then retry your seal.");
+                    eprintln!();
+                    eprintln!("  Agents must link seals to specs for tracking and coordination.");
+                    process::exit(1);
+                } else {
+                    eprintln!(
+                        "{} This seal has no spec. Run `writ spec add` for tracking.",
+                        "warning:".yellow().bold()
+                    );
+                    None
+                }
+            }
+        }
     };
 
     let agent = AgentIdentity {
@@ -5320,18 +5336,46 @@ fn cmd_spec_update(
 
 fn cmd_spec_add(
     cwd: &PathBuf,
-    id: &str,
-    title: &str,
+    summary: Option<&str>,
+    id: Option<&str>,
+    title: Option<&str>,
     description: &str,
     acceptance_criteria: Option<Vec<String>>,
     design_notes: Option<Vec<String>>,
     tech_stack: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use writ_core::repo::{generate_spec_id, slugify_title};
+
     let repo = Repository::open_from_dir(cwd)?;
+
+    // Resolve ID and title from the various input forms:
+    //   writ spec add "summary"                    → auto-ID from summary, title = summary
+    //   writ spec add --id my-id --title "title"   → explicit ID and title
+    //   writ spec add --id my-id                   → explicit ID, title = id
+    let (spec_id, spec_title) = match (summary, id, title) {
+        // Positional summary: auto-generate hash ID
+        (Some(s), None, None) => (generate_spec_id(s), s.to_string()),
+        (Some(s), None, Some(t)) => (generate_spec_id(s), t.to_string()),
+        // Explicit --id provided
+        (None, Some(i), Some(t)) => (i.to_string(), t.to_string()),
+        (None, Some(i), None) => (i.to_string(), i.to_string()),
+        // Both positional and --id (positional wins as summary, --id as ID)
+        (Some(_), Some(i), Some(t)) => (i.to_string(), t.to_string()),
+        (Some(s), Some(i), None) => (i.to_string(), s.to_string()),
+        // Nothing provided
+        (None, None, _) => {
+            eprintln!("error: provide a task summary or use --id and --title");
+            eprintln!("  usage: writ spec add \"brief task description\"");
+            eprintln!("     or: writ spec add --id my-id --title \"My task\"");
+            std::process::exit(1);
+        }
+    };
+
+    let slug = slugify_title(&spec_title);
     let mut spec = Spec::with_slug(
-        id.to_string(),
-        id.to_string(),
-        title.to_string(),
+        spec_id.clone(),
+        slug,
+        spec_title.clone(),
         description.to_string(),
     );
     if let Some(ac) = acceptance_criteria {
@@ -5344,8 +5388,15 @@ fn cmd_spec_add(
         spec.tech_stack = ts;
     }
     repo.add_spec(&spec)?;
-    println!("spec added: {id}");
-    println!("  title: {title}");
+
+    // Auto-claim for agents: if running in an agent environment,
+    // the creating agent automatically claims the spec.
+    if let Some(agent_env) = detect_agent_from_env() {
+        let _ = repo.spec_claim(&spec_id, &agent_env);
+    }
+
+    println!("spec added: {spec_id}");
+    println!("  title: {spec_title}");
     if !spec.acceptance_criteria.is_empty() {
         println!("  criteria:   {}", spec.acceptance_criteria.join("; "));
     }
@@ -5437,39 +5488,65 @@ fn cmd_spec_done(
 
     let repo = Repository::open_from_dir(cwd)?;
 
-    // Auto-detect spec ID if not provided
+    // SK.3b: Auto-scope spec ID. If an agent identity is available,
+    // use resolve_spec_for_agent to find their claimed spec. Otherwise
+    // fall back to the legacy "find any active spec" behavior for humans.
     let spec_id = match id {
-        Some(id) => id.to_string(),
+        Some(id) => {
+            let spec = repo.resolve_spec(id)?;
+            spec.id
+        }
         None => {
-            let specs = repo.list_specs()?;
-            let active: Vec<_> = specs
-                .iter()
-                .filter(|s| {
-                    matches!(
-                        s.status,
-                        writ_core::spec::SpecStatus::InProgress
-                            | writ_core::spec::SpecStatus::Pending
-                    )
-                })
-                .collect();
+            // Try agent-scoped resolution first.
+            let agent_id = agent
+                .map(|a| a.to_string())
+                .or_else(|| detect_agent_from_env().map(|a| a.to_string()))
+                .unwrap_or_else(|| "human".to_string());
 
-            match active.len() {
-                0 => {
-                    eprintln!("error: no active specs to complete.");
-                    eprintln!("hint: use `writ spec add` to create a spec first.");
-                    std::process::exit(1);
-                }
-                1 => {
-                    let id = active[0].id.clone();
-                    println!("Auto-detected active spec: {} \"{}\"", id, active[0].title);
-                    id
-                }
-                n => {
-                    eprintln!("error: {} active specs found. Please specify which one:", n);
-                    for s in &active {
-                        eprintln!("  writ spec done {} -s \"summary\"", s.id);
+            if agent_id != "human" {
+                match repo.resolve_spec_for_agent(None, &agent_id) {
+                    Ok(id) => {
+                        let spec = repo.load_spec(&id)?;
+                        println!("Auto-detected spec: {} \"{}\"", id, spec.title);
+                        id
                     }
-                    std::process::exit(1);
+                    Err(e) => {
+                        eprintln!("error: {}", e);
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                // Human fallback — find any active spec.
+                let specs = repo.list_specs()?;
+                let active: Vec<_> = specs
+                    .iter()
+                    .filter(|s| {
+                        matches!(
+                            s.status,
+                            writ_core::spec::SpecStatus::InProgress
+                                | writ_core::spec::SpecStatus::Pending
+                        )
+                    })
+                    .collect();
+
+                match active.len() {
+                    0 => {
+                        eprintln!("error: no active specs to complete.");
+                        eprintln!("hint: use `writ spec add` to create a spec first.");
+                        std::process::exit(1);
+                    }
+                    1 => {
+                        let id = active[0].id.clone();
+                        println!("Auto-detected active spec: {} \"{}\"", id, active[0].title);
+                        id
+                    }
+                    n => {
+                        eprintln!("error: {} active specs found. Please specify which one:", n);
+                        for s in &active {
+                            eprintln!("  writ spec done {} -s \"summary\"", s.id);
+                        }
+                        std::process::exit(1);
+                    }
                 }
             }
         }

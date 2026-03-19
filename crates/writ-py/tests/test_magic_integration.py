@@ -182,3 +182,112 @@ class TestMixedWorkflow:
         # Both workflows should coexist.
         assert Path(task["workspace_path"]).exists()
         assert (path / "frontend.js").exists()
+
+
+class TestAutoScoping:
+    """SK.3b / PY.2: Auto-scoping for seal() and spec_done()."""
+
+    def test_seal_auto_scopes_to_claimed_spec(self, tmp_repo):
+        """seal() without spec_id auto-scopes to agent's single claimed spec."""
+        repo, path = tmp_repo
+        plan_result = repo.plan(["Auth feature"])
+        spec_id = plan_result[0]["spec_id"]
+        repo.spec_claim(spec_id, "agent-1")
+
+        (path / "auth.py").write_text("def login(): pass\n")
+        # First seal WITH spec_id to make it InProgress.
+        repo.seal(
+            summary="initial work",
+            agent_id="agent-1",
+            agent_type="agent",
+            spec_id=spec_id,
+            status="in-progress",
+        )
+
+        # Second seal WITHOUT spec_id — should auto-scope.
+        (path / "auth.py").write_text("def login(): return True\n")
+        result = repo.seal(
+            summary="completed login",
+            agent_id="agent-1",
+            agent_type="agent",
+            status="in-progress",
+        )
+        assert result is not None
+        assert result.get("spec_id") == spec_id
+
+    def test_seal_graceful_fallback_no_claimed_spec(self, tmp_repo):
+        """seal() without spec_id and no claimed spec seals with spec_id=None."""
+        repo, path = tmp_repo
+        (path / "readme.txt").write_text("hello\n")
+        # Agent with no claimed spec — should NOT error, just seal without spec.
+        result = repo.seal(
+            summary="exploratory work",
+            agent_id="agent-1",
+            agent_type="agent",
+            status="in-progress",
+        )
+        assert result is not None
+        # spec_id should be None/absent since no spec was claimed.
+        assert result.get("spec_id") is None
+
+    def test_seal_graceful_fallback_multiple_specs(self, tmp_repo):
+        """seal() without spec_id and 2+ claimed specs falls back gracefully."""
+        repo, path = tmp_repo
+        plan_result = repo.plan(["Auth", "Payments"])
+        repo.spec_claim(plan_result[0]["spec_id"], "agent-1")
+        repo.spec_claim(plan_result[1]["spec_id"], "agent-1")
+
+        # Seal both to make InProgress.
+        (path / "a.py").write_text("a\n")
+        repo.seal(summary="a", agent_id="agent-1", agent_type="agent",
+                  spec_id=plan_result[0]["spec_id"], status="in-progress")
+        (path / "b.py").write_text("b\n")
+        repo.seal(summary="b", agent_id="agent-1", agent_type="agent",
+                  spec_id=plan_result[1]["spec_id"], status="in-progress")
+
+        # Now seal without spec_id — should fall back, not error.
+        (path / "c.py").write_text("c\n")
+        result = repo.seal(
+            summary="ambiguous work",
+            agent_id="agent-1",
+            agent_type="agent",
+            status="in-progress",
+        )
+        assert result is not None
+
+    def test_spec_done_auto_scopes_for_agent(self, tmp_repo):
+        """spec_done() without spec_id auto-scopes to agent's claimed spec."""
+        repo, path = tmp_repo
+        plan_result = repo.plan(["Auth feature"])
+        spec_id = plan_result[0]["spec_id"]
+        repo.spec_claim(spec_id, "agent-1")
+
+        (path / "auth.py").write_text("def login(): pass\n")
+        repo.seal(summary="auth work", agent_id="agent-1", agent_type="agent",
+                  spec_id=spec_id, status="in-progress")
+
+        # spec_done without spec_id, with agent_id — should auto-scope.
+        result = repo.spec_done(agent_id="agent-1", summary="Auth complete")
+        assert result is not None
+        assert result["id"] == spec_id
+        assert result["status"].lower() == "complete"
+
+    def test_spec_done_requires_spec_id_for_human(self, tmp_repo):
+        """spec_done() without spec_id for human agent raises error."""
+        repo, path = tmp_repo
+        with pytest.raises(Exception, match="spec_id required"):
+            repo.spec_done()
+
+    def test_resolve_spec_for_agent_direct(self, tmp_repo):
+        """resolve_spec_for_agent() returns the claimed spec ID."""
+        repo, path = tmp_repo
+        plan_result = repo.plan(["Auth feature"])
+        spec_id = plan_result[0]["spec_id"]
+        repo.spec_claim(spec_id, "agent-1")
+
+        (path / "auth.py").write_text("def login(): pass\n")
+        repo.seal(summary="auth", agent_id="agent-1", agent_type="agent",
+                  spec_id=spec_id, status="in-progress")
+
+        resolved = repo.resolve_spec_for_agent("agent-1")
+        assert resolved == spec_id

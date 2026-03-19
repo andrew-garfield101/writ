@@ -512,6 +512,22 @@ pub fn hook_claude_code(root: &Path) -> WritResult<HookResult> {
     created.extend(sc_result.created);
     updated.extend(sc_result.updated);
 
+    // Generate all skill directories (dual mode: skills + slash commands).
+    let sk_result = crate::skills::generate_skills(root)?;
+    if sk_result.created > 0 {
+        created.push(format!(
+            ".claude/skills/writ-*/ ({} skills, {} auto-invoke)",
+            sk_result.created,
+            crate::skills::auto_invoke_count()
+        ));
+    }
+    if sk_result.updated > 0 {
+        updated.push(format!(
+            ".claude/skills/writ-*/ ({} updated)",
+            sk_result.updated
+        ));
+    }
+
     // Ensure Bash(writ *) permission in .claude/settings.json.
     match ensure_claude_permissions(root) {
         Ok(Some(path)) => {
@@ -727,6 +743,10 @@ pub fn unhook_claude_code(root: &Path) -> WritResult<UninstallHookResult> {
     // Remove all writ slash command files.
     let sc_removed = crate::slash_commands::remove_slash_commands(root)?;
     removed.extend(sc_removed);
+
+    // Remove all writ skill directories.
+    let sk_removed = crate::skills::remove_skills(root)?;
+    removed.extend(sk_removed);
 
     // Remove Bash(writ *) permission from .claude/settings.json.
     match remove_claude_permissions(root) {
@@ -2446,6 +2466,276 @@ mod tests {
         assert!(
             !content.contains(WRIT_HOOK_MARKER),
             "unhook should remove all writ hook commands"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SK.9: Bri's init/uninit integration tests for skills
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_init_generates_both_slash_commands_and_skills() {
+        let dir = tempdir().unwrap();
+        let result = hook_claude_code(dir.path()).unwrap();
+
+        // Slash commands should exist.
+        let commands_dir = dir.path().join(".claude/commands");
+        assert!(commands_dir.is_dir(), "commands dir should exist");
+        let cmd_count = fs::read_dir(&commands_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("writ-")
+            })
+            .count();
+        assert!(cmd_count > 0, "slash commands should be generated");
+
+        // Skill directories should exist.
+        let skills_dir = dir.path().join(".claude/skills");
+        assert!(skills_dir.is_dir(), "skills dir should exist");
+        let skill_count = fs::read_dir(&skills_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("writ-")
+            })
+            .count();
+        assert_eq!(
+            skill_count,
+            crate::skills::SKILL_TEMPLATES.len(),
+            "all skill directories should be created"
+        );
+
+        // HookResult should mention skills in created files.
+        let has_skills_entry = result
+            .files_created
+            .iter()
+            .any(|f| f.contains(".claude/skills"));
+        assert!(has_skills_entry, "HookResult should list skills creation");
+    }
+
+    #[test]
+    fn test_uninit_removes_both_slash_commands_and_skills() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        // Verify both exist before uninit.
+        assert!(dir.path().join(".claude/commands").is_dir());
+        assert!(dir.path().join(".claude/skills").is_dir());
+
+        unhook_claude_code(dir.path()).unwrap();
+
+        // All writ slash commands should be removed.
+        let commands_dir = dir.path().join(".claude/commands");
+        if commands_dir.exists() {
+            let writ_cmds: Vec<_> = fs::read_dir(&commands_dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("writ-")
+                })
+                .collect();
+            assert!(
+                writ_cmds.is_empty(),
+                "writ slash commands should be removed"
+            );
+        }
+
+        // All writ skill directories should be removed.
+        let skills_dir = dir.path().join(".claude/skills");
+        if skills_dir.exists() {
+            let writ_skills: Vec<_> = fs::read_dir(&skills_dir)
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with("writ-")
+                })
+                .collect();
+            assert!(
+                writ_skills.is_empty(),
+                "writ skill directories should be removed"
+            );
+        }
+    }
+
+    #[test]
+    fn test_init_skills_idempotent() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        // Capture skill directory contents after first init.
+        let skills_dir = dir.path().join(".claude/skills");
+        let first_count = fs::read_dir(&skills_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("writ-")
+            })
+            .count();
+
+        // Second init should not duplicate skill directories.
+        hook_claude_code(dir.path()).unwrap();
+        let second_count = fs::read_dir(&skills_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("writ-")
+            })
+            .count();
+
+        assert_eq!(
+            first_count, second_count,
+            "reinit should not create duplicate skill directories"
+        );
+    }
+
+    #[test]
+    fn test_init_skill_directories_have_correct_structure() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        for template in crate::skills::SKILL_TEMPLATES {
+            let skill_dir = dir.path().join(".claude/skills").join(template.name);
+            assert!(skill_dir.is_dir(), "missing skill dir: {}", template.name);
+
+            let skill_md = skill_dir.join("SKILL.md");
+            assert!(skill_md.exists(), "missing SKILL.md in {}", template.name);
+
+            let content = fs::read_to_string(&skill_md).unwrap();
+            assert!(
+                content.starts_with("<!-- Generated by writ init. Do not edit. -->\n"),
+                "{}/SKILL.md missing generated header",
+                template.name
+            );
+
+            // Supporting files should be present.
+            for sf in template.supporting_files {
+                let sf_path = skill_dir.join(sf.filename);
+                assert!(
+                    sf_path.exists(),
+                    "{}/{} supporting file missing",
+                    template.name,
+                    sf.filename
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_uninit_preserves_non_writ_skills() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        // Create a custom skill.
+        let custom = dir.path().join(".claude/skills/my-custom-skill");
+        fs::create_dir_all(&custom).unwrap();
+        fs::write(custom.join("SKILL.md"), "# Custom Skill\n").unwrap();
+
+        unhook_claude_code(dir.path()).unwrap();
+
+        assert!(custom.exists(), "custom skill should survive uninit");
+        assert!(
+            custom.join("SKILL.md").exists(),
+            "custom SKILL.md should survive"
+        );
+    }
+
+    #[test]
+    fn test_reinit_updates_stale_skill_content() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        // Corrupt a SKILL.md to simulate stale content.
+        let skill_md = dir.path().join(".claude/skills/writ-context/SKILL.md");
+        fs::write(&skill_md, "stale content").unwrap();
+
+        // Reinit should fix the stale content.
+        hook_claude_code(dir.path()).unwrap();
+
+        let content = fs::read_to_string(&skill_md).unwrap();
+        assert!(
+            content.starts_with("<!-- Generated by writ init. Do not edit. -->\n"),
+            "reinit should restore generated header"
+        );
+        assert!(
+            content.contains("autoInvoke: true"),
+            "reinit should restore correct skill content"
+        );
+    }
+
+    #[test]
+    fn test_init_with_existing_skills_no_corruption() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        // Read original content of all SKILL.md files.
+        let mut originals = std::collections::HashMap::new();
+        for template in crate::skills::SKILL_TEMPLATES {
+            let path = dir
+                .path()
+                .join(".claude/skills")
+                .join(template.name)
+                .join("SKILL.md");
+            originals.insert(template.name, fs::read_to_string(&path).unwrap());
+        }
+
+        // Run init again — content should be identical.
+        hook_claude_code(dir.path()).unwrap();
+
+        for template in crate::skills::SKILL_TEMPLATES {
+            let path = dir
+                .path()
+                .join(".claude/skills")
+                .join(template.name)
+                .join("SKILL.md");
+            let after = fs::read_to_string(&path).unwrap();
+            assert_eq!(
+                originals[template.name], after,
+                "{}/SKILL.md content changed after reinit",
+                template.name
+            );
+        }
+    }
+
+    #[test]
+    fn test_init_skill_count_matches_template_count() {
+        let dir = tempdir().unwrap();
+        hook_claude_code(dir.path()).unwrap();
+
+        let skills_dir = dir.path().join(".claude/skills");
+        let skill_count = fs::read_dir(&skills_dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("writ-")
+            })
+            .count();
+
+        assert_eq!(
+            skill_count,
+            crate::skills::SKILL_TEMPLATES.len(),
+            "init should create exactly as many skill dirs as templates"
         );
     }
 }

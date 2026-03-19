@@ -23,18 +23,22 @@ class TestPlanSpecCreation:
             assert "spec_id" in spec_info
             assert "title" in spec_info
 
-    def test_plan_generates_slugs(self, tmp_repo):
-        """Plan generates URL-safe slugs from titles."""
+    def test_plan_generates_hash_ids(self, tmp_repo):
+        """Plan generates 12-char hex hash IDs, not slugs."""
         repo, path = tmp_repo
         result = repo.plan(["Backend API work"])
 
-        assert result[0]["spec_id"] == "backend-api-work"
+        spec_id = result[0]["spec_id"]
+        assert len(spec_id) == 12, f"spec ID should be 12 hex chars, got: {spec_id}"
+        assert all(c in "0123456789abcdef" for c in spec_id)
 
-    def test_plan_duplicate_title_errors(self, tmp_repo):
-        """Plan with duplicate titles returns an error."""
+    def test_plan_same_title_twice_succeeds(self, tmp_repo):
+        """Plan with duplicate titles succeeds (hash IDs are unique)."""
         repo, path = tmp_repo
-        with pytest.raises(Exception):
-            repo.plan(["Same title", "Same title"])
+        result = repo.plan(["Same title", "Same title"])
+
+        assert len(result) == 2
+        assert result[0]["spec_id"] != result[1]["spec_id"]
 
     def test_plan_titles_match(self, tmp_repo):
         """Plan preserves the original titles."""
@@ -48,13 +52,14 @@ class TestPlanSpecCreation:
     def test_plan_specs_appear_in_context(self, tmp_repo):
         """Plan-created specs are visible in context."""
         repo, path = tmp_repo
-        repo.plan(["Feature A", "Feature B"])
+        plan_result = repo.plan(["Feature A", "Feature B"])
 
         ctx = repo.context()
         # Plan-created specs should show up as unclaimed
         unclaimed_ids = [s["id"] for s in ctx.get("unclaimed_specs", [])]
-        assert "feature-a" in unclaimed_ids
-        assert "feature-b" in unclaimed_ids
+        # Use the returned spec IDs (hash-based), not slugs
+        assert plan_result[0]["spec_id"] in unclaimed_ids
+        assert plan_result[1]["spec_id"] in unclaimed_ids
 
 
 class TestUnclaimedSpecsInContext:
@@ -72,28 +77,32 @@ class TestUnclaimedSpecsInContext:
     def test_claimed_spec_removed_from_unclaimed(self, tmp_repo):
         """After claiming, spec no longer appears as unclaimed."""
         repo, path = tmp_repo
-        repo.plan(["Auth", "Payments"])
+        plan_result = repo.plan(["Auth", "Payments"])
 
-        repo.spec_claim("auth", "agent-1")
+        auth_id = plan_result[0]["spec_id"]
+        payments_id = plan_result[1]["spec_id"]
+
+        repo.spec_claim(auth_id, "agent-1")
 
         ctx = repo.context()
         unclaimed = ctx.get("unclaimed_specs", [])
         unclaimed_ids = [s["id"] for s in unclaimed]
-        assert "auth" not in unclaimed_ids
-        assert "payments" in unclaimed_ids
+        assert auth_id not in unclaimed_ids
+        assert payments_id in unclaimed_ids
 
     def test_completed_spec_not_in_unclaimed(self, tmp_repo):
         """Completed specs don't appear as unclaimed."""
         repo, path = tmp_repo
-        repo.plan(["Done task"])
+        plan_result = repo.plan(["Done task"])
+        spec_id = plan_result[0]["spec_id"]
 
         # Mark it done
-        repo.spec_done("done-task")
+        repo.spec_done(spec_id)
 
         ctx = repo.context()
         unclaimed = ctx.get("unclaimed_specs", [])
         unclaimed_ids = [s["id"] for s in unclaimed]
-        assert "done-task" not in unclaimed_ids
+        assert spec_id not in unclaimed_ids
 
 
 class TestSpecClaiming:

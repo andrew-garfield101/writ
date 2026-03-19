@@ -77,31 +77,35 @@ class TestMagicWorkflowIntegration:
         repo, path = tmp_repo
 
         # 1. Human creates specs via plan.
-        repo.plan([
+        plan_result = repo.plan([
             "Implement auth endpoint",
             "Add payment processing",
             "Build dashboard UI",
         ])
 
+        auth_id = plan_result[0]["spec_id"]
+        payments_id = plan_result[1]["spec_id"]
+        dashboard_id = plan_result[2]["spec_id"]
+
         # 2. Agent-1 claims and works on auth.
-        repo.spec_claim("implement-auth-endpoint", "agent-1")
+        repo.spec_claim(auth_id, "agent-1")
         (path / "auth.py").write_text("def login(): return True\n")
         repo.seal(
             summary="auth endpoint",
             agent_id="agent-1",
             agent_type="agent",
-            spec_id="implement-auth-endpoint",
+            spec_id=auth_id,
             status="in-progress",
         )
 
         # 3. Agent-2 claims and works on payments.
-        repo.spec_claim("add-payment-processing", "agent-2")
+        repo.spec_claim(payments_id, "agent-2")
         (path / "payments.py").write_text("def charge(): return True\n")
         repo.seal(
             summary="payment processing",
             agent_id="agent-2",
             agent_type="agent",
-            spec_id="add-payment-processing",
+            spec_id=payments_id,
             status="in-progress",
         )
 
@@ -109,7 +113,7 @@ class TestMagicWorkflowIntegration:
         ctx = repo.context()
         unclaimed = ctx.get("unclaimed_specs", [])
         unclaimed_ids = [s["id"] for s in unclaimed]
-        assert "build-dashboard-ui" in unclaimed_ids
+        assert dashboard_id in unclaimed_ids
 
         # 5. Both agents' files exist (same directory).
         assert (path / "auth.py").exists()
@@ -138,16 +142,18 @@ class TestBackwardCompatibility:
         repo, path = tmp_repo
 
         task = repo.create_task("Backend API", None)
-        assert task["spec_id"] == "backend-api"
+        # spec_id is now a hash, not a slug
+        spec_id = task["spec_id"]
+        assert len(spec_id) == 12
         assert Path(task["workspace_path"]).exists()
 
-        # Seal via workspace.
+        # Seal via workspace using the returned spec ID.
         (Path(task["workspace_path"]) / "api.py").write_text("# api\n")
         repo.seal(
             summary="api work",
             agent_id="ws-agent",
             agent_type="agent",
-            spec_id="backend-api",
+            spec_id=spec_id,
             status="in-progress",
         )
 

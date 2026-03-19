@@ -1802,7 +1802,10 @@ fn error_hint(err: &dyn std::error::Error) -> Option<String> {
         return Some("use `writ log` to see available seal IDs (prefix match supported)".into());
     }
     if msg.contains("spec not found") {
-        return Some("use `writ spec status` to see available specs, or try a different slug/ID prefix".into());
+        return Some(
+            "use `writ spec status` to see available specs, or try a different slug/ID prefix"
+                .into(),
+        );
     }
     if msg.contains("multiple specs match") {
         return Some("use the full spec ID (12 hex chars) to disambiguate".into());
@@ -1819,9 +1822,7 @@ fn error_hint(err: &dyn std::error::Error) -> Option<String> {
         return Some("run `git init` first, then `writ init`".into());
     }
     if msg.contains("unresolved conflicts") {
-        return Some(
-            "re-run with `writ finish --auto` to auto-resolve".into(),
-        );
+        return Some("re-run with `writ finish --auto` to auto-resolve".into());
     }
     if msg.contains("push rejected") || msg.contains("Push rejected") {
         return Some("pull first with `writ pull`, resolve, then push again".into());
@@ -2387,7 +2388,12 @@ fn cmd_plan(
         _ => {
             println!("\n  {} specs created:", results.len().to_string().bold());
             for r in &results {
-                println!("    {}  {}  \"{}\"", r.spec_id.cyan(), r.slug.dimmed(), r.title);
+                println!(
+                    "    {}  {}  \"{}\"",
+                    r.spec_id.cyan(),
+                    r.slug.dimmed(),
+                    r.title
+                );
             }
             println!();
             println!(
@@ -2583,13 +2589,24 @@ fn cmd_seal(
         (s, None)
     };
 
-    let spec_slug_display = seal.spec_id.as_deref()
+    let spec_slug_display = seal
+        .spec_id
+        .as_deref()
         .and_then(|sid| repo.load_spec(sid).ok())
         .filter(|s| !s.slug.is_empty())
         .map(|s| format!("  spec: {} ({})", s.id.cyan(), s.slug.dimmed()))
-        .or_else(|| seal.spec_id.as_deref().map(|sid| format!("  spec: {}", sid.cyan())))
+        .or_else(|| {
+            seal.spec_id
+                .as_deref()
+                .map(|sid| format!("  spec: {}", sid.cyan()))
+        })
         .unwrap_or_default();
-    println!("{} {}{}", "sealed".green().bold(), &seal.id[..12].cyan(), spec_slug_display);
+    println!(
+        "{} {}{}",
+        "sealed".green().bold(),
+        &seal.id[..12].cyan(),
+        spec_slug_display
+    );
 
     if let Some(ref w) = conflict_warning {
         if w.is_clean {
@@ -2736,7 +2753,9 @@ fn cmd_log(
                     .spec_id
                     .as_deref()
                     .map(|s| {
-                        let slug = repo.load_spec(s).ok()
+                        let slug = repo
+                            .load_spec(s)
+                            .ok()
                             .filter(|sp| !sp.slug.is_empty())
                             .map(|sp| sp.slug.clone())
                             .unwrap_or_default();
@@ -2777,7 +2796,9 @@ fn cmd_log(
                 );
                 if let Some(ref spec_id) = seal.spec_id {
                     // Try to load the spec to show slug alongside ID
-                    let slug_part = repo.load_spec(spec_id).ok()
+                    let slug_part = repo
+                        .load_spec(spec_id)
+                        .ok()
                         .filter(|s| !s.slug.is_empty())
                         .map(|s| format!("  {}", s.slug))
                         .unwrap_or_default();
@@ -5390,10 +5411,16 @@ fn cmd_spec_status(
         };
         let seal_count = spec.sealed_by.len();
         let lifecycle = format!("{:?}", spec.lifecycle_state);
-        let slug_display = if spec.slug.is_empty() { &spec.id } else { &spec.slug };
+        let slug_display = if spec.slug.is_empty() {
+            &spec.id
+        } else {
+            &spec.slug
+        };
         println!(
             "  {status_marker}{}  {}  {:?}  [{lifecycle}]  ({seal_count} seal(s))",
-            spec.id.cyan(), slug_display.dimmed(), spec.status
+            spec.id.cyan(),
+            slug_display.dimmed(),
+            spec.status
         );
     }
 

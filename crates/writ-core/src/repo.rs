@@ -2088,7 +2088,8 @@ impl Repository {
         for task in tasks {
             let id = generate_spec_id(&task);
             let slug = slugify_title(&task);
-            let spec = crate::spec::Spec::with_slug(id.clone(), slug.clone(), task.clone(), String::new());
+            let spec =
+                crate::spec::Spec::with_slug(id.clone(), slug.clone(), task.clone(), String::new());
             self.add_spec(&spec)?;
             results.push(PlanResult {
                 spec_id: id,
@@ -3898,9 +3899,7 @@ impl Repository {
         let specs = self.list_specs().ok()?;
         let completed: Vec<&Spec> = specs
             .iter()
-            .filter(|s| {
-                self.spec_eligible_for_convergence(s, epoch, bridge_tree.as_deref(), true)
-            })
+            .filter(|s| self.spec_eligible_for_convergence(s, epoch, bridge_tree.as_deref(), true))
             .collect();
 
         if completed.len() < 2 {
@@ -6739,14 +6738,7 @@ impl Repository {
         let specs = self.list_specs()?;
         let completed_ids: Vec<String> = specs
             .iter()
-            .filter(|s| {
-                self.spec_eligible_for_convergence(
-                    s,
-                    epoch,
-                    bridge_tree.as_deref(),
-                    true,
-                )
-            })
+            .filter(|s| self.spec_eligible_for_convergence(s, epoch, bridge_tree.as_deref(), true))
             .map(|s| s.id.clone())
             .collect();
 
@@ -24123,11 +24115,7 @@ mod seal_tree_convergence_tests {
             false,
         )
         .unwrap();
-        fs::write(
-            dir.path().join("shared.txt"),
-            "original\nOLD-B\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("shared.txt"), "original\nOLD-B\n").unwrap();
         repo.seal(
             agent("agent"),
             "old b".into(),
@@ -24137,11 +24125,7 @@ mod seal_tree_convergence_tests {
             false,
         )
         .unwrap();
-        fs::write(
-            dir.path().join("shared.txt"),
-            "original\nline2\nNEW\n",
-        )
-        .unwrap();
+        fs::write(dir.path().join("shared.txt"), "original\nline2\nNEW\n").unwrap();
         repo.seal(
             agent("agent"),
             "new work".into(),
@@ -31125,11 +31109,8 @@ mod workspace_tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         // Same title twice → same slug, different IDs
-        repo.plan(vec![
-            "Debug source code".into(),
-            "Debug source code".into(),
-        ])
-        .unwrap();
+        repo.plan(vec!["Debug source code".into(), "Debug source code".into()])
+            .unwrap();
 
         let err = repo.resolve_spec("debug-source-code");
         assert!(err.is_err());

@@ -204,8 +204,9 @@ fn remove_claude_permissions(root: &Path) -> WritResult<Option<String>> {
 const WRIT_INSTRUCTION: &str = "MANDATORY: This project uses writ for version control. \
 You MUST follow this workflow — it is not optional. \
 1) BEFORE starting any work, run `writ context` to check project state. \
-2) AFTER each meaningful unit of work, you MUST run `writ seal -s '<summary>' --agent claude-code`. \
-3) When your task is complete, you MUST run `writ spec done <spec-id>` BEFORE reporting results. \
+2) If no spec is assigned to you, create one: `writ spec add \"brief description of your task\"`. \
+3) AFTER each meaningful unit of work, run `writ seal -s '<summary>'` to checkpoint (auto-scoped to your spec). \
+4) When your task is complete, run `writ spec done` BEFORE reporting results (auto-scoped to your spec). \
 Your task is NOT complete until you have sealed your work. \
 NEVER run `git commit`, `git add`, `git push`, or `writ finish` — the user handles git.";
 
@@ -310,7 +311,13 @@ fn writ_hook_command() -> String {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "writ".to_string());
     format!(
-        "{writ} context 2>/dev/null && echo '[writ context snapshot — run `writ context` for latest state in multi-agent environments]' || true",
+        "echo '## Writ VCS Active' && \
+         echo 'This project uses writ for version control.' && \
+         echo 'Your FIRST action: create or claim a spec for your task.' && \
+         echo '  - If unclaimed specs exist below, claim one: writ spec claim <id>' && \
+         echo '  - If none match your task, create one: writ spec add \"brief task description\"' && \
+         echo '' && \
+         {writ} context 2>/dev/null || true",
         writ = writ_path
     )
 }
@@ -1109,11 +1116,11 @@ This project uses writ for version control. The `writ` CLI is available in PATH.
 You MUST follow these steps. They are not optional.
 
 1. BEFORE starting any work, run `writ context` to check project state
-2. Create or claim a spec: `writ spec add --id <id> --title "<description>"`
+2. If no spec is assigned to you, create one: `writ spec add "brief description of your task"`
 3. Do your work in small increments
-4. AFTER each meaningful unit of work, you MUST run `writ seal -s "<summary>" --agent claude-code --spec <spec-id>`
+4. AFTER each meaningful unit of work, run `writ seal -s "<summary>"` to checkpoint (auto-scoped to your spec)
 5. Check `writ context` periodically to see what other agents have done
-6. When task is complete, you MUST run `writ spec done <id>` BEFORE reporting results
+6. When task is complete, run `writ spec done` BEFORE reporting results (auto-scoped to your spec)
 
 ## Spec Lifecycle
 
@@ -1146,10 +1153,10 @@ Available formats:
 
 - `writ context` — structured project state
 - `writ context --spec <id>` — context scoped to a specific task
-- `writ seal -s "<summary>" --agent claude-code` — checkpoint work
-- `writ spec add --id <id> --title "<description>"` — create a task spec
+- `writ seal -s "<summary>"` — checkpoint work (auto-scoped to your spec)
+- `writ spec add "brief task description"` — create a task spec (ID auto-generated)
 - `writ spec status` — view active specs
-- `writ spec done <id>` — mark your task complete (creates final seal)
+- `writ spec done` — mark your task complete (auto-scoped to your spec)
 - `writ status` — project overview (agents, specs, progress)
 - `writ diff` — preview file changes
 - `writ log` — recent seal history

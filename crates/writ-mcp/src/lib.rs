@@ -42,11 +42,12 @@ pub struct SealParams {
 /// Parameters for writ_spec_add tool.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SpecAddParams {
-    /// Short lowercase hyphenated ID (e.g. 'auth-migration').
-    pub id: String,
-    /// Human-readable description of the task.
-    pub title: String,
-    /// Optional longer description.
+    /// Brief description of your task (5-15 words). Writ generates a unique ID automatically.
+    /// Example: "Add OAuth2 authentication to login page"
+    pub summary: String,
+    /// Optional explicit ID. Omit to auto-generate a hash ID (recommended).
+    pub id: Option<String>,
+    /// Optional longer description with implementation details.
     pub description: Option<String>,
 }
 
@@ -330,27 +331,28 @@ impl WritMcpServer {
     /// Create a new task spec before starting work.
     #[tool(
         name = "writ_spec_add",
-        description = "Create a new task spec before starting work. Every task should have a spec for tracking and attribution. Returns the new spec plus a project state summary."
+        description = "Create a task spec from a brief summary of your work. Writ auto-generates a unique ID. Just pass a short summary like 'Add OAuth2 login endpoint'. Returns the new spec plus a project state summary."
     )]
     async fn writ_spec_add(
         &self,
         Parameters(params): Parameters<SpecAddParams>,
     ) -> Result<CallToolResult, McpError> {
-        let spec_id = params.id.clone();
-
         // Check for unclaimed specs before creating a new one.
         // This nudges agents to claim existing specs from `writ plan` instead
         // of creating duplicates.
         let unclaimed_warning = self.check_unclaimed_specs();
 
-        let mut args = vec![
-            "spec".to_string(),
-            "add".to_string(),
-            "--id".to_string(),
-            params.id,
-            "--title".to_string(),
-            params.title,
-        ];
+        let mut args = vec!["spec".to_string(), "add".to_string()];
+
+        if let Some(ref id) = params.id {
+            // Explicit ID provided (power-user / backward compat).
+            args.extend(["--id".to_string(), id.clone()]);
+            args.extend(["--title".to_string(), params.summary.clone()]);
+        } else {
+            // Agent-first flow: positional summary, auto-generated hash ID.
+            args.push(params.summary.clone());
+        }
+
         if let Some(d) = params.description {
             args.extend(["--description".to_string(), d]);
         }
@@ -381,6 +383,15 @@ impl WritMcpServer {
                 v.get("text")?.as_str().map(|s| s.to_string())
             })
             .unwrap_or_default();
+
+        // Extract spec ID from the add output (line: "spec added: <id>").
+        let spec_id = add_text
+            .lines()
+            .find(|l| l.starts_with("spec added:"))
+            .and_then(|l| l.strip_prefix("spec added:"))
+            .map(|s| s.trim().to_string())
+            .or(params.id.clone())
+            .unwrap_or_else(|| "unknown".to_string());
 
         let mut combined = format!(
             "{}\n\nspec created: {}\n\nproject specs:\n{}",
@@ -993,15 +1004,21 @@ mod tests {
     }
 
     #[test]
-    fn test_spec_add_requires_id_and_title_in_schema() {
+    fn test_spec_add_requires_summary_in_schema() {
         let server = WritMcpServer::new("writ".to_string(), ".".to_string());
         let tools = server.tool_router.list_all();
         let tool = tools.iter().find(|t| t.name == "writ_spec_add").unwrap();
         let schema = &tool.input_schema;
         let required = schema.get("required").unwrap().as_array().unwrap();
         let names: Vec<&str> = required.iter().map(|v| v.as_str().unwrap()).collect();
-        assert!(names.contains(&"id"), "spec_add must require 'id'");
-        assert!(names.contains(&"title"), "spec_add must require 'title'");
+        assert!(
+            names.contains(&"summary"),
+            "spec_add must require 'summary'"
+        );
+        assert!(
+            !names.contains(&"id"),
+            "spec_add 'id' should be optional (auto-generated)"
+        );
     }
 
     #[test]
@@ -1200,26 +1217,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spec_add_minimal() {
+    async fn test_spec_add_summary_only() {
         let dir = tempfile::tempdir().unwrap();
         let server = echo_server(dir.path());
         let result = server
             .writ_spec_add(Parameters(SpecAddParams {
-                id: "auth-flow".to_string(),
-                title: "Add authentication".to_string(),
+                summary: "Add authentication flow".to_string(),
+                id: None,
                 description: None,
             }))
             .await
             .unwrap();
         let text = result_text(&result);
+        // Should use positional summary (no --id, no --title).
         assert!(
-            text.contains("spec add --id auth-flow --title Add authentication"),
-            "should contain spec add command, got: {}",
-            text
-        );
-        assert!(
-            text.contains("spec created: auth-flow"),
-            "should contain spec created confirmation, got: {}",
+            text.contains("spec add Add authentication flow"),
+            "should use positional summary form, got: {}",
             text
         );
         assert!(
@@ -1230,26 +1243,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_spec_add_with_explicit_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_spec_add(Parameters(SpecAddParams {
+                summary: "Add auth".to_string(),
+                id: Some("auth-flow".to_string()),
+                description: None,
+            }))
+            .await
+            .unwrap();
+        let text = result_text(&result);
+        assert!(
+            text.contains("spec add --id auth-flow --title Add auth"),
+            "should use explicit --id form, got: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
     async fn test_spec_add_with_description() {
         let dir = tempfile::tempdir().unwrap();
         let server = echo_server(dir.path());
         let result = server
             .writ_spec_add(Parameters(SpecAddParams {
-                id: "auth-flow".to_string(),
-                title: "Add auth".to_string(),
+                summary: "Add auth".to_string(),
+                id: None,
                 description: Some("OAuth2 flow".to_string()),
             }))
             .await
             .unwrap();
         let text = result_text(&result);
         assert!(
-            text.contains("spec add --id auth-flow --title Add auth --description OAuth2 flow"),
-            "should contain spec add command with description, got: {}",
-            text
-        );
-        assert!(
-            text.contains("spec created: auth-flow"),
-            "should contain spec created confirmation, got: {}",
+            text.contains("spec add Add auth --description OAuth2 flow"),
+            "should contain summary + description, got: {}",
             text
         );
     }

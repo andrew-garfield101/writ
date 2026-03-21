@@ -1978,6 +1978,29 @@ fn cmd_init(
         for warning in &hook_warnings {
             eprintln!("{} {}", "warning:".yellow().bold(), warning);
         }
+
+        // Post-init baseline seal: capture all generated files (skills, slash
+        // commands, CLAUDE.md, .mcp.json, etc.) so that specs created after
+        // init have a genesis tree that includes these files. Without this,
+        // every agent's first seal shows 20+ init artifacts as "new files."
+        if result.git_imported || result.already_imported {
+            let repo = Repository::open_from_dir(&cwd)?;
+            let bridge_agent = writ_core::seal::AgentIdentity {
+                id: "writ-bridge".to_string(),
+                agent_type: writ_core::seal::AgentType::Agent,
+            };
+            match repo.seal(
+                bridge_agent,
+                "post-init baseline (captures generated files)".to_string(),
+                None,
+                writ_core::seal::TaskStatus::Complete,
+                writ_core::seal::Verification::default(),
+                true, // allow_empty in case no new files were generated
+            ) {
+                Ok(_) => {}
+                Err(_) => {} // Best effort — don't fail init over this
+            }
+        }
     }
 
     match format {

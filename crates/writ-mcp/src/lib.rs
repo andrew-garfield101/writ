@@ -29,8 +29,8 @@ pub struct ContextParams {
 pub struct SealParams {
     /// Clear description of what you accomplished.
     pub summary: String,
-    /// The spec ID or slug this work belongs to (required).
-    pub spec: String,
+    /// The spec this work belongs to. Omit to auto-scope to your claimed spec.
+    pub spec: Option<String>,
     /// Your agent identity (defaults to 'claude-code').
     pub agent: Option<String>,
     /// Specific file paths to seal (default: all changes).
@@ -45,8 +45,6 @@ pub struct SpecAddParams {
     /// Brief description of your task (5-15 words). Writ generates a unique ID automatically.
     /// Example: "Add OAuth2 authentication to login page"
     pub summary: String,
-    /// Optional explicit ID. Omit to auto-generate a hash ID (recommended).
-    pub id: Option<String>,
     /// Optional longer description with implementation details.
     pub description: Option<String>,
 }
@@ -314,11 +312,12 @@ impl WritMcpServer {
             "seal".to_string(),
             "-s".to_string(),
             params.summary,
-            "--spec".to_string(),
-            params.spec,
             "--agent".to_string(),
             agent_id,
         ];
+        if let Some(spec) = params.spec {
+            args.extend(["--spec".to_string(), spec]);
+        }
         if let Some(p) = params.paths {
             args.extend(["--paths".to_string(), p.join(",")]);
         }
@@ -342,16 +341,13 @@ impl WritMcpServer {
         // of creating duplicates.
         let unclaimed_warning = self.check_unclaimed_specs();
 
-        let mut args = vec!["spec".to_string(), "add".to_string()];
-
-        if let Some(ref id) = params.id {
-            // Explicit ID provided (power-user / backward compat).
-            args.extend(["--id".to_string(), id.clone()]);
-            args.extend(["--title".to_string(), params.summary.clone()]);
-        } else {
-            // Agent-first flow: positional summary, auto-generated hash ID.
-            args.push(params.summary.clone());
-        }
+        // Agent-first flow: positional summary, auto-generated hash ID.
+        // No explicit ID parameter — agents always get hash IDs.
+        let mut args = vec![
+            "spec".to_string(),
+            "add".to_string(),
+            params.summary.clone(),
+        ];
 
         if let Some(d) = params.description {
             args.extend(["--description".to_string(), d]);
@@ -390,7 +386,6 @@ impl WritMcpServer {
             .find(|l| l.starts_with("spec added:"))
             .and_then(|l| l.strip_prefix("spec added:"))
             .map(|s| s.trim().to_string())
-            .or(params.id.clone())
             .unwrap_or_else(|| "unknown".to_string());
 
         let mut combined = format!(
@@ -986,7 +981,7 @@ mod tests {
     // ─── Schema validation ──────────────────────────────────────
 
     #[test]
-    fn test_seal_requires_summary_and_spec_in_schema() {
+    fn test_seal_requires_summary_not_spec_in_schema() {
         let server = WritMcpServer::new("writ".to_string(), ".".to_string());
         let tools = server.tool_router.list_all();
         let seal_tool = tools.iter().find(|t| t.name == "writ_seal").unwrap();
@@ -998,8 +993,8 @@ mod tests {
             "seal schema must require 'summary'"
         );
         assert!(
-            required_names.contains(&"spec"),
-            "seal schema must require 'spec'"
+            !required_names.contains(&"spec"),
+            "seal schema 'spec' should be optional (auto-scoped)"
         );
     }
 
@@ -1163,7 +1158,7 @@ mod tests {
         let result = server
             .writ_seal(Parameters(SealParams {
                 summary: "did stuff".to_string(),
-                spec: "feat-1".to_string(),
+                spec: Some("feat-1".to_string()),
                 agent: None,
                 paths: None,
                 allow_empty: None,
@@ -1171,7 +1166,7 @@ mod tests {
             .await
             .unwrap();
         let text = result_text(&result);
-        assert_eq!(text, "seal -s did stuff --spec feat-1 --agent claude-code");
+        assert_eq!(text, "seal -s did stuff --agent claude-code --spec feat-1");
     }
 
     #[tokio::test]
@@ -1181,7 +1176,7 @@ mod tests {
         let result = server
             .writ_seal(Parameters(SealParams {
                 summary: "added routes".to_string(),
-                spec: "api-1".to_string(),
+                spec: Some("api-1".to_string()),
                 agent: Some("backend-dev".to_string()),
                 paths: Some(vec!["src/app.py".to_string(), "src/models.py".to_string()]),
                 allow_empty: None,
@@ -1191,7 +1186,7 @@ mod tests {
         let text = result_text(&result);
         assert_eq!(
             text,
-            "seal -s added routes --spec api-1 --agent backend-dev --paths src/app.py,src/models.py"
+            "seal -s added routes --agent backend-dev --spec api-1 --paths src/app.py,src/models.py"
         );
     }
 
@@ -1202,7 +1197,7 @@ mod tests {
         let result = server
             .writ_seal(Parameters(SealParams {
                 summary: "metadata update".to_string(),
-                spec: "feat-1".to_string(),
+                spec: Some("feat-1".to_string()),
                 agent: None,
                 paths: None,
                 allow_empty: Some(true),
@@ -1212,7 +1207,7 @@ mod tests {
         let text = result_text(&result);
         assert_eq!(
             text,
-            "seal -s metadata update --spec feat-1 --agent claude-code --allow-empty"
+            "seal -s metadata update --agent claude-code --spec feat-1 --allow-empty"
         );
     }
 
@@ -1223,7 +1218,6 @@ mod tests {
         let result = server
             .writ_spec_add(Parameters(SpecAddParams {
                 summary: "Add authentication flow".to_string(),
-                id: None,
                 description: None,
             }))
             .await
@@ -1243,33 +1237,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_spec_add_with_explicit_id() {
-        let dir = tempfile::tempdir().unwrap();
-        let server = echo_server(dir.path());
-        let result = server
-            .writ_spec_add(Parameters(SpecAddParams {
-                summary: "Add auth".to_string(),
-                id: Some("auth-flow".to_string()),
-                description: None,
-            }))
-            .await
-            .unwrap();
-        let text = result_text(&result);
-        assert!(
-            text.contains("spec add --id auth-flow --title Add auth"),
-            "should use explicit --id form, got: {}",
-            text
-        );
-    }
-
-    #[tokio::test]
     async fn test_spec_add_with_description() {
         let dir = tempfile::tempdir().unwrap();
         let server = echo_server(dir.path());
         let result = server
             .writ_spec_add(Parameters(SpecAddParams {
                 summary: "Add auth".to_string(),
-                id: None,
                 description: Some("OAuth2 flow".to_string()),
             }))
             .await

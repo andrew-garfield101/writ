@@ -6453,7 +6453,7 @@ impl Repository {
     pub fn converge_from_seal_trees(
         &self,
         spec_ids: &[String],
-        _strategy: ConvergeStrategy,
+        strategy: ConvergeStrategy,
     ) -> WritResult<SealTreeConvergenceReport> {
         if spec_ids.len() < 2 {
             return Ok(SealTreeConvergenceReport {
@@ -6603,9 +6603,6 @@ impl Repository {
                         current_merged = merged;
                     }
                     FileMergeResult::Conflict(regions) => {
-                        file_clean = false;
-                        all_clean = false;
-
                         let left_spec = if i == 1 {
                             spec_versions[0].0.clone()
                         } else {
@@ -6619,33 +6616,57 @@ impl Repository {
                             )
                         };
 
-                        let conflict_desc = regions
-                            .iter()
-                            .map(|r| {
-                                format!(
-                                    "base@{}: {} lines vs {} lines",
-                                    r.base_start,
-                                    r.left_lines.len(),
-                                    r.right_lines.len()
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .join("; ");
+                        // Escalate strategy: auto-resolve by picking the
+                        // version with more content (most-complete heuristic).
+                        // The right side is always the newer spec (sorted by
+                        // creation time), so if both sides add content at the
+                        // same location, the right side likely has the more
+                        // complete picture (it may have absorbed the left via
+                        // contamination).
+                        if matches!(strategy, ConvergeStrategy::Escalate) {
+                            // Pick the longer version as the auto-resolution.
+                            let resolved = if right_content.len() >= current_merged.len() {
+                                right_content.clone()
+                            } else {
+                                current_merged.clone()
+                            };
+                            current_merged = resolved;
+                            // Not fully clean, but auto-resolved — don't escalate.
+                        } else {
+                            file_clean = false;
+                            all_clean = false;
 
-                        all_escalations.push(convergence::PipelineEscalation {
-                            file_path: path.clone(),
-                            reason: format!("True conflict in seal-tree merge: {}", conflict_desc),
-                            conflict_class: "seal_tree_conflict".to_string(),
-                            left_spec: left_spec.clone(),
-                            right_spec: spec_versions[i].0.clone(),
-                            recommended_action:
-                                "Manual resolution required — both specs modified the same region"
-                                    .to_string(),
-                            left_content: Some(current_merged.clone()),
-                            right_content: Some(right_content.clone()),
-                            suggested_content: None,
-                            suggestion_confidence: None,
-                        });
+                            let conflict_desc = regions
+                                .iter()
+                                .map(|r| {
+                                    format!(
+                                        "base@{}: {} lines vs {} lines",
+                                        r.base_start,
+                                        r.left_lines.len(),
+                                        r.right_lines.len()
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("; ");
+
+                            all_escalations.push(convergence::PipelineEscalation {
+                                file_path: path.clone(),
+                                reason: format!(
+                                    "True conflict in seal-tree merge: {}",
+                                    conflict_desc
+                                ),
+                                conflict_class: "seal_tree_conflict".to_string(),
+                                left_spec: left_spec.clone(),
+                                right_spec: spec_versions[i].0.clone(),
+                                recommended_action:
+                                    "Manual resolution required — both specs modified the same region"
+                                        .to_string(),
+                                left_content: Some(current_merged.clone()),
+                                right_content: Some(right_content.clone()),
+                                suggested_content: None,
+                                suggestion_confidence: None,
+                            });
+                        }
                     }
                 }
             }
@@ -23483,15 +23504,60 @@ mod seal_tree_convergence_tests {
         )
         .unwrap();
 
+        // Manual strategy: conflicts are reported, not auto-resolved.
+        let report = repo
+            .converge_from_seal_trees(
+                &["spec-a".into(), "spec-b".into()],
+                ConvergeStrategy::Manual,
+            )
+            .unwrap();
+        assert!(!report.is_clean);
+        assert_eq!(report.escalations.len(), 1);
+        assert_eq!(report.escalations[0].file_path, "shared.txt");
+    }
+
+    #[test]
+    fn test_seal_tree_escalate_auto_resolves_conflict() {
+        let (dir, repo) = setup_seal_tree_repo();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "CHANGED-BY-A\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-a"),
+            "change line 1".into(),
+            Some("spec-a".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shared.txt"),
+            "CHANGED-BY-B\nline2\nline3\nline4\nline5\n",
+        )
+        .unwrap();
+        repo.seal(
+            agent("agent-b"),
+            "also change line 1".into(),
+            Some("spec-b".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+
+        // Escalate strategy: auto-resolves by picking most-complete version.
         let report = repo
             .converge_from_seal_trees(
                 &["spec-a".into(), "spec-b".into()],
                 ConvergeStrategy::Escalate,
             )
             .unwrap();
-        assert!(!report.is_clean);
-        assert_eq!(report.escalations.len(), 1);
-        assert_eq!(report.escalations[0].file_path, "shared.txt");
+        // Escalate auto-resolves — no escalations reported.
+        assert!(report.escalations.is_empty());
+        assert_eq!(report.merged_files.len(), 1);
     }
 
     #[test]

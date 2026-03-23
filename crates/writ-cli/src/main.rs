@@ -819,6 +819,10 @@ enum SpecCommands {
         /// Tech stack (comma-separated).
         #[arg(long, value_delimiter = ',')]
         tech_stack: Option<Vec<String>>,
+
+        /// Agent identity for auto-claiming the created spec.
+        #[arg(long)]
+        agent: Option<String>,
     },
 
     /// Show all specs and their status.
@@ -1448,6 +1452,7 @@ fn main() {
                 acceptance_criteria,
                 design_notes,
                 tech_stack,
+                agent,
             } => cmd_spec_add(
                 &cwd,
                 summary.as_deref(),
@@ -1457,6 +1462,7 @@ fn main() {
                 acceptance_criteria,
                 design_notes,
                 tech_stack,
+                agent.as_deref(),
             ),
             SpecCommands::Status { state, format } => {
                 cmd_spec_status(&cwd, state.as_deref(), &format)
@@ -2101,7 +2107,7 @@ fn cmd_init(
                     );
                 }
                 println!(
-                    "  {} Tip: run {} for auto-convergence when multiple agents work in the same directory",
+                    "  {} Tip: run {} to monitor agent activity when multiple agents work in the same directory",
                     "→".green(),
                     "writ watch".bold()
                 );
@@ -2434,7 +2440,7 @@ fn cmd_plan(
                 "writ context".cyan()
             );
             println!(
-                "  Run {} to enable automatic convergence.",
+                "  Run {} to monitor agent activity in real time.",
                 "writ watch".cyan()
             );
         }
@@ -4336,17 +4342,24 @@ fn cmd_finish(
         }
     }
 
-    // Generate commit message
+    // Load summary for dry-run file listing.
     let summary = repo.summary()?;
-    let commit_message = if full {
-        summary.commit_message.clone()
-    } else {
-        // Build a message from completed spec summaries
-        let mut msg = summary.headline.clone();
-        if committable.len() > 1 {
-            msg = format!("{} ({} specs)", msg, committable.len());
+
+    // Generate commit message from committable specs (not all specs).
+    let commit_message = {
+        let titles: Vec<&str> = committable.iter().map(|s| s.title.as_str()).collect();
+        let first_title = titles.first().copied().unwrap_or("writ changes");
+        if committable.len() == 1 {
+            format!("writ: {}", first_title)
+        } else {
+            format!(
+                "writ: {} features complete — {}, +{} more ({} specs)",
+                committable.len(),
+                first_title,
+                committable.len() - 1,
+                committable.len(),
+            )
         }
-        msg
     };
 
     println!();
@@ -5366,6 +5379,7 @@ fn cmd_spec_add(
     acceptance_criteria: Option<Vec<String>>,
     design_notes: Option<Vec<String>>,
     tech_stack: Option<Vec<String>>,
+    agent: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use writ_core::repo::{generate_spec_id, slugify_title};
 
@@ -5412,10 +5426,13 @@ fn cmd_spec_add(
     }
     repo.add_spec(&spec)?;
 
-    // Auto-claim for agents: if running in an agent environment,
-    // the creating agent automatically claims the spec.
-    if let Some(agent_env) = detect_agent_from_env() {
-        let _ = repo.spec_claim(&spec_id, &agent_env);
+    // Auto-claim for agents: use explicit --agent flag (from MCP),
+    // fall back to environment detection.
+    let agent_id = agent
+        .map(|a| a.to_string())
+        .or_else(|| detect_agent_from_env().map(|a| a.to_string()));
+    if let Some(aid) = &agent_id {
+        let _ = repo.spec_claim(&spec_id, aid);
     }
 
     println!("spec added: {spec_id}");
@@ -6227,16 +6244,9 @@ fn cmd_converge_all(
 
                 println!();
                 println!(
-                    "  {} Seal the converged state:",
-                    "All merges applied.".green().bold()
-                );
-                println!(
-                    "    {}",
-                    format!(
-                        "writ seal -s \"converge-all: merged {} branch(es)\" --agent convergence-bot --status complete",
-                        report.merge_order.len(),
-                    )
-                    .cyan()
+                    "  {} Run {} to commit the converged result.",
+                    "All merges applied.".green().bold(),
+                    "`writ finish`".cyan().bold()
                 );
             } else {
                 println!(
@@ -8286,7 +8296,7 @@ fn append_watch_config_comment(config_path: &std::path::Path) {
     let watch_comment = r#"
 
 # Watch daemon configuration (uncomment to customize)
-# Run `writ watch` to start the convergence daemon.
+# Run `writ watch` to monitor agent activity in real time.
 # [watch]
 # interval = 5              # seconds between polls (min: 1)
 # auto_converge = true       # auto-converge overlapping seals

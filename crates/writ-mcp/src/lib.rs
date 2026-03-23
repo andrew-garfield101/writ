@@ -231,11 +231,20 @@ pub struct TaskParams {
 // ─── Server ──────────────────────────────────────────────────────
 
 /// The writ MCP server. Exposes writ CLI operations as native MCP tools.
+///
+/// Each MCP server instance gets a unique `agent_id` generated at startup.
+/// Since each Claude Code agent session launches its own MCP server process,
+/// this ID uniquely identifies the agent across spec_add, seal, and spec_done
+/// calls within that session. This fixes T1-BUG-21/22/23 (agent identity
+/// consistency in multi-agent same-directory mode).
 #[derive(Debug, Clone)]
 pub struct WritMcpServer {
     tool_router: ToolRouter<Self>,
     writ_binary: String,
     project_dir: String,
+    /// Unique agent identity for this MCP session.
+    /// Format: "claude-code-XXXX" where XXXX is a short random suffix.
+    agent_id: String,
 }
 
 #[tool_handler(router = self.tool_router)]
@@ -268,12 +277,26 @@ impl ServerHandler for WritMcpServer {
 
 #[tool_router(router = tool_router)]
 impl WritMcpServer {
-    /// Create a new server instance.
+    /// Create a new server instance with a unique agent identity.
     pub fn new(writ_binary: String, project_dir: String) -> Self {
+        // Generate a short unique suffix for this MCP session.
+        // Each agent process gets its own MCP server, so this ID
+        // is unique per agent within a multi-agent session.
+        let suffix: String = {
+            use std::time::SystemTime;
+            let seed = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            format!("{:04x}", (seed ^ (seed >> 16)) & 0xFFFF)
+        };
+        let agent_id = format!("claude-code-{}", suffix);
+
         Self {
             tool_router: Self::tool_router(),
             writ_binary,
             project_dir,
+            agent_id,
         }
     }
 
@@ -307,7 +330,9 @@ impl WritMcpServer {
         &self,
         Parameters(params): Parameters<SealParams>,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id = params.agent.unwrap_or_else(|| "claude-code".to_string());
+        let agent_id = params
+            .agent
+            .unwrap_or_else(|| self.agent_id.clone());
         let mut args = vec![
             "seal".to_string(),
             "-s".to_string(),
@@ -342,11 +367,13 @@ impl WritMcpServer {
         let unclaimed_warning = self.check_unclaimed_specs();
 
         // Agent-first flow: positional summary, auto-generated hash ID.
-        // No explicit ID parameter — agents always get hash IDs.
+        // Pass agent identity so the spec is auto-claimed by this agent.
         let mut args = vec![
             "spec".to_string(),
             "add".to_string(),
             params.summary.clone(),
+            "--agent".to_string(),
+            self.agent_id.clone(),
         ];
 
         if let Some(d) = params.description {
@@ -419,6 +446,9 @@ impl WritMcpServer {
         if let Some(s) = params.summary {
             args.extend(["-s".to_string(), s]);
         }
+        // Pass agent identity so the completion seal and auto-scoping
+        // know which agent is calling (fixes T1-BUG-22 and T1-BUG-23).
+        args.extend(["--agent".to_string(), self.agent_id.clone()]);
         self.run_writ_owned(&args)
     }
 
@@ -1166,7 +1196,12 @@ mod tests {
             .await
             .unwrap();
         let text = result_text(&result);
-        assert_eq!(text, "seal -s did stuff --agent claude-code --spec feat-1");
+        assert!(
+            text.starts_with("seal -s did stuff --agent claude-code-")
+                && text.contains("--spec feat-1"),
+            "expected seal with claude-code-XXXX agent and --spec feat-1, got: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -1205,9 +1240,11 @@ mod tests {
             .await
             .unwrap();
         let text = result_text(&result);
-        assert_eq!(
-            text,
-            "seal -s metadata update --agent claude-code --spec feat-1 --allow-empty"
+        assert!(
+            text.contains("seal -s metadata update --agent claude-code-")
+                && text.contains("--spec feat-1 --allow-empty"),
+            "expected seal with claude-code-XXXX agent, got: {}",
+            text
         );
     }
 
@@ -1223,10 +1260,10 @@ mod tests {
             .await
             .unwrap();
         let text = result_text(&result);
-        // Should use positional summary (no --id, no --title).
+        // Should use positional summary with agent identity.
         assert!(
-            text.contains("spec add Add authentication flow"),
-            "should use positional summary form, got: {}",
+            text.contains("spec add Add authentication flow --agent claude-code-"),
+            "should use positional summary form with agent, got: {}",
             text
         );
         assert!(
@@ -1249,8 +1286,9 @@ mod tests {
             .unwrap();
         let text = result_text(&result);
         assert!(
-            text.contains("spec add Add auth --description OAuth2 flow"),
-            "should contain summary + description, got: {}",
+            text.contains("spec add Add auth --agent claude-code-")
+                && text.contains("--description OAuth2 flow"),
+            "should contain summary, agent, and description, got: {}",
             text
         );
     }
@@ -1267,7 +1305,11 @@ mod tests {
             .await
             .unwrap();
         let text = result_text(&result);
-        assert_eq!(text, "spec done");
+        assert!(
+            text.starts_with("spec done --agent claude-code-"),
+            "expected spec done with agent, got: {}",
+            text
+        );
     }
 
     #[tokio::test]
@@ -1282,7 +1324,11 @@ mod tests {
             .await
             .unwrap();
         let text = result_text(&result);
-        assert_eq!(text, "spec done feat-1 -s all tests pass");
+        assert!(
+            text.contains("spec done feat-1 -s all tests pass --agent claude-code-"),
+            "expected spec done with agent, got: {}",
+            text
+        );
     }
 
     // ─── Arg building: Status & Review ──────────────────────────

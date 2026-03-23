@@ -1039,26 +1039,26 @@ fn writ_claude_md_section() -> String {
 **FIRST ACTION: Run `writ context` before doing anything else.**
 
 **EVERY TASK requires these 3 commands — no exceptions, no matter how small the task:**
-1. `writ spec add --id <id> --title "<description>"` — register your task
-2. `writ seal -s "<summary>" --agent claude-code` — after each unit of work
-3. `writ spec done <id>` — BEFORE reporting results to the user
+1. `writ spec add "brief description of your task"` — register your task (ID auto-generated)
+2. `writ seal -s "<summary>"` — after each unit of work (auto-scoped to your spec)
+3. `writ spec done` — BEFORE reporting results to the user (auto-scoped to your spec)
 
 Your task is NOT complete until you have run all three.
 Do NOT run `git commit`, `git add`, `git push`, or `writ finish`.
 
 ### Commands
 - `writ context` — structured project state (files, specs, activity). Run this FIRST.
-- `writ seal -s "<summary>" --agent claude-code` — checkpoint your work. You MUST do this after each unit of work.
-- `writ spec add --id <id> --title "<description>"` — create a task spec
+- `writ seal -s "<summary>"` — checkpoint your work (auto-scoped to your claimed spec)
+- `writ spec add "brief task description"` — create a task spec (ID auto-generated)
 - `writ spec status` — view active specs
-- `writ spec done <id>` — mark your task complete. You MUST do this before reporting results.
+- `writ spec done` — mark your task complete (auto-scoped to your claimed spec)
 - `writ status` — project overview (agents, specs, progress)
 - `writ diff` — preview file changes
 - `writ log` — recent seal history
 
 ### Rules
 - You MUST run `writ context` before starting work
-- You MUST run `writ seal -s "<summary>" --agent claude-code` after each meaningful unit of work
+- You MUST run `writ seal -s "<summary>"` after each meaningful unit of work
 - You MUST run `writ spec done` before reporting results to the user
 - You MUST include meaningful summaries in seals so other agents understand your work
 - Do NOT run `git add`, `git commit`, or `git push` — the user manages the git round-trip via `writ finish`
@@ -1066,8 +1066,7 @@ Do NOT run `git commit`, `git add`, `git push`, or `writ finish`.
 
 ### Multi-Agent (Same Directory)
 - Multiple agents can work in the same directory simultaneously
-- Each agent seals with `--spec <spec-id>` to scope changes
-- Run `writ watch` in the background for auto-convergence of overlapping work
+- Seals are auto-scoped to your claimed spec — no need for explicit `--spec`
 - Check `writ context` to see other agents' activity and convergence state
 "#.to_string()
 }
@@ -1079,16 +1078,17 @@ This project uses writ for version control. You MUST follow this workflow.
 
 ### Required Workflow
 1. BEFORE starting any work, run `writ context` to check project state
-2. Create specs for tasks: `writ spec add --id <id> --title "<description>"`
-3. AFTER each meaningful unit of work, you MUST run `writ seal -s "<summary>" --agent claude-code`
-4. When complete, you MUST run `writ spec done <id>` BEFORE reporting results
+2. Create a spec for your task: `writ spec add "brief description of your task"`
+3. AFTER each meaningful unit of work, run `writ seal -s "<summary>"` (auto-scoped to your spec)
+4. When complete, run `writ spec done` BEFORE reporting results (auto-scoped to your spec)
 
 Your task is NOT complete until you have sealed your work.
 
 ### Commands
 - `writ context` — structured project state. Run this FIRST.
-- `writ seal -s "<summary>" --agent claude-code` — checkpoint work. MUST do this after each unit of work.
-- `writ spec add / status / done` — task management
+- `writ seal -s "<summary>"` — checkpoint work (auto-scoped to your spec)
+- `writ spec add "task description"` — create a spec (ID auto-generated)
+- `writ spec done` — mark task complete (auto-scoped)
 - `writ status` — project overview
 - `writ log` — seal history
 
@@ -1461,7 +1461,7 @@ mod tests {
         );
         assert!(section.contains("writ diff"), "missing writ diff command");
         assert!(
-            section.contains("writ spec done <id>"),
+            section.contains("writ spec done"),
             "missing writ spec done command"
         );
     }
@@ -1544,8 +1544,12 @@ mod tests {
             "missing writ status command"
         );
         assert!(
-            section.contains("spec add / status / done"),
-            "missing spec task management shorthand"
+            section.contains("writ spec add"),
+            "missing spec add command"
+        );
+        assert!(
+            section.contains("writ spec done"),
+            "missing spec done command"
         );
     }
 

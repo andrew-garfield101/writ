@@ -1,9 +1,15 @@
 /// Build script for writ-cli.
 ///
-/// Exposes CARGO_PKG_VERSION as WRIT_VERSION_FULL for compile-time embedding.
-/// Version is controlled by the workspace Cargo.toml. Alpha/pre-release
-/// numbering is handled by the release pipeline, not build-time env vars.
+/// Exposes WRIT_VERSION_FULL for compile-time embedding.
+/// Base version comes from CARGO_PKG_VERSION (workspace Cargo.toml).
+/// Alpha builds: set WRIT_ALPHA env var to append `-alpha.N` suffix.
+/// No env var = clean version string (for release builds).
 fn main() {
-    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let base = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let version = match std::env::var("WRIT_ALPHA") {
+        Ok(a) if !a.is_empty() => format!("{}-alpha.{}", base, a),
+        _ => base,
+    };
     println!("cargo:rustc-env=WRIT_VERSION_FULL={}", version);
+    println!("cargo:rerun-if-env-changed=WRIT_ALPHA");
 }

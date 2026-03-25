@@ -1762,7 +1762,12 @@ impl Repository {
         let claimed: Vec<&Spec> = specs
             .iter()
             .filter(|s| s.claimed_by.as_deref() == Some(agent_id))
-            .filter(|s| matches!(s.status, SpecStatus::InProgress))
+            .filter(|s| {
+                matches!(
+                    s.status,
+                    SpecStatus::Pending | SpecStatus::InProgress
+                )
+            })
             .collect();
 
         match claimed.len() {
@@ -31313,6 +31318,22 @@ mod workspace_tests {
         )
         .unwrap();
 
+        let result = repo.resolve_spec_for_agent(None, "agent-1").unwrap();
+        assert_eq!(result, "spec-1");
+    }
+
+    #[test]
+    fn test_auto_scope_pending_spec_before_first_seal() {
+        // T1-BUG-24: auto-scope must work on Pending specs (freshly created,
+        // no seal yet). The agent creates a spec via spec_add, then
+        // immediately tries to seal without --spec.
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("spec-1".into(), "Auth work".into(), "".into()))
+            .unwrap();
+        repo.spec_claim("spec-1", "agent-1").unwrap();
+
+        // No seal yet — spec is still Pending. Auto-scope should still find it.
         let result = repo.resolve_spec_for_agent(None, "agent-1").unwrap();
         assert_eq!(result, "spec-1");
     }

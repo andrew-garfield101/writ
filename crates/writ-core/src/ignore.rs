@@ -16,7 +16,14 @@ use std::path::Path;
 const ALWAYS_IGNORED_DIRS: &[&str] = &[".writ"];
 
 /// Default ignore rules used when no `.writignore` file exists.
-const DEFAULT_IGNORE_DIRS: &[&str] = &[".git", "target", "node_modules", ".venv", "__pycache__"];
+const DEFAULT_IGNORE_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+    ".pytest_cache",
+];
 
 /// A parsed set of ignore rules.
 #[derive(Debug, Clone)]
@@ -107,6 +114,7 @@ const WRITIGNORE_DEFAULTS: &[&str] = &[
     "node_modules",
     ".venv",
     "__pycache__",
+    ".pytest_cache",
 ];
 
 /// Create a `.writignore` file in the repo root if one doesn't exist.

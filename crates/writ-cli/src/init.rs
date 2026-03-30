@@ -823,10 +823,9 @@ fn display_summary(
 
     if claude {
         println!(
-            "  {:<40} {} skills ({} auto-invoke)",
+            "  {:<40} {} skills (auto-invoke enabled)",
             ".claude/skills/writ-*/",
-            writ_core::skills::SKILL_TEMPLATES.len(),
-            writ_core::skills::auto_invoke_count()
+            writ_core::skills::SKILL_TEMPLATES.len()
         );
         println!(
             "  {:<40} {} slash commands",

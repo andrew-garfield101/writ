@@ -95,7 +95,7 @@ enum Commands {
     /// Remove writ from this project (inverse of init).
     Uninit {
         /// Skip confirmation prompt.
-        #[arg(long)]
+        #[arg(long, alias = "yes", short = 'y')]
         force: bool,
 
         /// Keep the .writignore file.
@@ -4284,6 +4284,9 @@ fn cmd_finish(
             matches!(
                 s.status,
                 writ_core::spec::SpecStatus::InProgress | writ_core::spec::SpecStatus::Pending
+            ) && !matches!(
+                s.lifecycle_state,
+                writ_core::spec::LifecycleState::Cancelled
             )
         })
         .collect();

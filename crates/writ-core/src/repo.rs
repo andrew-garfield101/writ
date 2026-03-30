@@ -1531,6 +1531,14 @@ impl Repository {
         }
 
         for spec in &specs {
+            // Skip cancelled specs — they shouldn't appear in status output.
+            if matches!(
+                spec.lifecycle_state,
+                crate::spec::LifecycleState::Cancelled
+            ) {
+                continue;
+            }
+
             let (agent, seal_count, files) = spec_seal_info
                 .get(&spec.id)
                 .map(|(a, c, f)| (a.clone(), *c, f.len()))

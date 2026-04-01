@@ -1,6 +1,6 @@
 # Your First Convergence
 
-This walkthrough demonstrates the core problem writ solves: merging work from multiple agents who touch the same files. Not with line based diffing, but with structural understanding.
+This walkthrough demonstrates the core problem writ solves: merging work from multiple agents who touch the same files. Not with line based diffing, but with sealed histories and genesis trees.
 
 ## The Scenario
 
@@ -19,8 +19,8 @@ writ init
 Create two specs:
 
 ```bash
-writ spec add --id backend --title "Backend API"
-writ spec add --id frontend --title "Frontend Components"
+writ spec add "Backend API"
+writ spec add "Frontend Components"
 ```
 
 ## Agent A: Backend Work
@@ -38,7 +38,7 @@ def hash_password(password: str) -> str:
 ```
 
 ```bash
-writ seal -s "added auth utilities" --agent backend-dev --spec backend
+writ seal -s "added auth utilities" --spec backend
 ```
 
 ## Agent B: Frontend Work
@@ -56,7 +56,7 @@ def sanitize_input(text: str) -> str:
 ```
 
 ```bash
-writ seal -s "added display utilities" --agent frontend-dev --spec frontend
+writ seal -s "added display utilities" --spec frontend
 ```
 
 ## The Divergence
@@ -78,11 +78,11 @@ Context shows:
 writ converge-all --apply --strategy escalate
 ```
 
-Writ's convergence engine analyzes the conflict structurally:
+Writ's convergence engine analyzes the conflict:
 
-1. **Phase 1 (Structural Diff):** Decomposes both versions into structural units (imports, function definitions)
-2. **Phase 2 (Classification):** Both sides added non overlapping function definitions
-3. **Phase 3 (Pattern Resolution):** The `NonOverlappingDefinitions` pattern fires at 0.92 confidence — both sides' functions are composed into one file
+1. **Pool filter** selects both specs for convergence (both have sealed changes to the same file)
+2. **Genesis tree merge** uses each spec's genesis snapshot as the common ancestor — since both added new content to the same file, the merge identifies non overlapping additions
+3. **Confidence scoring** rates the merge at high confidence — both sides added independent functions with no overlap, so they compose cleanly
 
 The merged `utils.py` contains all four functions from both agents:
 
@@ -136,6 +136,6 @@ Giving each agent a git worktree solves isolation. This is what solves convergen
 
 ## Next Steps
 
-- **[Convergence](../concepts/convergence.md)** for the full pipeline breakdown
+- **[Convergence](../concepts/convergence.md)** for the deep dive on how writ merges agent work
 - **[Multi Agent Workflow](../guides/multi-agent-workflow.md)** for production patterns
 - **[Convergence Resolution](../guides/convergence-resolution.md)** for handling escalations

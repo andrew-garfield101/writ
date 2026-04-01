@@ -256,11 +256,11 @@ files[3]{path,hash,modified,agent,spec}:
 
 seals[2]{id,summary,agent,timestamp,spec}:
   seal-0041,Implement phase 3 pattern matching,agent-1,2026-03-04T10:00:00Z,S-041
-  seal-0039,Language analyzer improvements,agent-2,2026-03-04T09:45:00Z,S-039
+  seal-0039,Auth middleware and token validation,agent-2,2026-03-04T09:45:00Z,S-039
 
 specs[2]{id,description,status,agent}:
   S-041,Convergence phase 3,active,agent-1
-  S-039,Language analyzers,complete,agent-2
+  S-039,Auth middleware,complete,agent-2
 ```
 
 The single line comment header at the top costs a few tokens but gives the LLM metadata about what it's reading — project name, format, timestamp. Negligible cost, meaningful orientation.

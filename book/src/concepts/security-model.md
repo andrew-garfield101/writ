@@ -100,16 +100,14 @@ Scope violations appear in three places:
 
 No more agents silently modifying files they shouldn't touch.
 
-## Content Traceability
+## Content Traceability (In Development)
 
-The convergence engine enforces a strict rule: **every line in merged output must trace back to an input** (base, left, or right).
+Content traceability is part of the LLM assisted convergence pipeline (Phase 5), currently feature flagged for a future release. When enabled, it enforces a strict rule: **every line in merged output must trace back to an input** (base, left, or right).
 
-This prevents:
-- **Hallucinated content** from leaking into merge results if an LLM is involved in resolution
+This will prevent:
+- **Hallucinated content** from leaking into merge results when an LLM is involved in resolution
 - **Convergence bugs** that might inject novel content
 - **Silent data corruption** during complex multi way merges
-
-If the verifier detects content in the merged output that doesn't originate from any input, the merge is rejected. This is the "no silent additions" rule — a guarantee that no other VCS provides.
 
 ## Security Event Monitoring
 
@@ -147,7 +145,7 @@ Events are severity classified (info, warning, critical) with configurable reten
 | **Signatures** | Authorship. Every seal can be verified back to its creator. |
 | **Trust levels** | Convergence quality. Lower trust agents get more scrutiny. |
 | **Scope enforcement** | File boundaries. Agents stay in their lane. |
-| **Content traceability** | Merge integrity. No hallucinated or injected content survives. |
+| **Content traceability** | Merge integrity. No hallucinated or injected content survives. *(In development — part of LLM convergence pipeline)* |
 | **Event monitoring** | Auditability. Every security relevant action is logged. |
 
 ## Next Steps

@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="assets/sigil-512.png" alt="Sigil — the writ-vcs mascot" width="256">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/sigil-512-dark.png" width="256">
+    <img src="assets/sigil-512.png" alt="Sigil — the writ-vcs mascot" width="256">
+  </picture>
 </p>
 
 # writ
@@ -15,13 +18,13 @@ Writ is a version control system designed from the ground up for LLMs and agenti
 
 Instead of bolting conventions into a VCS built for humans, writ provides elegant AI native version control.
 
-Structured context in one call. Three way merge that auto resolves overlapping agent work. Cryptographic integrity across any environment. And a clean round trip back to git when the work is done.
+Structured context in one call. A convergence engine that auto resolves overlapping agent work. Cryptographic integrity across any environment. And a clean round trip back to git when the work is done.
 
 Writ works alongside git, not instead of it. One `writ init` and agents get everything: native MCP tools, slash commands, workflow instructions, and a structured CLI. No plugins, no configuration, no separate install.
 
 **Context in one call.** Building situational awareness with current tools means multiple calls, parsing unstructured output, synthesizing project state from fragments. That's tokens and compute spent on infrastructure, not on the agent's actual task. `writ context` delivers everything — specs, seals, working state, file contention, integration risk — all in one structured response. That structured data costs more tokens than raw git output. The tradeoff: one call with ready to consume coordination data versus five separate calls that agents must parse, correlate, and reason about on their own. TOON format and spec scoped filtering keep context overhead lean, and writ's token ratio improves as projects scale.
 
-**Automatic convergence.** When multiple agents touch the same files, conventional merging sees conflicts. Writ sees overlapping work and merges it. Each agent's changes are tracked independently through spec scoped seals. When convergence runs, a three way merge engine uses the genesis state (a snapshot of the codebase when the spec was created) as the common ancestor, producing the correct combined result. Additive changes merge automatically. Real conflicts escalate with structured context and confidence scores for human or orchestrator review. No `<<<<` markers. No guesswork.
+**Automatic convergence.** When multiple agents touch the same files, conventional merging sees conflicts. Writ sees overlapping work and merges it. Each agent's changes are tracked independently through spec scoped seals. When convergence runs, writ's convergence engine uses the genesis state (a snapshot of the codebase when the spec was created) as the common ancestor, producing the correct combined result. Additive changes merge automatically. Real conflicts escalate with structured context and confidence scores for human or orchestrator review. No `<<<<` markers. No guesswork.
 
 **Cryptographic integrity.** BLAKE3 hash chains and Ed25519 signatures on every seal. Agent identity with trust levels and scope enforcement. Tamper with any checkpoint and the chain breaks.
 
@@ -35,16 +38,17 @@ Writ works alongside git, not instead of it. One `writ init` and agents get ever
 
 ## Writ's Building Blocks
 
-Six first class primitives:
+Seven first class primitives. Track work, checkpoint it, understand it, merge it, ship it, undo it, monitor it.
 
 | Primitive | What It Is |
 |-----------|-----------|
 | **Spec** | A task unit with a hash ID, lifecycle states, agent claiming, and a genesis snapshot. Tracks what's being worked on, who's doing it, and how far along. Closest analog is an issue that lives inside the VCS itself — not a branch. |
 | **Seal** | An immutable snapshot of file state. Parent chained, cryptographically signed, spec scoped. Every checkpoint is permanent and restorable. |
 | **Context** | Computed project state for agents. Specs, seals, file contention, integration risk, all assembled on demand in one structured call. The intelligence layer that turns raw data into coordination. |
-| **Convergence** | Three way merge using sealed histories and genesis trees as base. Auto resolves non-conflicting changes. Escalates real conflicts with confidence scores. |
-| **Object Store** | Content addressable storage (SHA-256). Every file version stored once, deduplicated automatically. Same model as git's object store. |
+| **Convergence** | Writ's convergence engine merges sealed histories using genesis trees as base. Auto resolves non-conflicting changes. Escalates real conflicts with confidence scores. |
 | **Finish** | The round trip to git. Converges outstanding work, materializes to disk, commits. One command replaces branch management and merge resolution. |
+| **Restore** | Instant rollback to any seal. Every checkpoint is permanent. When an agent goes off the rails, one command rewinds to a known good state. |
+| **Integration Risk** | Automatic overlap scoring. Writ tracks which files are touched by which agents and flags contention before it becomes a conflict. |
 
 ## The Commands
 
@@ -129,7 +133,7 @@ writ finish
 git push
 ```
 
-Agents discover writ without being told. The user's prompts are about the task, not the tool. "Add user authentication" — not "Add user authentication and please use writ." Init generates everything agents need to adopt writ automatically.
+`writ init` generates everything agents need — CLAUDE.md instructions, MCP tools, SessionStart hooks. Agents adopt writ automatically. Your prompts stay focused on the work.
 
 ```
  Human world                    Agent world                       Human world
@@ -155,7 +159,7 @@ Writ puts agent native metadata inside the VCS:
 | (nothing) | **Spec** | Task tracking with lifecycle, agent claiming, genesis snapshots — no git equivalent |
 | Commit | **Seal** | Immutable checkpoint with agent identity, spec linkage, crypto signatures |
 | Multiple `git` commands | `writ context` | One call returns everything an agent needs — structured data, not text to parse |
-| `git merge` | Convergence | Three way merge on seal trees. Auto resolves non-conflicting changes |
+| `git merge` | Convergence | Writ's convergence engine merges seal trees. Auto resolves non-conflicting changes |
 | `git checkout <ref>` | `writ restore` | Instant rollback to any seal — every seal is an immutable snapshot |
 | (nothing) | **Integration risk** | Automatic overlap scoring across agents and specs |
 | (nothing) | **File contention** | Which files are touched by which agents, sorted by risk |
@@ -233,7 +237,7 @@ Context output is also adaptive. Solo agent with no divergence? Integration risk
 
 ---
 
-\* *Benchmarks measured on macOS with Claude Code using tiktoken cl100k_base encoding. Build: writ 0.1.0-alpha.32. Results from a single test session. See the [output formats guide](https://andrew-garfield101.github.io/writ/concepts/output-formats.html) for methodology.*
+\* *Benchmarks measured on macOS with Claude Code using tiktoken cl100k_base encoding. Build: writ 0.1.0-alpha.32. See the [output formats guide](https://andrew-garfield101.github.io/writ/concepts/output-formats.html) for methodology.*
 
 ## Multi-Agent Workflow
 
@@ -364,7 +368,7 @@ This is what git worktrees, branch isolation, and PR automation don't solve. Wor
 
 ### How It Works
 
-Every spec in writ has a **genesis tree**: a snapshot of the file index at the moment the spec was created. When convergence runs, it uses this genesis tree as the common ancestor for three way merge:
+Every spec in writ has a **genesis tree**: a snapshot of the file index at the moment the spec was created. Writ's convergence engine uses this genesis tree as the common ancestor:
 
 - **Base**: the genesis tree (what files looked like when the spec started)
 - **Left**: spec A's sealed version of the file

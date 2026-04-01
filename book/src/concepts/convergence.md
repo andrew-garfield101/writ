@@ -4,62 +4,35 @@ Giving an agent better git access doesn't make `git merge` smarter. When five ag
 
 Git's merge is line based. It compares text and gives up when two sides change the same region. It doesn't know the difference between an import and a function body. It can't tell that two agents adding different functions to the same file is perfectly safe, not a conflict. The tool was built for humans resolving one merge at a time, not for fleets of agents producing changes that need to compose automatically.
 
-Writ's convergence engine understands code **structure**. It decomposes files into semantic units — imports, function definitions, class bodies, statements — and resolves conflicts at that level. The core principle: **compose, don't choose.** Multi agent work is fundamentally additive. Agents build complementary features. The engine preserves all contributions wherever possible and escalates clearly when it can't.
+Writ's convergence engine merges agent work using sealed histories and genesis trees. Instead of comparing raw text on disk, it reads each agent's sealed snapshots and uses the genesis state (a snapshot of the codebase at spec creation) as the common ancestor. Non-conflicting changes merge automatically. Real conflicts escalate with structured context and confidence scores. The core principle: **compose, don't choose.** Multi agent work is fundamentally additive. Agents build complementary features. The engine preserves all contributions wherever possible and escalates clearly when it can't.
 
-## The Pipeline
+## How It Works
 
-Convergence runs through six phases for each conflicted file:
+### Pool Filter
 
-### Phase 1: Structural Diff
+Before any merging begins, a three layer filter determines which specs participate:
 
-The file is decomposed into structural units using language aware analysis. Writ has dedicated analyzers for:
+1. **Epoch boundary** — only specs from the current session (since the last `writ finish`)
+2. **Commit state** — only uncommitted specs
+3. **Genesis tree** — structural filtering against the common ancestor
 
-- Python (functions, classes, imports, decorators)
-- Rust (functions, impl blocks, use statements, modules)
-- TypeScript (functions, classes, interfaces, imports)
-- JavaScript (functions, classes, imports, exports)
-- Go (functions, types, imports, methods)
-- Generic fallback (line based, for everything else)
+This prevents completed, already committed, or irrelevant specs from interfering with the merge.
 
-Each unit is tagged with its type (import, definition, statement) and its location in the file.
+### Genesis Tree Merge
 
-### Phase 2: Classification
+Every spec has a **genesis tree**: a snapshot of the file index at the moment the spec was created. Writ's convergence engine uses this as the common ancestor:
 
-Conflict regions are categorized:
+- **Base**: the genesis tree (what files looked like when the spec started)
+- **Left**: spec A's sealed version of the file
+- **Right**: spec B's sealed version of the file
 
-| Type | Meaning |
-|------|---------|
-| `BothModified` | Both sides changed the same structural unit |
-| `DeleteVsModify` | One side deleted a unit the other modified |
-| `BothAdded` | Both sides added new content in the same region |
-| `OneAdded` | Only one side added content (trivial merge) |
-| `Identical` | Both sides made the same change (trivial merge) |
+Non-conflicting changes (different lines, additive edits, independent sections) merge automatically. When both specs modify the same region in incompatible ways, the **Escalate** strategy auto-resolves by selecting the more complete version. If that's ambiguous, the conflict escalates with structured context for human or orchestrator review.
 
-### Phase 3: Pattern Resolution
+### Shadow Materialization
 
-Five deterministic patterns attempt to resolve conflicts. Each pattern has a base confidence score. The highest confidence match wins.
+Merge results are stored in the object store as **shadow state** — not written to disk. This means convergence can run while agents are still working without disturbing anyone's files. Disk materialization only happens at `writ finish`.
 
-| Pattern | Confidence | What It Resolves |
-|---------|-----------|-----------------|
-| **Import Accumulation** | 0.95 | Both sides add or modify imports. Union them. |
-| **Non Overlapping Definitions** | 0.92 | Both sides add functions or classes with different names. Compose them. |
-| **EOF Append** | 0.92 | Both sides append to the end of the file. Concatenate. |
-| **Additive Composition** | 0.88 | Both sides preserved the base and added content. Compose. |
-| **Superset Containment** | 0.82 | One side contains everything the other has. Use the superset. |
-
-Confidence scores adjust dynamically based on merge complexity. Larger merges receive proportionally more cautious scores.
-
-### Phase 4: Spec Aware Resolution (Feature Flagged)
-
-This is where writ's first class spec metadata gives convergence something no other VCS can offer. Specs carry file scope, acceptance criteria, and design notes. When a conflict is ambiguous at the structural level, spec context can resolve it — does this file belong to spec A or spec B? Which spec has this file in its declared scope? Which agent has the higher trust level for this file?
-
-Currently feature flagged off. When enabled, it uses the same structured metadata that `writ context` surfaces.
-
-### Phase 5: LLM Assisted Resolution (Feature Flagged)
-
-Sends unresolved conflicts to an LLM for resolution with full context. The LLM can select, reorder, and combine from the inputs — composition only, never novel code generation. Currently feature flagged off.
-
-### Phase 6: Verification
+### Verification
 
 The `HardenedVerifier` runs integrity checks on every merged output:
 
@@ -67,22 +40,27 @@ The `HardenedVerifier` runs integrity checks on every merged output:
 - **Balanced delimiters:** Brackets, braces, and parentheses are balanced
 - **Content loss detection:** Warns if significant content from either side was lost
 - **Conflict marker scan:** Ensures no `<<<<<<<` markers leaked into output
-- **Content traceability:** Every line in the output must trace back to an input (base, left, or right). Novel content injected by bugs or hallucinations is detected and rejected.
 
 If verification fails, the merge is rejected. Writ never silently applies a broken merge.
+
+## When Convergence Runs
+
+- **At `writ spec done`** — checks for overlapping work with other completed specs
+- **At `writ finish`** — final backstop that catches anything remaining before git commit
+- **Manually** — `writ converge-all --apply` for explicit control
 
 ## Confidence Thresholds
 
 | Range | Action |
 |-------|--------|
-| >= 0.85 | **Auto resolve.** The pattern is highly confident. Merge without human review. |
-| 0.60 to 0.84 | **Suggest.** Pass to Phase 4/5 or present as a recommendation. |
+| >= 0.85 | **Auto resolve.** The merge is highly confident. Apply without human review. |
+| 0.60 to 0.84 | **Suggest.** Present as a recommendation for review. |
 | < 0.60 | **Escalate.** The conflict is too ambiguous for automation. Escalate to a human or orchestrator agent. |
 
 ## Running Convergence
 
 ```bash
-# Merge all diverged branches, escalate what can't be auto resolved
+# Merge all diverged specs, escalate what can't be auto resolved
 writ converge-all --apply --strategy escalate
 
 # Preview what would happen without applying
@@ -95,7 +73,7 @@ writ converge backend frontend --apply
 ```python
 # Python SDK
 report = repo.converge_all(strategy="escalate", apply=True)
-print(f"Merged {len(report['merge_order'])} branches")
+print(f"Merged {len(report['merge_order'])} specs")
 print(f"Auto-merged: {report['total_auto_merged']}")
 ```
 
@@ -103,7 +81,7 @@ print(f"Auto-merged: {report['total_auto_merged']}")
 
 | Strategy | Behavior |
 |----------|----------|
-| `escalate` | Auto resolve high confidence conflicts, escalate the rest. Recommended for most workflows. |
+| `escalate` | Auto resolve high confidence merges, escalate the rest. Recommended for most workflows. |
 | `three-way-merge` | Standard three way merge. Leaves conflict markers where resolution fails. |
 | `most-recent` | Prefers the most recently sealed version on conflict. |
 | `orchestrator` | Reports all conflicts as structured JSON for an orchestrator agent to resolve programmatically. |
@@ -130,20 +108,20 @@ writ context --format human
 
 ```
 INTEGRATION RISK: HIGH (score: 65)
-  7 diverged branches (>3)
+  7 diverged specs (>3)
   file touched by 11 agents (>=5)
   6 scope violations (>5)
 ```
 
 Integration risk is scored 0 to 100 based on:
-- Number of diverged branches
+- Number of diverged specs
 - File contention (files touched by multiple agents)
 - Scope violations
 - Number of active agents
 
 When risk is high, converge before starting new work. Context surfaces this automatically so agents don't need to discover it themselves.
 
-## Example: Import Accumulation
+## Example: Additive Changes
 
 Two agents both modify `app.py`. Agent A adds:
 
@@ -157,20 +135,20 @@ Agent B adds:
 from payments import process_charge
 ```
 
-Git sees conflicting changes to the import block and produces conflict markers. Writ's `ImportAccumulation` pattern recognizes both as additive import changes and unions them:
+Git sees conflicting changes to the import block and produces conflict markers. Writ's convergence engine recognizes both as non-conflicting additive changes and composes them:
 
 ```python
 from auth import validate_token
 from payments import process_charge
 ```
 
-Confidence: 0.95. Auto resolved. No human intervention needed.
+Auto resolved. No human intervention needed.
 
 ## Example: Real Conflict
 
 Agent A changes `calculate_tax()` to use a flat rate. Agent B changes it to use a progressive rate. These are incompatible implementations of the same function.
 
-Writ classifies this as `BothModified` with no matching pattern. It escalates with full context:
+Writ classifies this as a real conflict with no automatic resolution. It escalates with full context:
 
 ```json
 {
@@ -185,6 +163,16 @@ Writ classifies this as `BothModified` with no matching pattern. It escalates wi
 ```
 
 Structured data, not text to parse. An orchestrator agent or human can review and decide.
+
+## In Development
+
+Two additional convergence phases are implemented and feature flagged for future releases:
+
+**Spec aware resolution (Phase 4).** Uses writ's first class spec metadata — file scope, acceptance criteria, design notes — to resolve ambiguous conflicts. Does this file belong to spec A or spec B? Which spec has this file in its declared scope? Which agent has the higher trust level? Spec context gives convergence something no other VCS can offer.
+
+**LLM assisted resolution (Phase 5).** Sends unresolved conflicts to an LLM for resolution with full context. The LLM can select, reorder, and combine from the inputs — composition only, never novel code generation. Includes content traceability: every line in merged output must trace back to an input, preventing hallucinated or injected content from reaching the working tree.
+
+Both phases use the same structured metadata that `writ context` surfaces. When enabled, they slot into the pipeline between the genesis tree merge and verification.
 
 ## Next Steps
 

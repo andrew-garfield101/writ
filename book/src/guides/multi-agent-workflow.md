@@ -11,18 +11,16 @@ writ init
 # Define tasks (optional — agents can also create their own specs)
 writ plan "Implement OAuth2 auth" "Add Stripe payments" "Build admin dashboard"
 
-# Start the convergence daemon
-writ watch
-
 # Launch agents however you normally do
 # Agents discover specs via writ context, claim one, work, seal, done.
+# Convergence runs automatically at spec done and at finish.
 
 # When ready
 writ finish
 git push
 ```
 
-Four writ commands for the human: `init`, `plan`, `watch`, `finish`. Two of those are optional. Everything between init and finish is the agent's world.
+Three writ commands for the human: `init`, `plan`, `finish`. Plan is optional. Everything between init and finish is the agent's world.
 
 ## Same Steps as Git
 
@@ -43,13 +41,12 @@ Same rhythm. Same mental model. The concepts map directly:
 
 | Git Concept | Writ Concept | What Improves |
 |------------|-------------|---------------|
-| Branch | Spec | Structured metadata: title, status, agent, file scope, dependencies |
+| (nothing) | Spec | Task tracking with lifecycle, agent claiming, genesis snapshots — no git equivalent |
 | Commit | Seal | Agent identity, spec linkage, immutable chain |
-| Merge | Converge | Structure aware, function level, auto resolves independent changes |
+| Merge | Converge | Writ's convergence engine merges seal trees. Auto resolves independent changes |
 | Worktree | Workspace | Shared object store, scoped context, native convergence (Level 2 only) |
 | `git status` | `writ context` | One call, structured output, token optimized |
 | `git log` | `writ log` | Filterable by spec, agent, workspace |
-| (nothing) | `writ watch` | Real time continuous convergence |
 | (nothing) | `writ plan` | Batch task definition |
 
 ## The Human's Commands
@@ -57,13 +54,13 @@ Same rhythm. Same mental model. The concepts map directly:
 ```
 writ init                  Once per project
 writ plan -f tasks.txt     Once if pre-defining tasks (optional)
-writ watch                 Once per session (optional, recommended for multi-agent)
 writ status                Whenever you want to check in
+writ watch                 Live seal monitoring (optional)
 writ finish                Once when work is done
 git push                   Standard git
 ```
 
-Most sessions: init, watch, finish, push. Four commands total. Two of those are git.
+Most sessions: init, finish, push. Three commands total. Two of those are git.
 
 ## The Agent's Commands
 
@@ -119,19 +116,19 @@ This is the majority of multi-agent work. Good task decomposition naturally sepa
 
 ### Level 1: Additive Overlap (Common)
 
-Agents add to the same file in different sections — different functions, different config blocks, different test cases. The changes are independent and can be merged structurally. The convergence engine handles this automatically, either via `writ watch` or manual `writ converge-all`.
+Agents add to the same file in different sections — different functions, different config blocks, different test cases. The changes are independent and can be merged. Writ's convergence engine handles this automatically at `writ spec done` and as a backstop at `writ finish`.
 
 ```
 Agent A seals: added loginWithGoogle() to auth.ts
 Agent B seals: added loginWithGitHub() to auth.ts
 
-→ writ watch detects overlap on auth.ts
+→ Agent A calls spec done → convergence checks for overlaps
 → convergence engine: both are independent function additions
 → auth.ts now has both functions
 → merged automatically, no human intervention
 ```
 
-Two agents both adding to a shared config file, both adding functions to a utility module, both adding routes to an API file. The convergence engine's structural awareness handles it because it understands that two function additions are not a conflict.
+Two agents both adding to a shared config file, both adding functions to a utility module, both adding routes to an API file. The convergence engine handles it because non-conflicting additions compose automatically.
 
 ### Level 2: Competing Rewrites (Rare)
 
@@ -153,15 +150,15 @@ Level 2 is rare. Most multi-agent work is Levels 0 and 1. But when it happens, w
 
 ```
 Level 0: Different files          → spec-scoped sealing (automatic)
-Level 1: Same file, additions     → convergence engine (auto via writ watch)
+Level 1: Same file, additions     → convergence engine (auto at spec done / finish)
 Level 2: Same file, rewrites      → workspaces (explicit via writ task)
 ```
 
-Users start at Level 0. Most stay there. If they hit Level 1, `writ watch` handles it invisibly. If they genuinely need Level 2, they opt in with `writ task`. Each level is discovered when needed, not configured upfront.
+Users start at Level 0. Most stay there. If they hit Level 1, convergence handles it automatically when specs complete. If they genuinely need Level 2, they opt in with `writ task`. Each level is discovered when needed, not configured upfront.
 
 ## Writ Watch
 
-`writ watch` is a background process that monitors for new seals and automatically runs convergence when agents' work overlaps. It is the thing that makes multi-agent development feel seamless.
+`writ watch` is a live monitoring tool that shows seal events as they happen. It gives you a real time view of agent activity without needing to poll `writ status`.
 
 ### Starting the Watcher
 
@@ -169,59 +166,31 @@ Users start at Level 0. Most stay there. If they hit Level 1, `writ watch` handl
 writ watch
 ```
 
-Runs in the foreground, showing real-time output:
+Runs in the foreground, showing real time output:
 
 ```
 $ writ watch
 
   writ watch active — monitoring for new seals...
 
-  [10:15:03] seal s-0041 (agent-1, auth-feature): 3 files — no overlap
-  [10:15:47] seal s-0042 (agent-2, payments): 2 files — no overlap
-  [10:16:12] seal s-0043 (agent-3, auth-feature): 1 file — overlap detected
-             → auto-converging src/auth.ts (agents 1, 3)
-             → convergence complete: independent additions merged
-  [10:22:05] seal s-0044 (agent-4, dashboard): 4 files — no overlap
+  [10:15:03] seal a3f8b2c9 (agent-1, auth-feature): 3 files
+  [10:15:47] seal b7e2a4f1 (agent-2, payments): 2 files
+  [10:16:12] seal d4c1e8a6 (agent-3, auth-feature): 1 file — overlaps with agent-1
+  [10:22:05] seal e9f3c7d2 (agent-4, dashboard): 4 files
 
-  Press q to quit. 3 seals converged, 0 conflicts.
+  Press q to quit.
 ```
 
-Run this in a dedicated terminal tab. If you forget to start it, everything still works — you just run `writ converge-all` manually at the end. `writ watch` is an enhancement, not a requirement.
+Run this in a dedicated terminal tab for passive visibility into agent activity. Overlapping files are flagged so you can track where convergence will be needed.
 
-### What It Does
+### How Convergence Works
 
-Every few seconds (configurable via `--interval`):
+Convergence runs automatically at two points:
 
-1. Scans for new seals since last check
-2. For each new seal, checks if any file was also modified by another agent's recent seal
-3. If no overlap — nothing to do, changes are independent
-4. If overlap detected — runs the convergence engine on overlapping files
-5. Writes the converged result back to the working directory
-6. Creates a convergence seal recording what was merged
+1. **`writ spec done`** — when an agent marks its task complete, convergence checks for overlapping work with other completed specs
+2. **`writ finish`** — final backstop that catches anything remaining before git commit
 
-Agents do not pause. Agents do not wait. By the time an agent looks at a file again, it has everyone's changes merged in.
-
-### When Convergence Cannot Auto-Resolve
-
-Agent A rewrites `loginWithGoogle()` completely. Agent B also rewrites `loginWithGoogle()` completely (different implementation). This is a genuine semantic conflict.
-
-`writ watch` handles this by:
-
-1. Detecting the genuine conflict
-2. NOT silently picking a winner
-3. Flagging it visibly in `writ status`
-
-```
-$ writ status
-
-  Auto-Convergence
-    217 merges completed automatically (no conflicts)
-
-  Needs Attention
-    src/auth.ts: conflicting changes to loginWithGoogle()
-```
-
-The vast majority of multi-agent work is non-overlapping or additively overlapping. Auto-convergence handles it silently. The rare genuine conflicts get flagged. The human only deals with exceptions.
+You do not need to run convergence manually in the normal workflow. Agents work, call spec done, and convergence handles the rest. `writ converge-all --apply` is available for explicit manual control when needed.
 
 ### Configuration
 
@@ -229,15 +198,12 @@ The vast majority of multi-agent work is non-overlapping or additively overlappi
 # .writ/config.toml
 [watch]
 interval = 5              # polling interval in seconds (default: 5)
-auto_converge = true      # auto-converge on overlap detection (default: true)
-max_retries = 3           # convergence retry limit before escalating
 ```
 
 CLI overrides:
 
 ```bash
 writ watch --interval 10          # custom polling interval
-writ watch --no-auto-converge     # watch and report, don't merge
 writ watch --daemon               # run as background process
 writ watch --stop                 # stop running daemon
 writ watch --status               # show daemon status
@@ -269,7 +235,6 @@ $ writ plan "Implement OAuth2 auth" "Add Stripe payments" "Build admin dashboard
     build-admin-dashboard     "Build admin dashboard"
 
   Next: launch your agents. They discover specs via `writ context`.
-  Run `writ watch` to enable automatic convergence.
 ```
 
 Titles are slugified into spec IDs automatically. Agents discover unclaimed specs via `writ context` and claim them.
@@ -312,7 +277,7 @@ for task in tasks:
     orchestrator.launch_agent(task)
 ```
 
-All three paths converge: specs exist → agents work (same directory, spec-scoped sealing) → writ watch auto-converges → writ finish → git push. One set of internals. Three entry points for different scales.
+All three paths converge: specs exist → agents work (same directory, spec scoped sealing) → convergence runs at spec done and finish → git push. One set of internals. Three entry points for different scales.
 
 ## Spec Claiming
 
@@ -351,11 +316,9 @@ $ writ status
   Active    3 agents    2 specs in progress
   Done      1 agent     1 spec completed (not committed)
 
-  S-001  implement-oauth2-auth     agent-1    3 seals    working
-  S-002  add-stripe-payments       agent-2    complete   (5 seals)
-  S-003  build-admin-dashboard     agent-3    1 seal     working
-
-  Auto-Convergence: 12 merges, 0 conflicts
+  a3f8b2c9  implement-oauth2-auth     agent-1    3 seals    working
+  b7e2a4f1  add-stripe-payments       agent-2    complete   (5 seals)
+  d4c1e8a6  build-admin-dashboard     agent-3    1 seal     working
 
   1 spec complete · run `writ finish` when ready
 ```
@@ -364,7 +327,7 @@ Full transparency into what every agent is doing without branch archaeology or p
 
 ## Finishing
 
-`writ finish` promotes completed work to git. When `writ watch` has been running, everything is already converged by the time you finish.
+`writ finish` promotes completed work to git. Convergence runs as a final backstop, catching any remaining overlaps before committing.
 
 ```bash
 $ writ finish
@@ -378,7 +341,7 @@ $ writ finish
 $ git push
 ```
 
-If `writ watch` was not running, `writ finish` auto-converges before committing — same result, just done at finish time instead of in real time.
+Convergence also runs at `writ spec done`, so most overlaps are already resolved by finish time.
 
 ## Troubleshooting
 
@@ -399,6 +362,6 @@ Run `writ context` to refresh. If `writ watch` is running, converged changes app
 ## Next Steps
 
 - **[Workspaces](workspaces.md)** for Level 2 physical isolation when competing rewrites require separate directories
-- **[Convergence](../concepts/convergence.md)** for the deep dive on the six phase merge pipeline
+- **[Convergence](../concepts/convergence.md)** for the deep dive on how writ merges agent work
 - **[Workflow Modes](workflow-modes.md)** for commit automation options
 - **[CLI Reference](../reference/cli.md)** for the full command reference

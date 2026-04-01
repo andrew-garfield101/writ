@@ -16,9 +16,9 @@ Writ replaces that workflow with structured, single call access to everything an
 
 - **Seals instead of commits.** A seal carries agent identity, spec linkage, test results, status lifecycle, and cryptographic integrity. Every seal is chained to its predecessor via BLAKE3 hashes. The metadata that git forces you to encode in commit messages and branch names is a first class part of the data model.
 
-- **Specs instead of branches.** A spec is a structured requirement with status, dependencies, file scope, and acceptance criteria. When an agent seals work against a spec, that link is permanent. Context groups work by spec. Convergence merges spec by spec. Scope enforcement keeps agents in their lane.
+- **Specs instead of branches.** A spec is a task unit with a hash ID, lifecycle states, agent claiming, and a genesis snapshot — closer to an issue inside the VCS than a branch. When an agent seals work against a spec, that link is permanent. Context groups work by spec. Convergence merges spec by spec. Scope enforcement keeps agents in their lane.
 
-- **Convergence instead of merge.** Writ merges meaning, not lines. Language aware analyzers decompose code structurally, compose additive changes automatically, and escalate real conflicts with full context. Giving an agent better git access doesn't make `git merge` smarter. Convergence is the problem, and it requires a purpose built solution.
+- **Convergence instead of merge.** Writ's convergence engine merges agent work using sealed histories and genesis trees as the common ancestor. Non-conflicting changes compose automatically. Real conflicts escalate with structured context and confidence scores. Giving an agent better git access doesn't make `git merge` smarter. Convergence is the problem, and it requires a purpose built solution.
 
 ## Where Writ Fits
 
@@ -54,8 +54,8 @@ The single agent with git world is today. The fleet of fifty agents world is nex
 writ init
 
 # Agents seal checkpoints as they work
-writ seal -s "added auth module" --agent implementer --spec auth
-writ seal -s "tests passing" --agent tester --spec auth --tests-passed 42
+writ seal -s "added auth module" --spec auth
+writ seal -s "tests passing" --spec auth --tests-passed 42
 
 # One call gives agents everything they need
 writ context --format json
@@ -64,11 +64,11 @@ writ context --format json
 writ finish
 ```
 
-> **Note:** Writ is in early alpha. The core is stable and thoroughly tested (1,350+ Rust tests, 400+ Python tests), but the API may change before 1.0. We welcome feedback and contributions.
+> **Note:** Writ is in early alpha. The core is stable and thoroughly tested (2,096+ Rust tests, 834+ Python tests), but the API may change before 1.0. We welcome feedback and contributions.
 
 ## Next Steps
 
 - **[Installation](getting-started/installation.md)** to get writ on your machine
 - **[Quickstart](getting-started/quickstart.md)** for a five minute walkthrough
 - **[Seals vs Commits](concepts/seals-vs-commits.md)** to understand the data model
-- **[Convergence](concepts/convergence.md)** for the deep dive on semantic merging
+- **[Convergence](concepts/convergence.md)** for the deep dive on how writ merges agent work

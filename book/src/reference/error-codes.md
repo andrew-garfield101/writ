@@ -10,7 +10,7 @@ You're not inside a writ project. Run `writ init` to set one up, or navigate to 
 
 ### "Seal chain verification failed"
 
-A seal in the history has been tampered with or corrupted. Run `writ verify --chain` for details on which seal failed and why.
+A seal in the history has been tampered with or corrupted. Run `writ verify` for details on which seal failed and why.
 
 ### "Push diverged"
 

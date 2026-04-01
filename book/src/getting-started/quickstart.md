@@ -80,8 +80,7 @@ TOON delivers the same structured data as JSON in up to 33% fewer bytes — fiel
 Specs are structured requirements that agents work against. Think of them as feature tickets that live inside the VCS:
 
 ```bash
-writ spec add --id auth --title "Authentication System" \
-  --description "JWT-based auth with token refresh"
+writ spec add "JWT-based auth with token refresh"
 ```
 
 Now when agents seal work with `--spec auth`, that work is permanently linked to this requirement. Context output scopes to the spec's files and shows progress. Convergence merges spec by spec. Scope enforcement can restrict agents to their spec's declared files.
@@ -179,13 +178,11 @@ Everything above works with multiple agents in the same project directory. Each 
 # Define tasks in batch
 writ plan "Implement auth" "Add payments" "Build dashboard"
 
-# Start the convergence daemon (auto-merges overlapping work)
-writ watch
-
 # Launch agents — they discover specs via writ context, claim one, and work
+# Convergence runs automatically at spec done and at writ finish
 ```
 
-No workspaces, no branches, no path management. Agents work in the same directory. `writ watch` auto-converges overlapping changes in real time. See the [Multi Agent Workflow](../guides/multi-agent-workflow.md) guide for the full walkthrough.
+No workspaces, no branches, no path management. Agents work in the same directory. Convergence merges overlapping changes automatically when specs complete. See the [Multi Agent Workflow](../guides/multi-agent-workflow.md) guide for the full walkthrough.
 
 ## Next Steps
 

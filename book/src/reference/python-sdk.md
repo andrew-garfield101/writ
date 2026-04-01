@@ -59,15 +59,4 @@ result = repo.verify_chain()
 result = repo.verify_seal("a7c2e8f4b31a")
 ```
 
-### High-Level SDK
-
-```python
-from writ.sdk import Agent, Phase, Pipeline
-
-with Agent("implementer", spec_id="auth") as agent:
-    ctx = agent.context
-    # ... do work ...
-    agent.seal("implemented token refresh", tests_passed=12)
-```
-
 See the [Getting Started guide](../getting-started/quickstart.md) for usage examples.

@@ -11,8 +11,7 @@ In writ, that relationship is explicit and machine readable.
 ### Creating a Spec
 
 ```bash
-writ spec add --id auth --title "Authentication System" \
-  --description "JWT-based auth with token refresh and role-based access"
+writ spec add "JWT-based auth with token refresh and role-based access"
 ```
 
 Or during install:

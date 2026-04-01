@@ -59,7 +59,7 @@ Same rhythm. Same mental model. The concepts map directly:
 |------------|-------------|---------------|
 | Branch | Task | Structured metadata: title, status, agent assignment, file scope |
 | Commit | Seal | Agent identity, spec linkage, workspace tagging, immutable chain |
-| Merge | Converge | Structure aware, function level analysis, auto resolves independent changes |
+| Merge | Converge | Genesis tree based, confidence scoring, auto resolves independent changes |
 | `git status` | `writ context` | One call, structured output, token optimized, agent ready |
 | `git log` | `writ log` | Filterable by spec, agent, workspace |
 
@@ -233,7 +233,7 @@ Most users will never need these. `writ task` and `writ finish` handle the full 
 |----------|---------------|
 | Single agent | No workspace needed. Work directly in the project. |
 | Multiple agents, different files | No workspace needed. Same directory, spec-scoped sealing. See [Multi Agent Workflow](multi-agent-workflow.md). |
-| Multiple agents, additive changes to same file | No workspace needed. `writ watch` auto-converges additions. |
+| Multiple agents, additive changes to same file | No workspace needed. Convergence runs at `spec done` and `writ finish`. |
 | Multiple agents, competing rewrites of same code | `writ task` per approach. Physical isolation prevents in-progress breakage. |
 | CI pipeline with parallel jobs | `writ task` per job. Each gets isolation with shared history. |
 

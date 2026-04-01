@@ -119,7 +119,7 @@ Every seal contains three hashes:
 Verify the chain at any time:
 
 ```bash
-writ verify --chain
+writ verify
 ```
 
 If any seal has been tampered with, verification fails and reports exactly where the chain broke.

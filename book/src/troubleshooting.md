@@ -38,7 +38,7 @@ If the merged output is wrong, restore to the pre convergence seal and try again
 ## Seal Chain Verification Fails
 
 ```bash
-writ verify --chain
+writ verify
 ```
 
 If verification fails, it reports the exact seal where the chain broke. Common causes:

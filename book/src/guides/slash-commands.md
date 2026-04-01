@@ -63,7 +63,7 @@ Slash commands are thin wrappers. They don't contain business logic — they doc
 
 ```bash
 writ init
-# ✓ Generated 17 slash commands in .claude/commands/
+# ✓ Generated 20 slash commands in .claude/commands/
 ```
 
 Slash commands are only generated when Claude Code is detected (presence of `CLAUDE.md` or `.claude/` directory). Other frameworks get the CLI and instruction templates appropriate to their environment.

@@ -151,24 +151,23 @@ When unclaimed specs exist (created via `writ plan` or `writ spec add` but not y
 
 ### `writ watch`
 
-Convergence daemon that monitors for new seals and auto-converges overlapping work in real time.
+Live seal event monitoring. Shows agent activity in real time without needing to poll `writ status`.
 
 ```bash
 writ watch [OPTIONS]
 
 Options:
   --interval <SECONDS>       Polling interval [default: 5]
-  --no-auto-converge         Watch and report without auto-merging
   --daemon                   Run as background process
   --stop                     Stop running daemon
   --status                   Show daemon status and recent activity
 ```
 
-By default, runs in the foreground showing real-time output. Press `q` to quit.
-
-When overlap is detected between seals from different specs touching the same file, the convergence engine runs automatically. If convergence succeeds, the merged result is written to the working directory and a convergence seal is created. If convergence cannot auto-resolve, the conflict is recorded and surfaced via `writ status`.
+By default, runs in the foreground showing real time output. Press `q` to quit. Seal events display as they happen, with overlapping files flagged for visibility.
 
 Daemon mode (`--daemon`) runs the watcher as a background process with output logged to `.writ/watch.log` and PID stored in `.writ/watch.pid`.
+
+Note: convergence runs automatically at `writ spec done` and as a backstop at `writ finish`. Watch is a monitoring tool, not a convergence trigger.
 
 Configuration via `.writ/config.toml`:
 
@@ -315,7 +314,7 @@ When workspaces exist with changes, `writ finish` automatically:
 
 ### `writ converge`
 
-Two-spec convergence (three-way merge).
+Two-spec convergence.
 
 ```bash
 writ converge <LEFT_SPEC> <RIGHT_SPEC> [OPTIONS]
@@ -362,10 +361,11 @@ Non-overlapping changes merge cleanly. Overlapping changes go through the conver
 Register a new spec.
 
 ```bash
-writ spec add --id <ID> --title <TITLE> [OPTIONS]
+writ spec add "<DESCRIPTION>" [OPTIONS]
 
 Options:
-  --description <DESC>   Spec description
+  --id <ID>              Custom spec ID (default: auto-generated hash)
+  --title <TITLE>        Custom title (default: derived from description)
 ```
 
 ### `writ spec status`
@@ -506,7 +506,7 @@ Cannot delete the main workspace.
 Verify seal chain integrity and signatures.
 
 ```bash
-writ verify --chain [OPTIONS]     # Full chain verification
+writ verify [OPTIONS]              # Full chain verification (default)
 writ verify --seal <ID> [OPTIONS] # Single seal verification
 
 Options:
@@ -689,7 +689,7 @@ Start the MCP server. Communicates over stdio using the standard MCP protocol. N
 writ mcp-serve
 ```
 
-The server exposes 17 tools matching the full writ CLI. Each tool calls the CLI via subprocess — same behavior, same output, same enforcement. See the [MCP server guide](../guides/mcp-server.md) for the full tool list and setup instructions.
+The server exposes 21 tools matching the full writ CLI. Each tool calls the CLI via subprocess — same behavior, same output, same enforcement. See the [MCP server guide](../guides/mcp-server.md) for the full tool list and setup instructions.
 
 ### `writ mcp-install`
 

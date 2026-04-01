@@ -6,12 +6,12 @@ build-backend = "maturin"
 name = "writ-vcs"
 version = "0.1.0"
 description = "AI-native version control for agentic workflows — structured checkpoints, spec-driven development, and multi-agent coordination"
-requires-python = ">=3.8"
+requires-python = ">=3.10"
 license = "AGPL-3.0-only"
 readme = "README.md"
 keywords = ["version-control", "ai", "agents", "llm", "vcs", "agentic"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Topic :: Software Development :: Version Control",
     "License :: OSI Approved :: GNU Affero General Public License v3",
@@ -21,8 +21,8 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/agarfield/writ"
-Issues = "https://github.com/agarfield/writ/issues"
+Repository = "https://github.com/andrew-garfield101/writ"
+Issues = "https://github.com/andrew-garfield101/writ/issues"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

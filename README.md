@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="assets/sigil-512-dark.png" width="256">
-    <img src="assets/sigil-512.png" alt="Sigil — the writ-vcs mascot" width="256">
+    <img src="assets/sigil-512.png" alt="Sigil, the writ-vcs mascot" width="256">
   </picture>
 </p>
 
@@ -22,7 +22,7 @@ Structured context in one call. A convergence engine that auto resolves overlapp
 
 Writ works alongside git, not instead of it. One `writ init` and agents get everything: native MCP tools, slash commands, workflow instructions, and a structured CLI. No plugins, no configuration, no separate install.
 
-**Context in one call.** Building situational awareness with current tools means multiple calls, parsing unstructured output, synthesizing project state from fragments. That's tokens and compute spent on infrastructure, not on the agent's actual task. `writ context` delivers everything — specs, seals, working state, file contention, integration risk — all in one structured response. That structured data costs more tokens than raw git output. The tradeoff: one call with ready to consume coordination data versus five separate calls that agents must parse, correlate, and reason about on their own. TOON format and spec scoped filtering keep context overhead lean, and writ's token ratio improves as projects scale.
+**Context in one call.** Building situational awareness with current tools means multiple calls, parsing unstructured output, synthesizing project state from fragments. That's tokens and compute spent on infrastructure, not on the agent's actual task. `writ context` delivers everything (specs, seals, working state, file contention, integration risk) in one structured response. That structured data costs more tokens than raw git output. The tradeoff: one call with ready to consume coordination data versus five separate calls that agents must parse, correlate, and reason about on their own. TOON format and spec scoped filtering keep context overhead lean, and writ's token ratio improves as projects scale.
 
 **Automatic convergence.** When multiple agents touch the same files, conventional merging sees conflicts. Writ sees overlapping work and merges it. Each agent's changes are tracked independently through spec scoped seals. When convergence runs, writ's convergence engine uses the genesis state (a snapshot of the codebase when the spec was created) as the common ancestor, producing the correct combined result. Additive changes merge automatically. Real conflicts escalate with structured context and confidence scores for human or orchestrator review. No `<<<<` markers. No guesswork.
 
@@ -30,7 +30,7 @@ Writ works alongside git, not instead of it. One `writ init` and agents get ever
 
 **Environment agnostic.** Zero trust setups where every agent action is verified. Fully autonomous systems like [OpenClaw](https://github.com/openclaw) where agents operate without oversight. Mixed workflows with humans in the loop. VMs, containers, CI runners, bare metal. Writ provides version control for whatever environment agents work in.
 
-**Built for any scale.** Writ's efficiency compounds as you add agents. TOON format and scoped context keep overhead lean — scoped context grows only 1.6x from 1 to 8 agents while providing full multi agent awareness that git cannot offer at any token cost. Convergence handles what git can't. Deployment profiles scale from a 500MB Raspberry Pi to unlimited enterprise. The more agents in the system, the more writ matters. Lifecycle management and garbage collection keep repositories clean without ever compromising the immutable seal history.
+**Built for any scale.** Writ's efficiency compounds as you add agents. TOON format and scoped context keep overhead lean. Scoped context grows only 1.6x from 1 to 8 agents while providing full multi agent awareness that git cannot offer at any token cost. Convergence handles what git can't. Deployment profiles scale from a 500MB Raspberry Pi to unlimited enterprise. The more agents in the system, the more writ matters. Lifecycle management and garbage collection keep repositories clean without ever compromising the immutable seal history.
 
 > *"One `writ context` call and I know who did what, which specs are complete, where work overlaps, and what files are contested. That is genuinely valuable and unlike anything available in git alone."*
 >
@@ -42,7 +42,7 @@ Seven first class primitives. Track work, checkpoint it, understand it, merge it
 
 | Primitive | What It Is |
 |-----------|-----------|
-| **Spec** | A task unit with a hash ID, lifecycle states, agent claiming, and a genesis snapshot. Tracks what's being worked on, who's doing it, and how far along. Closest analog is an issue that lives inside the VCS itself — not a branch. |
+| **Spec** | A task unit with a hash ID, lifecycle states, agent claiming, and a genesis snapshot. Tracks what's being worked on, who's doing it, and how far along. Closest analog is an issue that lives inside the VCS itself, not a branch. |
 | **Seal** | An immutable snapshot of file state. Parent chained, cryptographically signed, spec scoped. Every checkpoint is permanent and restorable. |
 | **Context** | Computed project state for agents. Specs, seals, file contention, integration risk, all assembled on demand in one structured call. The intelligence layer that turns raw data into coordination. |
 | **Convergence** | Writ's convergence engine merges sealed histories using genesis trees as base. Auto resolves non-conflicting changes. Escalates real conflicts with confidence scores. |
@@ -106,7 +106,7 @@ One command sets up everything:
 writ init
 ```
 
-Writ detects your environment and configures everything automatically. Agent frameworks get workflow instructions added to their configuration files — CLAUDE.md for Claude Code, AGENTS.md for Codex. Claude Code also gets 21 MCP tools, 20 slash commands, and a SessionStart hook that injects context at the beginning of every agent session. For any other agent framework, the CLI is available in PATH and the Python SDK works out of the box. See the [quickstart guide](https://andrew-garfield101.github.io/writ/getting-started/quickstart.html) for a full walkthrough.
+Writ detects your environment and configures everything automatically. Agent frameworks get workflow instructions added to their configuration files: CLAUDE.md for Claude Code, AGENTS.md for Codex. Claude Code also gets 21 MCP tools, 20 slash commands, and a SessionStart hook that injects context at the beginning of every agent session. For any other agent framework, the CLI is available in PATH and the Python SDK works out of the box. See the [quickstart guide](https://andrew-garfield101.github.io/writ/getting-started/quickstart.html) for a full walkthrough.
 
 The full round trip:
 
@@ -133,7 +133,7 @@ writ finish
 git push
 ```
 
-`writ init` generates everything agents need — CLAUDE.md instructions, MCP tools, SessionStart hooks. Agents adopt writ automatically. Your prompts stay focused on the work.
+`writ init` generates everything agents need: CLAUDE.md instructions, MCP tools, SessionStart hooks. Agents adopt writ automatically. Your prompts stay focused on the work.
 
 ```
  Human world                    Agent world                       Human world
@@ -146,7 +146,7 @@ git push
 
 ## Why Writ
 
-Most multi agent tooling gives each agent a git worktree and merges via PRs. That handles **isolation** — keeping agents from stepping on each other's files. It doesn't handle **convergence** — bringing their work back together when they inevitably touch the same code.
+Most multi agent tooling gives each agent a git worktree and merges via PRs. That handles **isolation**: keeping agents from stepping on each other's files. It doesn't handle **convergence**: bringing their work back together when they inevitably touch the same code.
 
 Git worktrees weren't designed for agents. They solve the wrong problem at the wrong layer. The agent still has to shell out to a CLI, parse unstructured text output, reconstruct project state from multiple commands, and hope that merge conflicts get caught before they corrupt the codebase. Every one of those steps burns tokens and compute on work that isn't the agent's actual task.
 
@@ -156,28 +156,28 @@ Writ puts agent native metadata inside the VCS:
 
 | Git | Writ | What Changes |
 |-----|------|-------------|
-| (nothing) | **Spec** | Task tracking with lifecycle, agent claiming, genesis snapshots — no git equivalent |
+| (nothing) | **Spec** | Task tracking with lifecycle, agent claiming, genesis snapshots. No git equivalent |
 | Commit | **Seal** | Immutable checkpoint with agent identity, spec linkage, crypto signatures |
-| Multiple `git` commands | `writ context` | One call returns everything an agent needs — structured data, not text to parse |
+| Multiple `git` commands | `writ context` | One call returns everything an agent needs. Structured data, not text to parse |
 | `git merge` | Convergence | Writ's convergence engine merges seal trees. Auto resolves non-conflicting changes |
-| `git checkout <ref>` | `writ restore` | Instant rollback to any seal — every seal is an immutable snapshot |
+| `git checkout <ref>` | `writ restore` | Instant rollback to any seal. Every seal is an immutable snapshot |
 | (nothing) | **Integration risk** | Automatic overlap scoring across agents and specs |
 | (nothing) | **File contention** | Which files are touched by which agents, sorted by risk |
 | (nothing) | `writ finish` | Converge + commit in one command |
 | `git verify-commit` | `writ verify` | BLAKE3 + Ed25519, full chain validation |
-| (nothing) | `writ status` | Fleet dashboard — agents, specs, progress, commit readiness |
+| (nothing) | `writ status` | Fleet dashboard: agents, specs, progress, commit readiness |
 
 ### Use Cases
 
 - **Multi agent software development.** Multiple coding agents working concurrently on overlapping codebases. The core use case writ was designed for
-- **Single agent workflows.** Even one agent benefits from structured checkpoints, instant rollback, and the git round trip — `writ init` → work → `writ finish`
+- **Single agent workflows.** Even one agent benefits from structured checkpoints, instant rollback, and the git round trip: `writ init` → work → `writ finish`
 - **Autonomous pipelines.** Sub agents in orchestration frameworks producing artifacts that need version control, provenance, and safe convergence
 - **Knowledge work.** Documentation, configuration, data processing. Any iterative task where agents modify shared files and need structured history
 - **Human AI collaboration.** Mixed workflows where humans and agents contribute to the same project with full transparency into who did what
 
 ## Context
 
-Situational awareness is the most expensive recurring cost in an agentic workflow. With conventional tools, that means multiple calls — `git log`, `git diff`, `git status`, reading files — each returning unstructured text that needs parsing and synthesis. Capable agents spend a significant portion of their compute budget on tooling overhead instead of their actual task. At fleet scale, that overhead compounds: every agent, every session, every context read.
+Situational awareness is the most expensive recurring cost in an agentic workflow. With conventional tools, that means multiple calls (`git log`, `git diff`, `git status`, reading files), each returning unstructured text that needs parsing and synthesis. Capable agents spend a significant portion of their compute budget on tooling overhead instead of their actual task. At fleet scale, that overhead compounds: every agent, every session, every context read.
 
 Writ consolidates all of that into a single call:
 
@@ -188,15 +188,15 @@ writ context --format toon
 
 One structured response. Everything an agent needs to start working immediately:
 
-- **Spec details** — title, status, claimed agent, seal count, last activity
-- **Unclaimed specs** — tasks available for this agent to pick up
-- **Recent seals** — who did what, when, with which files
-- **Working state** — new, modified, and deleted files in the current scope
-- **Agent activity** — which agents own which files, their latest work
-- **File contention** — "hot files" touched by 2+ agents, sorted by risk
-- **Integration risk** — level (low/medium/high), score (0-100), contributing factors
-- **Stale specs** — specs with no recent activity that may be abandoned
-- **Session status** — whether all specs are complete
+- **Spec details.** Title, status, claimed agent, seal count, last activity
+- **Unclaimed specs.** Tasks available for this agent to pick up
+- **Recent seals.** Who did what, when, with which files
+- **Working state.** New, modified, and deleted files in the current scope
+- **Agent activity.** Which agents own which files, their latest work
+- **File contention.** "Hot files" touched by 2+ agents, sorted by risk
+- **Integration risk.** Level (low/medium/high), score (0-100), contributing factors
+- **Stale specs.** Specs with no recent activity that may be abandoned
+- **Session status.** Whether all specs are complete
 
 Or programmatically:
 
@@ -208,7 +208,7 @@ With git, an agent makes 4-5 tool calls and synthesizes its own situational mode
 
 ### Output Formats
 
-Every time an agent requests context, there's token use — repeated key names, structural punctuation, formatting overhead. Tokens spent on syntax instead of reasoning. TOON minimizes that:
+Every time an agent requests context, there's token use: repeated key names, structural punctuation, formatting overhead. Tokens spent on syntax instead of reasoning. TOON minimizes that:
 
 ```
 seals[5]{id,summary,agent,timestamp,spec}:
@@ -219,15 +219,15 @@ seals[5]{id,summary,agent,timestamp,spec}:
 
 Field names declared once. Rows streamed as values. No braces, no repeated keys.
 
-One `writ context` call replaces five git commands — `status`, `log`, `diff`, `branch`, and author tracking — delivering specs, seals, ownership, convergence state, and integration risk in a single structured payload.
+One `writ context` call replaces five git commands (`status`, `log`, `diff`, `branch`, and author tracking), delivering specs, seals, ownership, convergence state, and integration risk in a single structured payload.
 
-That structured data costs more tokens than raw git output. A medium project (4 specs, 20 files): writ TOON returns 3,372 tokens versus 369 for five git commands. That's the cost of coordination data — agent attribution, integration risk, file contention, spec lifecycle — information git does not track and cannot provide at any token cost. The tradeoff: git returns unstructured text that agents must parse, correlate, and reason about across five separate calls. Writ returns structured data ready for immediate consumption.
+That structured data costs more tokens than raw git output. A medium project (4 specs, 20 files): writ TOON returns 3,372 tokens versus 369 for five git commands. That's the cost of coordination data (agent attribution, integration risk, file contention, spec lifecycle), information git does not track and cannot provide at any token cost. The tradeoff: git returns unstructured text that agents must parse, correlate, and reason about across five separate calls. Writ returns structured data ready for immediate consumption.
 
 Three things keep that overhead in check:
 
 **TOON format** saves 12% over JSON on every call. Field names declared once, rows streamed as values, no redundant structure.
 
-**Spec scoped context** (`writ context --spec <id>`) is the big lever. Each agent sees only their slice of the project — 65% fewer tokens than full context at fleet scale. Scoped context grows only 1.6x from 1 to 8 agents. Full context grows 3x over the same range.
+**Spec scoped context** (`writ context --spec <id>`) is the big lever. Each agent sees only their slice of the project, 65% fewer tokens than full context at fleet scale. Scoped context grows only 1.6x from 1 to 8 agents. Full context grows 3x over the same range.
 
 **Writ scales better with project size.** Git output grows 6.3x from small to XL projects. TOON grows only 3.4x. The bigger the project and the more agents in it, the better writ's efficiency relative to git.
 
@@ -362,7 +362,7 @@ Full transparency. No branch archaeology, no parsing commit messages. Every agen
 
 ## Convergence
 
-Five agents. Same file. Git sees five conflicts. Your options: resolve them manually, pick a winner, or assign files to single owners — which defeats the purpose of having multiple agents in the first place.
+Five agents. Same file. Git sees five conflicts. Your options: resolve them manually, pick a winner, or assign files to single owners, which defeats the purpose of having multiple agents in the first place.
 
 This is what git worktrees, branch isolation, and PR automation don't solve. Worktrees give agents isolation. Nothing in conventional tooling gives them convergence. Isolation keeps agents from stepping on each other. Convergence brings their work back together. Git handles the first. Writ handles the second.
 
@@ -377,18 +377,18 @@ Every spec in writ has a **genesis tree**: a snapshot of the file index at the m
 Non-conflicting changes (different lines, additive edits, independent sections) merge automatically. When both specs modify the same region in incompatible ways, the **Escalate** strategy auto-resolves by selecting the more complete version. If that's ambiguous, the conflict escalates with structured context for human or orchestrator review.
 
 A three layer **pool filter** ensures only relevant specs participate:
-1. **Epoch boundary** — only specs from the current session (since last `writ finish`)
-2. **Commit state** — only uncommitted specs
-3. **Genesis tree** — structural filtering against the common ancestor
+1. **Epoch boundary.** Only specs from the current session (since last `writ finish`)
+2. **Commit state.** Only uncommitted specs
+3. **Genesis tree.** Structural filtering against the common ancestor
 
 Merge ordering is optimized automatically: specs that touch disjoint files merge first, minimizing conflict complexity for the overlapping cases that follow.
 
-Results are stored in the object store as **shadow state** — not written to disk. Convergence can run while agents are still working without disturbing anyone's files. Disk materialization only happens at `writ finish`.
+Results are stored in the object store as **shadow state**, not written to disk. Convergence can run while agents are still working without disturbing anyone's files. Disk materialization only happens at `writ finish`.
 
 ### When Convergence Runs
 
-- **At `writ spec done`** — checks for overlapping work with other completed specs
-- **At `writ finish`** — final backstop that catches anything remaining before git commit
+- **At `writ spec done`.** Checks for overlapping work with other completed specs
+- **At `writ finish`.** Final backstop that catches anything remaining before git commit
 
 Every resolution is confidence scored. High confidence (≥ 0.85) auto-resolves. Low confidence escalates with structured context so orchestrator agents can resolve conflicts programmatically, or surface them to a human with all the data they need.
 
@@ -413,7 +413,7 @@ See the [convergence deep dive](https://andrew-garfield101.github.io/writ/concep
 
 ## Workspaces
 
-Most multi agent work happens in the same directory with spec scoped sealing and convergence handling overlaps automatically. Workspaces exist for the rare case where agents need physical file isolation — competing rewrites of the same code, where each agent's changes would break the other's in-progress work.
+Most multi agent work happens in the same directory with spec scoped sealing and convergence handling overlaps automatically. Workspaces exist for the rare case where agents need physical file isolation: competing rewrites of the same code, where each agent's changes would break the other's in-progress work.
 
 ```bash
 # Level 2: agents rewrite the same code in fundamentally different ways
@@ -452,7 +452,7 @@ writ show a3f8b2 --diff
 writ restore a3f8b2
 ```
 
-Agents can do the same thing programmatically. If an agent detects something went wrong — tests failing, scope violations piling up — it can walk the seal history and self correct:
+Agents can do the same thing programmatically. If an agent detects something went wrong (tests failing, scope violations piling up), it can walk the seal history and self correct:
 
 ```python
 seals = repo.log(limit=10)
@@ -467,13 +467,13 @@ Restoring doesn't delete history. The old seals still exist in the log. `writ lo
 
 ## Security
 
-Writ is built for environments where multiple autonomous agents have write access to the same codebase. That demands security guarantees that traditional VCS was never designed for — whether you're running a zero trust setup where every agent action is verified, a fully autonomous system where agents operate without human oversight, or anything in between.
+Writ is built for environments where multiple autonomous agents have write access to the same codebase. That demands security guarantees that traditional VCS was never designed for, whether you're running a zero trust setup where every agent action is verified, a fully autonomous system where agents operate without human oversight, or anything in between.
 
-**Cryptographic integrity.** Every seal is chained to its predecessor via BLAKE3 hashes — tamper with any checkpoint and the entire chain breaks. Ed25519 digital signatures authenticate who created each seal. `writ verify` validates the full history in one command.
+**Cryptographic integrity.** Every seal is chained to its predecessor via BLAKE3 hashes. Tamper with any checkpoint and the entire chain breaks. Ed25519 digital signatures authenticate who created each seal. `writ verify` validates the full history in one command.
 
-**Agent identity.** Every agent is a registered entity with a unique keypair, trust level, role, and scope constraints. Trust levels (full, standard, restricted, untrusted) directly affect convergence behavior — untrusted or newly introduced agents receive lower confidence caps, limiting their influence on automated merge decisions. Agents can be suspended or revoked without deleting their history, and all seals created after a compromise timestamp are automatically flagged for review.
+**Agent identity.** Every agent is a registered entity with a unique keypair, trust level, role, and scope constraints. Trust levels (full, standard, restricted, untrusted) directly affect convergence behavior. Untrusted or newly introduced agents receive lower confidence caps, limiting their influence on automated merge decisions. Agents can be suspended or revoked without deleting their history, and all seals created after a compromise timestamp are automatically flagged for review.
 
-**Scope enforcement.** Specs declare which files they own. When an agent seals changes to files outside its spec's scope, writ flags the violation — in context output, in the audit log, and optionally as a hard rejection. No more agents silently modifying files they shouldn't touch.
+**Scope enforcement.** Specs declare which files they own. When an agent seals changes to files outside its spec's scope, writ flags the violation: in context output, in the audit log, and optionally as a hard rejection. No more agents silently modifying files they shouldn't touch.
 
 **Audit trail.** An append only security event log records scope violations, signature failures, agent revocations, and convergence anomalies. Events are severity classified (info, warning, critical) with configurable retention.
 
@@ -486,17 +486,17 @@ See the [security model](https://andrew-garfield101.github.io/writ/concepts/secu
 
 ## Lifecycle and Storage
 
-AI models update. Tooling shifts. What agents produce today may need to be rolled back tomorrow. A VCS for agentic development needs more than immutable history — it needs active lifecycle management that keeps repositories healthy as projects scale and models evolve.
+AI models update. Tooling shifts. What agents produce today may need to be rolled back tomorrow. A VCS for agentic development needs more than immutable history. It needs active lifecycle management that keeps repositories healthy as projects scale and models evolve.
 
-**Spec lifecycle.** Specs progress through a managed lifecycle: active, stale, completed, cancelled, archived. Stale detection is automatic — `writ context` warns when specs go inactive so nothing falls through the cracks.
+**Spec lifecycle.** Specs progress through a managed lifecycle: active, stale, completed, cancelled, archived. Stale detection is automatic. `writ context` warns when specs go inactive so nothing falls through the cracks.
 
-**Storage aware.** Writ tracks storage usage across categories (seals, working state, security events, keys) and alerts when usage approaches configured budgets. Seals are never refused — immutable history is sacred.
+**Storage aware.** Writ tracks storage usage across categories (seals, working state, security events, keys) and alerts when usage approaches configured budgets. Seals are never refused. Immutable history is sacred.
 
 **Safe cleanup.** `writ gc` generates a plan, shows what it will do, and asks before executing. GC only cleans expired working state, archived specs past retention, and old security events. Every cleanup action is recorded in an audit trail.
 
-**Deployment profiles.** Preconfigured storage budgets and retention periods for different environments — from a 500MB Raspberry Pi to unlimited enterprise.
+**Deployment profiles.** Preconfigured storage budgets and retention periods for different environments, from a 500MB Raspberry Pi to unlimited enterprise.
 
-**Workflow modes.** Two modes that scale from solo developer to enterprise fleet. `user` mode (default): you run `writ finish` manually. `auto` mode: fully autonomous commit pipeline with configurable safety rails — test verification, max specs per commit, branch targeting. Configure globally or per project. See the [configuration reference](https://andrew-garfield101.github.io/writ/reference/configuration.html) for details.
+**Workflow modes.** Two modes that scale from solo developer to enterprise fleet. `user` mode (default): you run `writ finish` manually. `auto` mode: fully autonomous commit pipeline with configurable safety rails: test verification, max specs per commit, branch targeting. Configure globally or per project. See the [configuration reference](https://andrew-garfield101.github.io/writ/reference/configuration.html) for details.
 
 ```bash
 writ gc status                             # storage breakdown + stale spec warnings
@@ -516,11 +516,11 @@ repo.spec_done(spec_id="a3f7b2c1")                     # mark complete
 repo.finish()                                           # converge + commit
 ```
 
-Full programmatic access to every writ operation. Built via PyO3 bindings to the Rust core — same code path as the CLI, not a separate implementation. See the [Python SDK reference](https://andrew-garfield101.github.io/writ/reference/python-sdk.html) for the full API.
+Full programmatic access to every writ operation. Built via PyO3 bindings to the Rust core. Same code path as the CLI, not a separate implementation. See the [Python SDK reference](https://andrew-garfield101.github.io/writ/reference/python-sdk.html) for the full API.
 
 ## MCP Server
 
-Writ ships a native MCP (Model Context Protocol) server built in Rust. It's part of the `writ` binary — no separate install, no Python runtime, no plugins. When an agent connects via MCP, every writ command is available as a native tool in the agent's palette.
+Writ ships a native MCP (Model Context Protocol) server built in Rust. It's part of the `writ` binary. No separate install, no Python runtime, no plugins. When an agent connects via MCP, every writ command is available as a native tool in the agent's palette.
 
 ```bash
 # Automatic: writ init generates .mcp.json for Claude Code
@@ -547,7 +547,7 @@ When `.mcp.json` is committed to your repository, every developer who clones the
 | **Workspaces** | `writ_workspace_create`, `writ_workspace_list`, `writ_workspace_status`, `writ_workspace_delete` |
 | **Diagnostics** | `writ_verify`, `writ_doctor` |
 
-Each tool is a thin wrapper around the CLI. Same behavior, same output, same enforcement. Auto-scoping works through MCP — agents seal and call spec done without passing explicit IDs when they have one claimed spec. `writ_context` defaults to TOON format. The MCP server is the CLI, just reachable through the protocol agents already speak.
+Each tool is a thin wrapper around the CLI. Same behavior, same output, same enforcement. Auto-scoping works through MCP: agents seal and call spec done without passing explicit IDs when they have one claimed spec. `writ_context` defaults to TOON format. The MCP server is the CLI, just reachable through the protocol agents already speak.
 
 See the [MCP server guide](https://andrew-garfield101.github.io/writ/guides/mcp-server.html) for the full setup walkthrough and tool reference.
 
@@ -650,8 +650,8 @@ pytest tests/
 
 ## Roadmap
 
-- **Spec aware resolution.** Convergence that uses writ's first class spec metadata — file scope, acceptance criteria, semantic intent — to make merge decisions that no other VCS has the context for. Deterministic convergence ships in v0.1.0. Spec aware resolution planned for a future release
-- **LLM assisted convergence.** Direct LLM API integration for conflict resolution when deterministic patterns can't resolve. Composition only — the LLM can select, reorder, and combine from existing code, never generate novel content. Planned for a future release
+- **Spec aware resolution.** Convergence that uses writ's first class spec metadata (file scope, acceptance criteria, semantic intent) to make merge decisions that no other VCS has the context for. Deterministic convergence ships in v0.1.0. Spec aware resolution planned for a future release
+- **LLM assisted convergence.** Direct LLM API integration for conflict resolution when deterministic patterns can't resolve. Composition only: the LLM can select, reorder, and combine from existing code, never generate novel content. Planned for a future release
 
 See [CHANGELOG.md](CHANGELOG.md) for shipped features and version history.
 

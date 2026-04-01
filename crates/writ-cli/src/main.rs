@@ -19,7 +19,7 @@ use writ_core::spec::{Spec, SpecUpdate};
 use writ_core::Repository;
 
 #[derive(Parser)]
-#[command(name = "writ", about = "writ — AI-native version control", version = env!("WRIT_VERSION_FULL"))]
+#[command(name = "writ", about = "writ — AI-native version control", version)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

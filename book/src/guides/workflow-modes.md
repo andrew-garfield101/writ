@@ -104,7 +104,7 @@ Agents seal checkpoints and mark tasks complete. They do not run `writ finish` o
 | Learning writ | `user` | Full control, see everything |
 | Solo developer | `user` | Simple, direct |
 | Small team (2-5 agents) | `user` | Easy to track manually |
-| Medium team (10-50 agents) | `user` | `writ watch` handles convergence, user controls commits |
+| Medium team (10-50 agents) | `user` | Convergence runs at spec done and finish, user controls commits |
 | CI pipeline | `auto` | Needs to commit without waiting |
 | Overnight batch | `auto` | No human present |
 

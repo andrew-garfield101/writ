@@ -103,7 +103,6 @@ Output:
   build-admin-dashboard     "Build admin dashboard"
 
 Next: launch your agents. They discover specs via `writ context`.
-Run `writ watch` to enable automatic convergence.
 ```
 
 ### `writ seal`
@@ -174,8 +173,6 @@ Configuration via `.writ/config.toml`:
 ```toml
 [watch]
 interval = 5              # polling interval in seconds
-auto_converge = true      # auto-converge on overlap detection
-max_retries = 3           # convergence retry limit before escalating
 log_file = ".writ/watch.log"
 ```
 

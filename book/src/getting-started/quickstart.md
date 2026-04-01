@@ -36,7 +36,7 @@ Writ detects your environment automatically. If you're in a git repo, it reads t
 A **seal** is writ's structured checkpoint. After making some changes to your project:
 
 ```bash
-writ seal -s "added authentication endpoint" --agent dev-1 --spec auth
+writ seal -s "added authentication endpoint" --spec auth
 ```
 
 Output:

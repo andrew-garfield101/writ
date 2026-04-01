@@ -22,7 +22,7 @@ Each seal contains three cryptographic fields:
 
 ```bash
 # Verify the full chain from genesis to HEAD
-writ verify --chain
+writ verify
 
 # Verify a specific seal
 writ verify --seal a7c2e8f4b31a

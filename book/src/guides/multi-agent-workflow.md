@@ -357,7 +357,7 @@ Run `writ status` to see which files have conflicts. The conflict means two agen
 
 ### Agent not seeing other agents' work
 
-Run `writ context` to refresh. If `writ watch` is running, converged changes appear in the working directory automatically. If not, run `writ converge-all --apply` to merge outstanding overlaps.
+Run `writ context` to refresh. Convergence runs at `writ spec done` and `writ finish`. To merge outstanding overlaps manually, run `writ converge-all --apply`.
 
 ## Next Steps
 

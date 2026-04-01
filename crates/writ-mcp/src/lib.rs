@@ -330,9 +330,7 @@ impl WritMcpServer {
         &self,
         Parameters(params): Parameters<SealParams>,
     ) -> Result<CallToolResult, McpError> {
-        let agent_id = params
-            .agent
-            .unwrap_or_else(|| self.agent_id.clone());
+        let agent_id = params.agent.unwrap_or_else(|| self.agent_id.clone());
         let mut args = vec![
             "seal".to_string(),
             "-s".to_string(),

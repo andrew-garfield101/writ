@@ -1532,10 +1532,7 @@ impl Repository {
 
         for spec in &specs {
             // Skip cancelled specs — they shouldn't appear in status output.
-            if matches!(
-                spec.lifecycle_state,
-                crate::spec::LifecycleState::Cancelled
-            ) {
+            if matches!(spec.lifecycle_state, crate::spec::LifecycleState::Cancelled) {
                 continue;
             }
 
@@ -1770,12 +1767,7 @@ impl Repository {
         let claimed: Vec<&Spec> = specs
             .iter()
             .filter(|s| s.claimed_by.as_deref() == Some(agent_id))
-            .filter(|s| {
-                matches!(
-                    s.status,
-                    SpecStatus::Pending | SpecStatus::InProgress
-                )
-            })
+            .filter(|s| matches!(s.status, SpecStatus::Pending | SpecStatus::InProgress))
             .collect();
 
         match claimed.len() {

@@ -1,6 +1,6 @@
 # Seals vs Commits
 
-Git commits were designed for humans. An email address, a timestamp, a diff, and a message. Everything else — which task it serves, whether tests passed, which requirement it belongs to — is convention layered on top through commit messages and branch names.
+Git commits were designed for humans. An email address, a timestamp, a diff, and a message. Everything else (which task it serves, whether tests passed, which requirement it belongs to) is convention layered on top through commit messages and branch names.
 
 Writ's fundamental unit of history is the **seal**. A seal carries the same structured metadata that agents need to work effectively, built into the data model rather than bolted on through naming conventions.
 
@@ -63,7 +63,7 @@ This is the intelligence layer. Git stores diffs. Writ stores structured knowled
 
 Like git commits, seals are **immutable**. Once created, a seal's content and metadata never change. The hash chain guarantees this: tamper with any seal and every subsequent chain hash breaks.
 
-Unlike git, writ never rewrites history. There's no `rebase`, no `amend`, no `force push`. If something goes wrong, you `writ restore` to a previous seal and seal the restored state. The old seals stay in the log. Every seal is an immutable snapshot — this is what makes safe rollback possible in fully autonomous environments where agents operate without human oversight.
+Unlike git, writ never rewrites history. There's no `rebase`, no `amend`, no `force push`. If something goes wrong, you `writ restore` to a previous seal and seal the restored state. The old seals stay in the log. Every seal is an immutable snapshot. This is what makes safe rollback possible in fully autonomous environments where agents operate without human oversight.
 
 ## Creating a Seal
 

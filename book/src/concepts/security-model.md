@@ -2,7 +2,7 @@
 
 Writ is built for environments where multiple autonomous agents have write access to the same codebase. That demands security guarantees that traditional VCS was never designed for.
 
-Whether you're running a zero trust setup where every agent action is verified, a fully autonomous system where agents operate without human oversight, or a mixed environment with humans in the loop — the security model is the same. Trust nothing by default. Verify everything cryptographically. Log every security relevant action.
+Whether you're running a zero trust setup where every agent action is verified, a fully autonomous system where agents operate without human oversight, or a mixed environment with humans in the loop. The security model is the same. Trust nothing by default. Verify everything cryptographically. Log every security relevant action.
 
 ## Cryptographic Seal Chains
 
@@ -40,7 +40,7 @@ This means convergence seals (created by the engine during merge) are cryptograp
 
 ## Agent Identity
 
-Every agent in writ is a registered entity, not just a string ID. In environments where dozens of agents have write access, knowing *who* did *what* — and being able to prove it cryptographically — is not optional.
+Every agent in writ is a registered entity, not just a string ID. In environments where dozens of agents have write access, knowing *who* did *what*, and being able to prove it cryptographically, is not optional.
 
 ### Registration
 
@@ -57,7 +57,7 @@ writ agent register --id backend-dev --role implementer --trust-level standard
 | **Restricted** | Limited scope. Constrained to specific files. | Reduced confidence caps. Changes more likely to be reviewed. |
 | **Untrusted** | New or unverified. | Lowest confidence caps. Changes almost always escalated. |
 
-Trust levels directly affect convergence. When two agents' changes conflict, the engine factors in their trust levels when scoring confidence. An untrusted agent's changes receive lower confidence, making auto resolution less likely and human review more likely. This is how writ scales security across fleets of agents with varying levels of trust — from a known, verified lead agent to a newly introduced model that hasn't earned trust yet.
+Trust levels directly affect convergence. When two agents' changes conflict, the engine factors in their trust levels when scoring confidence. An untrusted agent's changes receive lower confidence, making auto resolution less likely and human review more likely. This is how writ scales security across fleets of agents with varying levels of trust: from a known, verified lead agent to a newly introduced model that hasn't earned trust yet.
 
 ### Suspension and Revocation
 
@@ -65,7 +65,7 @@ Agents can be:
 - **Suspended:** Temporarily blocked from creating seals. All existing seals remain.
 - **Revoked:** Permanently deactivated. History preserved, but the agent cannot create new seals.
 
-Both actions are recorded as security events in the audit log. In a fleet of autonomous agents, this is how you respond to a compromised agent immediately — suspend it, review the damage, and all seals created after the compromise timestamp are automatically flagged.
+Both actions are recorded as security events in the audit log. In a fleet of autonomous agents, this is how you respond to a compromised agent immediately. Suspend it, review the damage, and all seals created after the compromise timestamp are automatically flagged.
 
 ## Scope Enforcement
 
@@ -145,7 +145,7 @@ Events are severity classified (info, warning, critical) with configurable reten
 | **Signatures** | Authorship. Every seal can be verified back to its creator. |
 | **Trust levels** | Convergence quality. Lower trust agents get more scrutiny. |
 | **Scope enforcement** | File boundaries. Agents stay in their lane. |
-| **Content traceability** | Merge integrity. No hallucinated or injected content survives. *(In development — part of LLM convergence pipeline)* |
+| **Content traceability** | Merge integrity. No hallucinated or injected content survives. *(In development, part of LLM convergence pipeline)* |
 | **Event monitoring** | Auditability. Every security relevant action is logged. |
 
 ## Next Steps

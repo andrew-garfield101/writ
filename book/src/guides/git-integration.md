@@ -21,7 +21,7 @@ The baseline seal becomes the "base" for all convergence operations. Every agent
 
 ### During Work: Agents Seal, Not Commit
 
-Agents use `writ seal` to checkpoint their work and `writ spec done` to mark tasks complete. They do not run `git add`, `git commit`, or `git push`. The seal chain captures richer metadata than git commits — agent identity, spec linkage, test results, verification status — and keeps the git history clean.
+Agents use `writ seal` to checkpoint their work and `writ spec done` to mark tasks complete. They do not run `git add`, `git commit`, or `git push`. The seal chain captures richer metadata than git commits (agent identity, spec linkage, test results, verification status) and keeps the git history clean.
 
 ### Finishing: `writ finish`
 
@@ -40,7 +40,7 @@ writ finish --strategy per-spec      # one git commit per completed spec
 writ finish --dry-run                # preview without committing
 ```
 
-After `writ finish`, you're back in standard git. Push, create PRs, run CI — all normal.
+After `writ finish`, you're back in standard git. Push, create PRs, run CI. All normal.
 
 ### Manual Alternative
 
@@ -95,7 +95,7 @@ writ push                            # push seals to remote
 writ pull                            # pull seals from remote
 ```
 
-This is separate from git remotes. Writ remotes sync seal chains between writ repositories. Git remotes sync git history. In most workflows, you only need git remotes — `writ finish` converts seals to git commits, and git handles the distribution.
+This is separate from git remotes. Writ remotes sync seal chains between writ repositories. Git remotes sync git history. In most workflows, you only need git remotes. `writ finish` converts seals to git commits, and git handles the distribution.
 
 ## Best Practices
 

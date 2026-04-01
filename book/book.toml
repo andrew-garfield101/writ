@@ -2,7 +2,7 @@
 authors = ["Andrew Garfield"]
 language = "en"
 src = "src"
-title = "Writ Documentation"
+title = "writ-vcs Documentation"
 description = "AI-native version control for agentic systems"
 
 [build]

@@ -1,6 +1,6 @@
 # Output Formats
 
-For most version control systems, output format is an afterthought. Humans read the terminal, so the output is text. But writ's primary consumer isn't a human reading a terminal — it's an LLM agent parsing structured data into its context window. Every unnecessary token in that output is a token the agent can't spend on reasoning.
+For most version control systems, output format is an afterthought. Humans read the terminal, so the output is text. But writ's primary consumer isn't a human reading a terminal. It's an LLM agent parsing structured data into its context window. Every unnecessary token in that output is a token the agent can't spend on reasoning.
 
 This is the token tax. JSON's repeated key names, braces, quotes, and commas are structural overhead that carries no information for an agent that already knows the schema. For a single context call, the cost is small. For a fleet of agents making dozens of context calls per session, it compounds into real compute savings.
 
@@ -28,7 +28,7 @@ Consider a typical context response for a project with 20 tracked files. In JSON
 }
 ```
 
-`"path"`, `"hash"`, `"modified"`, `"agent"`, `"spec"` — repeated for every single row. For 20 files with 5 keys, that's 100 redundant key tokens before you even count the quotes, braces, colons, and commas.
+`"path"`, `"hash"`, `"modified"`, `"agent"`, `"spec"`. Repeated for every single row. For 20 files with 5 keys, that's 100 redundant key tokens before you even count the quotes, braces, colons, and commas.
 
 The same data in TOON:
 
@@ -43,13 +43,13 @@ Field names declared once in the header. Row count declared explicitly. No brace
 
 ## Benchmarks
 
-All numbers come from writ's benchmark suite, which runs in CI using tiktoken cl100k_base (the BPE tokenizer used by GPT-4 and close enough to Claude's tokenizer for benchmarking). The benchmark generates a realistic `ContextOutput` struct with 5 specs, 10 recent seals, and 40 tracked files — the same struct that `repo.context()` returns in production — and formats it through each formatter. Results are verified against Claude's actual tokenizer via the Anthropic API.
+All numbers come from writ's benchmark suite, which runs in CI using tiktoken cl100k_base (the BPE tokenizer used by GPT-4 and close enough to Claude's tokenizer for benchmarking). The benchmark generates a realistic `ContextOutput` struct with 5 specs, 10 recent seals, and 40 tracked files, the same struct that `repo.context()` returns in production, and formats it through each formatter. Results are verified against Claude's actual tokenizer via the Anthropic API.
 
 ### Git vs Writ: cost per capability
 
 The core question: what does it cost an agent to understand project state?
 
-Without writ, an agent runs multiple git commands — `git status`, `git log`, `git diff --stat`, `git branch -a` — each returning unstructured text that needs parsing and synthesis. With writ, one call returns structured data ready for immediate consumption.
+Without writ, an agent runs multiple git commands (`git status`, `git log`, `git diff --stat`, `git branch -a`), each returning unstructured text that needs parsing and synthesis. With writ, one call returns structured data ready for immediate consumption.
 
 | Source | Tokens | Capabilities | Tokens per Capability |
 |--------|--------|-------------|----------------------|
@@ -60,7 +60,7 @@ Without writ, an agent runs multiple git commands — `git status`, `git log`, `
 
 **Writ capabilities (10):** working state, seal history, diff, specs, agent activity, integration risk, convergence status, file contention, chain integrity, session state.
 
-Writ's total token count is higher because it delivers 2.5x more information. But per capability, writ is 25% more efficient — and it does it in a single call with structured output, versus five separate commands returning text that the agent has to parse, correlate, and synthesize.
+Writ's total token count is higher because it delivers 2.5x more information. But per capability, writ is 25% more efficient. It does it in a single call with structured output, versus five separate commands returning text that the agent has to parse, correlate, and synthesize.
 
 ### TOON vs JSON: format efficiency
 
@@ -72,17 +72,17 @@ Within writ, TOON reduces the structural overhead of the output itself. Real byt
 | Full context | **~20%** |
 | Spec list | **~10%** |
 
-Actual token savings from BPE tokenization are more modest than byte savings — BPE tokenizers are smart about merging structural characters (`{"` becomes one token, `": "` becomes one token). The measured token reductions are approximately 29% on seal logs, 15% on full context, and 10% on spec lists. Still meaningful, still compounding at scale — but we report the real numbers.
+Actual token savings from BPE tokenization are more modest than byte savings. BPE tokenizers are smart about merging structural characters (`{"` becomes one token, `": "` becomes one token). The measured token reductions are approximately 29% on seal logs, 15% on full context, and 10% on spec lists. Still meaningful, still compounding at scale, but we report the real numbers.
 
 ### Fleet scaling
 
-At scale, the efficiency compounds. A 10 agent fleet reading context 5 times each makes 50 writ calls vs 250 git commands. The token cost is 84,250 (writ) vs 44,750 (git) — but writ delivers structured, pre-parsed output with full multi-agent awareness. Git output requires each agent to parse, correlate, and synthesize five separate command outputs, adding interpretation overhead that doesn't show up in raw token counts.
+At scale, the efficiency compounds. A 10 agent fleet reading context 5 times each makes 50 writ calls vs 250 git commands. The token cost is 84,250 (writ) vs 44,750 (git). But writ delivers structured, pre-parsed output with full multi-agent awareness. Git output requires each agent to parse, correlate, and synthesize five separate command outputs, adding interpretation overhead that doesn't show up in raw token counts.
 
 The tool call reduction alone is significant. 50 calls vs 250 calls means fewer round trips, less orchestration complexity, and less context window consumed by intermediate parsing.
 
 ### Adaptive output
 
-Writ context is adaptive. Empty sections are omitted entirely — no diverged branches means the field doesn't appear, no scope violations means no violations section, low integration risk from a solo agent means no risk block. This isn't a format trick. It's a design principle. Solo agents get a lean context. Fleet deployments get the full picture. The output scales with complexity, not with a fixed schema.
+Writ context is adaptive. Empty sections are omitted entirely. No diverged branches means the field doesn't appear, no scope violations means no violations section, low integration risk from a solo agent means no risk block. This isn't a format trick. It's a design principle. Solo agents get a lean context. Fleet deployments get the full picture. The output scales with complexity, not with a fixed schema.
 
 ## Verifying benchmarks
 
@@ -122,9 +122,9 @@ These use Claude's actual tokenizer via the API, giving exact token counts rathe
 
 **Use TOON when** the consumer is an LLM agent. This is the primary use case writ was designed for. TOON delivers the same structured data in fewer tokens, leaving more room for reasoning. This is the recommended format for agentic workflows.
 
-**Use JSON when** you need maximum compatibility. JSON is the universal interchange format — every language, every tool, every pipeline can parse it. Use JSON for debugging, for piping writ output to other tools, or when you're unsure what will consume the output.
+**Use JSON when** you need maximum compatibility. JSON is the universal interchange format: every language, every tool, every pipeline can parse it. Use JSON for debugging, for piping writ output to other tools, or when you're unsure what will consume the output.
 
-**Use JSON Compact when** you want JSON compatibility with reduced whitespace. This is a middle ground — parseable by any JSON library, smaller than pretty JSON, but not as token efficient as TOON.
+**Use JSON Compact when** you want JSON compatibility with reduced whitespace. This is a middle ground: parseable by any JSON library, smaller than pretty JSON, but not as token efficient as TOON.
 
 ## Configuration
 
@@ -183,7 +183,7 @@ writ context                            # uses TOON without --format flag
 | Command | Notes |
 |---------|-------|
 | `writ context` | Primary use case for TOON. Full project state. |
-| `writ log` | Seal history. Highly tabular — ideal for TOON. |
+| `writ log` | Seal history. Highly tabular, ideal for TOON. |
 | `writ spec status` | Active specs and their state. |
 | `writ status` | Fleet overview: agents, specs, progress. |
 | `writ show` | Single seal detail. |
@@ -207,7 +207,7 @@ ctx_toon = repo.context(format="toon")
 ctx_json = repo.context(format="json")
 ```
 
-The `format="dict"` default is what most Python code wants — a native Python dict with no serialization cost. Use `format="toon"` when building prompts to send to an LLM, so the context string goes directly into the prompt without re-serialization:
+The `format="dict"` default is what most Python code wants: a native Python dict with no serialization cost. Use `format="toon"` when building prompts to send to an LLM, so the context string goes directly into the prompt without re-serialization:
 
 ```python
 import writ
@@ -263,7 +263,7 @@ specs[2]{id,description,status,agent}:
   S-039,Auth middleware,complete,agent-2
 ```
 
-The single line comment header at the top costs a few tokens but gives the LLM metadata about what it's reading — project name, format, timestamp. Negligible cost, meaningful orientation.
+The single line comment header at the top costs a few tokens but gives the LLM metadata about what it's reading: project name, format, timestamp. Negligible cost, meaningful orientation.
 
 ## Next Steps
 

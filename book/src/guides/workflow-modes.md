@@ -30,7 +30,7 @@ writ finish                  # Promote completed work to git
 git push                     # Standard git from here
 ```
 
-`writ status` shows a fleet overview: how many agents are active, which specs are complete, what's ready to commit. It adapts automatically to scale — expanding details for small projects, collapsing to summaries for large ones.
+`writ status` shows a fleet overview: how many agents are active, which specs are complete, what's ready to commit. It adapts automatically to scale, expanding details for small projects and collapsing to summaries for large ones.
 
 `writ finish` is interactive. It shows all completed specs, lets you select which to include, and offers commit strategies:
 
@@ -72,7 +72,7 @@ Auto mode is powerful and dangerous. The configuration includes guardrails:
 
 **Test verification**: The `verify_command` must exit 0 before a commit proceeds. If tests fail, the commit is blocked and the spec goes into a blocked state.
 
-**Branch targeting**: Auto commits go to a designated branch (`writ/auto`), not directly to main. The human merges when ready. This is the strongest safety rail — agents commit freely, but the human controls what reaches main.
+**Branch targeting**: Auto commits go to a designated branch (`writ/auto`), not directly to main. The human merges when ready. This is the strongest safety rail. Agents commit freely, but the human controls what reaches main.
 
 **Max specs per commit**: Prevents runaway mega-commits. If more than N specs are completed, they're committed in batches.
 
@@ -95,7 +95,7 @@ writ seal -s "added auth endpoint" --spec auth        # checkpoint (captures onl
 writ spec done auth -s "JWT auth complete"            # mark task complete
 ```
 
-Agents seal checkpoints and mark tasks complete. They do not run `writ finish` or `git commit`. The workflow mode determines what happens after `spec done` — and that's not the agent's concern. Multiple agents can work in the same directory simultaneously — spec-scoped sealing keeps each agent's changes separate.
+Agents seal checkpoints and mark tasks complete. They do not run `writ finish` or `git commit`. The workflow mode determines what happens after `spec done`, and that's not the agent's concern. Multiple agents can work in the same directory simultaneously. Spec-scoped sealing keeps each agent's changes separate.
 
 ## Choosing a Mode
 

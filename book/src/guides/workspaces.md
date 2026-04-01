@@ -1,10 +1,10 @@
 # Workspaces
 
-Workspaces provide physical file isolation for agents. Most multi-agent work does not need workspaces — agents work in the same directory and [spec-scoped sealing](multi-agent-workflow.md) keeps their changes separate. Workspaces exist for Level 2 scenarios where agents make competing rewrites to the same file and need separate copies to work from.
+Workspaces provide physical file isolation for agents. Most multi-agent work does not need workspaces. Agents work in the same directory and [spec-scoped sealing](multi-agent-workflow.md) keeps their changes separate. Workspaces exist for Level 2 scenarios where agents make competing rewrites to the same file and need separate copies to work from.
 
-When you run `writ task`, writ creates a workspace automatically — a full copy of your project where an agent works without stepping on anyone else's files. When the work is done, `writ finish` converges everything back together and commits to git. You never interact with workspaces directly. You think in tasks. Writ handles the rest.
+When you run `writ task`, writ creates a workspace automatically, a full copy of your project where an agent works without stepping on anyone else's files. When the work is done, `writ finish` converges everything back together and commits to git. You never interact with workspaces directly. You think in tasks. Writ handles the rest.
 
-> **When to use workspaces:** Two agents need to rewrite the same function in fundamentally different ways. One agent takes the PKCE approach, another takes the implicit flow approach. They need separate copies of the file. For everything else — different files, additive changes to the same file — use the [same-directory workflow](multi-agent-workflow.md) instead.
+> **When to use workspaces:** Two agents need to rewrite the same function in fundamentally different ways. One agent takes the PKCE approach, another takes the implicit flow approach. They need separate copies of the file. For everything else (different files, additive changes to the same file), use the [same-directory workflow](multi-agent-workflow.md) instead.
 
 ## The Flow
 
@@ -130,7 +130,7 @@ Tasks are labeled as "Tasks" in status output because you created them with `wri
 `writ finish` handles convergence automatically. When workspaces exist with completed work:
 
 1. Writ detects all workspaces with changes
-2. Runs convergence — files changed in only one workspace merge cleanly, overlapping changes go through the convergence engine
+2. Runs convergence: files changed in only one workspace merge cleanly, overlapping changes go through the convergence engine
 3. If convergence is clean, proceeds to git commit
 4. If there are escalations that need human resolution, writ stops and shows you what needs attention
 5. After a successful commit, prompts to clean up workspace directories
@@ -177,17 +177,17 @@ writ finish
 git push
 ```
 
-No tasks, no workspaces. The agent works directly in the project. This is the simplest path — identical to pre-workspace writ. Works perfectly for single agent use or manual human work.
+No tasks, no workspaces. The agent works directly in the project. This is the simplest path, identical to pre-workspace writ. Works perfectly for single agent use or manual human work.
 
-Both paths end the same way: `writ finish` then `git push`. The difference is whether you need isolation (Path 1) or not (Path 2). You don't have to decide upfront — start with Path 2 and switch to Path 1 by running `writ task` whenever you need a second agent.
+Both paths end the same way: `writ finish` then `git push`. The difference is whether you need isolation (Path 1) or not (Path 2). You don't have to decide upfront. Start with Path 2 and switch to Path 1 by running `writ task` whenever you need a second agent.
 
 ## Under the Hood
 
 `writ task` is syntactic sugar. One command that assembles three things:
 
-1. **Spec** — a structured task definition (ID derived from title, or `--id` to override)
-2. **Workspace** — a full project copy at `workspaces/<id>/` with its own index and HEAD
-3. **Assignment** — the spec is scoped to the workspace so `writ context` surfaces it as the agent's task
+1. **Spec**: a structured task definition (ID derived from title, or `--id` to override)
+2. **Workspace**: a full project copy at `workspaces/<id>/` with its own index and HEAD
+3. **Assignment**: the spec is scoped to the workspace so `writ context` surfaces it as the agent's task
 
 All workspaces share the same `.writ/` directory for objects, seals, and specs. Creating a workspace copies files but doesn't duplicate the content addressable storage.
 
@@ -202,7 +202,7 @@ my-project/
   ...
 ```
 
-The first `writ task` invocation adds `workspaces/` to `.gitignore` automatically. Running `writ task` from inside a workspace shows a warning — tasks should be created from the main project directory.
+The first `writ task` invocation adds `workspaces/` to `.gitignore` automatically. Running `writ task` from inside a workspace shows a warning. Tasks should be created from the main project directory.
 
 ## Advanced Usage
 

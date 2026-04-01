@@ -4,7 +4,7 @@ Orchestration frameworks coordinate what agents *do*. Writ controls what agents 
 
 ## Specs
 
-A spec is a structured requirement that agents work against. In git, the relationship between code and requirements is implicit — a branch named `feature/auth` is convention. Nothing enforces it. Nothing links a commit to a ticket. Nothing tells an agent "these are the files you should be touching."
+A spec is a structured requirement that agents work against. In git, the relationship between code and requirements is implicit. A branch named `feature/auth` is convention. Nothing enforces it. Nothing links a commit to a ticket. Nothing tells an agent "these are the files you should be touching."
 
 In writ, that relationship is explicit and machine readable.
 
@@ -122,11 +122,11 @@ Shows:
 
 ```
 SPECS:
-  auth (in-progress) — Authentication System
+  auth (in-progress): Authentication System
     agents: backend-dev (12 seals), test-bot (3 seals)
     files: src/auth.py, src/middleware.py, tests/test_auth.py
 
-  payments (in-progress) — Payment Integration
+  payments (in-progress): Payment Integration
     agents: payments-dev (8 seals)
     files: src/payments.py, src/stripe.py
 
@@ -134,7 +134,7 @@ INTEGRATION RISK: LOW (score: 15)
   No file contention between specs
 ```
 
-Every piece of work is linked to a requirement and attributed to an identity. Convergence uses this metadata to make better merge decisions. Security auditing uses it to track who changed what and whether they were authorized. And context delivers all of it in one call — structured data an agent can act on immediately.
+Every piece of work is linked to a requirement and attributed to an identity. Convergence uses this metadata to make better merge decisions. Security auditing uses it to track who changed what and whether they were authorized. And context delivers all of it in one call: structured data an agent can act on immediately.
 
 ## Next Steps
 

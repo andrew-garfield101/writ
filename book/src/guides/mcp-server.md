@@ -1,10 +1,10 @@
 # MCP Server
 
-Writ ships a native MCP (Model Context Protocol) server built in Rust. It's part of the `writ` binary — no separate install, no Python runtime, no plugins. When an agent connects via MCP, every writ command is available as a native tool in the agent's palette.
+Writ ships a native MCP (Model Context Protocol) server built in Rust. It's part of the `writ` binary. No separate install, no Python runtime, no plugins. When an agent connects via MCP, every writ command is available as a native tool in the agent's palette.
 
 ## How It Works
 
-The MCP server is a thin bridge between the MCP protocol and the writ CLI. Each tool function calls the `writ` CLI via subprocess — same behavior, same output, same enforcement as running commands directly. The server communicates over stdio using the standard MCP protocol.
+The MCP server is a thin bridge between the MCP protocol and the writ CLI. Each tool function calls the `writ` CLI via subprocess: same behavior, same output, same enforcement as running commands directly. The server communicates over stdio using the standard MCP protocol.
 
 ```
 ┌─────────────────┐         stdio            ┌──────────────────┐
@@ -44,7 +44,7 @@ The generated `.mcp.json`:
 }
 ```
 
-Commit this file to git. Every developer who clones the project gets MCP tools automatically — zero setup for the team.
+Commit this file to git. Every developer who clones the project gets MCP tools automatically. Zero setup for the team.
 
 ### Manual (Claude Code)
 
@@ -66,7 +66,7 @@ This writes the MCP server config to Claude Desktop's configuration file (`~/Lib
 
 ### Starting the Server
 
-You don't normally start the server manually — the MCP client (Claude Code or Claude Desktop) starts it automatically using the config. But for debugging or testing:
+You don't normally start the server manually. The MCP client (Claude Code or Claude Desktop) starts it automatically using the config. But for debugging or testing:
 
 ```bash
 writ mcp-serve
@@ -91,7 +91,7 @@ The server starts on stdio and waits for MCP protocol messages.
 
 | Tool | Parameters | What It Does |
 |------|-----------|-------------|
-| `writ_status` | completed (optional), active (optional), agent (optional), spec (optional) | Fleet overview — agents, specs, progress. |
+| `writ_status` | completed (optional), active (optional), agent (optional), spec (optional) | Fleet overview: agents, specs, progress. |
 | `writ_diff` | spec (optional), agent (optional), stat (optional) | View file changes, optionally scoped to a spec or agent. |
 | `writ_log` | spec (optional), agent (optional), all (optional), limit (optional) | Seal history. `all` includes diverged branches. |
 | `writ_show` | seal_id (required), diff (optional) | Inspect a specific seal in detail. |

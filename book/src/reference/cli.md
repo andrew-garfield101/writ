@@ -68,7 +68,7 @@ task created: backend-api-work
   Or provide your own prompt for the agent.
 ```
 
-The first `writ task` invocation adds `workspaces/` to `.gitignore` automatically. Running `writ task` from inside a workspace shows a warning — tasks should be created from the main project directory.
+The first `writ task` invocation adds `workspaces/` to `.gitignore` automatically. Running `writ task` from inside a workspace shows a warning: tasks should be created from the main project directory.
 
 ### `writ task list`
 
@@ -196,7 +196,7 @@ Options:
   --format <FORMAT>        Output: json, toon, json-compact
 ```
 
-The default view adapts automatically to project scale — expanding details for small projects, collapsing to summaries for large fleets. Use filter flags to drill down.
+The default view adapts automatically to project scale, expanding details for small projects and collapsing to summaries for large fleets. Use filter flags to drill down.
 
 When tasks exist (specs created via `writ task`), they appear under a "Tasks" header showing task name, agent, seal count, and status.
 
@@ -689,7 +689,7 @@ Start the MCP server. Communicates over stdio using the standard MCP protocol. N
 writ mcp-serve
 ```
 
-The server exposes 21 tools matching the full writ CLI. Each tool calls the CLI via subprocess — same behavior, same output, same enforcement. See the [MCP server guide](../guides/mcp-server.md) for the full tool list and setup instructions.
+The server exposes 21 tools matching the full writ CLI. Each tool calls the CLI via subprocess: same behavior, same output, same enforcement. See the [MCP server guide](../guides/mcp-server.md) for the full tool list and setup instructions.
 
 ### `writ mcp-install`
 

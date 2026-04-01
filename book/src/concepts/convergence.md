@@ -12,9 +12,9 @@ Writ's convergence engine merges agent work using sealed histories and genesis t
 
 Before any merging begins, a three layer filter determines which specs participate:
 
-1. **Epoch boundary** — only specs from the current session (since the last `writ finish`)
-2. **Commit state** — only uncommitted specs
-3. **Genesis tree** — structural filtering against the common ancestor
+1. **Epoch boundary**: only specs from the current session (since the last `writ finish`)
+2. **Commit state**: only uncommitted specs
+3. **Genesis tree**: structural filtering against the common ancestor
 
 This prevents completed, already committed, or irrelevant specs from interfering with the merge.
 
@@ -30,7 +30,7 @@ Non-conflicting changes (different lines, additive edits, independent sections) 
 
 ### Shadow Materialization
 
-Merge results are stored in the object store as **shadow state** — not written to disk. This means convergence can run while agents are still working without disturbing anyone's files. Disk materialization only happens at `writ finish`.
+Merge results are stored in the object store as **shadow state**, not written to disk. This means convergence can run while agents are still working without disturbing anyone's files. Disk materialization only happens at `writ finish`.
 
 ### Verification
 
@@ -45,9 +45,9 @@ If verification fails, the merge is rejected. Writ never silently applies a brok
 
 ## When Convergence Runs
 
-- **At `writ spec done`** — checks for overlapping work with other completed specs
-- **At `writ finish`** — final backstop that catches anything remaining before git commit
-- **Manually** — `writ converge-all --apply` for explicit control
+- **At `writ spec done`**: checks for overlapping work with other completed specs
+- **At `writ finish`**: final backstop that catches anything remaining before git commit
+- **Manually**: `writ converge-all --apply` for explicit control
 
 ## Confidence Thresholds
 
@@ -96,7 +96,7 @@ When multiple specs have diverged, writ optimizes the merge order:
 2. Specs with **minimal overlap** merge next
 3. Specs with **high overlap** merge last, benefiting from the cleaner base established by earlier merges
 
-This greedy overlap minimizing approach reduces total conflict complexity. For a fleet of agents working across many specs, ordering matters — it's the difference between cascading conflicts and clean sequential merges.
+This greedy overlap minimizing approach reduces total conflict complexity. For a fleet of agents working across many specs, ordering matters. It's the difference between cascading conflicts and clean sequential merges.
 
 ## Integration Risk
 
@@ -168,9 +168,9 @@ Structured data, not text to parse. An orchestrator agent or human can review an
 
 Two additional convergence phases are implemented and feature flagged for future releases:
 
-**Spec aware resolution (Phase 4).** Uses writ's first class spec metadata — file scope, acceptance criteria, design notes — to resolve ambiguous conflicts. Does this file belong to spec A or spec B? Which spec has this file in its declared scope? Which agent has the higher trust level? Spec context gives convergence something no other VCS can offer.
+**Spec aware resolution (Phase 4).** Uses writ's first class spec metadata (file scope, acceptance criteria, design notes) to resolve ambiguous conflicts. Does this file belong to spec A or spec B? Which spec has this file in its declared scope? Which agent has the higher trust level? Spec context gives convergence something no other VCS can offer.
 
-**LLM assisted resolution (Phase 5).** Sends unresolved conflicts to an LLM for resolution with full context. The LLM can select, reorder, and combine from the inputs — composition only, never novel code generation. Includes content traceability: every line in merged output must trace back to an input, preventing hallucinated or injected content from reaching the working tree.
+**LLM assisted resolution (Phase 5).** Sends unresolved conflicts to an LLM for resolution with full context. The LLM can select, reorder, and combine from the inputs. Composition only, never novel code generation. Includes content traceability: every line in merged output must trace back to an input, preventing hallucinated or injected content from reaching the working tree.
 
 Both phases use the same structured metadata that `writ context` surfaces. When enabled, they slot into the pipeline between the genesis tree merge and verification.
 

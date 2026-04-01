@@ -41,7 +41,7 @@ Same rhythm. Same mental model. The concepts map directly:
 
 | Git Concept | Writ Concept | What Improves |
 |------------|-------------|---------------|
-| (nothing) | Spec | Task tracking with lifecycle, agent claiming, genesis snapshots — no git equivalent |
+| (nothing) | Spec | Task tracking with lifecycle, agent claiming, genesis snapshots. No git equivalent |
 | Commit | Seal | Agent identity, spec linkage, immutable chain |
 | Merge | Converge | Writ's convergence engine merges seal trees. Auto resolves independent changes |
 | Worktree | Workspace | Shared object store, scoped context, native convergence (Level 2 only) |
@@ -77,7 +77,7 @@ The agent never creates workspaces, never runs convergence, never touches git. I
 
 This is the foundation that makes same-directory multi-agent work possible.
 
-When an agent runs `writ seal -s "auth endpoint" --spec auth-feature`, writ captures only the files that changed since this agent's last seal for this spec. Other agents' changes are invisible to the seal — not because they're in a different directory, but because writ knows they belong to a different spec.
+When an agent runs `writ seal -s "auth endpoint" --spec auth-feature`, writ captures only the files that changed since this agent's last seal for this spec. Other agents' changes are invisible to the seal, not because they're in a different directory, but because writ knows they belong to a different spec.
 
 ```bash
 # 4 agents, same directory, zero ceremony
@@ -116,7 +116,7 @@ This is the majority of multi-agent work. Good task decomposition naturally sepa
 
 ### Level 1: Additive Overlap (Common)
 
-Agents add to the same file in different sections — different functions, different config blocks, different test cases. The changes are independent and can be merged. Writ's convergence engine handles this automatically at `writ spec done` and as a backstop at `writ finish`.
+Agents add to the same file in different sections: different functions, different config blocks, different test cases. The changes are independent and can be merged. Writ's convergence engine handles this automatically at `writ spec done` and as a backstop at `writ finish`.
 
 ```
 Agent A seals: added loginWithGoogle() to auth.ts
@@ -187,8 +187,8 @@ Run this in a dedicated terminal tab for passive visibility into agent activity.
 
 Convergence runs automatically at two points:
 
-1. **`writ spec done`** — when an agent marks its task complete, convergence checks for overlapping work with other completed specs
-2. **`writ finish`** — final backstop that catches anything remaining before git commit
+1. **`writ spec done`**: when an agent marks its task complete, convergence checks for overlapping work with other completed specs
+2. **`writ finish`**: final backstop that catches anything remaining before git commit
 
 You do not need to run convergence manually in the normal workflow. Agents work, call spec done, and convergence handles the rest. `writ converge-all --apply` is available for explicit manual control when needed.
 

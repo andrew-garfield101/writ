@@ -2,7 +2,7 @@
 
 ## Something Broke During Agent Work
 
-Every seal is an immutable snapshot. This is the safety net — whether an agent went off the rails, a model update produced unexpected behavior, or a convergence produced bad output.
+Every seal is an immutable snapshot. This is the safety net, whether an agent went off the rails, a model update produced unexpected behavior, or a convergence produced bad output.
 
 ```bash
 # Find the last known good seal
@@ -31,7 +31,7 @@ writ converge-all --dry-run --strategy escalate
 Common causes:
 - **Low confidence scores:** The engine wasn't confident about the merge. Review the escalated files manually.
 - **Structural misparse:** The language analyzer didn't correctly identify a code construct. File a bug report.
-- **Overlapping function edits:** Two agents modified the same function body. This is a real conflict — review and resolve.
+- **Overlapping function edits:** Two agents modified the same function body. This is a real conflict. Review and resolve.
 
 If the merged output is wrong, restore to the pre convergence seal and try again with a different strategy, or resolve the escalated conflicts manually.
 
@@ -88,7 +88,7 @@ If your git repo has moved ahead of writ's baseline:
 writ bridge import
 ```
 
-This re-imports the current git state as a new baseline seal. Git is the storage layer, writ is the intelligence layer — they stay in sync through the bridge.
+This re-imports the current git state as a new baseline seal. Git is the storage layer, writ is the intelligence layer. They stay in sync through the bridge.
 
 ## Getting Help
 

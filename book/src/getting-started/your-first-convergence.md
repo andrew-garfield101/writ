@@ -61,7 +61,7 @@ writ seal -s "added display utilities" --spec frontend
 
 ## The Divergence
 
-Both agents created a `utils.py` with different functions. In git, this is a conflict. Two sides changed the same file — give up, produce markers, make a human figure it out.
+Both agents created a `utils.py` with different functions. In git, this is a conflict. Two sides changed the same file. Give up, produce markers, make a human figure it out.
 
 ```bash
 writ context --format human
@@ -81,8 +81,8 @@ writ converge-all --apply --strategy escalate
 Writ's convergence engine analyzes the conflict:
 
 1. **Pool filter** selects both specs for convergence (both have sealed changes to the same file)
-2. **Genesis tree merge** uses each spec's genesis snapshot as the common ancestor — since both added new content to the same file, the merge identifies non overlapping additions
-3. **Confidence scoring** rates the merge at high confidence — both sides added independent functions with no overlap, so they compose cleanly
+2. **Genesis tree merge** uses each spec's genesis snapshot as the common ancestor. Since both added new content to the same file, the merge identifies non overlapping additions
+3. **Confidence scoring** rates the merge at high confidence. Both sides added independent functions with no overlap, so they compose cleanly
 
 The merged `utils.py` contains all four functions from both agents:
 
@@ -122,15 +122,15 @@ If both agents had modified the *same* function body differently, that's a genui
 }
 ```
 
-Structured data, not text to parse. An orchestrator agent can resolve this programmatically — no regex parsing of conflict markers required.
+Structured data, not text to parse. An orchestrator agent can resolve this programmatically, no regex parsing of conflict markers required.
 
 ## Why This Matters
 
-This is a two agent demo. The principle scales. When you have ten agents working across five specs, all touching overlapping files, the merge problem doesn't scale linearly — it explodes combinatorially. Writ's convergence engine handles this by:
+This is a two agent demo. The principle scales. When you have ten agents working across five specs, all touching overlapping files, the merge problem doesn't scale linearly. It explodes combinatorially. Writ's convergence engine handles this by:
 
-1. **Optimizing merge order** — disjoint specs merge first, reducing conflict surface for later merges
-2. **Composing additive changes** — the common case in multi agent work where agents build complementary features
-3. **Escalating real conflicts** — with structured context that agents or humans can act on
+1. **Optimizing merge order.** Disjoint specs merge first, reducing conflict surface for later merges
+2. **Composing additive changes.** The common case in multi agent work where agents build complementary features
+3. **Escalating real conflicts.** With structured context that agents or humans can act on
 
 Giving each agent a git worktree solves isolation. This is what solves convergence.
 

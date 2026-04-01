@@ -73,7 +73,7 @@ For agents consuming this programmatically, use TOON for maximum token efficienc
 writ context --format toon
 ```
 
-TOON delivers the same structured data as JSON in up to 33% fewer bytes — field names declared once, rows streamed as values, no braces or repeated keys. Compare this to the alternative: `git log`, `git diff`, `git status`, read a few files, parse all the text, synthesize a mental model. With writ, that entire workflow collapses into one call. See [Output Formats](../concepts/output-formats.md) for benchmark numbers and format details.
+TOON delivers the same structured data as JSON in up to 33% fewer bytes. Field names declared once, rows streamed as values, no braces or repeated keys. Compare this to the alternative: `git log`, `git diff`, `git status`, read a few files, parse all the text, synthesize a mental model. With writ, that entire workflow collapses into one call. See [Output Formats](../concepts/output-formats.md) for benchmark numbers and format details.
 
 ## 4. Add a Spec
 
@@ -129,7 +129,7 @@ When ready, promote completed work to git:
 writ finish
 ```
 
-`writ finish` shows all completed specs, lets you select which to include, and offers commit strategy options (single commit, per spec, or grouped). It generates a commit message from the full session history — which agents worked on which specs, what was completed, what was tested. Full provenance, automatically.
+`writ finish` shows all completed specs, lets you select which to include, and offers commit strategy options (single commit, per spec, or grouped). It generates a commit message from the full session history: which agents worked on which specs, what was completed, what was tested. Full provenance, automatically.
 
 ```bash
 # Or manually with a generated commit message
@@ -145,11 +145,11 @@ In five minutes you:
 
 1. **Initialized** writ with automatic environment detection and format configuration
 2. **Sealed** a checkpoint with structured metadata (agent, spec, status)
-3. **Checked context** in token optimized TOON format — one call, full project state
+3. **Checked context** in token optimized TOON format, one call for full project state
 4. **Defined a spec** that agents can work against
-5. **Completed** the spec with `writ spec done` — final seal, clean lifecycle transition
+5. **Completed** the spec with `writ spec done`, final seal and clean lifecycle transition
 6. **Checked status** to see fleet progress at a glance
-7. **Committed** back to git with `writ finish` — auto generated provenance, strategy selection
+7. **Committed** back to git with `writ finish`, auto generated provenance and strategy selection
 
 Git stayed in place the whole time. Writ added the intelligence layer on top.
 

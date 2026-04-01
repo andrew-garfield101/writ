@@ -155,7 +155,7 @@ jobs:
       - name: Build CLI
         run: |
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} -p writ-cli
+            cross build --release --target ${{ matrix.target }} -p writ-cli --features vendored-ssl
           else
             cargo build --release --target ${{ matrix.target }} -p writ-cli
           fi

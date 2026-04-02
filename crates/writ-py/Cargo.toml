@@ -9,11 +9,11 @@ name = "_native"
 crate-type = ["cdylib"]
 
 [features]
-vendored-ssl = ["openssl/vendored"]
+vendored-ssl = ["openssl/vendored", "writ-core/vendored-ssl"]
 
 [dependencies]
 writ-core = { path = "../writ-core", features = ["bridge"] }
-pyo3 = { version = "0.23", features = ["abi3-py38"] }
+pyo3 = { version = "0.23", features = ["abi3-py310"] }
 pythonize = "0.23"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

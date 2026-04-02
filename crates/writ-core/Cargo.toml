@@ -8,6 +8,7 @@ description = "Core library for writ — the AI-native version control system"
 [features]
 default = []
 bridge = ["git2"]
+vendored-ssl = ["openssl-sys/vendored"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -26,6 +27,7 @@ toon-format = { version = "0.4", default-features = false }
 hostname = "0.4"
 dirs = "5"
 git2 = { version = "0.19", optional = true }
+openssl-sys = { version = "0.9", optional = true }
 notify = "6"
 
 [target.'cfg(unix)'.dependencies]

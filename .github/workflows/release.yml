@@ -73,13 +73,9 @@ jobs:
           manylinux: 2_28
           docker-options: ${{ matrix.docker-options || '' }}
           before-script-linux: |
-            # Install build dependencies for vendored OpenSSL and Python linking
+            # Install cmake for libgit2-sys vendored build
             if command -v yum &>/dev/null; then
-              yum install -y perl-IPC-Cmd perl-FindBin perl-File-Compare perl-File-Copy python3-devel || true
-            elif command -v dnf &>/dev/null; then
-              dnf install -y perl-IPC-Cmd perl-FindBin perl-File-Compare perl-File-Copy python3-devel || true
-            elif command -v apt-get &>/dev/null; then
-              apt-get update && apt-get install -y perl python3-dev || true
+              yum install -y cmake3 || yum install -y cmake || true
             fi
 
       - name: Upload wheel artifact

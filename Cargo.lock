@@ -2915,8 +2915,8 @@ dependencies = [
  "git2",
  "hostname",
  "libc",
+ "libgit2-sys",
  "notify",
- "openssl-sys",
  "proptest",
  "rand 0.8.5",
  "serde",
@@ -2947,7 +2947,6 @@ dependencies = [
 name = "writ-py"
 version = "0.1.0"
 dependencies = [
- "openssl",
  "pyo3",
  "pythonize",
  "serde",

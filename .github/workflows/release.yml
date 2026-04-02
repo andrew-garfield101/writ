@@ -23,11 +23,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             extra-args: "--features vendored-ssl"
-            docker-options: "-e PYO3_NO_PYTHON=1"
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             extra-args: "--features vendored-ssl"
-            docker-options: "-e PYO3_NO_PYTHON=1"
           - os: macos-14
             target: x86_64-apple-darwin
             extra-args: "--features vendored-ssl"
@@ -71,13 +69,9 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -m crates/writ-py/Cargo.toml --interpreter python3.8 ${{ matrix.extra-args || '' }}
-          manylinux: 2_17
-          before-script-linux: |
-            # Ensure Python 3.8 is available for abi3 linking
-            if [ -d /opt/python/cp38-cp38/bin ]; then
-              export PATH="/opt/python/cp38-cp38/bin:$PATH"
-            fi
+          args: --release --out dist -m crates/writ-py/Cargo.toml ${{ matrix.extra-args || '' }}
+          manylinux: auto
+          docker-options: ${{ matrix.docker-options || '' }}
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4

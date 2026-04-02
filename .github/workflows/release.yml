@@ -111,9 +111,17 @@ jobs:
     permissions:
       id-token: write
     steps:
-      - name: Download all artifacts
+      - name: Download wheel artifacts
         uses: actions/download-artifact@v4
         with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download sdist artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sdist
           path: dist
           merge-multiple: true
 

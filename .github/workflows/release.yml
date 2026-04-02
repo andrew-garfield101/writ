@@ -69,8 +69,8 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -m crates/writ-py/Cargo.toml ${{ matrix.extra-args || '' }}
-          manylinux: auto
+          args: --release --out dist -m crates/writ-py/Cargo.toml --find-interpreter ${{ matrix.extra-args || '' }}
+          manylinux: 2_28
 
       - name: Upload wheel artifact
         uses: actions/upload-artifact@v4

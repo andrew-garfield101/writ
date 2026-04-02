@@ -1,7 +1,7 @@
 class Writ < Formula
   desc "AI-native version control for agentic systems"
   homepage "https://github.com/andrew-garfield101/writ"
-  version "0.1.0"
+  version "0.1.1"
   license "AGPL-3.0-only"
 
   on_macos do

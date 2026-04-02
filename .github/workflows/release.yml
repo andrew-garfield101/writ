@@ -71,13 +71,12 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -m crates/writ-py/Cargo.toml ${{ matrix.extra-args || '' }}
-          manylinux: 2_28
-          docker-options: ${{ matrix.docker-options || '' }}
+          args: --release --out dist -m crates/writ-py/Cargo.toml --interpreter python3.8 ${{ matrix.extra-args || '' }}
+          manylinux: 2_17
           before-script-linux: |
-            # Install cmake for libgit2-sys vendored build
-            if command -v yum &>/dev/null; then
-              yum install -y cmake3 || yum install -y cmake || true
+            # Ensure Python 3.8 is available for abi3 linking
+            if [ -d /opt/python/cp38-cp38/bin ]; then
+              export PATH="/opt/python/cp38-cp38/bin:$PATH"
             fi
 
       - name: Upload wheel artifact

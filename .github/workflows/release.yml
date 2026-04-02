@@ -134,6 +134,7 @@ jobs:
           - os: macos-14
             target: x86_64-apple-darwin
             artifact: writ
+            vendored-ssl: true
           - os: macos-14
             target: aarch64-apple-darwin
             artifact: writ
@@ -154,10 +155,14 @@ jobs:
 
       - name: Build CLI
         run: |
+          FEATURES=""
+          if [ "${{ matrix.cross }}" = "true" ] || [ "${{ matrix.vendored-ssl }}" = "true" ]; then
+            FEATURES="--features vendored-ssl"
+          fi
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --target ${{ matrix.target }} -p writ-cli --features vendored-ssl
+            cross build --release --target ${{ matrix.target }} -p writ-cli $FEATURES
           else
-            cargo build --release --target ${{ matrix.target }} -p writ-cli
+            cargo build --release --target ${{ matrix.target }} -p writ-cli $FEATURES
           fi
         shell: bash
 

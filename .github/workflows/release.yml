@@ -69,7 +69,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist -m crates/writ-py/Cargo.toml --find-interpreter ${{ matrix.extra-args || '' }}
+          args: --release --out dist -m crates/writ-py/Cargo.toml ${{ matrix.extra-args || '' }}
           manylinux: 2_28
           docker-options: ${{ matrix.docker-options || '' }}
           before-script-linux: |

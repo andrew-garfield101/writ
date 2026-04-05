@@ -22,6 +22,102 @@ Structured context in one call. A convergence engine that auto resolves overlapp
 
 Writ works alongside git, not instead of it. One `writ init` and agents get everything: native MCP tools, slash commands, workflow instructions, and a structured CLI. No plugins, no configuration, no separate install.
 
+---
+
+Your agents work in the same codebase. Same files. Same time. Different tasks. Their work overlaps. Writ brings those changes together, at the agentic level, before reaching git.
+
+```bash
+pip install writ-vcs
+```
+
+```bash
+writ init                    # set up the project
+# launch your agents — they discover writ automatically
+writ finish                  # merge everything, commit to git
+git push
+```
+
+Two commands. That's the whole workflow.
+
+### See It In Action
+
+**One command to set up.**
+
+<p align="center">
+  <img src="assets/demos/final/clip1-init.gif" alt="writ init demo" width="800">
+</p>
+
+**Prompt your agents like you always do.**
+
+<p align="center">
+  <img src="assets/demos/final/clip2-prompt.gif" alt="Agent prompt demo" width="800">
+</p>
+
+**The agent handles the rest.**
+
+<p align="center">
+  <img src="assets/demos/final/clip3-agent.gif" alt="Agent discovers writ demo" width="800">
+</p>
+
+**Scale to as many agents as you need.**
+
+<p align="center">
+  <img src="assets/demos/final/clip4-watch.gif" alt="writ watch demo" width="800">
+</p>
+
+**One command to ship.**
+
+<p align="center">
+  <img src="assets/demos/final/clip5-finish.gif" alt="writ finish demo" width="800">
+</p>
+
+### What happens between init and finish
+
+You don't do anything. Your agents do.
+
+Each agent automatically discovers writ through your project's configuration. It creates a task, checkpoints its work as it goes, and marks its task complete when it's done. You don't mention writ in your prompts. You don't manage branches. You don't resolve conflicts.
+
+When you run `writ finish`, writ reads each agent's checkpointed history, merges overlapping changes using the project state from when each task started, and produces a single clean git commit. If two agents added functions to the same file, both functions are in the result. If two agents rewrote the same function differently, writ tells you and lets you decide.
+
+```
+ Your world                     Agent world                      Your world
+┌──────────┐  writ init      ┌─────────────────┐  writ finish  ┌──────────────┐
+│ git repo │ ──────────────→ │ agents work:    │ ────────────→ │ git commit   │
+│          │                 │ create tasks,   │               │ with all     │
+│          │                 │ checkpoint,     │  writ status  │ agents' work │
+│          │                 │ mark complete   │◀───────────── │ merged       │
+└──────────┘                 └─────────────────┘               └──────────────┘
+```
+
+### Why this matters
+
+Git was built for humans coordinating with humans. Pull requests, branch names, commit messages. These are human communication tools.
+
+Agents don't communicate through branches. They work concurrently, they modify shared files, and they don't wait for code review. When three agents touch the same file in the same minute, git's model breaks. You get merge conflicts at best. Lost work at worst.
+
+Writ is built for this reality. It tracks each agent's changes independently, merges them structurally, and gives you a single clean result. The more agents you run, the more writ matters.
+
+| Agents | Without writ | With writ |
+|--------|-------------|-----------|
+| 1 | Git works fine | Structured checkpoints + instant rollback |
+| 2, different files | Git works fine | Same, plus agent attribution |
+| 2, same files | Manual merge required | Automatic merge |
+| 4+ agents | Chaos. Branches, conflicts, lost work | One command. Clean merge. |
+
+### What you get
+
+**Instant rollback.** Every agent checkpoint is an immutable snapshot. Something goes wrong? `writ restore` rewinds to any previous state. No work is ever lost.
+
+**One call context.** `writ context` gives agents structured data about the entire project, who's working on what, which files overlap, what's at risk, in a single call. No more agents running five git commands to understand what's happening.
+
+**Automatic convergence.** When agents touch the same files, writ merges their changes using each agent's full checkpoint history. Independent additions merge cleanly. Real conflicts surface with clear context for resolution.
+
+**Cryptographic integrity.** Every checkpoint is hash chained and signed. `writ verify` validates the entire history. Tamper with anything and the chain breaks.
+
+**Works with any agent.** Claude Code, Codex, custom systems, scripts. Writ detects your environment and configures itself. Agents discover writ through your project configuration, no prompt engineering required.
+
+---
+
 **Context in one call.** Building situational awareness with current tools means multiple calls, parsing unstructured output, synthesizing project state from fragments. That's tokens and compute spent on infrastructure, not on the agent's actual task. `writ context` delivers everything (specs, seals, working state, file contention, integration risk) in one structured response. That structured data costs more tokens than raw git output. The tradeoff: one call with ready to consume coordination data versus five separate calls that agents must parse, correlate, and reason about on their own. TOON format and spec scoped filtering keep context overhead lean, and writ's token ratio improves as projects scale.
 
 **Automatic convergence.** When multiple agents touch the same files, conventional merging sees conflicts. Writ sees overlapping work and merges it. Each agent's changes are tracked independently through spec scoped seals. When convergence runs, writ's convergence engine uses the genesis state (a snapshot of the codebase when the spec was created) as the common ancestor, producing the correct combined result. Additive changes merge automatically. Real conflicts escalate with structured context and confidence scores for human or orchestrator review. No `<<<<` markers. No guesswork.
@@ -593,7 +689,6 @@ writ diff [--spec ID] [--stat]        # spec aware diff with filtering
 writ show SEAL_ID [--diff]            # inspect a seal
 writ restore SEAL_ID                  # restore to a seal's state
 writ bridge import                    # import git state as baseline
-writ push / pull                      # sync with remotes
 writ workspace create <name>          # create isolated parallel workspace
 writ workspace list                   # list all workspaces
 writ workspace status [name]          # workspace details and progress

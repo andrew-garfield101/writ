@@ -648,34 +648,6 @@ Exit code 0 when all checks pass, 1 if any check fails.
 
 See [Version Compatibility](version-compat.md) for details on schema versioning, auto-migration, and troubleshooting.
 
-## Remote Sync
-
-### `writ push`
-
-Push local state to a remote.
-
-```bash
-writ push [REMOTE]
-```
-
-### `writ pull`
-
-Pull remote state into local.
-
-```bash
-writ pull [REMOTE]
-```
-
-### `writ remote`
-
-Manage remotes.
-
-```bash
-writ remote init <PATH>        # Initialize a remote repository
-writ remote add <NAME> <PATH>  # Add a named remote
-writ remote status [REMOTE]    # Check remote state
-```
-
 ## MCP Server
 
 ### `writ mcp-serve`

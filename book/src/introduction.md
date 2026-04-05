@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/andrew-garfield101/writ/main/assets/sigil-512.png" alt="Sigil — the writ-vcs mascot" width="256">
+</p>
+
 # writ-vcs
 
 **The first AI native version control system for agentic development.** *(writ for short)*

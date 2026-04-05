@@ -84,19 +84,6 @@ The [workflow mode](workflow-modes.md) determines how `writ finish` creates git 
 
 Auto mode's branch targeting is the key safety rail. Agents commit freely to `writ/auto`, but the human controls what reaches main through standard git merge or PR workflows.
 
-## Remotes
-
-Writ has its own remote sync for distributed seal chains:
-
-```bash
-writ remote init /path/to/remote     # initialize a writ remote
-writ remote add origin /path         # add a named remote
-writ push                            # push seals to remote
-writ pull                            # pull seals from remote
-```
-
-This is separate from git remotes. Writ remotes sync seal chains between writ repositories. Git remotes sync git history. In most workflows, you only need git remotes. `writ finish` converts seals to git commits, and git handles the distribution.
-
 ## Best Practices
 
 - Run `writ init` once per project, at the start of each session

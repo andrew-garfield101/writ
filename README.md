@@ -118,6 +118,28 @@ Writ is built for this reality. It tracks each agent's changes independently, me
 
 ---
 
+## Table of Contents
+
+- [Install](#install)
+- [Why Writ](#why-writ)
+- [Context](#context)
+- [Multi-Agent Workflow](#multi-agent-workflow)
+- [Convergence](#convergence)
+- [Workspaces](#workspaces)
+- [Going Back](#going-back)
+- [Security](#security)
+- [Lifecycle and Storage](#lifecycle-and-storage)
+- [Python SDK](#python-sdk)
+- [MCP Server](#mcp-server)
+- [CLI Reference](#cli-reference)
+- [Architecture](#architecture)
+- [Building from Source](#building-from-source)
+- [Roadmap](#roadmap)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
 **Context in one call.** Building situational awareness with current tools means multiple calls, parsing unstructured output, synthesizing project state from fragments. That's tokens and compute spent on infrastructure, not on the agent's actual task. `writ context` delivers everything (specs, seals, working state, file contention, integration risk) in one structured response. That structured data costs more tokens than raw git output. The tradeoff: one call with ready to consume coordination data versus five separate calls that agents must parse, correlate, and reason about on their own. TOON format and spec scoped filtering keep context overhead lean, and writ's token ratio improves as projects scale.
 
 **Automatic convergence.** When multiple agents touch the same files, conventional merging sees conflicts. Writ sees overlapping work and merges it. Each agent's changes are tracked independently through spec scoped seals. When convergence runs, writ's convergence engine uses the genesis state (a snapshot of the codebase when the spec was created) as the common ancestor, producing the correct combined result. Additive changes merge automatically. Real conflicts escalate with structured context and confidence scores for human or orchestrator review. No `<<<<` markers. No guesswork.
@@ -163,26 +185,6 @@ writ spec add "task description"    Create a task (auto-generated hash ID)
 writ seal -s "what I did"           Checkpoint work (auto-scoped to claimed spec)
 writ spec done                      Mark task complete (auto-scoped)
 ```
-
-## Table of Contents
-
-- [Install](#install)
-- [Why Writ](#why-writ)
-- [Context](#context)
-- [Multi-Agent Workflow](#multi-agent-workflow)
-- [Convergence](#convergence)
-- [Workspaces](#workspaces)
-- [Going Back](#going-back)
-- [Security](#security)
-- [Lifecycle and Storage](#lifecycle-and-storage)
-- [Python SDK](#python-sdk)
-- [MCP Server](#mcp-server)
-- [CLI Reference](#cli-reference)
-- [Architecture](#architecture)
-- [Building from Source](#building-from-source)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
-- [License](#license)
 
 ## Install
 

@@ -600,6 +600,17 @@ enum Commands {
         action: GcCommands,
     },
 
+    /// Show agent productivity analytics derived from the seal chain.
+    Analytics {
+        /// Show details for a single agent only.
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
     /// Resolve escalated convergence conflicts.
     /// Run without arguments to see pending escalations.
     Resolve {
@@ -1102,6 +1113,14 @@ enum GcCommands {
         #[arg(long)]
         yes: bool,
 
+        /// Prune objects and seals from committed specs (work already in git).
+        #[arg(long)]
+        committed: bool,
+
+        /// Keep committed objects for N days before pruning (default: 7).
+        #[arg(long, default_value = "7")]
+        keep_days: u64,
+
         /// Output format: "human" (default) or "json".
         #[arg(long, default_value = "human")]
         format: String,
@@ -1116,6 +1135,13 @@ enum GcCommands {
 
     /// Show detailed storage breakdown by category.
     Storage {
+        /// Output format: "human" (default) or "json".
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
+
+    /// Audit storage: show what's active, committed, and prunable.
+    Audit {
         /// Output format: "human" (default) or "json".
         #[arg(long, default_value = "human")]
         format: String,
@@ -1572,12 +1598,22 @@ fn main() {
             GcCommands::Run {
                 dry_run,
                 yes,
+                committed,
+                keep_days,
                 format,
-            } => cmd_gc_run(&cwd, dry_run, yes, &format),
+            } => {
+                if committed {
+                    cmd_gc_committed(&cwd, dry_run, yes, keep_days, &format)
+                } else {
+                    cmd_gc_run(&cwd, dry_run, yes, &format)
+                }
+            }
             GcCommands::Status { format } => cmd_gc_status(&cwd, &format),
             GcCommands::Storage { format } => cmd_gc_storage(&cwd, &format),
+            GcCommands::Audit { format } => cmd_gc_audit(&cwd, &format),
             GcCommands::Log { limit, format } => cmd_gc_log(&cwd, limit, &format),
         },
+        Commands::Analytics { agent, format } => cmd_analytics(&cwd, agent.as_deref(), &format),
         Commands::Resolve {
             file,
             accept,
@@ -4639,6 +4675,45 @@ fn cmd_finish(
         _ => {}
     }
 
+    // Auto-GC: if enabled, prune committed objects when threshold is exceeded.
+    {
+        let writ_dir = cwd.join(".writ");
+        let gc_config = writ_core::gc::GcConfig::load(&writ_dir).unwrap_or_default();
+        if gc_config.auto_gc_enabled() {
+            let all_seals = writ_core::gc::load_all_seals(&writ_dir).unwrap_or_default();
+            let orphans =
+                writ_core::gc::find_orphaned_objects(&writ_dir, &all_seals).unwrap_or_default();
+            let object_count = orphans.len();
+
+            if object_count > gc_config.auto_gc_threshold() {
+                let specs = repo.list_specs().unwrap_or_default();
+                let plan = writ_core::gc::GcPlan::generate_committed(
+                    &writ_dir,
+                    &specs,
+                    gc_config.auto_gc_keep_days(),
+                )
+                .ok();
+
+                if let Some(plan) = plan {
+                    if !plan.actions.is_empty() {
+                        let result =
+                            writ_core::gc::execute_plan(&writ_dir, &plan, &specs).ok();
+                        if let Some(r) = result {
+                            if r.objects_pruned > 0 {
+                                println!(
+                                    "  {} Auto-GC: pruned {} object(s), freed {:.1} MB.",
+                                    "✓".green(),
+                                    r.objects_pruned,
+                                    r.bytes_freed as f64 / 1_048_576.0
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     println!();
     println!("  {} Run `git push` when ready.", "→".dimmed());
 
@@ -7620,8 +7695,338 @@ fn cmd_security_events(
 }
 
 // -------------------------------------------------------------------
+// Analytics
+// -------------------------------------------------------------------
+
+fn cmd_analytics(
+    cwd: &PathBuf,
+    agent_filter: Option<&str>,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use writ_core::analytics::AnalyticsReport;
+
+    let writ_dir = cwd.join(".writ");
+    let report = AnalyticsReport::generate(&writ_dir)?;
+
+    let agents: Vec<_> = match agent_filter {
+        Some(id) => report
+            .agents
+            .iter()
+            .filter(|a| a.agent_id == id)
+            .cloned()
+            .collect(),
+        None => report.agents.clone(),
+    };
+
+    if format == "json" {
+        let output = if agent_filter.is_some() {
+            serde_json::json!({
+                "generated_at": report.generated_at,
+                "agents": agents,
+            })
+        } else {
+            serde_json::to_value(&report)?
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    if report.total_seals == 0 {
+        println!(
+            "{} No seals yet. Run some agents and come back.",
+            "·".dimmed()
+        );
+        return Ok(());
+    }
+
+    if agents.is_empty() {
+        println!(
+            "{} No data for agent '{}'.",
+            "·".dimmed(),
+            agent_filter.unwrap_or("")
+        );
+        return Ok(());
+    }
+
+    println!("{}", "Agent Performance Analytics".bold());
+    println!();
+    if let Some(range) = &report.time_range {
+        let hours = range.duration_secs as f64 / 3600.0;
+        println!(
+            "  {} {} seal(s) across {} agent(s), {} spec(s) over {:.1}h",
+            "·".cyan(),
+            report.total_seals,
+            report.total_agents,
+            report.total_specs,
+            hours
+        );
+        println!();
+    }
+
+    for metrics in &agents {
+        println!("  {}", metrics.agent_id.bold());
+        println!(
+            "    seals:           {} (across {} spec{})",
+            metrics.seal_count,
+            metrics.spec_count,
+            if metrics.spec_count == 1 { "" } else { "s" }
+        );
+        println!(
+            "    files changed:   {} ({} added, {} modified, {} deleted)",
+            metrics.files_changed,
+            metrics.files_added,
+            metrics.files_modified,
+            metrics.files_deleted
+        );
+        println!(
+            "    avg per seal:    {:.1} files",
+            metrics.avg_files_per_seal
+        );
+        println!(
+            "    avg per spec:    {:.1} seals",
+            metrics.avg_seals_per_spec
+        );
+        if let Some(interval) = metrics.avg_seal_interval_secs {
+            let mins = interval as f64 / 60.0;
+            println!("    seal cadence:    every {:.1} min", mins);
+        }
+        let active_mins = metrics.active_duration_secs as f64 / 60.0;
+        if active_mins >= 1.0 {
+            println!("    active time:     {:.1} min", active_mins);
+        }
+        if metrics.warning_count > 0 {
+            println!(
+                "    warnings:        {} {}",
+                metrics.warning_count,
+                "(scope, ghost, etc.)".dimmed()
+            );
+        }
+        if metrics.convergence_triggered > 0 {
+            let rate = if metrics.convergence_triggered > 0 {
+                metrics.convergence_succeeded as f64 / metrics.convergence_triggered as f64
+                    * 100.0
+            } else {
+                0.0
+            };
+            println!(
+                "    convergence:     {}/{} succeeded ({:.0}%)",
+                metrics.convergence_succeeded, metrics.convergence_triggered, rate
+            );
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+// -------------------------------------------------------------------
 // GC commands
 // -------------------------------------------------------------------
+
+fn cmd_gc_audit(
+    cwd: &PathBuf,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use writ_core::gc::{
+        find_committed_prunable, find_orphaned_objects, load_all_seals, StorageReport,
+    };
+    use writ_core::spec::CommitState;
+
+    let repo = Repository::open_from_dir(cwd)?;
+    let specs = repo.list_specs()?;
+    let writ_dir = cwd.join(".writ");
+    let all_seals = load_all_seals(&writ_dir)?;
+
+    // Storage overview.
+    let report = StorageReport::scan(&writ_dir, 0)?;
+
+    // Categorize specs.
+    let active_specs: Vec<_> = specs
+        .iter()
+        .filter(|s| matches!(s.commit_state, CommitState::Uncommitted))
+        .collect();
+    let committed_specs: Vec<_> = specs
+        .iter()
+        .filter(|s| matches!(s.commit_state, CommitState::Committed | CommitState::Pushed))
+        .collect();
+
+    // Categorize seals.
+    let committed_spec_ids: std::collections::HashSet<String> =
+        committed_specs.iter().map(|s| s.id.clone()).collect();
+    let active_seal_count = all_seals
+        .iter()
+        .filter(|s| {
+            s.spec_id
+                .as_ref()
+                .map(|id| !committed_spec_ids.contains(id))
+                .unwrap_or(true)
+        })
+        .count();
+    let committed_seal_count = all_seals.len() - active_seal_count;
+
+    // Find prunable data.
+    let orphans = find_orphaned_objects(&writ_dir, &all_seals)?;
+    let orphan_bytes: u64 = orphans.iter().map(|o| o.size_bytes).sum();
+    let committed_prunable = find_committed_prunable(&writ_dir, &specs, &all_seals, 0)?;
+
+    if format == "json" {
+        let output = serde_json::json!({
+            "total_other_bytes": report.other_bytes,
+            "total_seal_bytes": report.seal_bytes,
+            "total_seals": all_seals.len(),
+            "active_seals": active_seal_count,
+            "committed_seals": committed_seal_count,
+            "active_specs": active_specs.len(),
+            "committed_specs": committed_specs.len(),
+            "orphaned_objects": orphans.len(),
+            "orphaned_bytes": orphan_bytes,
+            "committed_prunable_objects": committed_prunable.object_hashes.len(),
+            "committed_prunable_bytes": committed_prunable.total_bytes,
+            "committed_prunable_seals": committed_prunable.seal_ids.len(),
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("{}", "Storage Audit".bold());
+        println!();
+        println!("  {}", "Overview".underline());
+        println!(
+            "    Objects:  {:.1} MB",
+            report.other_bytes as f64 / 1_048_576.0
+        );
+        println!(
+            "    Seals:    {:.1} MB ({} total)",
+            report.seal_bytes as f64 / 1_048_576.0,
+            all_seals.len()
+        );
+        println!(
+            "    Specs:    {} active, {} committed",
+            active_specs.len(),
+            committed_specs.len()
+        );
+        println!(
+            "    Seals:    {} active, {} committed",
+            active_seal_count, committed_seal_count
+        );
+
+        println!();
+        println!("  {}", "Reclaimable".underline());
+        println!(
+            "    Orphaned objects:     {} ({:.1} MB)",
+            orphans.len(),
+            orphan_bytes as f64 / 1_048_576.0
+        );
+        println!(
+            "    Committed objects:    {} ({:.1} MB)",
+            committed_prunable.object_hashes.len(),
+            committed_prunable.total_bytes as f64 / 1_048_576.0
+        );
+        println!(
+            "    Committed seals:      {}",
+            committed_prunable.seal_ids.len()
+        );
+
+        let total_reclaimable = orphan_bytes + committed_prunable.total_bytes;
+        println!();
+        println!(
+            "    {} {:.1} MB reclaimable via `writ gc run` and `writ gc run --committed`",
+            "Total:".bold(),
+            total_reclaimable as f64 / 1_048_576.0
+        );
+
+        if committed_prunable.object_hashes.is_empty() && orphans.is_empty() {
+            println!();
+            println!(
+                "  {} Storage is clean. Nothing to prune.",
+                "✓".green()
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_gc_committed(
+    cwd: &PathBuf,
+    dry_run: bool,
+    yes: bool,
+    keep_days: u64,
+    format: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use writ_core::gc::{execute_plan, GcPlan};
+
+    let repo = Repository::open_from_dir(cwd)?;
+    let specs = repo.list_specs()?;
+    let writ_dir = cwd.join(".writ");
+
+    let plan = GcPlan::generate_committed(&writ_dir, &specs, keep_days)?;
+
+    if plan.actions.is_empty() {
+        println!(
+            "{} Nothing to prune. No committed specs past the {}-day keep period.",
+            "✓".green(),
+            keep_days
+        );
+        return Ok(());
+    }
+
+    // Display the plan.
+    println!("{}", "Committed spec pruning plan:".bold());
+    for action in &plan.actions {
+        if let writ_core::gc::GcAction::PruneCommitted {
+            spec_ids,
+            object_count,
+            seal_count,
+            total_bytes,
+            reason: _,
+        } = action
+        {
+            println!(
+                "  {} {} object(s) + {} seal(s) from {} spec(s) — {:.1} MB",
+                "·".cyan(),
+                object_count,
+                seal_count,
+                spec_ids.len(),
+                *total_bytes as f64 / 1_048_576.0
+            );
+            for id in spec_ids {
+                println!("    {} {}", "spec".dimmed(), id.dimmed());
+            }
+        }
+    }
+    println!();
+    println!("  {}", plan.summary.summary_line);
+
+    if dry_run {
+        println!();
+        println!("{}", "DRY RUN — no changes made.".yellow().bold());
+        return Ok(());
+    }
+
+    // Confirm unless --yes.
+    if !yes {
+        print!("\nProceed? [y/N] ");
+        std::io::Write::flush(&mut std::io::stdout())?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            println!("Aborted.");
+            return Ok(());
+        }
+    }
+
+    let result = execute_plan(&writ_dir, &plan, &specs)?;
+
+    println!();
+    println!(
+        "{} Pruned {} object(s), freed {:.1} MB. {} seal(s) archived to gc-log.jsonl.",
+        "✓".green().bold(),
+        result.objects_pruned,
+        result.bytes_freed as f64 / 1_048_576.0,
+        result.transitions_applied.len(), // reusing for seal archive count
+    );
+
+    Ok(())
+}
 
 fn cmd_gc_run(
     cwd: &PathBuf,
@@ -7744,6 +8149,23 @@ fn cmd_gc_run(
                                     "    {}     {count} object(s), ~{:.1} MB savings",
                                     "recompress".cyan(),
                                     *estimated_savings_bytes as f64 / 1_048_576.0
+                                );
+                                println!("                   {}", reason.dimmed());
+                            }
+                            writ_core::gc::GcAction::PruneCommitted {
+                                spec_ids,
+                                object_count,
+                                seal_count,
+                                total_bytes,
+                                reason,
+                            } => {
+                                println!(
+                                    "    {}  {} object(s) + {} seal(s) from {} spec(s), {:.1} MB",
+                                    "committed".cyan(),
+                                    object_count,
+                                    seal_count,
+                                    spec_ids.len(),
+                                    *total_bytes as f64 / 1_048_576.0
                                 );
                                 println!("                   {}", reason.dimmed());
                             }

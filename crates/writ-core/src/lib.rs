@@ -5,6 +5,7 @@
 //! and **convergence** (not merging).
 
 pub mod agent;
+pub mod analytics;
 #[cfg(feature = "bridge")]
 pub mod bridge;
 pub mod config;

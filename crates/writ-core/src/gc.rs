@@ -1,8 +1,10 @@
 //! Garbage collection and lifecycle management.
 //!
 //! Provides storage tracking, GC plan generation, and safe cleanup
-//! of expired specs, old security events, and other working state.
-//! Seals are immutable and never deleted.
+//! of expired specs, old security events, orphaned objects, and
+//! committed seal data. Committed seals can be pruned after their
+//! work has been promoted to git — metadata is archived to a compact
+//! log before the seal file and exclusive objects are removed.
 
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
@@ -127,6 +129,26 @@ pub struct GcConfig {
     /// Object store compression settings.
     #[serde(default)]
     pub storage: StorageConfig,
+    /// Auto-GC: run committed pruning after `writ finish` when orphan count
+    /// exceeds the threshold. Default: true.
+    #[serde(default = "default_auto_gc")]
+    pub auto_gc: bool,
+    /// Orphan count threshold for auto-GC. Default: 500.
+    #[serde(default = "default_auto_gc_threshold")]
+    pub auto_gc_object_threshold: usize,
+    /// Keep-days for auto-GC committed pruning. Default: 7.
+    #[serde(default = "default_auto_gc_keep_days")]
+    pub auto_gc_keep_days: u64,
+}
+
+fn default_auto_gc() -> bool {
+    true
+}
+fn default_auto_gc_threshold() -> usize {
+    500
+}
+fn default_auto_gc_keep_days() -> u64 {
+    7
 }
 
 impl Default for GcConfig {
@@ -150,7 +172,25 @@ impl GcConfig {
                 compression_level: 3,
                 max_object_size_bytes: 100 * 1024 * 1024, // 100 MB
             },
+            auto_gc: true,
+            auto_gc_object_threshold: 500,
+            auto_gc_keep_days: 7,
         }
+    }
+
+    /// Check if auto-GC is enabled.
+    pub fn auto_gc_enabled(&self) -> bool {
+        self.auto_gc
+    }
+
+    /// Get the auto-GC orphan count threshold.
+    pub fn auto_gc_threshold(&self) -> usize {
+        self.auto_gc_object_threshold
+    }
+
+    /// Get the auto-GC keep-days setting.
+    pub fn auto_gc_keep_days(&self) -> u64 {
+        self.auto_gc_keep_days
     }
 
     /// Raspberry Pi profile — constrained device with tight budgets.
@@ -176,6 +216,9 @@ impl GcConfig {
                 compression_level: 1, // minimize CPU on weak processor
                 max_object_size_bytes: 10 * 1024 * 1024, // 10 MB
             },
+            auto_gc: true,
+            auto_gc_object_threshold: 200, // tighter threshold for constrained device
+            auto_gc_keep_days: 3,
         }
     }
 
@@ -202,6 +245,9 @@ impl GcConfig {
                 compression_level: 3,
                 max_object_size_bytes: 100 * 1024 * 1024, // 100 MB
             },
+            auto_gc: true,
+            auto_gc_object_threshold: 500,
+            auto_gc_keep_days: 7,
         }
     }
 
@@ -228,6 +274,9 @@ impl GcConfig {
                 compression_level: 6, // better ratio, servers have CPU headroom
                 max_object_size_bytes: 256 * 1024 * 1024, // 256 MB
             },
+            auto_gc: true,
+            auto_gc_object_threshold: 1000, // higher threshold for enterprise
+            auto_gc_keep_days: 30,          // longer grace period
         }
     }
 
@@ -424,6 +473,16 @@ pub enum GcAction {
         total_bytes: u64,
         reason: String,
     },
+    /// Prune objects and seals from committed specs.
+    /// These objects are safely reclaimable because the work is already in git.
+    /// Seal metadata is archived before seal files are deleted.
+    PruneCommitted {
+        spec_ids: Vec<String>,
+        object_count: usize,
+        seal_count: usize,
+        total_bytes: u64,
+        reason: String,
+    },
     /// Recompress legacy (uncompressed) objects with zstd.
     RecompressObjects {
         count: usize,
@@ -454,6 +513,67 @@ pub struct GcPlan {
 }
 
 impl GcPlan {
+    /// Build a GC plan for committed spec pruning.
+    ///
+    /// This is the `writ gc --committed` path: identifies objects and seals
+    /// from specs that have been committed to git and are past the keep_days
+    /// grace period. Their work is safely in git and the writ objects can be
+    /// reclaimed.
+    pub fn generate_committed(
+        writ_dir: &Path,
+        specs: &[crate::spec::Spec],
+        keep_days: u64,
+    ) -> WritResult<Self> {
+        let storage = StorageReport::scan(writ_dir, 0)?;
+        let all_seals = load_all_seals(writ_dir)?;
+        let prunable = find_committed_prunable(writ_dir, specs, &all_seals, keep_days)?;
+
+        let mut actions = Vec::new();
+
+        if !prunable.object_hashes.is_empty() || !prunable.seal_ids.is_empty() {
+            actions.push(GcAction::PruneCommitted {
+                spec_ids: prunable.spec_ids.clone(),
+                object_count: prunable.object_hashes.len(),
+                seal_count: prunable.seal_ids.len(),
+                total_bytes: prunable.total_bytes,
+                reason: format!(
+                    "{} object(s) and {} seal(s) from {} committed spec(s), {:.1} MB reclaimable",
+                    prunable.object_hashes.len(),
+                    prunable.seal_ids.len(),
+                    prunable.spec_ids.len(),
+                    prunable.total_bytes as f64 / 1_048_576.0
+                ),
+            });
+        }
+
+        let summary = GcSummary {
+            total_actions: actions.len(),
+            transitions: 0,
+            deletions: 0,
+            events_to_clean: 0,
+            objects_to_prune: prunable.object_hashes.len(),
+            objects_to_recompress: 0,
+            summary_line: if actions.is_empty() {
+                "Nothing to prune — no committed specs past the keep period.".into()
+            } else {
+                format!(
+                    "Prunable: {} objects ({:.1} MB) + {} seals from {} committed specs",
+                    prunable.object_hashes.len(),
+                    prunable.total_bytes as f64 / 1_048_576.0,
+                    prunable.seal_ids.len(),
+                    prunable.spec_ids.len(),
+                )
+            },
+        };
+
+        Ok(Self {
+            generated_at: Utc::now(),
+            storage,
+            actions,
+            summary,
+        })
+    }
+
     /// Build a GC plan by scanning specs and events.
     pub fn generate(
         writ_dir: &Path,
@@ -928,6 +1048,96 @@ pub fn execute_plan(
                 }
                 executed += 1;
             }
+
+            GcAction::PruneCommitted {
+                spec_ids: _,
+                object_count: _,
+                seal_count: _,
+                total_bytes: _,
+                reason,
+            } => {
+                // Re-verify at execution time with fresh data.
+                let fresh_specs: Vec<crate::spec::Spec> = {
+                    let specs_dir = writ_dir.join("specs");
+                    let mut s = Vec::new();
+                    if specs_dir.exists() {
+                        for entry in fs::read_dir(&specs_dir)? {
+                            let entry = entry?;
+                            if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
+                                let data = fs::read_to_string(entry.path())?;
+                                if let Ok(spec) = serde_json::from_str(&data) {
+                                    s.push(spec);
+                                }
+                            }
+                        }
+                    }
+                    s
+                };
+
+                let fresh_seals = load_all_seals(writ_dir)?;
+                let prunable = find_committed_prunable(
+                    writ_dir,
+                    &fresh_specs,
+                    &fresh_seals,
+                    0, // No keep_days at execution (already filtered at plan time)
+                )?;
+
+                // Archive seal metadata before deleting.
+                let seals_to_archive: Vec<&crate::seal::Seal> = fresh_seals
+                    .iter()
+                    .filter(|s| prunable.seal_ids.contains(&s.id))
+                    .collect();
+                let seal_refs: Vec<crate::seal::Seal> =
+                    seals_to_archive.into_iter().cloned().collect();
+                let archived = archive_seal_metadata(writ_dir, &seal_refs)?;
+
+                // Delete seal files.
+                let seals_dir = writ_dir.join("seals");
+                for seal_id in &prunable.seal_ids {
+                    let seal_path = seals_dir.join(format!("{}.json", seal_id));
+                    if seal_path.exists() {
+                        fs::remove_file(&seal_path)?;
+                    }
+                }
+
+                // Delete prunable objects.
+                let objects_dir = writ_dir.join("objects");
+                for hash in &prunable.object_hashes {
+                    if hash.len() < 3 {
+                        continue;
+                    }
+                    let (prefix, rest) = hash.split_at(2);
+                    let obj_path = objects_dir.join(prefix).join(rest);
+                    if obj_path.exists() {
+                        fs::remove_file(&obj_path)?;
+                        objects_pruned += 1;
+                        bytes_freed += prunable.total_bytes / prunable.object_hashes.len().max(1) as u64;
+
+                        write_tombstone(
+                            &gc_dir,
+                            &Tombstone {
+                                id: hash.clone(),
+                                object_type: "committed-object".into(),
+                                final_state: "committed".into(),
+                                cleaned_at: Utc::now(),
+                                reason: reason.clone(),
+                            },
+                        )?;
+
+                        // Clean up empty prefix directory.
+                        let prefix_dir = objects_dir.join(prefix);
+                        if let Ok(mut entries) = prefix_dir.read_dir() {
+                            if entries.next().is_none() {
+                                fs::remove_dir(&prefix_dir).ok();
+                            }
+                        }
+                    }
+                }
+
+                if archived > 0 || !prunable.object_hashes.is_empty() {
+                    executed += 1;
+                }
+            }
         }
     }
 
@@ -1094,6 +1304,208 @@ pub fn find_orphaned_objects(
     }
 
     Ok(orphans)
+}
+
+/// Result of scanning for committed spec objects that can be pruned.
+#[derive(Debug, Clone)]
+pub struct CommittedPrunable {
+    /// Spec IDs whose objects can be pruned.
+    pub spec_ids: Vec<String>,
+    /// Object hashes exclusively referenced by committed seals.
+    pub object_hashes: Vec<String>,
+    /// Total bytes reclaimable.
+    pub total_bytes: u64,
+    /// Seal IDs that can be archived and removed.
+    pub seal_ids: Vec<String>,
+}
+
+/// Find objects that are ONLY referenced by committed/pushed specs' seals
+/// and not by any active (uncommitted) seal or the current index.
+///
+/// This is the core of `writ gc --committed`: objects that have done their
+/// job (work is in git) and can be safely reclaimed.
+///
+/// The `keep_days` parameter adds a grace period — committed objects younger
+/// than this many days are kept even if prunable.
+pub fn find_committed_prunable(
+    writ_dir: &Path,
+    specs: &[crate::spec::Spec],
+    seals: &[crate::seal::Seal],
+    keep_days: u64,
+) -> WritResult<CommittedPrunable> {
+    use crate::spec::CommitState;
+
+    let now = Utc::now();
+
+    // Identify committed spec IDs past the keep_days grace period.
+    let committed_spec_ids: HashSet<String> = specs
+        .iter()
+        .filter(|s| matches!(s.commit_state, CommitState::Committed | CommitState::Pushed))
+        .filter(|s| {
+            if keep_days == 0 {
+                return true;
+            }
+            let committed_at = s.committed_at.unwrap_or(s.updated_at);
+            let age_days = now
+                .signed_duration_since(committed_at)
+                .num_days()
+                .max(0) as u64;
+            age_days >= keep_days
+        })
+        .map(|s| s.id.clone())
+        .collect();
+
+    if committed_spec_ids.is_empty() {
+        return Ok(CommittedPrunable {
+            spec_ids: Vec::new(),
+            object_hashes: Vec::new(),
+            total_bytes: 0,
+            seal_ids: Vec::new(),
+        });
+    }
+
+    // Partition seals: committed vs active.
+    let mut committed_seals = Vec::new();
+    let mut active_seals = Vec::new();
+    for seal in seals {
+        let is_committed = seal
+            .spec_id
+            .as_ref()
+            .map(|id| committed_spec_ids.contains(id))
+            .unwrap_or(false);
+        if is_committed {
+            committed_seals.push(seal);
+        } else {
+            active_seals.push(seal);
+        }
+    }
+
+    // Build the "protected" set: hashes referenced by ANY active seal.
+    let mut protected = HashSet::new();
+    for seal in &active_seals {
+        protected.insert(seal.tree.clone());
+        for change in &seal.changes {
+            if let Some(ref h) = change.old_hash {
+                protected.insert(h.clone());
+            }
+            if let Some(ref h) = change.new_hash {
+                protected.insert(h.clone());
+            }
+        }
+    }
+
+    // Also protect the current index's referenced objects.
+    let index_path = writ_dir.join("index.json");
+    if index_path.exists() {
+        if let Ok(data) = fs::read_to_string(&index_path) {
+            if let Ok(index) = serde_json::from_str::<serde_json::Value>(&data) {
+                if let Some(entries) = index.get("entries").and_then(|e| e.as_object()) {
+                    for (_path, entry) in entries {
+                        if let Some(hash) = entry.get("hash").and_then(|h| h.as_str()) {
+                            protected.insert(hash.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Collect hashes referenced by committed seals that are NOT protected.
+    let mut prunable_hashes = Vec::new();
+    let mut committed_referenced = HashSet::new();
+    for seal in &committed_seals {
+        committed_referenced.insert(seal.tree.clone());
+        for change in &seal.changes {
+            if let Some(ref h) = change.old_hash {
+                committed_referenced.insert(h.clone());
+            }
+            if let Some(ref h) = change.new_hash {
+                committed_referenced.insert(h.clone());
+            }
+        }
+    }
+
+    // Only prune objects that exist on disk and are NOT in the protected set.
+    let objects_dir = writ_dir.join("objects");
+    let mut total_bytes = 0u64;
+    for hash in &committed_referenced {
+        if protected.contains(hash) {
+            continue;
+        }
+        let (prefix, rest) = hash.split_at(2.min(hash.len()));
+        let obj_path = objects_dir.join(prefix).join(rest);
+        if obj_path.exists() {
+            if let Ok(meta) = obj_path.metadata() {
+                total_bytes += meta.len();
+                prunable_hashes.push(hash.clone());
+            }
+        }
+    }
+
+    // Collect seal IDs from committed specs.
+    let seal_ids: Vec<String> = committed_seals
+        .iter()
+        .map(|s| s.id.clone())
+        .collect();
+
+    Ok(CommittedPrunable {
+        spec_ids: committed_spec_ids.into_iter().collect(),
+        object_hashes: prunable_hashes,
+        total_bytes,
+        seal_ids,
+    })
+}
+
+/// Archived seal metadata — compact record saved to gc-log before seal deletion.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchivedSeal {
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
+    pub agent_id: String,
+    pub spec_id: Option<String>,
+    pub summary: String,
+    pub file_count: usize,
+    pub archived_at: DateTime<Utc>,
+}
+
+/// Archive seal metadata to `.writ/gc-log.jsonl` before deleting seal files.
+///
+/// Each line is a JSON object with the seal's key metadata. The actual
+/// file content (in the object store) is pruned, but the metadata record
+/// persists indefinitely for audit trails.
+pub fn archive_seal_metadata(
+    writ_dir: &Path,
+    seals: &[crate::seal::Seal],
+) -> WritResult<usize> {
+    if seals.is_empty() {
+        return Ok(0);
+    }
+
+    let log_path = writ_dir.join("gc-log.jsonl");
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)?;
+
+    let now = Utc::now();
+    let mut archived = 0;
+
+    for seal in seals {
+        let record = ArchivedSeal {
+            id: seal.id.clone(),
+            timestamp: seal.timestamp,
+            agent_id: seal.agent.id.clone(),
+            spec_id: seal.spec_id.clone(),
+            summary: seal.summary.clone(),
+            file_count: seal.changes.len(),
+            archived_at: now,
+        };
+        let line = serde_json::to_string(&record)?;
+        writeln!(file, "{}", line)?;
+        archived += 1;
+    }
+
+    Ok(archived)
 }
 
 /// A legacy or explicit-raw object that can be recompressed.
@@ -2951,5 +3363,576 @@ mod tests {
             on_disk[0], 0x00,
             "incompressible object should get MAGIC_RAW prefix"
         );
+    }
+
+    // =========================================================================
+    // B.1: find_committed_prunable() tests
+    // =========================================================================
+
+    /// Helper: create a spec with a specific commit_state and committed_at timestamp.
+    fn make_committed_spec(id: &str, commit_state: crate::spec::CommitState, days_ago: i64) -> Spec {
+        let now = Utc::now();
+        let ts = now - Duration::days(days_ago);
+        Spec {
+            id: id.into(),
+            slug: String::new(),
+            title: id.into(),
+            description: String::new(),
+            status: SpecStatus::Complete,
+            depends_on: Vec::new(),
+            file_scope: Vec::new(),
+            created_at: ts,
+            updated_at: ts,
+            sealed_by: Vec::new(),
+            acceptance_criteria: Vec::new(),
+            design_notes: Vec::new(),
+            tech_stack: Vec::new(),
+            lifecycle_state: LifecycleState::Completed,
+            last_activity: ts,
+            completion_summary: Some("done".into()),
+            commit_state: commit_state.clone(),
+            completed_at: Some(ts),
+            commit_hash: if matches!(
+                commit_state,
+                crate::spec::CommitState::Committed | crate::spec::CommitState::Pushed
+            ) {
+                Some("abc123".into())
+            } else {
+                None
+            },
+            committed_at: if matches!(
+                commit_state,
+                crate::spec::CommitState::Committed | crate::spec::CommitState::Pushed
+            ) {
+                Some(ts)
+            } else {
+                None
+            },
+            workspace: None,
+            claimed_by: None,
+            genesis_tree: None,
+        }
+    }
+
+    #[test]
+    fn test_committed_prunable_no_committed_specs() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        let specs = vec![
+            make_spec("active-1", LifecycleState::Active, 0),
+            make_spec("pending-1", LifecycleState::Active, 1),
+        ];
+        let seals: Vec<crate::seal::Seal> = vec![];
+
+        let result = find_committed_prunable(writ_dir, &specs, &seals, 7).unwrap();
+        assert!(result.spec_ids.is_empty(), "no committed specs → empty result");
+        assert!(result.object_hashes.is_empty());
+        assert_eq!(result.total_bytes, 0);
+        assert!(result.seal_ids.is_empty());
+    }
+
+    #[test]
+    fn test_committed_prunable_objects_not_referenced_by_active() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Committed spec with objects.
+        let committed_spec =
+            make_committed_spec("done-spec", crate::spec::CommitState::Committed, 10);
+
+        let obj_hash = "aa".to_string() + &"1".repeat(62);
+        let tree_hash = "bb".to_string() + &"2".repeat(62);
+        write_test_object(writ_dir, &obj_hash, b"committed file content");
+        write_test_object(writ_dir, &tree_hash, b"committed tree");
+
+        let seal = make_test_seal(
+            &tree_hash,
+            vec![FileChange {
+                path: "src/auth.rs".into(),
+                change_type: ChangeType::Added,
+                old_hash: None,
+                new_hash: Some(obj_hash.clone()),
+            }],
+            Some("done-spec"),
+        );
+
+        let result =
+            find_committed_prunable(writ_dir, &[committed_spec], &[seal], 0).unwrap();
+        assert!(
+            result.spec_ids.contains(&"done-spec".to_string()),
+            "committed spec should be in prunable list"
+        );
+        assert!(
+            !result.object_hashes.is_empty(),
+            "objects from committed spec should be prunable"
+        );
+        assert!(result.total_bytes > 0);
+    }
+
+    #[test]
+    fn test_committed_prunable_objects_protected_by_active_seal() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        let shared_hash = "cc".to_string() + &"3".repeat(62);
+        let committed_tree = "dd".to_string() + &"4".repeat(62);
+        let active_tree = "ee".to_string() + &"5".repeat(62);
+        write_test_object(writ_dir, &shared_hash, b"shared file");
+        write_test_object(writ_dir, &committed_tree, b"committed tree");
+        write_test_object(writ_dir, &active_tree, b"active tree");
+
+        let committed_spec =
+            make_committed_spec("done", crate::spec::CommitState::Committed, 10);
+
+        // Committed seal references shared_hash.
+        let committed_seal = make_test_seal(
+            &committed_tree,
+            vec![FileChange {
+                path: "shared.rs".into(),
+                change_type: ChangeType::Added,
+                old_hash: None,
+                new_hash: Some(shared_hash.clone()),
+            }],
+            Some("done"),
+        );
+
+        // Active seal ALSO references shared_hash → it's protected.
+        let active_seal = make_test_seal(
+            &active_tree,
+            vec![FileChange {
+                path: "shared.rs".into(),
+                change_type: ChangeType::Modified,
+                old_hash: Some(shared_hash.clone()),
+                new_hash: Some("ff".to_string() + &"6".repeat(62)),
+            }],
+            Some("active-spec"),
+        );
+
+        let result = find_committed_prunable(
+            writ_dir,
+            &[committed_spec],
+            &[committed_seal, active_seal],
+            0,
+        )
+        .unwrap();
+
+        // shared_hash is protected by active_seal.
+        assert!(
+            !result.object_hashes.contains(&shared_hash),
+            "object referenced by active seal should NOT be prunable"
+        );
+    }
+
+    #[test]
+    fn test_committed_prunable_keep_days_younger_excluded() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Committed 2 days ago, keep_days = 7 → too young.
+        let spec = make_committed_spec("recent", crate::spec::CommitState::Committed, 2);
+
+        let result = find_committed_prunable(writ_dir, &[spec], &[], 7).unwrap();
+        assert!(
+            result.spec_ids.is_empty(),
+            "spec younger than keep_days should be excluded"
+        );
+    }
+
+    #[test]
+    fn test_committed_prunable_keep_days_older_included() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Committed 10 days ago, keep_days = 7 → old enough.
+        let spec = make_committed_spec("old", crate::spec::CommitState::Committed, 10);
+        let tree = "aa".to_string() + &"7".repeat(62);
+        write_test_object(writ_dir, &tree, b"old tree");
+
+        let seal = make_test_seal(&tree, vec![], Some("old"));
+
+        let result = find_committed_prunable(writ_dir, &[spec], &[seal], 7).unwrap();
+        assert!(
+            result.spec_ids.contains(&"old".to_string()),
+            "spec older than keep_days should be included"
+        );
+    }
+
+    #[test]
+    fn test_committed_prunable_keep_days_zero_includes_all() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Committed today — normally excluded with keep_days=7, but keep_days=0 means include all.
+        let spec = make_committed_spec("today", crate::spec::CommitState::Committed, 0);
+        let tree = "bb".to_string() + &"8".repeat(62);
+        write_test_object(writ_dir, &tree, b"fresh tree");
+
+        let seal = make_test_seal(&tree, vec![], Some("today"));
+
+        let result = find_committed_prunable(writ_dir, &[spec], &[seal], 0).unwrap();
+        assert!(
+            result.spec_ids.contains(&"today".to_string()),
+            "keep_days=0 should include all committed specs regardless of age"
+        );
+    }
+
+    #[test]
+    fn test_committed_prunable_cancelled_spec_not_included() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Cancelled (not committed) — find_committed_prunable only looks at
+        // CommitState::Committed | Pushed, not lifecycle_state.
+        let mut spec = make_spec("cancelled", LifecycleState::Cancelled, 48);
+        spec.commit_state = crate::spec::CommitState::Uncommitted;
+
+        let result = find_committed_prunable(writ_dir, &[spec], &[], 0).unwrap();
+        assert!(
+            result.spec_ids.is_empty(),
+            "cancelled but uncommitted spec should NOT be in committed prunable"
+        );
+    }
+
+    #[test]
+    fn test_committed_prunable_mixed_partition() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        let committed =
+            make_committed_spec("done-1", crate::spec::CommitState::Committed, 10);
+        let pushed = make_committed_spec("done-2", crate::spec::CommitState::Pushed, 15);
+        let active = make_spec("active-1", LifecycleState::Active, 0);
+
+        // Objects for committed specs.
+        let tree1 = "a1".to_string() + &"0".repeat(62);
+        let tree2 = "a2".to_string() + &"0".repeat(62);
+        write_test_object(writ_dir, &tree1, b"tree1");
+        write_test_object(writ_dir, &tree2, b"tree2");
+
+        let seal1 = make_test_seal(&tree1, vec![], Some("done-1"));
+        let seal2 = make_test_seal(&tree2, vec![], Some("done-2"));
+
+        let result = find_committed_prunable(
+            writ_dir,
+            &[committed, pushed, active],
+            &[seal1, seal2],
+            0,
+        )
+        .unwrap();
+
+        // Both committed and pushed specs should be in the result.
+        assert!(result.spec_ids.contains(&"done-1".to_string()));
+        assert!(result.spec_ids.contains(&"done-2".to_string()));
+        assert!(
+            !result.spec_ids.contains(&"active-1".to_string()),
+            "active spec should NOT be in prunable list"
+        );
+        assert_eq!(result.seal_ids.len(), 2, "should have 2 seal IDs from committed specs");
+    }
+
+    // =========================================================================
+    // B.2: archive_seal_metadata() tests
+    // =========================================================================
+
+    #[test]
+    fn test_archive_empty_seals_no_file() {
+        let dir = tempdir().unwrap();
+        let result = archive_seal_metadata(dir.path(), &[]).unwrap();
+        assert_eq!(result, 0);
+        assert!(
+            !dir.path().join("gc-log.jsonl").exists(),
+            "no file should be created for empty seals list"
+        );
+    }
+
+    #[test]
+    fn test_archive_three_seals_creates_three_lines() {
+        let dir = tempdir().unwrap();
+        let tree1 = "11".to_string() + &"1".repeat(62);
+        let tree2 = "22".to_string() + &"2".repeat(62);
+        let tree3 = "33".to_string() + &"3".repeat(62);
+
+        let seals = vec![
+            make_test_seal(&tree1, vec![], Some("spec-a")),
+            make_test_seal(&tree2, vec![], Some("spec-b")),
+            make_test_seal(&tree3, vec![], Some("spec-c")),
+        ];
+
+        let result = archive_seal_metadata(dir.path(), &seals).unwrap();
+        assert_eq!(result, 3);
+
+        let content = fs::read_to_string(dir.path().join("gc-log.jsonl")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3, "should have exactly 3 JSONL lines");
+    }
+
+    #[test]
+    fn test_archive_appends_not_overwrites() {
+        let dir = tempdir().unwrap();
+        let tree1 = "44".to_string() + &"4".repeat(62);
+        let tree2 = "55".to_string() + &"5".repeat(62);
+
+        let batch1 = vec![
+            make_test_seal(&tree1, vec![], Some("spec-a")),
+            make_test_seal(&tree2, vec![], Some("spec-b")),
+        ];
+        archive_seal_metadata(dir.path(), &batch1).unwrap();
+
+        let tree3 = "66".to_string() + &"6".repeat(62);
+        let batch2 = vec![make_test_seal(&tree3, vec![], Some("spec-c"))];
+        archive_seal_metadata(dir.path(), &batch2).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("gc-log.jsonl")).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 3, "two archives (2 + 1) should produce 3 total lines");
+    }
+
+    #[test]
+    fn test_archive_lines_have_expected_fields() {
+        let dir = tempdir().unwrap();
+        let tree = "77".to_string() + &"7".repeat(62);
+        let seal = make_test_seal(&tree, vec![], Some("my-spec"));
+
+        archive_seal_metadata(dir.path(), &[seal]).unwrap();
+
+        let content = fs::read_to_string(dir.path().join("gc-log.jsonl")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+
+        assert!(record.get("id").is_some(), "should have 'id' field");
+        assert!(record.get("timestamp").is_some(), "should have 'timestamp' field");
+        assert!(record.get("agent_id").is_some(), "should have 'agent_id' field");
+        assert!(record.get("summary").is_some(), "should have 'summary' field");
+        assert!(record.get("archived_at").is_some(), "should have 'archived_at' field");
+        assert!(record.get("file_count").is_some(), "should have 'file_count' field");
+        assert_eq!(
+            record["agent_id"].as_str().unwrap(),
+            "test-agent",
+            "agent_id should match seal's agent"
+        );
+    }
+
+    // =========================================================================
+    // B.3: GcPlan::generate_committed() tests
+    // =========================================================================
+
+    #[test]
+    fn test_generate_committed_no_committed_specs_empty_plan() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        let specs = vec![make_spec("active", LifecycleState::Active, 0)];
+        let plan = GcPlan::generate_committed(writ_dir, &specs, 0).unwrap();
+
+        assert!(plan.actions.is_empty(), "no committed specs → no actions");
+        assert_eq!(plan.summary.objects_to_prune, 0);
+    }
+
+    #[test]
+    fn test_generate_committed_with_prunable_objects() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Create a committed spec.
+        let spec =
+            make_committed_spec("prunable", crate::spec::CommitState::Committed, 10);
+        fs::write(
+            writ_dir.join("specs").join("prunable.json"),
+            serde_json::to_string(&spec).unwrap(),
+        )
+        .unwrap();
+
+        // Create a seal and object for the committed spec.
+        let tree = "ab".to_string() + &"c".repeat(62);
+        let obj = "de".to_string() + &"f".repeat(62);
+        write_test_object(writ_dir, &tree, b"tree data");
+        write_test_object(writ_dir, &obj, b"file content here");
+
+        let seal = make_test_seal(
+            &tree,
+            vec![FileChange {
+                path: "src/prunable.rs".into(),
+                change_type: ChangeType::Added,
+                old_hash: None,
+                new_hash: Some(obj.clone()),
+            }],
+            Some("prunable"),
+        );
+        write_test_seal(writ_dir, &seal);
+
+        let plan = GcPlan::generate_committed(writ_dir, &[spec], 0).unwrap();
+
+        assert_eq!(plan.actions.len(), 1, "should have 1 PruneCommitted action");
+        match &plan.actions[0] {
+            GcAction::PruneCommitted {
+                spec_ids,
+                object_count,
+                seal_count,
+                total_bytes,
+                ..
+            } => {
+                assert!(spec_ids.contains(&"prunable".to_string()));
+                assert!(*object_count > 0, "should have objects to prune");
+                assert_eq!(*seal_count, 1, "should have 1 seal to archive");
+                assert!(*total_bytes > 0, "should report bytes to free");
+            }
+            other => panic!("expected PruneCommitted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_generate_committed_plan_includes_correct_counts() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        let spec1 =
+            make_committed_spec("spec-a", crate::spec::CommitState::Committed, 10);
+        let spec2 =
+            make_committed_spec("spec-b", crate::spec::CommitState::Pushed, 15);
+
+        // Write specs to disk (generate_committed uses load_all_seals internally).
+        for spec in &[&spec1, &spec2] {
+            fs::write(
+                writ_dir.join("specs").join(format!("{}.json", spec.id)),
+                serde_json::to_string(spec).unwrap(),
+            )
+            .unwrap();
+        }
+
+        // Create seals and objects for both specs.
+        let tree_a = "f1".to_string() + &"a".repeat(62);
+        let tree_b = "f2".to_string() + &"b".repeat(62);
+        write_test_object(writ_dir, &tree_a, b"tree a");
+        write_test_object(writ_dir, &tree_b, b"tree b");
+
+        let seal_a = make_test_seal(&tree_a, vec![], Some("spec-a"));
+        let seal_b = make_test_seal(&tree_b, vec![], Some("spec-b"));
+        write_test_seal(writ_dir, &seal_a);
+        write_test_seal(writ_dir, &seal_b);
+
+        let plan =
+            GcPlan::generate_committed(writ_dir, &[spec1, spec2], 0).unwrap();
+
+        assert_eq!(plan.actions.len(), 1);
+        if let GcAction::PruneCommitted { seal_count, .. } = &plan.actions[0] {
+            assert_eq!(*seal_count, 2, "should have seals from both specs");
+        }
+        assert!(plan.summary.objects_to_prune > 0);
+    }
+
+    #[test]
+    fn test_generate_committed_respects_keep_days() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+
+        // Committed 3 days ago.
+        let spec =
+            make_committed_spec("recent", crate::spec::CommitState::Committed, 3);
+        fs::write(
+            writ_dir.join("specs").join("recent.json"),
+            serde_json::to_string(&spec).unwrap(),
+        )
+        .unwrap();
+
+        let tree = "ab".to_string() + &"9".repeat(62);
+        write_test_object(writ_dir, &tree, b"tree");
+        let seal = make_test_seal(&tree, vec![], Some("recent"));
+        write_test_seal(writ_dir, &seal);
+
+        // keep_days = 7 → 3-day-old spec should be excluded.
+        let plan = GcPlan::generate_committed(writ_dir, &[spec.clone()], 7).unwrap();
+        assert!(
+            plan.actions.is_empty(),
+            "spec younger than keep_days should not generate actions"
+        );
+
+        // keep_days = 2 → 3-day-old spec should be included.
+        let plan = GcPlan::generate_committed(writ_dir, &[spec], 2).unwrap();
+        assert_eq!(
+            plan.actions.len(),
+            1,
+            "spec older than keep_days should generate PruneCommitted action"
+        );
+    }
+
+    // =========================================================================
+    // B.4: Auto-GC config tests
+    // =========================================================================
+
+    #[test]
+    fn test_auto_gc_enabled_per_profile() {
+        // All profiles should have auto_gc enabled by default.
+        for name in &["dev", "raspberry-pi", "prod", "enterprise"] {
+            let config = GcConfig::from_profile(name).unwrap();
+            assert!(
+                config.auto_gc_enabled(),
+                "profile '{}' should have auto_gc enabled",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_auto_gc_threshold_varies_by_profile() {
+        let rpi = GcConfig::raspberry_pi();
+        let dev = GcConfig::development();
+        let ent = GcConfig::enterprise();
+
+        // Raspberry Pi has tighter threshold than enterprise.
+        assert!(
+            rpi.auto_gc_threshold() < ent.auto_gc_threshold(),
+            "RPi threshold ({}) should be lower than enterprise ({})",
+            rpi.auto_gc_threshold(),
+            ent.auto_gc_threshold()
+        );
+
+        // Dev has reasonable defaults.
+        assert_eq!(dev.auto_gc_threshold(), 500);
+        assert_eq!(dev.auto_gc_keep_days(), 7);
+    }
+
+    #[test]
+    fn test_auto_gc_config_serialization_roundtrip() {
+        let mut config = GcConfig::default();
+        config.auto_gc = false;
+        config.auto_gc_object_threshold = 100;
+        config.auto_gc_keep_days = 3;
+
+        let json = serde_json::to_string(&config).unwrap();
+        let recovered: GcConfig = serde_json::from_str(&json).unwrap();
+
+        assert!(!recovered.auto_gc_enabled());
+        assert_eq!(recovered.auto_gc_threshold(), 100);
+        assert_eq!(recovered.auto_gc_keep_days(), 3);
+    }
+
+    #[test]
+    fn test_auto_gc_backward_compat_missing_fields() {
+        // Old config JSON without auto_gc fields should get defaults.
+        let json = r#"{
+            "mode": "manual",
+            "budget_bytes": 1000000,
+            "specs": {"stale_timeout_secs": 7200, "expiry_timeout_secs": 86400, "retention_period_secs": 604800, "grace_period_secs": 3600},
+            "security_events": {"retention_critical": 730, "retention_warning": 180, "retention_info": 30},
+            "allocation": {"seal_pct": 60, "working_state_pct": 20, "security_event_pct": 15, "headroom_pct": 5},
+            "warning_threshold_pct": 80
+        }"#;
+        let config: GcConfig = serde_json::from_str(json).unwrap();
+
+        assert!(config.auto_gc, "default auto_gc should be true");
+        assert_eq!(config.auto_gc_object_threshold, 500, "default threshold");
+        assert_eq!(config.auto_gc_keep_days, 7, "default keep_days");
     }
 }

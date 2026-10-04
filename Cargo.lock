@@ -2862,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "writ-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "chrono",
  "clap",
@@ -2880,7 +2880,7 @@ dependencies = [
 
 [[package]]
 name = "writ-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -2907,7 +2907,7 @@ dependencies = [
 
 [[package]]
 name = "writ-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "rmcp",
  "schemars",
@@ -2920,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "writ-py"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "pyo3",
  "pythonize",

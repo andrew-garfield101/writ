@@ -1100,6 +1100,97 @@ impl PyRepository {
         to_pydict(py, &output)
     }
 
+    /// Prune objects from committed specs (work already in git).
+    ///
+    /// Parameters:
+    /// - `keep_days`: Grace period — committed objects younger than this are kept (default: 7).
+    /// - `dry_run`: If True, returns the plan without executing (default: False).
+    ///
+    /// Returns a dict. For dry_run: plan with actions/summary. For execution:
+    /// objects_pruned, bytes_freed, seals_archived.
+    #[pyo3(signature = (keep_days=7, dry_run=false))]
+    fn gc_committed(&self, py: Python, keep_days: u64, dry_run: bool) -> PyResult<PyObject> {
+        let writ_dir = self.inner.writ_dir();
+        let specs = self.inner.list_specs().map_err(writ_err)?;
+        let plan =
+            writ_core::gc::GcPlan::generate_committed(writ_dir, &specs, keep_days)
+                .map_err(writ_err)?;
+
+        if dry_run {
+            return to_pydict(py, &plan);
+        }
+
+        let result =
+            writ_core::gc::execute_plan(writ_dir, &plan, &specs).map_err(writ_err)?;
+
+        let output = serde_json::json!({
+            "objects_pruned": result.objects_pruned,
+            "bytes_freed": result.bytes_freed,
+            "seals_archived": result.transitions_applied.len(),
+            "specs_cleaned": result.specs_cleaned,
+        });
+        to_pydict(py, &output)
+    }
+
+    /// Audit the object store: breakdown of active vs committed data.
+    ///
+    /// Returns a dict with total bytes, seal/spec counts, orphan info,
+    /// and committed-prunable object/seal counts.
+    fn gc_audit(&self, py: Python) -> PyResult<PyObject> {
+        use writ_core::gc::{
+            find_committed_prunable, find_orphaned_objects, load_all_seals, StorageReport,
+        };
+        use writ_core::spec::CommitState;
+
+        let writ_dir = self.inner.writ_dir();
+        let specs = self.inner.list_specs().map_err(writ_err)?;
+        let all_seals = load_all_seals(writ_dir).map_err(writ_err)?;
+        let report = StorageReport::scan(writ_dir, 0).map_err(writ_err)?;
+
+        let active_specs = specs
+            .iter()
+            .filter(|s| matches!(s.commit_state, CommitState::Uncommitted))
+            .count();
+        let committed_specs = specs.len() - active_specs;
+
+        let committed_spec_ids: std::collections::HashSet<String> = specs
+            .iter()
+            .filter(|s| matches!(s.commit_state, CommitState::Committed | CommitState::Pushed))
+            .map(|s| s.id.clone())
+            .collect();
+        let active_seals = all_seals
+            .iter()
+            .filter(|s| {
+                s.spec_id
+                    .as_ref()
+                    .map(|id| !committed_spec_ids.contains(id))
+                    .unwrap_or(true)
+            })
+            .count();
+        let committed_seals = all_seals.len() - active_seals;
+
+        let orphans = find_orphaned_objects(writ_dir, &all_seals).map_err(writ_err)?;
+        let orphan_bytes: u64 = orphans.iter().map(|o| o.size_bytes).sum();
+        let committed_prunable =
+            find_committed_prunable(writ_dir, &specs, &all_seals, 0).map_err(writ_err)?;
+
+        let output = serde_json::json!({
+            "total_other_bytes": report.other_bytes,
+            "total_seal_bytes": report.seal_bytes,
+            "total_seals": all_seals.len(),
+            "active_seals": active_seals,
+            "committed_seals": committed_seals,
+            "active_specs": active_specs,
+            "committed_specs": committed_specs,
+            "orphaned_objects": orphans.len(),
+            "orphaned_bytes": orphan_bytes,
+            "committed_prunable_objects": committed_prunable.object_hashes.len(),
+            "committed_prunable_bytes": committed_prunable.total_bytes,
+            "committed_prunable_seals": committed_prunable.seal_ids.len(),
+        });
+        to_pydict(py, &output)
+    }
+
     /// Cancel a spec (transition lifecycle to Cancelled).
     ///
     /// Allowed from Active or Stale states.

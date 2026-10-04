@@ -103,10 +103,8 @@ impl AnalyticsReport {
         agents.sort_by(|a, b| b.seal_count.cmp(&a.seal_count));
 
         let total_seals = seals.len();
-        let total_specs: std::collections::HashSet<&String> = seals
-            .iter()
-            .filter_map(|s| s.spec_id.as_ref())
-            .collect();
+        let total_specs: std::collections::HashSet<&String> =
+            seals.iter().filter_map(|s| s.spec_id.as_ref()).collect();
         let total_agents = agents.len();
 
         let time_range = if seals.is_empty() {

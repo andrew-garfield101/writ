@@ -1111,7 +1111,8 @@ pub fn execute_plan(
                     if obj_path.exists() {
                         fs::remove_file(&obj_path)?;
                         objects_pruned += 1;
-                        bytes_freed += prunable.total_bytes / prunable.object_hashes.len().max(1) as u64;
+                        bytes_freed +=
+                            prunable.total_bytes / prunable.object_hashes.len().max(1) as u64;
 
                         write_tombstone(
                             &gc_dir,
@@ -1346,10 +1347,7 @@ pub fn find_committed_prunable(
                 return true;
             }
             let committed_at = s.committed_at.unwrap_or(s.updated_at);
-            let age_days = now
-                .signed_duration_since(committed_at)
-                .num_days()
-                .max(0) as u64;
+            let age_days = now.signed_duration_since(committed_at).num_days().max(0) as u64;
             age_days >= keep_days
         })
         .map(|s| s.id.clone())
@@ -1443,10 +1441,7 @@ pub fn find_committed_prunable(
     }
 
     // Collect seal IDs from committed specs.
-    let seal_ids: Vec<String> = committed_seals
-        .iter()
-        .map(|s| s.id.clone())
-        .collect();
+    let seal_ids: Vec<String> = committed_seals.iter().map(|s| s.id.clone()).collect();
 
     Ok(CommittedPrunable {
         spec_ids: committed_spec_ids.into_iter().collect(),
@@ -1473,10 +1468,7 @@ pub struct ArchivedSeal {
 /// Each line is a JSON object with the seal's key metadata. The actual
 /// file content (in the object store) is pruned, but the metadata record
 /// persists indefinitely for audit trails.
-pub fn archive_seal_metadata(
-    writ_dir: &Path,
-    seals: &[crate::seal::Seal],
-) -> WritResult<usize> {
+pub fn archive_seal_metadata(writ_dir: &Path, seals: &[crate::seal::Seal]) -> WritResult<usize> {
     if seals.is_empty() {
         return Ok(0);
     }
@@ -3370,7 +3362,11 @@ mod tests {
     // =========================================================================
 
     /// Helper: create a spec with a specific commit_state and committed_at timestamp.
-    fn make_committed_spec(id: &str, commit_state: crate::spec::CommitState, days_ago: i64) -> Spec {
+    fn make_committed_spec(
+        id: &str,
+        commit_state: crate::spec::CommitState,
+        days_ago: i64,
+    ) -> Spec {
         let now = Utc::now();
         let ts = now - Duration::days(days_ago);
         Spec {
@@ -3427,7 +3423,10 @@ mod tests {
         let seals: Vec<crate::seal::Seal> = vec![];
 
         let result = find_committed_prunable(writ_dir, &specs, &seals, 7).unwrap();
-        assert!(result.spec_ids.is_empty(), "no committed specs → empty result");
+        assert!(
+            result.spec_ids.is_empty(),
+            "no committed specs → empty result"
+        );
         assert!(result.object_hashes.is_empty());
         assert_eq!(result.total_bytes, 0);
         assert!(result.seal_ids.is_empty());
@@ -3459,8 +3458,7 @@ mod tests {
             Some("done-spec"),
         );
 
-        let result =
-            find_committed_prunable(writ_dir, &[committed_spec], &[seal], 0).unwrap();
+        let result = find_committed_prunable(writ_dir, &[committed_spec], &[seal], 0).unwrap();
         assert!(
             result.spec_ids.contains(&"done-spec".to_string()),
             "committed spec should be in prunable list"
@@ -3485,8 +3483,7 @@ mod tests {
         write_test_object(writ_dir, &committed_tree, b"committed tree");
         write_test_object(writ_dir, &active_tree, b"active tree");
 
-        let committed_spec =
-            make_committed_spec("done", crate::spec::CommitState::Committed, 10);
+        let committed_spec = make_committed_spec("done", crate::spec::CommitState::Committed, 10);
 
         // Committed seal references shared_hash.
         let committed_seal = make_test_seal(
@@ -3607,8 +3604,7 @@ mod tests {
         let writ_dir = dir.path();
         setup_gc_writ_dir(writ_dir);
 
-        let committed =
-            make_committed_spec("done-1", crate::spec::CommitState::Committed, 10);
+        let committed = make_committed_spec("done-1", crate::spec::CommitState::Committed, 10);
         let pushed = make_committed_spec("done-2", crate::spec::CommitState::Pushed, 15);
         let active = make_spec("active-1", LifecycleState::Active, 0);
 
@@ -3621,13 +3617,9 @@ mod tests {
         let seal1 = make_test_seal(&tree1, vec![], Some("done-1"));
         let seal2 = make_test_seal(&tree2, vec![], Some("done-2"));
 
-        let result = find_committed_prunable(
-            writ_dir,
-            &[committed, pushed, active],
-            &[seal1, seal2],
-            0,
-        )
-        .unwrap();
+        let result =
+            find_committed_prunable(writ_dir, &[committed, pushed, active], &[seal1, seal2], 0)
+                .unwrap();
 
         // Both committed and pushed specs should be in the result.
         assert!(result.spec_ids.contains(&"done-1".to_string()));
@@ -3636,7 +3628,11 @@ mod tests {
             !result.spec_ids.contains(&"active-1".to_string()),
             "active spec should NOT be in prunable list"
         );
-        assert_eq!(result.seal_ids.len(), 2, "should have 2 seal IDs from committed specs");
+        assert_eq!(
+            result.seal_ids.len(),
+            2,
+            "should have 2 seal IDs from committed specs"
+        );
     }
 
     // =========================================================================
@@ -3693,7 +3689,11 @@ mod tests {
 
         let content = fs::read_to_string(dir.path().join("gc-log.jsonl")).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 3, "two archives (2 + 1) should produce 3 total lines");
+        assert_eq!(
+            lines.len(),
+            3,
+            "two archives (2 + 1) should produce 3 total lines"
+        );
     }
 
     #[test]
@@ -3705,14 +3705,30 @@ mod tests {
         archive_seal_metadata(dir.path(), &[seal]).unwrap();
 
         let content = fs::read_to_string(dir.path().join("gc-log.jsonl")).unwrap();
-        let record: serde_json::Value = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        let record: serde_json::Value =
+            serde_json::from_str(content.lines().next().unwrap()).unwrap();
 
         assert!(record.get("id").is_some(), "should have 'id' field");
-        assert!(record.get("timestamp").is_some(), "should have 'timestamp' field");
-        assert!(record.get("agent_id").is_some(), "should have 'agent_id' field");
-        assert!(record.get("summary").is_some(), "should have 'summary' field");
-        assert!(record.get("archived_at").is_some(), "should have 'archived_at' field");
-        assert!(record.get("file_count").is_some(), "should have 'file_count' field");
+        assert!(
+            record.get("timestamp").is_some(),
+            "should have 'timestamp' field"
+        );
+        assert!(
+            record.get("agent_id").is_some(),
+            "should have 'agent_id' field"
+        );
+        assert!(
+            record.get("summary").is_some(),
+            "should have 'summary' field"
+        );
+        assert!(
+            record.get("archived_at").is_some(),
+            "should have 'archived_at' field"
+        );
+        assert!(
+            record.get("file_count").is_some(),
+            "should have 'file_count' field"
+        );
         assert_eq!(
             record["agent_id"].as_str().unwrap(),
             "test-agent",
@@ -3744,8 +3760,7 @@ mod tests {
         setup_gc_writ_dir(writ_dir);
 
         // Create a committed spec.
-        let spec =
-            make_committed_spec("prunable", crate::spec::CommitState::Committed, 10);
+        let spec = make_committed_spec("prunable", crate::spec::CommitState::Committed, 10);
         fs::write(
             writ_dir.join("specs").join("prunable.json"),
             serde_json::to_string(&spec).unwrap(),
@@ -3796,10 +3811,8 @@ mod tests {
         let writ_dir = dir.path();
         setup_gc_writ_dir(writ_dir);
 
-        let spec1 =
-            make_committed_spec("spec-a", crate::spec::CommitState::Committed, 10);
-        let spec2 =
-            make_committed_spec("spec-b", crate::spec::CommitState::Pushed, 15);
+        let spec1 = make_committed_spec("spec-a", crate::spec::CommitState::Committed, 10);
+        let spec2 = make_committed_spec("spec-b", crate::spec::CommitState::Pushed, 15);
 
         // Write specs to disk (generate_committed uses load_all_seals internally).
         for spec in &[&spec1, &spec2] {
@@ -3821,8 +3834,7 @@ mod tests {
         write_test_seal(writ_dir, &seal_a);
         write_test_seal(writ_dir, &seal_b);
 
-        let plan =
-            GcPlan::generate_committed(writ_dir, &[spec1, spec2], 0).unwrap();
+        let plan = GcPlan::generate_committed(writ_dir, &[spec1, spec2], 0).unwrap();
 
         assert_eq!(plan.actions.len(), 1);
         if let GcAction::PruneCommitted { seal_count, .. } = &plan.actions[0] {
@@ -3838,8 +3850,7 @@ mod tests {
         setup_gc_writ_dir(writ_dir);
 
         // Committed 3 days ago.
-        let spec =
-            make_committed_spec("recent", crate::spec::CommitState::Committed, 3);
+        let spec = make_committed_spec("recent", crate::spec::CommitState::Committed, 3);
         fs::write(
             writ_dir.join("specs").join("recent.json"),
             serde_json::to_string(&spec).unwrap(),

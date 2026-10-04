@@ -4696,8 +4696,7 @@ fn cmd_finish(
 
                 if let Some(plan) = plan {
                     if !plan.actions.is_empty() {
-                        let result =
-                            writ_core::gc::execute_plan(&writ_dir, &plan, &specs).ok();
+                        let result = writ_core::gc::execute_plan(&writ_dir, &plan, &specs).ok();
                         if let Some(r) = result {
                             if r.objects_pruned > 0 {
                                 println!(
@@ -7803,8 +7802,7 @@ fn cmd_analytics(
         }
         if metrics.convergence_triggered > 0 {
             let rate = if metrics.convergence_triggered > 0 {
-                metrics.convergence_succeeded as f64 / metrics.convergence_triggered as f64
-                    * 100.0
+                metrics.convergence_succeeded as f64 / metrics.convergence_triggered as f64 * 100.0
             } else {
                 0.0
             };
@@ -7823,10 +7821,7 @@ fn cmd_analytics(
 // GC commands
 // -------------------------------------------------------------------
 
-fn cmd_gc_audit(
-    cwd: &PathBuf,
-    format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_gc_audit(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     use writ_core::gc::{
         find_committed_prunable, find_orphaned_objects, load_all_seals, StorageReport,
     };
@@ -7935,10 +7930,7 @@ fn cmd_gc_audit(
 
         if committed_prunable.object_hashes.is_empty() && orphans.is_empty() {
             println!();
-            println!(
-                "  {} Storage is clean. Nothing to prune.",
-                "✓".green()
-            );
+            println!("  {} Storage is clean. Nothing to prune.", "✓".green());
         }
     }
 

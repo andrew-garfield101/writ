@@ -1112,16 +1112,14 @@ impl PyRepository {
     fn gc_committed(&self, py: Python, keep_days: u64, dry_run: bool) -> PyResult<PyObject> {
         let writ_dir = self.inner.writ_dir();
         let specs = self.inner.list_specs().map_err(writ_err)?;
-        let plan =
-            writ_core::gc::GcPlan::generate_committed(writ_dir, &specs, keep_days)
-                .map_err(writ_err)?;
+        let plan = writ_core::gc::GcPlan::generate_committed(writ_dir, &specs, keep_days)
+            .map_err(writ_err)?;
 
         if dry_run {
             return to_pydict(py, &plan);
         }
 
-        let result =
-            writ_core::gc::execute_plan(writ_dir, &plan, &specs).map_err(writ_err)?;
+        let result = writ_core::gc::execute_plan(writ_dir, &plan, &specs).map_err(writ_err)?;
 
         let output = serde_json::json!({
             "objects_pruned": result.objects_pruned,

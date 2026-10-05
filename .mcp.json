@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "writ": {
+      "command": "writ",
+      "args": [
+        "mcp-serve"
+      ]
+    }
+  }
+}

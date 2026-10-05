@@ -146,4 +146,4 @@ jobs:
         working-directory: crates/writ-py
         run: |
           source ${{ github.workspace }}/.venv/bin/activate
-          pytest tests/ -v
+          pytest tests/ ${{ github.workspace }}/bench/test_verify_check.py -v

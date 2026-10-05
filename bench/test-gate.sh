@@ -26,12 +26,22 @@ py_log="$(dirname "$OUT")/test-gate-python.log"
 rust_rc=$?
 bare_ignores="$(grep -rnE '#\[ignore\][[:space:]]*$' crates --include='*.rs' | grep -v '^\s*//' || true)"
 
+# Store verify on this repo with the binary the Rust run just built. verify
+# exits 1 on any failure; capture it. This repo's three finding 28 blobs are
+# the expected outcome, anything else fails the gate.
+WRIT_BIN="${WRIT:-$ROOT/target/debug/writ}"
+verify_rc=0
+verify_json="$(python3 "$ROOT/bench/verify_check.py" "$ROOT" --writ "$WRIT_BIN" \
+    --allow-missing ae01d21c123e --allow-missing 50ff4a66d3af --allow-missing 80dbd0cf0eac 2>&1)" \
+    || verify_rc=$?
+
 # shellcheck disable=SC1091
 source "$VENV/bin/activate"
-python -m pytest crates/writ-py/tests -q -p no:cacheprovider -rxXf >"$py_log" 2>&1
+python -m pytest crates/writ-py/tests bench/test_verify_check.py -q -p no:cacheprovider -rxXf >"$py_log" 2>&1
 py_rc=$?
 
 RUST_LOG="$rust_log" PY_LOG="$py_log" RUST_RC=$rust_rc PY_RC=$py_rc \
+VERIFY_JSON="$verify_json" VERIFY_RC=$verify_rc \
 BARE="$bare_ignores" OUT="$OUT" python3 - <<'PY'
 import json, os, re, datetime as dt
 
@@ -50,9 +60,6 @@ EXPECTED_IGNORED = {
     "ignore::tests::repo_level::test_rejected_scope_violation_seal_leaves_object_count_unchanged",  # 17
     "test_large_file_block_insert_reports_only_inserted_lines",  # 23
     "test_insert_that_crosses_line_limit_is_still_minimal",  # 23
-    "test_index_only_blob_is_not_orphaned_after_bridge_import",  # 28
-    "test_carried_forward_blob_is_not_orphaned",  # 28
-    "test_verify_all_chains_fails_when_referenced_blob_missing",  # 28
 }
 ignored_tests = set(re.findall(r"^test (\S+) \.\.\. ignored", rust, re.M))
 unexpected_ignores = sorted(ignored_tests - EXPECTED_IGNORED)
@@ -71,10 +78,17 @@ for key in ("failed", "errors", "xpassed"):
         problems.append(f"python: {p[key]} {key}")
 if int(os.environ["PY_RC"]) not in (0,) and not problems:
     problems.append(f"python: pytest rc {os.environ['PY_RC']}")
+try:
+    verify = json.loads(os.environ["VERIFY_JSON"])
+    if verify["verdict"] == "FAIL":
+        problems.extend(f"verify: {v}" for v in verify["problems"])
+except json.JSONDecodeError:
+    verify = {"verdict": "ERROR", "detail": os.environ["VERIFY_JSON"].strip()[:300]}
+    problems.append(f"verify: could not run (rc {os.environ['VERIFY_RC']}): {verify['detail']}")
 result_failures = re.findall(r"^test (\S+) \.\.\. FAILED", rust, re.M)
 result = {
     "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
-    "rust": r, "python": p, "bare_ignores": bare,
+    "rust": r, "python": p, "verify": verify, "bare_ignores": bare,
     "rust_failures": result_failures,
     "rust_ignored": sorted(ignored_tests),
     "python_xfails": re.findall(r"^XFAIL (\S+)", py, re.M),

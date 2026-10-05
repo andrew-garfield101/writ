@@ -220,3 +220,32 @@ Recommendations for sprint 2, ordered by ms saved per call on this repo:
 - Stat cache (size + mtime + inode in the index; re-hash only on mismatch, as git does): about -85 ms of the remaining state cost.
 - diff-quality (finding 23): linear-space Myers/histogram diff removes the 300+ ms / 780 MB spike whenever a large file is modified.
 - Hardware SHA-256 (`sha2` `asm` feature, or BLAKE3, already a dependency, for content addressing) is a smaller win once the cache exists.
+
+## Hotfix 0.2.1 validation
+
+Spec `gc-tests` (H.3). Store mutations in this section are seals only; `gc run` was never run on this repo.
+
+### After H.1 (`gc-reachability`, seal `d708d63e62a7`)
+
+Built from HEAD `61d595a` plus the exact sealed `gc.rs` (`7a6da9e3db7c`) and `error.rs` (`fc308db58e2c`), since `gc.rs` had moved past the seal by validation time. Release build, run read-only against this repo's `.writ`.
+
+- Tests un-ignored: `test_carried_forward_blob_is_not_orphaned`, `test_index_only_blob_is_not_orphaned_after_bridge_import`, `test_committed_prunable_keeps_carried_forward_blob`. `store_integrity.rs`: 5 passed, 1 ignored (verify, H.2). `gc::` unit tests: 104 passed. All three were confirmed failing at their target assertion on HEAD before the fix.
+- `writ gc audit --format json`: `orphaned_objects` **4** (was 1,294 misreported live blobs on 0.2.0), `orphaned_bytes` 1,098, `committed_prunable_objects` 53 (2,175,683 bytes), 24 seals (5 active, 19 committed).
+- The 4 orphans are the convergence_v3 records `repo.rs` writes with no root (finding 32, sprint 2). Independent oracle, `python3 bench/store_integrity.py . --json --orphans` with the 3 allowances: orphans `27910e700091` 242 B, `631e16c4944c` 305 B, `c1655521d835` 245 B, `fe2df46f484c` 306 B, every one decodes to a JSON object with `"type": "convergence_v3"`, no others. Count (4) and bytes (1,098) match the audit exactly, so the Rust and Python live sets agree.
+- Integrity: `seals 24, referenced 1587, missing 0, allowed 3` (`50ff4a66d3af`, `80dbd0cf0eac`, `ae01d21c123e`), `unused_allowances` empty. Before H.3 work: same 3, nothing else.
+
+### After H.2 (`verify-objects`, seals `2c6ed9e1530d` and `c4b5ab186458` for the exit code)
+
+Final binary: `target/release/writ`, 12,083,392 bytes (H.1 build 12,063,088, +20,304 B, +0.17%). Sources checked against the seals by SHA-256: `gc.rs` `cc9f1382801c`, `repo.rs` `3b1fed6e7de6`, `error.rs` `fc308db58e2c`, `main.rs` and `tests/verify_objects.rs` match `c4b5ab186458`. `.writ` backed up to the scratchpad before each `gc run`; the abort was rehearsed on a copy of `.writ` first.
+
+- Tests un-ignored: `test_verify_all_chains_fails_when_referenced_blob_missing`, `test_gc_run_aborts_on_missing_object_and_proceeds_with_force`. No finding 28 entry left in the gate's expected-ignored list.
+- `writ verify --all-chains`: **exit 1**, `objects: INVALID`, exactly 3 `FAIL missing object` lines: `50ff4a66d3af` (`.venv311/.../sboms/writ-py.cyclonedx.json`), `80dbd0cf0eac` (`crates/writ-py/python/writ/_native.abi3.so`), `ae01d21c123e` (`.venv311/.../RECORD`). JSON: `all_valid: false`, `missing_objects` those 3, `unreadable_trees` empty, every head and spec chain valid. `bench/verify_check.py` verdict **EXPECTED**.
+- `writ gc run` (no `--yes`, stdin closed): **exit 1**, `store check failed: 3 referenced object(s) missing or unreadable`, the same 3 hashes and paths, then `gc run aborted ... pass --force to proceed`. All 1,662 files under `.writ` byte-identical before and after (sorted SHA-256 manifest). `--force` was not run on this repo; it is covered by `gc_run_integrity.rs` in a temp store.
+- Integrity before and after: `seals 27, referenced 1600, missing 0, allowed 3, orphans 4`, exit 0. `gc audit`: `orphaned_objects` 4, 1,098 bytes, still the four convergence_v3 records.
+- Note: every command that opens the repo rewrites `.writ/version.toml` `last_opened_at` (`repo.rs:275`), so "byte-identical" is measured around the `gc run` call alone.
+
+`writ verify` now exits 1 on any reported failure, so the bench treats the exit code as data: `bench/verify_check.py` (8 contract tests in `bench/test_verify_check.py`) classifies PASS / EXPECTED (only allow-listed missing objects, every allowance used) / FAIL (chain failure, unreadable tree, unlisted missing object, stale allowance). `bench/writ-scorecard.sh` gains a Verify section; `bench/test-gate.sh` runs the check with the debug binary it just built and fails on FAIL.
+
+### Hotfix 0.2.1 gate (`bench/test-gate.sh`, release `maturin develop`)
+
+PASS, exit 0. Rust **2,168 passed**, 0 failed, 3 ignored (finding 17 x1, finding 23 x2). Python **880 passed**, 0 failed, 0 errors, 0 XPASS, 21 xfailed, 10 skipped. Verify EXPECTED (exit 1, 3 excused). Sprint 1 final gate for comparison: Rust 2,137 / Python 872, same ignores and xfails.

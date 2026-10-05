@@ -1057,22 +1057,7 @@ pub fn execute_plan(
                 reason,
             } => {
                 // Re-verify at execution time with fresh data.
-                let fresh_specs: Vec<crate::spec::Spec> = {
-                    let specs_dir = writ_dir.join("specs");
-                    let mut s = Vec::new();
-                    if specs_dir.exists() {
-                        for entry in fs::read_dir(&specs_dir)? {
-                            let entry = entry?;
-                            if entry.path().extension().and_then(|e| e.to_str()) == Some("json") {
-                                let data = fs::read_to_string(entry.path())?;
-                                if let Ok(spec) = serde_json::from_str(&data) {
-                                    s.push(spec);
-                                }
-                            }
-                        }
-                    }
-                    s
-                };
+                let fresh_specs = load_all_specs(writ_dir)?;
 
                 let fresh_seals = load_all_seals(writ_dir)?;
                 let prunable = find_committed_prunable(
@@ -1243,11 +1228,299 @@ pub fn load_all_seals(writ_dir: &Path) -> WritResult<Vec<crate::seal::Seal>> {
     Ok(seals)
 }
 
-/// Find orphaned objects not referenced by any seal.
+/// Load every spec from `.writ/specs/` without going through Repository.
 ///
-/// Walks all seals to build a set of referenced hashes (tree, old_hash,
-/// new_hash), then walks `.writ/objects/` to find on-disk objects not in
-/// the referenced set.
+/// Strict on purpose: a spec that fails to parse could hide a `genesis_tree`,
+/// so GC refuses to compute a live set rather than guess.
+pub fn load_all_specs(writ_dir: &Path) -> WritResult<Vec<crate::spec::Spec>> {
+    let specs_dir = writ_dir.join("specs");
+    if !specs_dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut specs = Vec::new();
+    for entry in fs::read_dir(&specs_dir)? {
+        let path = entry?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let data = fs::read_to_string(&path)?;
+        let spec = serde_json::from_str(&data)
+            .map_err(|e| WritError::Other(format!("cannot parse spec {}: {e}", path.display())))?;
+        specs.push(spec);
+    }
+    Ok(specs)
+}
+
+/// A tree object the live-set scan could not expand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct UnreadableTree {
+    pub hash: String,
+    /// The root that references it, e.g. `tree of seal 1a2b3c4d5e6f`.
+    pub referenced_as: String,
+    pub reason: String,
+}
+
+/// A referenced object that is absent from `.writ/objects/`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MissingObject {
+    pub hash: String,
+    /// One location that references it: a file path, or a root such as
+    /// `tree of seal 1a2b3c4d5e6f`.
+    pub referenced_as: String,
+}
+
+/// Every object reachable from the store's roots, with one referencing
+/// location per hash.
+///
+/// Roots: each seal's `tree` (expanded: every blob it lists), each seal's
+/// `changes[].old_hash/new_hash`, each spec's `genesis_tree` (expanded), and
+/// every workspace index (`.writ/workspaces/*/index.json`; the pre-workspace
+/// flat `.writ/index.json` is migrated away and not read). Trees are flat (`path -> {hash, size}`), so one
+/// level of expansion reaches every blob.
+///
+/// Trees that cannot be read are recorded in `unreadable_trees`, never
+/// skipped: an unexpanded tree means the live set is incomplete.
+pub struct LiveObjects {
+    store: crate::object::ObjectStore,
+    refs: std::collections::HashMap<String, String>,
+    expanded_trees: HashSet<String>,
+    unreadable_trees: Vec<UnreadableTree>,
+}
+
+impl LiveObjects {
+    /// An empty live set over `writ_dir`'s object store.
+    pub fn new(writ_dir: &Path) -> Self {
+        Self {
+            store: crate::object::ObjectStore::new(&writ_dir.join("objects")),
+            refs: std::collections::HashMap::new(),
+            expanded_trees: HashSet::new(),
+            unreadable_trees: Vec::new(),
+        }
+    }
+
+    /// Scan every root: seals, specs, and workspace indexes.
+    pub fn scan(
+        writ_dir: &Path,
+        seals: &[crate::seal::Seal],
+        specs: &[crate::spec::Spec],
+    ) -> WritResult<Self> {
+        let mut live = Self::new(writ_dir);
+        for seal in seals {
+            live.add_seal(seal);
+        }
+        for spec in specs {
+            live.add_spec(spec);
+        }
+        live.add_workspace_indexes(writ_dir)?;
+        Ok(live)
+    }
+
+    /// Add a seal's tree (expanded) and its change hashes.
+    pub fn add_seal(&mut self, seal: &crate::seal::Seal) {
+        let short = &seal.id[..seal.id.len().min(12)];
+        self.add_tree(&seal.tree, &format!("tree of seal {short}"));
+        for change in &seal.changes {
+            for hash in [&change.old_hash, &change.new_hash].into_iter().flatten() {
+                self.insert(hash, &change.path);
+            }
+        }
+    }
+
+    /// Add a spec's genesis tree (expanded), if it has one.
+    pub fn add_spec(&mut self, spec: &crate::spec::Spec) {
+        if let Some(ref tree) = spec.genesis_tree {
+            self.add_tree(tree, &format!("genesis tree of spec {}", spec.id));
+        }
+    }
+
+    /// Add every hash referenced by every workspace index.
+    pub fn add_workspace_indexes(&mut self, writ_dir: &Path) -> WritResult<()> {
+        let mut paths = Vec::new();
+        let ws_dir = writ_dir.join("workspaces");
+        if ws_dir.is_dir() {
+            for entry in fs::read_dir(&ws_dir)? {
+                let path = entry?.path().join("index.json");
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+        for path in paths {
+            let index = crate::index::Index::load(&path).map_err(|e| {
+                WritError::Other(format!("cannot read index {}: {e}", path.display()))
+            })?;
+            for (file, entry) in &index.entries {
+                self.insert(&entry.hash, file);
+            }
+        }
+        Ok(())
+    }
+
+    /// Add a tree hash and every blob it lists. Unreadable trees are recorded.
+    fn add_tree(&mut self, tree: &str, referenced_as: &str) {
+        if tree.is_empty() {
+            return;
+        }
+        self.insert(tree, referenced_as);
+        if !self.expanded_trees.insert(tree.to_string()) {
+            return;
+        }
+        match self.read_tree(tree) {
+            Ok(entries) => {
+                for (path, hash) in entries {
+                    self.insert(&hash, &path);
+                }
+            }
+            Err(e) => self.unreadable_trees.push(UnreadableTree {
+                hash: tree.to_string(),
+                referenced_as: referenced_as.to_string(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+
+    /// Decode a tree object into `(path, hash)` pairs. Accepts both the
+    /// index-entry form (`{"path": {"hash": .., "size": ..}}`) and the bare
+    /// form (`{"path": "<hash>"}`).
+    fn read_tree(&self, tree: &str) -> WritResult<Vec<(String, String)>> {
+        let data = self.store.retrieve(tree)?;
+        let map: std::collections::BTreeMap<String, serde_json::Value> =
+            serde_json::from_slice(&data)
+                .map_err(|e| WritError::Other(format!("not a tree object: {e}")))?;
+        map.into_iter()
+            .map(|(path, value)| {
+                let hash = match &value {
+                    serde_json::Value::String(h) => Some(h.clone()),
+                    serde_json::Value::Object(o) => {
+                        o.get("hash").and_then(|h| h.as_str()).map(str::to_string)
+                    }
+                    _ => None,
+                };
+                hash.map(|h| (path.clone(), h))
+                    .ok_or_else(|| WritError::Other(format!("tree entry {path} has no hash")))
+            })
+            .collect()
+    }
+
+    fn insert(&mut self, hash: &str, referenced_as: &str) {
+        self.refs
+            .entry(hash.to_string())
+            .or_insert_with(|| referenced_as.to_string());
+    }
+
+    /// True if `hash` is reachable from any root.
+    pub fn contains(&self, hash: &str) -> bool {
+        self.refs.contains_key(hash)
+    }
+
+    /// Number of distinct live hashes.
+    pub fn len(&self) -> usize {
+        self.refs.len()
+    }
+
+    /// True if no root references anything.
+    pub fn is_empty(&self) -> bool {
+        self.refs.is_empty()
+    }
+
+    /// Trees that could not be expanded (missing, corrupt, or not a tree).
+    pub fn unreadable_trees(&self) -> &[UnreadableTree] {
+        &self.unreadable_trees
+    }
+
+    /// Fail with `LiveSetIncomplete` if any tree could not be expanded.
+    /// Pruning against an incomplete live set can delete live data.
+    pub fn require_complete(&self) -> WritResult<()> {
+        if self.unreadable_trees.is_empty() {
+            return Ok(());
+        }
+        Err(WritError::LiveSetIncomplete(
+            self.unreadable_trees
+                .iter()
+                .map(|t| format!("{} ({}): {}", t.hash, t.referenced_as, t.reason))
+                .collect(),
+        ))
+    }
+
+    /// Every referenced hash with no object on disk, sorted by hash.
+    pub fn missing(&self) -> Vec<MissingObject> {
+        let mut missing: Vec<MissingObject> = self
+            .refs
+            .iter()
+            .filter(|(hash, _)| !self.store.exists(hash))
+            .map(|(hash, at)| MissingObject {
+                hash: hash.clone(),
+                referenced_as: at.clone(),
+            })
+            .collect();
+        missing.sort_by(|a, b| a.hash.cmp(&b.hash));
+        missing
+    }
+
+    /// Consume into the plain hash set.
+    pub fn into_hash_set(self) -> HashSet<String> {
+        self.refs.into_keys().collect()
+    }
+}
+
+/// The complete live set: every object reachable from any seal tree, seal
+/// change list, spec genesis tree, or workspace index.
+///
+/// Errors with `LiveSetIncomplete` when any tree cannot be expanded, because
+/// an object absent from an incomplete live set may still be live.
+pub fn collect_live_objects(
+    writ_dir: &Path,
+    seals: &[crate::seal::Seal],
+    specs: &[crate::spec::Spec],
+) -> WritResult<HashSet<String>> {
+    let live = LiveObjects::scan(writ_dir, seals, specs)?;
+    live.require_complete()?;
+    Ok(live.into_hash_set())
+}
+
+/// Result of checking that every live object is present and readable.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct StoreCheck {
+    /// Referenced objects absent from `.writ/objects/`, sorted by hash.
+    pub missing_objects: Vec<MissingObject>,
+    /// Tree objects that exist but cannot be decoded (corrupt or not a tree).
+    /// Missing trees appear in `missing_objects`, not here.
+    pub unreadable_trees: Vec<UnreadableTree>,
+}
+
+impl StoreCheck {
+    /// True when nothing is missing and every tree decodes.
+    pub fn is_clean(&self) -> bool {
+        self.missing_objects.is_empty() && self.unreadable_trees.is_empty()
+    }
+}
+
+/// Walk the live set (every seal, every spec, every workspace index) and
+/// report referenced objects that are missing or unreadable.
+pub fn check_store(writ_dir: &Path) -> WritResult<StoreCheck> {
+    let seals = load_all_seals(writ_dir)?;
+    let specs = load_all_specs(writ_dir)?;
+    let live = LiveObjects::scan(writ_dir, &seals, &specs)?;
+    let missing_objects = live.missing();
+    let missing: HashSet<&str> = missing_objects.iter().map(|m| m.hash.as_str()).collect();
+    let unreadable_trees = live
+        .unreadable_trees()
+        .iter()
+        .filter(|t| !missing.contains(t.hash.as_str()))
+        .cloned()
+        .collect();
+    Ok(StoreCheck {
+        missing_objects,
+        unreadable_trees,
+    })
+}
+
+/// Find objects on disk that are absent from the live set.
+///
+/// The live set comes from `collect_live_objects`: every seal tree (expanded),
+/// every change hash, every spec `genesis_tree` (expanded, specs loaded from
+/// `writ_dir`), and every workspace index. Errors if any tree cannot be
+/// expanded rather than report live objects as orphans.
 ///
 /// **CRITICAL SAFETY:** The `seals` parameter MUST include ALL seals from
 /// `.writ/seals/` — including flagged/suspicious seals. Flagged seals'
@@ -1258,25 +1531,16 @@ pub fn find_orphaned_objects(
     writ_dir: &Path,
     seals: &[crate::seal::Seal],
 ) -> WritResult<Vec<OrphanedObject>> {
-    // 1. Build referenced hash set from all seals
-    let mut referenced = HashSet::new();
-    for seal in seals {
-        referenced.insert(seal.tree.clone());
-        for change in &seal.changes {
-            if let Some(ref h) = change.old_hash {
-                referenced.insert(h.clone());
-            }
-            if let Some(ref h) = change.new_hash {
-                referenced.insert(h.clone());
-            }
-        }
-    }
-
-    // 2. Walk objects directory, find orphans
     let objects_dir = writ_dir.join("objects");
     if !objects_dir.exists() {
         return Ok(Vec::new());
     }
+
+    // 1. Build the live set from every root.
+    let specs = load_all_specs(writ_dir)?;
+    let referenced = collect_live_objects(writ_dir, seals, &specs)?;
+
+    // 2. Walk objects directory, find orphans
 
     let mut orphans = Vec::new();
     for prefix_entry in fs::read_dir(&objects_dir)? {
@@ -1378,50 +1642,22 @@ pub fn find_committed_prunable(
         }
     }
 
-    // Build the "protected" set: hashes referenced by ANY active seal.
-    let mut protected = HashSet::new();
-    for seal in &active_seals {
-        protected.insert(seal.tree.clone());
-        for change in &seal.changes {
-            if let Some(ref h) = change.old_hash {
-                protected.insert(h.clone());
-            }
-            if let Some(ref h) = change.new_hash {
-                protected.insert(h.clone());
-            }
-        }
-    }
+    // A = the committed seals archived this run. Protected = the live set over
+    // (all seals minus A), every spec genesis tree, every workspace index.
+    // Prunable = reachable from A and not protected. The executor archives A
+    // and prunes in one operation, so no object reachable from a seal that
+    // stays in the store is ever deleted.
+    let remaining: Vec<crate::seal::Seal> = active_seals.into_iter().cloned().collect();
+    let protected = collect_live_objects(writ_dir, &remaining, specs)?;
 
-    // Also protect the current index's referenced objects.
-    let index_path = writ_dir.join("index.json");
-    if index_path.exists() {
-        if let Ok(data) = fs::read_to_string(&index_path) {
-            if let Ok(index) = serde_json::from_str::<serde_json::Value>(&data) {
-                if let Some(entries) = index.get("entries").and_then(|e| e.as_object()) {
-                    for (_path, entry) in entries {
-                        if let Some(hash) = entry.get("hash").and_then(|h| h.as_str()) {
-                            protected.insert(hash.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Collect hashes referenced by committed seals that are NOT protected.
-    let mut prunable_hashes = Vec::new();
-    let mut committed_referenced = HashSet::new();
+    // Candidates: everything the committed seals reach, trees expanded.
+    let mut committed_live = LiveObjects::new(writ_dir);
     for seal in &committed_seals {
-        committed_referenced.insert(seal.tree.clone());
-        for change in &seal.changes {
-            if let Some(ref h) = change.old_hash {
-                committed_referenced.insert(h.clone());
-            }
-            if let Some(ref h) = change.new_hash {
-                committed_referenced.insert(h.clone());
-            }
-        }
+        committed_live.add_seal(seal);
     }
+    committed_live.require_complete()?;
+    let committed_referenced = committed_live.into_hash_set();
+    let mut prunable_hashes = Vec::new();
 
     // Only prune objects that exist on disk and are NOT in the protected set.
     let objects_dir = writ_dir.join("objects");
@@ -2621,6 +2857,16 @@ mod tests {
         }
     }
 
+    /// Helper: store a real tree object (one entry named `label`, so each
+    /// label yields a distinct hash) and return its hash.
+    fn write_test_tree(writ_dir: &Path, label: &str) -> String {
+        let blob = crate::hash::hash_bytes(label.as_bytes());
+        let json = format!(r#"{{"{label}":{{"hash":"{blob}","size":0}}}}"#);
+        crate::object::ObjectStore::new(&writ_dir.join("objects"))
+            .store(json.as_bytes())
+            .unwrap()
+    }
+
     /// Helper: write an object file on disk (simulating ObjectStore).
     fn write_test_object(writ_dir: &Path, hash: &str, content: &[u8]) {
         let (prefix, rest) = hash.split_at(2);
@@ -2642,10 +2888,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let writ_dir = dir.path();
 
-        let tree_hash = "aa".to_string() + &"a".repeat(62);
         let file_hash = "bb".to_string() + &"b".repeat(62);
 
-        write_test_object(writ_dir, &tree_hash, b"tree data");
+        let tree_hash = write_test_tree(writ_dir, "tree data");
         write_test_object(writ_dir, &file_hash, b"file data");
 
         let seal = make_test_seal(
@@ -2671,11 +2916,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let writ_dir = dir.path();
 
-        let tree_hash = "aa".to_string() + &"a".repeat(62);
         let file_hash = "bb".to_string() + &"b".repeat(62);
         let orphan_hash = "cc".to_string() + &"c".repeat(62);
 
-        write_test_object(writ_dir, &tree_hash, b"tree data");
+        let tree_hash = write_test_tree(writ_dir, "tree data");
         write_test_object(writ_dir, &file_hash, b"file data");
         write_test_object(writ_dir, &orphan_hash, b"orphan data");
 
@@ -2700,8 +2944,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let writ_dir = dir.path();
 
-        let tree_hash = "aa".to_string() + &"a".repeat(62);
-        write_test_object(writ_dir, &tree_hash, b"tree index content");
+        let tree_hash = write_test_tree(writ_dir, "tree index content");
 
         let seal = make_test_seal(&tree_hash, vec![], None);
 
@@ -2714,11 +2957,10 @@ mod tests {
         let dir = tempdir().unwrap();
         let writ_dir = dir.path();
 
-        let tree_hash = "aa".to_string() + &"a".repeat(62);
         let old_hash = "bb".to_string() + &"b".repeat(62);
         let new_hash = "cc".to_string() + &"c".repeat(62);
 
-        write_test_object(writ_dir, &tree_hash, b"tree");
+        let tree_hash = write_test_tree(writ_dir, "tree");
         write_test_object(writ_dir, &old_hash, b"old version");
         write_test_object(writ_dir, &new_hash, b"new version");
 
@@ -2742,10 +2984,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let writ_dir = dir.path();
 
-        let tree_hash = "aa".to_string() + &"a".repeat(62);
         let new_hash = "dd".to_string() + &"d".repeat(62);
 
-        write_test_object(writ_dir, &tree_hash, b"tree");
+        let tree_hash = write_test_tree(writ_dir, "tree");
         write_test_object(writ_dir, &new_hash, b"new content");
 
         let seal = make_test_seal(
@@ -2768,13 +3009,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let writ_dir = dir.path();
 
-        let tree1 = "aa".to_string() + &"a".repeat(62);
-        let tree2 = "bb".to_string() + &"b".repeat(62);
         let file1 = "cc".to_string() + &"c".repeat(62);
         let file2 = "dd".to_string() + &"d".repeat(62);
 
-        write_test_object(writ_dir, &tree1, b"tree1");
-        write_test_object(writ_dir, &tree2, b"tree2");
+        let tree1 = write_test_tree(writ_dir, "tree1");
+        let tree2 = write_test_tree(writ_dir, "tree2");
         write_test_object(writ_dir, &file1, b"file1");
         write_test_object(writ_dir, &file2, b"file2");
 
@@ -2838,10 +3077,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let writ_dir = dir.path();
 
-        let flagged_tree = "ff".to_string() + &"f".repeat(62);
         let flagged_file = "ab".to_string() + &"1".repeat(62);
 
-        write_test_object(writ_dir, &flagged_tree, b"flagged tree");
+        let flagged_tree = write_test_tree(writ_dir, "flagged tree");
         write_test_object(writ_dir, &flagged_file, b"flagged content");
 
         // Create a seal that would be flagged (but still exists on disk)
@@ -2955,8 +3193,7 @@ mod tests {
         setup_gc_writ_dir(writ_dir);
 
         // Create object referenced by a seal
-        let tree_hash = "aa".to_string() + &"a".repeat(62);
-        write_test_object(writ_dir, &tree_hash, b"tree");
+        let tree_hash = write_test_tree(writ_dir, "tree");
 
         let seal = make_test_seal(&tree_hash, vec![], None);
         write_test_seal(writ_dir, &seal);
@@ -3016,8 +3253,7 @@ mod tests {
         let writ_dir = dir.path();
         setup_gc_writ_dir(writ_dir);
 
-        let tree_hash = "aa".to_string() + &"a".repeat(62);
-        write_test_object(writ_dir, &tree_hash, b"tree data");
+        let tree_hash = write_test_tree(writ_dir, "tree data");
 
         let seal = make_test_seal(&tree_hash, vec![], None);
         write_test_seal(writ_dir, &seal);
@@ -3129,8 +3365,7 @@ mod tests {
         let writ_dir = dir.path();
         setup_gc_writ_dir(writ_dir);
 
-        let obj_hash = "ab".to_string() + &"1".repeat(62);
-        write_test_object(writ_dir, &obj_hash, b"data");
+        let obj_hash = write_test_tree(writ_dir, "data");
 
         // Generate plan — object is orphaned at this point
         let config = GcConfig::default();
@@ -3443,9 +3678,8 @@ mod tests {
             make_committed_spec("done-spec", crate::spec::CommitState::Committed, 10);
 
         let obj_hash = "aa".to_string() + &"1".repeat(62);
-        let tree_hash = "bb".to_string() + &"2".repeat(62);
         write_test_object(writ_dir, &obj_hash, b"committed file content");
-        write_test_object(writ_dir, &tree_hash, b"committed tree");
+        let tree_hash = write_test_tree(writ_dir, "committed tree");
 
         let seal = make_test_seal(
             &tree_hash,
@@ -3477,11 +3711,9 @@ mod tests {
         setup_gc_writ_dir(writ_dir);
 
         let shared_hash = "cc".to_string() + &"3".repeat(62);
-        let committed_tree = "dd".to_string() + &"4".repeat(62);
-        let active_tree = "ee".to_string() + &"5".repeat(62);
         write_test_object(writ_dir, &shared_hash, b"shared file");
-        write_test_object(writ_dir, &committed_tree, b"committed tree");
-        write_test_object(writ_dir, &active_tree, b"active tree");
+        let committed_tree = write_test_tree(writ_dir, "committed tree");
+        let active_tree = write_test_tree(writ_dir, "active tree");
 
         let committed_spec = make_committed_spec("done", crate::spec::CommitState::Committed, 10);
 
@@ -3548,8 +3780,7 @@ mod tests {
 
         // Committed 10 days ago, keep_days = 7 → old enough.
         let spec = make_committed_spec("old", crate::spec::CommitState::Committed, 10);
-        let tree = "aa".to_string() + &"7".repeat(62);
-        write_test_object(writ_dir, &tree, b"old tree");
+        let tree = write_test_tree(writ_dir, "old tree");
 
         let seal = make_test_seal(&tree, vec![], Some("old"));
 
@@ -3568,8 +3799,7 @@ mod tests {
 
         // Committed today — normally excluded with keep_days=7, but keep_days=0 means include all.
         let spec = make_committed_spec("today", crate::spec::CommitState::Committed, 0);
-        let tree = "bb".to_string() + &"8".repeat(62);
-        write_test_object(writ_dir, &tree, b"fresh tree");
+        let tree = write_test_tree(writ_dir, "fresh tree");
 
         let seal = make_test_seal(&tree, vec![], Some("today"));
 
@@ -3609,10 +3839,8 @@ mod tests {
         let active = make_spec("active-1", LifecycleState::Active, 0);
 
         // Objects for committed specs.
-        let tree1 = "a1".to_string() + &"0".repeat(62);
-        let tree2 = "a2".to_string() + &"0".repeat(62);
-        write_test_object(writ_dir, &tree1, b"tree1");
-        write_test_object(writ_dir, &tree2, b"tree2");
+        let tree1 = write_test_tree(writ_dir, "tree1");
+        let tree2 = write_test_tree(writ_dir, "tree2");
 
         let seal1 = make_test_seal(&tree1, vec![], Some("done-1"));
         let seal2 = make_test_seal(&tree2, vec![], Some("done-2"));
@@ -3768,9 +3996,8 @@ mod tests {
         .unwrap();
 
         // Create a seal and object for the committed spec.
-        let tree = "ab".to_string() + &"c".repeat(62);
         let obj = "de".to_string() + &"f".repeat(62);
-        write_test_object(writ_dir, &tree, b"tree data");
+        let tree = write_test_tree(writ_dir, "tree data");
         write_test_object(writ_dir, &obj, b"file content here");
 
         let seal = make_test_seal(
@@ -3824,10 +4051,8 @@ mod tests {
         }
 
         // Create seals and objects for both specs.
-        let tree_a = "f1".to_string() + &"a".repeat(62);
-        let tree_b = "f2".to_string() + &"b".repeat(62);
-        write_test_object(writ_dir, &tree_a, b"tree a");
-        write_test_object(writ_dir, &tree_b, b"tree b");
+        let tree_a = write_test_tree(writ_dir, "tree a");
+        let tree_b = write_test_tree(writ_dir, "tree b");
 
         let seal_a = make_test_seal(&tree_a, vec![], Some("spec-a"));
         let seal_b = make_test_seal(&tree_b, vec![], Some("spec-b"));
@@ -3857,8 +4082,7 @@ mod tests {
         )
         .unwrap();
 
-        let tree = "ab".to_string() + &"9".repeat(62);
-        write_test_object(writ_dir, &tree, b"tree");
+        let tree = write_test_tree(writ_dir, "tree");
         let seal = make_test_seal(&tree, vec![], Some("recent"));
         write_test_seal(writ_dir, &seal);
 
@@ -3945,5 +4169,347 @@ mod tests {
         assert!(config.auto_gc, "default auto_gc should be true");
         assert_eq!(config.auto_gc_object_threshold, 500, "default threshold");
         assert_eq!(config.auto_gc_keep_days, 7, "default keep_days");
+    }
+
+    // -----------------------------------------------------------------------
+    // Finding 28: the live set walks trees, genesis trees, and indexes
+    // -----------------------------------------------------------------------
+
+    fn store_blob(writ_dir: &Path, content: &[u8]) -> String {
+        crate::object::ObjectStore::new(&writ_dir.join("objects"))
+            .store(content)
+            .unwrap()
+    }
+
+    fn store_tree(writ_dir: &Path, entries: &[(&str, &str)]) -> String {
+        let map: std::collections::BTreeMap<&str, serde_json::Value> = entries
+            .iter()
+            .map(|(p, h)| (*p, serde_json::json!({ "hash": h, "size": 1 })))
+            .collect();
+        store_blob(writ_dir, &serde_json::to_vec(&map).unwrap())
+    }
+
+    fn write_index(writ_dir: &Path, workspace: &str, entries: &[(&str, &str)]) {
+        let mut index = crate::index::Index::default();
+        for (p, h) in entries {
+            index.entries.insert(
+                p.to_string(),
+                crate::index::IndexEntry {
+                    hash: h.to_string(),
+                    size: 1,
+                },
+            );
+        }
+        let dir = writ_dir.join("workspaces").join(workspace);
+        fs::create_dir_all(&dir).unwrap();
+        index.save(&dir.join("index.json")).unwrap();
+    }
+
+    fn orphan_hashes(writ_dir: &Path, seals: &[Seal]) -> HashSet<String> {
+        find_orphaned_objects(writ_dir, seals)
+            .unwrap()
+            .into_iter()
+            .map(|o| o.hash)
+            .collect()
+    }
+
+    #[test]
+    fn test_live_set_blob_only_in_seal_tree_is_not_orphaned() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let carried = store_blob(writ_dir, b"carried forward");
+        let tree = store_tree(writ_dir, &[("carried.txt", &carried)]);
+        let seal = make_test_seal(&tree, vec![], None);
+
+        let orphans = orphan_hashes(writ_dir, &[seal]);
+        assert!(!orphans.contains(&carried));
+        assert!(!orphans.contains(&tree));
+    }
+
+    #[test]
+    fn test_live_set_genesis_tree_and_contents_are_live() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let base = store_blob(writ_dir, b"genesis content");
+        let genesis = store_tree(writ_dir, &[("base.txt", &base)]);
+        let mut spec = make_committed_spec("g", crate::spec::CommitState::Uncommitted, 0);
+        spec.genesis_tree = Some(genesis.clone());
+        fs::write(
+            writ_dir.join("specs").join("g.json"),
+            serde_json::to_string(&spec).unwrap(),
+        )
+        .unwrap();
+
+        let orphans = orphan_hashes(writ_dir, &[]);
+        assert!(!orphans.contains(&genesis));
+        assert!(!orphans.contains(&base));
+    }
+
+    #[test]
+    fn test_live_set_workspace_index_hashes_are_live() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let main_only = store_blob(writ_dir, b"index only, main");
+        let other_only = store_blob(writ_dir, b"index only, other workspace");
+        let garbage = store_blob(writ_dir, b"truly unreferenced");
+        write_index(writ_dir, "main", &[("untracked.txt", &main_only)]);
+        write_index(writ_dir, "feature", &[("f.txt", &other_only)]);
+
+        let orphans = orphan_hashes(writ_dir, &[]);
+        assert!(!orphans.contains(&main_only));
+        assert!(!orphans.contains(&other_only));
+        assert_eq!(orphans, HashSet::from([garbage]));
+    }
+
+    #[test]
+    fn test_live_set_accepts_bare_hash_tree_entries() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let blob = store_blob(writ_dir, b"bare form");
+        let tree = store_blob(writ_dir, format!(r#"{{"a.txt":"{blob}"}}"#).as_bytes());
+        let seal = make_test_seal(&tree, vec![], None);
+
+        assert!(orphan_hashes(writ_dir, &[seal]).is_empty());
+    }
+
+    #[test]
+    fn test_live_set_missing_tree_refuses_orphan_scan() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        store_blob(writ_dir, b"might be live");
+        let absent_tree = "ab".to_string() + &"c".repeat(62);
+        let seal = make_test_seal(&absent_tree, vec![], None);
+
+        let err = find_orphaned_objects(writ_dir, &[seal]).unwrap_err();
+        match err {
+            WritError::LiveSetIncomplete(trees) => {
+                assert_eq!(trees.len(), 1);
+                assert!(trees[0].starts_with(&absent_tree));
+                assert!(trees[0].contains("tree of seal"));
+            }
+            other => panic!("expected LiveSetIncomplete, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_live_set_non_tree_object_as_tree_refuses_orphan_scan() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let not_a_tree = store_blob(writ_dir, b"plain file content");
+        let seal = make_test_seal(&not_a_tree, vec![], None);
+
+        assert!(matches!(
+            find_orphaned_objects(writ_dir, &[seal]),
+            Err(WritError::LiveSetIncomplete(_))
+        ));
+    }
+
+    #[test]
+    fn test_live_objects_missing_lists_hash_and_path() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let present = store_blob(writ_dir, b"present");
+        let absent = "de".to_string() + &"f".repeat(62);
+        let tree = store_tree(writ_dir, &[("ok.txt", &present), ("gone.txt", &absent)]);
+        let seal = make_test_seal(&tree, vec![], None);
+
+        let live = LiveObjects::scan(writ_dir, &[seal], &[]).unwrap();
+        assert!(live.unreadable_trees().is_empty());
+        assert_eq!(
+            live.missing(),
+            vec![MissingObject {
+                hash: absent,
+                referenced_as: "gone.txt".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn test_collect_live_objects_covers_every_root() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let in_tree = store_blob(writ_dir, b"tree");
+        let in_change = store_blob(writ_dir, b"change");
+        let in_genesis = store_blob(writ_dir, b"genesis");
+        let in_index = store_blob(writ_dir, b"index");
+        let tree = store_tree(writ_dir, &[("t", &in_tree)]);
+        let genesis = store_tree(writ_dir, &[("g", &in_genesis)]);
+        write_index(writ_dir, "main", &[("i", &in_index)]);
+        let seal = make_test_seal(
+            &tree,
+            vec![FileChange {
+                path: "c".into(),
+                change_type: ChangeType::Deleted,
+                old_hash: Some(in_change.clone()),
+                new_hash: None,
+            }],
+            None,
+        );
+        let mut spec = make_committed_spec("s", crate::spec::CommitState::Uncommitted, 0);
+        spec.genesis_tree = Some(genesis.clone());
+
+        let live = collect_live_objects(writ_dir, &[seal], &[spec]).unwrap();
+        for h in [
+            &tree,
+            &in_tree,
+            &in_change,
+            &genesis,
+            &in_genesis,
+            &in_index,
+        ] {
+            assert!(live.contains(h), "{h} missing from live set");
+        }
+    }
+
+    #[test]
+    fn test_committed_prunable_keeps_blob_carried_in_active_tree() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let carried = store_blob(writ_dir, b"carried into the active seal's tree");
+        let committed_tree = store_tree(writ_dir, &[("c.txt", &carried)]);
+        let active_tree = store_tree(writ_dir, &[("c.txt", &carried), ("n.txt", &carried)]);
+        let committed_seal = make_test_seal(
+            &committed_tree,
+            vec![FileChange {
+                path: "c.txt".into(),
+                change_type: ChangeType::Added,
+                old_hash: None,
+                new_hash: Some(carried.clone()),
+            }],
+            Some("done"),
+        );
+        // The active seal never mentions c.txt in its change list.
+        let active_seal = make_test_seal(&active_tree, vec![], Some("active"));
+        let spec = make_committed_spec("done", crate::spec::CommitState::Committed, 10);
+
+        let result =
+            find_committed_prunable(writ_dir, &[spec], &[committed_seal, active_seal], 0).unwrap();
+        assert!(!result.object_hashes.contains(&carried));
+        assert!(result.object_hashes.contains(&committed_tree));
+    }
+
+    #[test]
+    fn test_committed_prunable_blob_only_in_committed_tree_is_prunable() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let only_committed = store_blob(writ_dir, b"carried only by the committed tree");
+        let tree = store_tree(writ_dir, &[("x.txt", &only_committed)]);
+        let seal = make_test_seal(&tree, vec![], Some("done"));
+        let spec = make_committed_spec("done", crate::spec::CommitState::Committed, 10);
+
+        let result = find_committed_prunable(writ_dir, &[spec], &[seal], 0).unwrap();
+        assert!(result.object_hashes.contains(&only_committed));
+    }
+
+    #[test]
+    fn test_committed_prunable_keeps_workspace_index_blobs() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let indexed = store_blob(writ_dir, b"current working state");
+        let tree = store_tree(writ_dir, &[("w.txt", &indexed)]);
+        let seal = make_test_seal(&tree, vec![], Some("done"));
+        let spec = make_committed_spec("done", crate::spec::CommitState::Committed, 10);
+        write_index(writ_dir, "main", &[("w.txt", &indexed)]);
+
+        let result = find_committed_prunable(writ_dir, &[spec], &[seal], 0).unwrap();
+        assert!(!result.object_hashes.contains(&indexed));
+    }
+
+    #[test]
+    fn test_committed_prunable_refuses_when_active_tree_missing() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let tree = store_tree(writ_dir, &[]);
+        let committed = make_test_seal(&tree, vec![], Some("done"));
+        let active = make_test_seal(&("ef".to_string() + &"0".repeat(62)), vec![], None);
+        let spec = make_committed_spec("done", crate::spec::CommitState::Committed, 10);
+
+        assert!(matches!(
+            find_committed_prunable(writ_dir, &[spec], &[committed, active], 0),
+            Err(WritError::LiveSetIncomplete(_))
+        ));
+    }
+
+    #[test]
+    fn test_check_store_clean_when_every_live_object_present() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let blob = store_blob(writ_dir, b"present");
+        let tree = store_tree(writ_dir, &[("a.txt", &blob)]);
+        write_test_seal(writ_dir, &make_test_seal(&tree, vec![], None));
+
+        assert!(check_store(writ_dir).unwrap().is_clean());
+    }
+
+    #[test]
+    fn test_check_store_reports_missing_blob_with_path() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let absent = "0a".to_string() + &"1".repeat(62);
+        let tree = store_tree(writ_dir, &[("lost.txt", &absent)]);
+        write_test_seal(writ_dir, &make_test_seal(&tree, vec![], None));
+
+        let check = check_store(writ_dir).unwrap();
+        assert!(!check.is_clean());
+        assert_eq!(check.missing_objects.len(), 1);
+        assert_eq!(check.missing_objects[0].hash, absent);
+        assert_eq!(check.missing_objects[0].referenced_as, "lost.txt");
+        assert!(check.unreadable_trees.is_empty());
+    }
+
+    #[test]
+    fn test_check_store_missing_tree_listed_once_as_missing() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let absent_tree = "0b".to_string() + &"2".repeat(62);
+        write_test_seal(writ_dir, &make_test_seal(&absent_tree, vec![], None));
+
+        let check = check_store(writ_dir).unwrap();
+        assert_eq!(check.missing_objects.len(), 1);
+        assert!(check.missing_objects[0]
+            .referenced_as
+            .starts_with("tree of seal"));
+        assert!(check.unreadable_trees.is_empty());
+    }
+
+    #[test]
+    fn test_check_store_reports_present_but_undecodable_tree() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let not_a_tree = store_blob(writ_dir, b"not json");
+        write_test_seal(writ_dir, &make_test_seal(&not_a_tree, vec![], None));
+
+        let check = check_store(writ_dir).unwrap();
+        assert!(check.missing_objects.is_empty());
+        assert_eq!(check.unreadable_trees.len(), 1);
+        assert_eq!(check.unreadable_trees[0].hash, not_a_tree);
+    }
+
+    #[test]
+    fn test_check_store_reports_missing_index_blob() {
+        let dir = tempdir().unwrap();
+        let writ_dir = dir.path();
+        setup_gc_writ_dir(writ_dir);
+        let absent = "0c".to_string() + &"3".repeat(62);
+        write_index(writ_dir, "main", &[("untracked.txt", &absent)]);
+
+        let check = check_store(writ_dir).unwrap();
+        assert_eq!(check.missing_objects[0].referenced_as, "untracked.txt");
     }
 }

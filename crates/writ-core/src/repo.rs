@@ -1135,13 +1135,25 @@ impl Repository {
             }
         }
 
-        let all_valid = head_chain.valid && spec_chains.iter().all(|sc| sc.chain.valid);
+        let objects = self.verify_objects()?;
+        let all_valid =
+            head_chain.valid && spec_chains.iter().all(|sc| sc.chain.valid) && objects.is_clean();
 
         Ok(AllChainsVerification {
             head_chain,
             spec_chains,
+            missing_objects: objects.missing_objects,
+            unreadable_trees: objects.unreadable_trees,
             all_valid,
         })
+    }
+
+    /// Check that every object reachable from the live set (every seal tree,
+    /// change hash, spec genesis tree, and workspace index) is present and,
+    /// for trees, decodable. Chain verification alone checks seal hashes and
+    /// signatures, not object presence (finding 28).
+    pub fn verify_objects(&self) -> WritResult<crate::gc::StoreCheck> {
+        crate::gc::check_store(&self.writ_dir)
     }
 
     /// Verify cryptographic integrity of a spec's branch chain.
@@ -10280,11 +10292,15 @@ pub struct SpecChainResult {
     pub chain: ChainVerification,
 }
 
-/// Result of verifying HEAD chain + all spec branch chains.
+/// Result of verifying HEAD chain + all spec branch chains + object presence.
 #[derive(Debug, Clone, Serialize)]
 pub struct AllChainsVerification {
     pub head_chain: ChainVerification,
     pub spec_chains: Vec<SpecChainResult>,
+    /// Objects referenced by the live set but absent from the store.
+    pub missing_objects: Vec<crate::gc::MissingObject>,
+    /// Tree objects present but undecodable.
+    pub unreadable_trees: Vec<crate::gc::UnreadableTree>,
     pub all_valid: bool,
 }
 
@@ -10294,6 +10310,65 @@ mod tests {
     use crate::seal::AgentType;
     use crate::spec::{LifecycleState, SpecStatus};
     use tempfile::tempdir;
+
+    #[test]
+    fn test_verify_all_chains_lists_missing_tree_blob_with_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let agent = AgentIdentity {
+            id: "amis-test".into(),
+            agent_type: AgentType::Agent,
+        };
+        fs::write(dir.path().join("kept.txt"), "kept\n").unwrap();
+        fs::write(dir.path().join("edit.txt"), "v1\n").unwrap();
+        let first = repo
+            .seal(
+                agent.clone(),
+                "one".into(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        fs::write(dir.path().join("edit.txt"), "v2\n").unwrap();
+        repo.seal(
+            agent,
+            "two".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        let kept = first
+            .changes
+            .iter()
+            .find(|c| c.path == "kept.txt")
+            .and_then(|c| c.new_hash.clone())
+            .unwrap();
+        assert!(repo
+            .verify_all_chains(None)
+            .unwrap()
+            .missing_objects
+            .is_empty());
+
+        fs::remove_file(
+            repo.writ_dir()
+                .join("objects")
+                .join(&kept[..2])
+                .join(&kept[2..]),
+        )
+        .unwrap();
+
+        let result = repo.verify_all_chains(None).unwrap();
+        assert!(!result.all_valid);
+        assert!(result.head_chain.valid, "chain itself is intact");
+        assert_eq!(result.missing_objects.len(), 1);
+        assert_eq!(result.missing_objects[0].hash, kept);
+        assert_eq!(result.missing_objects[0].referenced_as, "kept.txt");
+        assert!(!repo.verify_objects().unwrap().is_clean());
+    }
 
     fn test_agent() -> AgentIdentity {
         AgentIdentity {

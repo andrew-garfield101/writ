@@ -96,6 +96,25 @@ except json.JSONDecodeError:
 PY
 echo
 
+echo "## Verify"
+echo
+echo "\`writ verify --all-chains\` exits 1 on any failure; the exit code is captured, not fatal. EXPECTED means the only failures are the allow-listed missing objects above."
+echo
+verify_rc=0
+verify="$(python3 "$ROOT/bench/verify_check.py" "$REPO" --writ "$WRIT" "${allow_args[@]}" 2>&1)" || verify_rc=$?
+VERIFY="$verify" VERIFY_RC="$verify_rc" python3 - <<'PY'
+import json, os
+try:
+    v = json.loads(os.environ["VERIFY"])
+    print(f"**{v['verdict']}** (verify exit {v['verify_rc']}): {v['missing_objects']} missing, "
+          f"{len(v['excused'])} excused.")
+    for prob in v["problems"]:
+        print(f"- FAIL {prob}")
+except json.JSONDecodeError:
+    print(f"**ERROR** (rc {os.environ['VERIFY_RC']}): {os.environ['VERIFY'].strip()}")
+PY
+echo
+
 echo "## Context cost"
 echo
 if [[ -n "$bench_md" && -f "$bench_md" ]]; then

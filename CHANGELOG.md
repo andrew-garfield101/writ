@@ -7,6 +7,18 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.1] — 2026-10-05
+
+**On 0.2.0, do not run `writ gc run` or `writ finish` until you upgrade.**
+
+### Fixed
+
+- The garbage collector, including the automatic run inside `writ finish`, treated every object carried forward unchanged as garbage. `writ gc run` could delete file contents writ still needs (every file from a git baseline import), and the automatic run inside `writ finish` could remove committed seals and their file contents seven days after a spec was committed. `writ verify` now reports referenced but missing objects, and `gc run` refuses to proceed when any are missing (`--force` overrides).
+
+---
+
+## [0.2.0] — 2026-10-04
+
 ### Added
 
 **Convergence v2 (Six Phase Pipeline)**

@@ -13,8 +13,9 @@ use std::path::Path;
 
 use tempfile::{tempdir, TempDir};
 
-use writ_core::gc::{find_orphaned_objects, load_all_seals};
+use writ_core::gc::{find_committed_prunable, find_orphaned_objects, load_all_seals};
 use writ_core::seal::{AgentIdentity, AgentType, Seal, TaskStatus, Verification};
+use writ_core::spec::{CommitState, Spec};
 use writ_core::Repository;
 
 fn seal(repo: &Repository, summary: &str) -> Seal {
@@ -68,7 +69,6 @@ fn object_file(writ_dir: &Path, hash: &str) -> std::path::PathBuf {
 /// is loaded, exactly as `gc run` does.
 #[cfg(feature = "bridge")]
 #[test]
-#[ignore = "finding 28: find_orphaned_objects never walks seal trees, so carried-forward blobs are pruned (sprint 2 gc-integrity)"]
 fn test_index_only_blob_is_not_orphaned_after_bridge_import() {
     use std::process::Command;
     let dir = tempdir().unwrap();
@@ -114,7 +114,6 @@ fn test_index_only_blob_is_not_orphaned_after_bridge_import() {
 /// Minimal shape without git: the referenced set is computed from a seal
 /// whose tree carries a blob its change list does not mention.
 #[test]
-#[ignore = "finding 28: find_orphaned_objects never walks seal trees, so carried-forward blobs are pruned (sprint 2 gc-integrity)"]
 fn test_carried_forward_blob_is_not_orphaned() {
     let (_dir, repo, carried_hash, second) = carried_forward_repo();
     let orphans = find_orphaned_objects(repo.writ_dir(), &[second]).unwrap();
@@ -136,7 +135,6 @@ fn test_orphan_scan_with_full_history_keeps_carried_blob() {
 }
 
 #[test]
-#[ignore = "finding 28: verify --all-chains checks seal hashes and signatures, not object presence (sprint 2 gc-integrity)"]
 fn test_verify_all_chains_fails_when_referenced_blob_missing() {
     let (_dir, repo, carried_hash, _second) = carried_forward_repo();
     assert!(
@@ -165,5 +163,50 @@ fn test_context_fails_loudly_when_referenced_blob_missing() {
     assert!(
         err.is_some(),
         "diff over a missing blob must error, not guess"
+    );
+}
+
+/// `find_committed_prunable` builds its protected set the same way the orphan
+/// scan did: active seals' top-level tree plus their change lists, plus a flat
+/// `.writ/index.json` that current repos no longer have (the index lives at
+/// `.writ/workspaces/main/index.json`). A blob that an active seal carries
+/// forward in its tree, and that only committed seals mention in their change
+/// lists, is therefore pruned by `writ gc run --committed`.
+///
+/// History (spec ids are assigned in memory; the function takes slices):
+///   s1 done:   add carried.txt, edited.txt
+///   s2 active: edit edited.txt              (tree still holds carried.txt)
+///   s3 done:   delete carried.txt           (index no longer holds it)
+/// `restore s2` needs carried.txt's blob, so it must not be prunable.
+#[test]
+fn test_committed_prunable_keeps_carried_forward_blob() {
+    let (dir, repo, carried_hash, s2) = carried_forward_repo();
+    fs::remove_file(dir.path().join("carried.txt")).unwrap();
+    let s3 = seal(&repo, "delete carried.txt");
+    assert!(
+        s3.changes
+            .iter()
+            .any(|c| c.path == "carried.txt" && c.old_hash.as_deref() == Some(&carried_hash)),
+        "precondition: s3 records the deletion"
+    );
+
+    let mut seals = load_all_seals(repo.writ_dir()).unwrap();
+    assert_eq!(seals.len(), 3);
+    for s in &mut seals {
+        s.spec_id = Some(if s.id == s2.id { "active" } else { "done" }.to_string());
+    }
+    let mut done = Spec::new("done".into(), "done".into(), String::new());
+    done.commit_state = CommitState::Committed;
+    done.committed_at = Some(chrono::Utc::now() - chrono::Duration::days(30));
+    let active = Spec::new("active".into(), "active".into(), String::new());
+
+    let result = find_committed_prunable(repo.writ_dir(), &[done, active], &seals, 0).unwrap();
+    // Non-vacuous: the committed partition was found and holds two seals.
+    assert_eq!(result.spec_ids, vec!["done".to_string()]);
+    assert_eq!(result.seal_ids.len(), 2);
+    assert!(object_file(repo.writ_dir(), &carried_hash).exists());
+    assert!(
+        !result.object_hashes.contains(&carried_hash),
+        "carried.txt's blob is in active seal s2's tree but reported prunable"
     );
 }

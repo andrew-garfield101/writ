@@ -75,6 +75,9 @@ pub enum WritError {
     RemoteLockTimeout,
     /// Decompression bomb: object decompresses to more than the allowed limit.
     DecompressionBomb { hash: String, limit: usize },
+    /// The GC live set could not be computed: these trees (one line each,
+    /// `hash (root): reason`) could not be expanded, so pruning is unsafe.
+    LiveSetIncomplete(Vec<String>),
     /// Generic error with a message.
     Other(String),
 }
@@ -179,6 +182,12 @@ impl fmt::Display for WritError {
                     limit
                 )
             }
+            WritError::LiveSetIncomplete(trees) => write!(
+                f,
+                "live set incomplete, refusing to treat any object as garbage; {} unreadable tree(s): {}",
+                trees.len(),
+                trees.join("; ")
+            ),
             WritError::Other(msg) => write!(f, "{msg}"),
         }
     }

@@ -13,6 +13,10 @@ zstd payloads are decoded with the `zstd` CLI (stdlib has no zstd before 3.14).
 `--allow-missing PREFIX` (repeatable) excuses specific objects known to be
 permanently lost; they are reported separately and do not fail the check.
 
+`--orphans` also lists on-disk objects outside the live set (an oracle for
+`writ gc audit`'s orphaned_objects), each with its size and, when it decodes to
+a JSON object, its "type" field. Orphans are reported, never a failure.
+
 Exit: 0 = zero unexcused missing, 1 = missing objects found, 2 = cannot read.
 """
 
@@ -52,7 +56,26 @@ def read_object(writ_dir: Path, h: str) -> bytes:
     return raw
 
 
-def check(writ_dir: Path, allow: tuple[str, ...] = ()) -> dict:
+def orphan_report(writ_dir: Path, referenced: set[str]) -> list[dict]:
+    """On-disk objects not in the referenced set, with size and JSON "type"."""
+    out = []
+    for prefix in sorted((writ_dir / "objects").iterdir()):
+        if not prefix.is_dir() or len(prefix.name) != 2:
+            continue
+        for obj in sorted(prefix.iterdir()):
+            h = prefix.name + obj.name
+            if h in referenced:
+                continue
+            try:
+                doc = json.loads(read_object(writ_dir, h))
+                kind = doc.get("type") if isinstance(doc, dict) else None
+            except (ValueError, UnicodeDecodeError):
+                kind = None
+            out.append({"hash": h[:12], "bytes": obj.stat().st_size, "type": kind})
+    return out
+
+
+def check(writ_dir: Path, allow: tuple[str, ...] = (), orphans: bool = False) -> dict:
     seals_dir = writ_dir / "seals"
     if not seals_dir.is_dir():
         raise StoreError(f"no seals dir at {seals_dir}")
@@ -97,6 +120,7 @@ def check(writ_dir: Path, allow: tuple[str, ...] = ()) -> dict:
     absent = sorted(h for h in referenced if not object_path(writ_dir, h).exists())
     allowed = [h for h in absent if any(h.startswith(a) for a in allow)]
     missing = [h for h in absent if h not in allowed]
+    extra = {"orphans": orphan_report(writ_dir, referenced)} if orphans else {}
     return {
         "seals": seals,
         "referenced_objects": len(referenced),
@@ -107,6 +131,7 @@ def check(writ_dir: Path, allow: tuple[str, ...] = ()) -> dict:
         "missing_sample": [h[:12] for h in missing[:10]],
         "allowed_missing": [h[:12] for h in allowed],
         "unused_allowances": [a for a in allow if not any(h.startswith(a) for h in allowed)],
+        **extra,
     }
 
 
@@ -116,11 +141,13 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--json", action="store_true", help="print JSON")
     ap.add_argument("--allow-missing", action="append", default=[], metavar="PREFIX",
                     help="hash prefix (>= 12 hex) of a known-lost object to excuse")
+    ap.add_argument("--orphans", action="store_true",
+                    help="also list on-disk objects outside the live set")
     args = ap.parse_args(argv)
     try:
         if any(len(a) < 12 for a in args.allow_missing):
             raise StoreError("--allow-missing prefixes must be at least 12 characters")
-        result = check(args.repo / ".writ", tuple(args.allow_missing))
+        result = check(args.repo / ".writ", tuple(args.allow_missing), args.orphans)
     except (StoreError, OSError, json.JSONDecodeError) as exc:
         print(f"store_integrity: {exc}", file=sys.stderr)
         return 2
@@ -128,7 +155,8 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2))
     else:
         print(f"seals {result['seals']}, referenced {result['referenced_objects']}, "
-              f"missing {result['missing_objects']}, allowed {len(result['allowed_missing'])}")
+              f"missing {result['missing_objects']}, allowed {len(result['allowed_missing'])}"
+              + (f", orphans {len(result['orphans'])}" if args.orphans else ""))
     return 1 if result["missing_objects"] else 0
 
 

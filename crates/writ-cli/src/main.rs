@@ -1127,6 +1127,11 @@ enum GcCommands {
         #[arg(long)]
         committed: bool,
 
+        /// Proceed even when referenced objects are already missing from the
+        /// store. Without it, gc run aborts and lists them.
+        #[arg(long)]
+        force: bool,
+
         /// Keep committed objects for N days before pruning (default: 7).
         #[arg(long, default_value = "7")]
         keep_days: u64,
@@ -1614,15 +1619,16 @@ fn main() {
                 dry_run,
                 yes,
                 committed,
+                force,
                 keep_days,
                 format,
-            } => {
+            } => gc_store_precheck(&cwd.join(".writ"), dry_run, force).and_then(|()| {
                 if committed {
                     cmd_gc_committed(&cwd, dry_run, yes, keep_days, &format)
                 } else {
                     cmd_gc_run(&cwd, dry_run, yes, &format)
                 }
-            }
+            }),
             GcCommands::Status { format } => cmd_gc_status(&cwd, &format),
             GcCommands::Storage { format } => cmd_gc_storage(&cwd, &format),
             GcCommands::Audit { format } => cmd_gc_audit(&cwd, &format),
@@ -4696,7 +4702,22 @@ fn cmd_finish(
     {
         let writ_dir = cwd.join(".writ");
         let gc_config = writ_core::gc::GcConfig::load(&writ_dir).unwrap_or_default();
-        if gc_config.auto_gc_enabled() {
+        let store_clean = match writ_core::gc::check_store(&writ_dir) {
+            Ok(check) => check.is_clean(),
+            Err(e) => {
+                eprintln!(
+                    "  {} Auto-GC skipped: store check failed: {e}",
+                    "!".yellow()
+                );
+                false
+            }
+        };
+        if gc_config.auto_gc_enabled() && !store_clean {
+            eprintln!(
+                "  {} Auto-GC skipped: referenced objects are missing; run `writ verify --all-chains`.",
+                "!".yellow()
+            );
+        } else if gc_config.auto_gc_enabled() {
             let all_seals = writ_core::gc::load_all_seals(&writ_dir).unwrap_or_default();
             let orphans =
                 writ_core::gc::find_orphaned_objects(&writ_dir, &all_seals).unwrap_or_default();
@@ -7066,34 +7087,36 @@ fn cmd_remote_status(
 
 fn cmd_verify(
     cwd: &std::path::Path,
-    chain: bool,
+    _chain: bool,
     all_chains: bool,
     seal_id: Option<&str>,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
 
-    if let Some(id) = seal_id {
-        return cmd_verify_seal(&repo, id, format);
-    }
+    // Each helper prints its report (JSON or human) and returns whether
+    // everything checked out. Any reported failure exits 1.
+    let valid = if let Some(id) = seal_id {
+        cmd_verify_seal(&repo, id, format)?
+    } else if all_chains {
+        cmd_verify_all_chains(&repo, format)?
+    } else {
+        // `--chain` and the default both verify the full HEAD chain.
+        cmd_verify_chain(&repo, format)?
+    };
 
-    if all_chains {
-        return cmd_verify_all_chains(&repo, format);
+    if !valid {
+        std::io::Write::flush(&mut std::io::stdout())?;
+        process::exit(1);
     }
-
-    if chain {
-        return cmd_verify_chain(&repo, format);
-    }
-
-    // Default: verify the full chain
-    cmd_verify_chain(&repo, format)
+    Ok(())
 }
 
 fn cmd_verify_seal(
     repo: &Repository,
     seal_id: &str,
     format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let full_id = repo.resolve_seal_id(seal_id)?;
     let seal = repo.load_seal(&full_id)?;
     let short_id = &seal.id[..12.min(seal.id.len())];
@@ -7114,7 +7137,7 @@ fn cmd_verify_seal(
                 println!("  status: N/A (pre-security seal)");
             }
         }
-        return Ok(());
+        return Ok(true);
     }
 
     let result = repo.verify_seal(&seal, None);
@@ -7182,28 +7205,31 @@ fn cmd_verify_seal(
         }
     }
 
-    Ok(())
+    // A failed signature check is a reported failure too (shown as FAIL).
+    Ok(all_ok && result.signature_valid != Some(false))
 }
 
-fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<bool, Box<dyn std::error::Error>> {
     let spinner = if format != "json" {
         Some(make_spinner("verifying seal chain..."))
     } else {
         None
     };
 
-    let result = repo.verify_chain(None)?;
+    let mut result = repo.verify_chain(None)?;
+    let objects = repo.verify_objects()?;
+    result.valid &= objects.is_clean();
 
     if let Some(sp) = spinner {
         sp.finish_and_clear();
     }
 
-    if result.total_seals == 0 {
+    if result.total_seals == 0 && objects.is_clean() {
         match format {
             "json" => println!(r#"{{"valid":true,"seals_checked":0,"message":"empty chain"}}"#),
             _ => println!("no seals to verify"),
         }
-        return Ok(());
+        return Ok(true);
     }
 
     match format {
@@ -7219,6 +7245,8 @@ fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<(), Box<dyn std::
                         "error": f.error,
                     })
                 }).collect::<Vec<_>>(),
+                "missing_objects": missing_objects_json(&objects.missing_objects),
+                "unreadable_trees": &objects.unreadable_trees,
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         }
@@ -7230,7 +7258,7 @@ fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<(), Box<dyn std::
                 result.verified.to_string().green(),
                 result.unsecured.to_string().dimmed()
             );
-            if !result.failures.is_empty() {
+            if !result.valid {
                 for f in &result.failures {
                     let short_id = &f.seal_id[..12.min(f.seal_id.len())];
                     println!(
@@ -7240,10 +7268,13 @@ fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<(), Box<dyn std::
                         f.error.as_deref().unwrap_or("unknown")
                     );
                 }
+                print_object_failures(&objects);
                 println!(
                     "  result: {} ({} error(s))",
                     "INVALID".red().bold(),
                     result.failures.len()
+                        + objects.missing_objects.len()
+                        + objects.unreadable_trees.len()
                 );
             } else {
                 println!("  result: {}", "VALID".green().bold());
@@ -7251,13 +7282,42 @@ fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<(), Box<dyn std::
         }
     }
 
-    Ok(())
+    Ok(result.valid)
+}
+
+/// `missing_objects` as JSON: `[{"hash": .., "path": ..}]`.
+fn missing_objects_json(missing: &[writ_core::gc::MissingObject]) -> serde_json::Value {
+    missing
+        .iter()
+        .map(|m| serde_json::json!({ "hash": m.hash, "path": m.referenced_as }))
+        .collect()
+}
+
+/// One FAIL line per missing object (hash and one path) or unreadable tree.
+fn print_object_failures(objects: &writ_core::gc::StoreCheck) {
+    for m in &objects.missing_objects {
+        println!(
+            "  {} missing object {}  {}",
+            "FAIL".red().bold(),
+            m.hash,
+            m.referenced_as
+        );
+    }
+    for t in &objects.unreadable_trees {
+        println!(
+            "  {} unreadable tree {}  {}: {}",
+            "FAIL".red().bold(),
+            t.hash,
+            t.referenced_as,
+            t.reason
+        );
+    }
 }
 
 fn cmd_verify_all_chains(
     repo: &Repository,
     format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let result = repo.verify_all_chains(None)?;
 
     match format {
@@ -7291,6 +7351,8 @@ fn cmd_verify_all_chains(
                         }).collect::<Vec<_>>(),
                     })
                 }).collect::<Vec<_>>(),
+                "missing_objects": missing_objects_json(&result.missing_objects),
+                "unreadable_trees": &result.unreadable_trees,
             });
             println!("{}", serde_json::to_string_pretty(&json).unwrap());
         }
@@ -7341,6 +7403,19 @@ fn cmd_verify_all_chains(
                 }
             }
 
+            println!("\n=== objects ===");
+            let objects = writ_core::gc::StoreCheck {
+                missing_objects: result.missing_objects.clone(),
+                unreadable_trees: result.unreadable_trees.clone(),
+            };
+            if objects.is_clean() {
+                println!("  every referenced object present");
+                println!("  result: VALID");
+            } else {
+                print_object_failures(&objects);
+                println!("  result: INVALID");
+            }
+
             println!(
                 "\noverall: {}",
                 if result.all_valid {
@@ -7352,7 +7427,7 @@ fn cmd_verify_all_chains(
         }
     }
 
-    Ok(())
+    Ok(result.all_valid)
 }
 
 // ---------------------------------------------------------------------------
@@ -7952,6 +8027,67 @@ fn cmd_gc_audit(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::E
     }
 
     Ok(())
+}
+
+/// Print each missing object (hash and one referencing path) and each
+/// unreadable tree, one per line, to stderr.
+fn print_store_problems(check: &writ_core::gc::StoreCheck) {
+    for m in &check.missing_objects {
+        eprintln!(
+            "  {} {}  {}",
+            "MISSING".red().bold(),
+            m.hash,
+            m.referenced_as
+        );
+    }
+    for t in &check.unreadable_trees {
+        eprintln!(
+            "  {} {}  {}: {}",
+            "UNREADABLE".red().bold(),
+            t.hash,
+            t.referenced_as,
+            t.reason
+        );
+    }
+}
+
+/// Before gc run deletes anything, check that every live object is present.
+/// Aborts with the list unless `--force`; a dry run only warns.
+fn gc_store_precheck(
+    writ_dir: &std::path::Path,
+    dry_run: bool,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !writ_dir.exists() {
+        return Err("not a writ repository (no .writ directory)".into());
+    }
+    let check = writ_core::gc::check_store(writ_dir)?;
+    if check.is_clean() {
+        return Ok(());
+    }
+    let count = check.missing_objects.len() + check.unreadable_trees.len();
+    eprintln!(
+        "{} {} referenced object(s) missing or unreadable:",
+        "store check failed:".red().bold(),
+        count
+    );
+    print_store_problems(&check);
+    if dry_run || force {
+        eprintln!(
+            "  {}",
+            if dry_run {
+                "dry run: continuing, nothing will be deleted"
+            } else {
+                "--force: proceeding anyway"
+            }
+            .yellow()
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "gc run aborted: {count} referenced object(s) missing; run `writ verify --all-chains` for details, or pass --force to proceed"
+    )
+    .into())
 }
 
 fn cmd_gc_committed(

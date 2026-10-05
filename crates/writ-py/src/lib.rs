@@ -176,12 +176,16 @@ struct SealResult {
     file_scope_warning: Option<writ_core::repo::FileScopeWarning>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hints: Vec<String>,
+    /// Pending files the default seal scope left out, with reasons (S.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    left_out: Option<writ_core::seal_scope::SealScope>,
 }
 
 fn build_seal_result(
     repo: &writ_core::Repository,
     seal: writ_core::seal::Seal,
     conflict_warning: Option<writ_core::repo::SealConflictWarning>,
+    scope: Option<writ_core::seal_scope::SealScope>,
 ) -> SealResult {
     let file_scope_warning = seal.spec_id.as_ref().and_then(|sid| {
         let changed: Vec<String> = seal.changes.iter().map(|c| c.path.clone()).collect();
@@ -213,11 +217,27 @@ fn build_seal_result(
         );
     }
 
+    let left_out = scope.filter(|s| s.has_left_out());
+    if let (Some(scope), Some(sid)) = (&left_out, seal.spec_id.as_deref()) {
+        for line in scope.left_out_lines() {
+            hints.push(format!("LEFT_OUT: {line}"));
+        }
+        if let Some(line) = scope.retry_line(&seal.summary, sid, &seal.agent.id, false) {
+            let lead = if scope.retry_needs_paths() {
+                "Another agent is working here; replace <paths> with the files you changed and run"
+            } else {
+                "If you changed these files, seal them with"
+            };
+            hints.push(format!("{lead}: {line}"));
+        }
+    }
+
     SealResult {
         seal,
         conflict_warning,
         file_scope_warning,
         hints,
+        left_out,
     }
 }
 
@@ -271,7 +291,7 @@ impl PyRepository {
     /// seal, the HEAD recorded at that time is used to check whether another
     /// agent sealed in between. If so, the returned dict includes a
     /// `conflict_warning` field with details.
-    #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="complete", paths=None, tests_passed=None, tests_failed=None, linted=false, allow_empty=false))]
+    #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="in-progress", paths=None, tests_passed=None, tests_failed=None, linted=false, allow_empty=false))]
     fn seal(
         &self,
         py: Python,
@@ -321,12 +341,12 @@ impl PyRepository {
                 )
                 .map_err(writ_err)?;
             self.inner.clear_context_head();
-            let result = build_seal_result(&self.inner, seal, None);
+            let result = build_seal_result(&self.inner, seal, None, None);
             to_pydict(py, &result)
         } else if tracked_head.is_some() {
-            let (seal, warning) = self
+            let (seal, warning, scope) = self
                 .inner
-                .seal_with_check(
+                .seal_with_check_scoped(
                     agent,
                     summary.to_string(),
                     spec_id,
@@ -337,21 +357,22 @@ impl PyRepository {
                 )
                 .map_err(writ_err)?;
             self.inner.clear_context_head();
-            let result = build_seal_result(&self.inner, seal, warning);
+            let result = build_seal_result(&self.inner, seal, warning, scope);
             to_pydict(py, &result)
         } else {
-            let seal = self
+            let (seal, scope) = self
                 .inner
-                .seal(
+                .seal_scoped(
                     agent,
                     summary.to_string(),
                     spec_id,
                     task_status,
                     verification,
                     allow_empty,
+                    writ_core::seal_scope::ScopeMode::Seal,
                 )
                 .map_err(writ_err)?;
-            let result = build_seal_result(&self.inner, seal, None);
+            let result = build_seal_result(&self.inner, seal, None, scope);
             to_pydict(py, &result)
         }
     }
@@ -359,7 +380,7 @@ impl PyRepository {
     /// Seal with optimistic conflict detection.
     ///
     /// Returns a dict with `seal` and optional `conflict_warning`.
-    #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="complete", tests_passed=None, tests_failed=None, linted=false, allow_empty=false, expected_head=None))]
+    #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="in-progress", tests_passed=None, tests_failed=None, linted=false, allow_empty=false, expected_head=None))]
     fn seal_with_check(
         &self,
         py: Python,
@@ -385,9 +406,9 @@ impl PyRepository {
             linted,
         };
 
-        let (seal, warning) = self
+        let (seal, warning, scope) = self
             .inner
-            .seal_with_check(
+            .seal_with_check_scoped(
                 agent,
                 summary.to_string(),
                 spec_id,
@@ -398,7 +419,7 @@ impl PyRepository {
             )
             .map_err(writ_err)?;
 
-        let result = build_seal_result(&self.inner, seal, warning);
+        let result = build_seal_result(&self.inner, seal, warning, scope);
         to_pydict(py, &result)
     }
 
@@ -649,7 +670,11 @@ impl PyRepository {
     ///   add_spec(id="my-id", title="My Title")   — explicit ID (keyword)
     ///   add_spec("my-id", "My Title")             — explicit ID (positional, backward compat)
     ///   add_spec(title="OAuth2 auth")             — auto-generated ID
-    #[pyo3(signature = (id=None, title="", description="", acceptance_criteria=None, design_notes=None, tech_stack=None))]
+    ///
+    /// `file_scope` declares the files the spec owns (paths, `dir/`
+    /// prefixes, globs); seals without `paths` then capture exactly these.
+    #[pyo3(signature = (id=None, title="", description="", acceptance_criteria=None, design_notes=None, tech_stack=None, file_scope=None))]
+    #[allow(clippy::too_many_arguments)]
     fn add_spec(
         &self,
         py: Python,
@@ -659,6 +684,7 @@ impl PyRepository {
         acceptance_criteria: Option<Vec<String>>,
         design_notes: Option<Vec<String>>,
         tech_stack: Option<Vec<String>>,
+        file_scope: Option<Vec<String>>,
     ) -> PyResult<PyObject> {
         let (final_id, final_title) = match (id, title.is_empty()) {
             // add_spec(title="OAuth2 auth") — auto-generate ID from title
@@ -687,6 +713,9 @@ impl PyRepository {
         }
         if let Some(ts) = tech_stack {
             spec.tech_stack = ts;
+        }
+        if let Some(fs) = file_scope {
+            spec.file_scope = fs;
         }
         self.inner.add_spec(&spec).map_err(writ_err)?;
         to_pydict(py, &spec)
@@ -1267,6 +1296,12 @@ impl PyRepository {
             strategy: String,
             dry_run: bool,
             specs_finished: usize,
+            /// What was left out (S.1): drift, unsealed, in-progress paths.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            left_out: Option<writ_core::repo::FinishPlan>,
+            /// Sealed paths git refused to stage, with reasons (finding 44).
+            #[serde(skip_serializing_if = "Vec::is_empty")]
+            refused: Vec<(String, String)>,
         }
 
         // Validate strategy
@@ -1297,6 +1332,8 @@ impl PyRepository {
                 strategy: strategy.to_string(),
                 dry_run,
                 specs_finished: 0,
+                left_out: None,
+                refused: Vec::new(),
             };
             return to_pydict(py, &result);
         }
@@ -1330,11 +1367,14 @@ impl PyRepository {
                     specs: spec_ids,
                 }],
             };
+            let ids: Vec<String> = committable.iter().map(|s| s.id.clone()).collect();
             let result = FinishResult {
                 specs_finished: committable.len(),
                 commits,
                 strategy: strategy.to_string(),
                 dry_run: true,
+                left_out: Some(self.inner.finish_plan(&ids).map_err(writ_err)?),
+                refused: Vec::new(),
             };
             return to_pydict(py, &result);
         }
@@ -1344,6 +1384,9 @@ impl PyRepository {
         let git = Git2Ops::open(root).map_err(|e| WritError::new_err(e.to_string()))?;
 
         let mut commits = Vec::new();
+        let mut refused: Vec<(String, String)> = Vec::new();
+        let all_ids: Vec<String> = committable.iter().map(|s| s.id.clone()).collect();
+        let left_out = self.inner.finish_plan(&all_ids).map_err(writ_err)?;
 
         match strategy {
             "per-spec" => {
@@ -1351,15 +1394,16 @@ impl PyRepository {
                 sorted.sort_by_key(|s| s.completed_at);
 
                 for s in &sorted {
-                    // Stage files in this spec's scope if available, otherwise stage all
-                    if !s.file_scope.is_empty() {
-                        let paths: Vec<&str> = s.file_scope.iter().map(|p| p.as_str()).collect();
-                        git.stage_files(&paths)
-                            .map_err(|e| WritError::new_err(e.to_string()))?;
-                    } else {
-                        git.stage_all()
-                            .map_err(|e| WritError::new_err(e.to_string()))?;
-                    }
+                    // S.1: stage only this spec's sealed paths, sealed content.
+                    let plan = self
+                        .inner
+                        .finish_plan(std::slice::from_ref(&s.id))
+                        .map_err(writ_err)?;
+                    let outcome = self
+                        .inner
+                        .stage_finish_plan(&git, &plan, false)
+                        .map_err(writ_err)?;
+                    refused.extend(outcome.refused);
 
                     if !git
                         .has_staged_changes()
@@ -1385,9 +1429,12 @@ impl PyRepository {
                 }
             }
             _ => {
-                // Single commit strategy
-                git.stage_all()
-                    .map_err(|e| WritError::new_err(e.to_string()))?;
+                // Single commit strategy: completed specs' sealed paths only.
+                let outcome = self
+                    .inner
+                    .stage_finish_plan(&git, &left_out, false)
+                    .map_err(writ_err)?;
+                refused.extend(outcome.refused);
 
                 if !git
                     .has_staged_changes()
@@ -1398,6 +1445,8 @@ impl PyRepository {
                         strategy: strategy.to_string(),
                         dry_run: false,
                         specs_finished: 0,
+                        left_out: Some(left_out),
+                        refused,
                     };
                     return to_pydict(py, &result);
                 }
@@ -1430,6 +1479,8 @@ impl PyRepository {
             strategy: strategy.to_string(),
             dry_run: false,
             specs_finished,
+            left_out: Some(left_out),
+            refused,
         };
         to_pydict(py, &result)
     }

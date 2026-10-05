@@ -1952,9 +1952,9 @@ fn prune_unused_python_imports(content: &str) -> String {
 
 /// Fix formatting in merged Python content.
 ///
-/// Ensures 2 blank lines before top-level `class` and `def` definitions
-/// (PEP 8). Does not add blank lines at the very start of the file or
-/// after import blocks.
+/// Ensures exactly 2 blank lines before top-level `class` and `def`
+/// definitions (PEP 8), including after an import block. Does not add blank
+/// lines at the very start of the file.
 fn fix_python_formatting(content: &str) -> String {
     let lines: Vec<&str> = content.lines().collect();
     let mut result: Vec<String> = Vec::new();
@@ -1976,16 +1976,9 @@ fn fix_python_formatting(content: &str) -> String {
                 }
             }
 
-            // Check if the preceding non-blank line is an import —
-            // only need 2 blanks between import block and first definition.
-            let prev_is_import = result
-                .iter()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .map(|l| is_import_line(l))
-                .unwrap_or(false);
-
-            let needed = if prev_is_import { 2 } else { 2 };
+            // PEP 8: exactly 2 blank lines before a top-level definition,
+            // including the first one after an import block.
+            let needed = 2;
 
             // Add blank lines to reach the needed count.
             while trailing_blanks < needed {

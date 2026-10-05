@@ -75,6 +75,7 @@ def make_overlapping_repo(tmp_path: Path):
         agent_type="agent",
         spec_id="feat-a",
         status="in-progress",
+        paths=["shared.rs"],
     )
 
     # Spec B modifies shared.rs differently
@@ -85,6 +86,7 @@ def make_overlapping_repo(tmp_path: Path):
         agent_type="agent",
         spec_id="feat-b",
         status="in-progress",
+        paths=["shared.rs"],
     )
 
     return repo, seal_a, seal_b
@@ -154,6 +156,7 @@ class TestSealReturnsConvergenceInfo:
             agent_type="agent",
             spec_id="s1",
             status="in-progress",
+            paths=["a.txt"],
         )
 
         (path / "b.txt").write_text("agent-b work\n")
@@ -163,6 +166,7 @@ class TestSealReturnsConvergenceInfo:
             agent_type="agent",
             spec_id="s2",
             status="in-progress",
+            paths=["b.txt"],
         )
 
         conv = seal_b.get("convergence")
@@ -268,6 +272,7 @@ class TestSealConvergenceDisabledViaConfig:
             agent_type="agent",
             spec_id="feat-a",
             status="in-progress",
+            paths=["shared.rs"],
         )
 
         (tmp_path / "shared.rs").write_text("// version B\n")
@@ -277,6 +282,7 @@ class TestSealConvergenceDisabledViaConfig:
             agent_type="agent",
             spec_id="feat-b",
             status="in-progress",
+            paths=["shared.rs"],
         )
 
         conv = seal_b.get("convergence")
@@ -338,21 +344,24 @@ class TestSealCLIShowsConvergenceOutput:
         # Baseline seal with shared file
         (path / "shared.rs").write_text("// base\nfn hello() {}\n")
         run_writ(
-            ["seal", "-s", "baseline", "--agent", "setup", "--spec", "setup-spec"],
+            ["seal", "-s", "baseline", "--agent", "setup", "--spec", "setup-spec",
+             "--paths", "shared.rs"],
             path,
         )
 
         # Spec A modifies shared file
         (path / "shared.rs").write_text("// base\nfn hello() {}\nfn a() {}\n")
         run_writ(
-            ["seal", "-s", "a work", "--agent", "agent-a", "--spec", "feat-a"],
+            ["seal", "-s", "a work", "--agent", "agent-a", "--spec", "feat-a",
+             "--paths", "shared.rs"],
             path,
         )
 
         # Spec B modifies shared file differently
         (path / "shared.rs").write_text("// base\nfn hello() {}\nfn b() {}\n")
         result = run_writ(
-            ["seal", "-s", "b work", "--agent", "agent-b", "--spec", "feat-b"],
+            ["seal", "-s", "b work", "--agent", "agent-b", "--spec", "feat-b",
+             "--paths", "shared.rs"],
             path, check=False,
         )
 
@@ -417,6 +426,7 @@ class TestFiveAgentsSealTriggeredConvergence:
             agent_type="agent",
             spec_id="auth",
             status="in-progress",
+            paths=["shared.rs", "auth.py"],
         )
         seals.append(("auth", s))
 
@@ -429,6 +439,7 @@ class TestFiveAgentsSealTriggeredConvergence:
             agent_type="agent",
             spec_id="payments",
             status="in-progress",
+            paths=["shared.rs", "payments.py"],
         )
         seals.append(("payments", s))
 
@@ -440,6 +451,7 @@ class TestFiveAgentsSealTriggeredConvergence:
             agent_type="agent",
             spec_id="dashboard",
             status="in-progress",
+            paths=["dashboard.js"],
         )
         seals.append(("dashboard", s))
 
@@ -452,6 +464,7 @@ class TestFiveAgentsSealTriggeredConvergence:
             agent_type="agent",
             spec_id="api",
             status="in-progress",
+            paths=["config.toml", "api.py"],
         )
         seals.append(("api", s))
 
@@ -464,6 +477,7 @@ class TestFiveAgentsSealTriggeredConvergence:
             agent_type="agent",
             spec_id="monitoring",
             status="in-progress",
+            paths=["config.toml", "monitor.py"],
         )
         seals.append(("monitoring", s))
 

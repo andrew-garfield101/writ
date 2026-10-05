@@ -43,6 +43,7 @@ def make_sealed_overlapping_specs(tmp_path: Path):
         agent_type="agent",
         spec_id="feat-a",
         status="in-progress",
+        paths=["shared.rs"],
     )
 
     # Spec B adds feature_b to shared.rs
@@ -53,6 +54,7 @@ def make_sealed_overlapping_specs(tmp_path: Path):
         agent_type="agent",
         spec_id="feat-b",
         status="in-progress",
+        paths=["shared.rs"],
     )
 
     # Mark both specs done
@@ -121,12 +123,14 @@ class TestConvergeFromSealTrees:
         repo.seal(
             summary="a", agent_id="a1", agent_type="agent",
             spec_id="s1", status="in-progress",
+            paths=["a.txt"],
         )
 
         (path / "b.txt").write_text("b work\n")
         repo.seal(
             summary="b", agent_id="b1", agent_type="agent",
             spec_id="s2", status="in-progress",
+            paths=["b.txt"],
         )
 
         repo.spec_done("s1")
@@ -145,6 +149,7 @@ class TestConvergeFromSealTrees:
         repo.seal(
             summary="solo", agent_id="a1", agent_type="agent",
             spec_id="solo", status="in-progress",
+            paths=["file.txt"],
         )
         repo.spec_done("solo")
 
@@ -191,6 +196,7 @@ class TestFinalizeConvergence:
         repo.seal(
             summary="wip", agent_id="a1", agent_type="agent",
             spec_id="wip", status="in-progress",
+            paths=["file.txt"],
         )
 
         report = repo.finalize_convergence()
@@ -269,6 +275,7 @@ class TestFullV3Workflow:
             agent_type="agent",
             spec_id="auth-module",
             status="in-progress",
+            paths=["shared.rs", "auth.py"],
         )
         repo.spec_done("auth-module")
 
@@ -281,6 +288,7 @@ class TestFullV3Workflow:
             agent_type="agent",
             spec_id="payment-system",
             status="in-progress",
+            paths=["shared.rs", "pay.py"],
         )
         repo.spec_done("payment-system")
 
@@ -292,6 +300,7 @@ class TestFullV3Workflow:
             agent_type="agent",
             spec_id="dashboard-ui",
             status="in-progress",
+            paths=["dash.js"],
         )
         repo.spec_done("dashboard-ui")
 

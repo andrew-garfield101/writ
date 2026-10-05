@@ -107,6 +107,7 @@ class TestMagicWorkflowIntegration:
             agent_type="agent",
             spec_id=payments_id,
             status="in-progress",
+            paths=["payments.py"],
         )
 
         # 4. Context shows remaining unclaimed spec.

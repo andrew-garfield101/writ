@@ -33,7 +33,9 @@ pub struct SealParams {
     pub spec: Option<String>,
     /// Your agent identity (defaults to 'claude-code').
     pub agent: Option<String>,
-    /// Specific file paths to seal (default: all changes).
+    /// The files you changed. Without it, only files your spec owns are
+    /// sealed (its scope plus files its earlier seals captured); other
+    /// agents' pending files are never included.
     pub paths: Option<Vec<String>>,
     /// Allow sealing with zero file changes (metadata-only seal).
     pub allow_empty: Option<bool>,
@@ -47,6 +49,9 @@ pub struct SpecAddParams {
     pub summary: String,
     /// Optional longer description with implementation details.
     pub description: Option<String>,
+    /// Files this task owns: paths, `dir/` prefixes, or globs such as
+    /// `src/auth/**`. Seals without `paths` then capture exactly these.
+    pub scope: Option<Vec<String>>,
 }
 
 /// Parameters for writ_spec_done tool.
@@ -56,6 +61,9 @@ pub struct SpecDoneParams {
     pub id: Option<String>,
     /// Optional completion summary.
     pub summary: Option<String>,
+    /// Files to include in the final seal. Without it, only files the spec
+    /// owns are sealed.
+    pub paths: Option<Vec<String>>,
 }
 
 /// Parameters for writ_status tool.
@@ -374,6 +382,9 @@ impl WritMcpServer {
             self.agent_id.clone(),
         ];
 
+        for glob in params.scope.unwrap_or_default() {
+            args.extend(["--scope".to_string(), glob]);
+        }
         if let Some(d) = params.description {
             args.extend(["--description".to_string(), d]);
         }
@@ -443,6 +454,9 @@ impl WritMcpServer {
         }
         if let Some(s) = params.summary {
             args.extend(["-s".to_string(), s]);
+        }
+        if let Some(p) = params.paths {
+            args.extend(["--paths".to_string(), p.join(",")]);
         }
         // Pass agent identity so the completion seal and auto-scoping
         // know which agent is calling (fixes T1-BUG-22 and T1-BUG-23).
@@ -1254,6 +1268,7 @@ mod tests {
             .writ_spec_add(Parameters(SpecAddParams {
                 summary: "Add authentication flow".to_string(),
                 description: None,
+                scope: None,
             }))
             .await
             .unwrap();
@@ -1279,6 +1294,7 @@ mod tests {
             .writ_spec_add(Parameters(SpecAddParams {
                 summary: "Add auth".to_string(),
                 description: Some("OAuth2 flow".to_string()),
+                scope: None,
             }))
             .await
             .unwrap();
@@ -1299,6 +1315,7 @@ mod tests {
             .writ_spec_done(Parameters(SpecDoneParams {
                 id: None,
                 summary: None,
+                paths: None,
             }))
             .await
             .unwrap();
@@ -1318,6 +1335,7 @@ mod tests {
             .writ_spec_done(Parameters(SpecDoneParams {
                 id: Some("feat-1".to_string()),
                 summary: Some("all tests pass".to_string()),
+                paths: None,
             }))
             .await
             .unwrap();

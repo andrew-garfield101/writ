@@ -204,8 +204,8 @@ fn remove_claude_permissions(root: &Path) -> WritResult<Option<String>> {
 const WRIT_INSTRUCTION: &str = "MANDATORY: This project uses writ for version control. \
 You MUST follow this workflow — it is not optional. \
 1) BEFORE starting any work, run `writ context` to check project state. \
-2) If no spec is assigned to you, create one: `writ spec add \"brief description of your task\"`. \
-3) AFTER each meaningful unit of work, run `writ seal -s '<summary>'` to checkpoint (auto-scoped to your spec). \
+2) If no spec is assigned to you, create one: `writ spec add \"brief description of your task\" --scope \"<glob of files you will change>\"`. \
+3) AFTER each meaningful unit of work, run `writ seal -s '<summary>' --paths <changed files, comma-separated>` to checkpoint (auto-scoped to your spec). \
 4) When your task is complete, run `writ spec done` BEFORE reporting results (auto-scoped to your spec). \
 Your task is NOT complete until you have sealed your work. \
 NEVER run `git commit`, `git add`, `git push`, or `writ finish` — the user handles git.";
@@ -1059,8 +1059,8 @@ fn writ_claude_md_section() -> String {
 **FIRST ACTION: Run `writ context` before doing anything else.**
 
 **EVERY TASK requires these 3 commands — no exceptions, no matter how small the task:**
-1. `writ spec add "brief description of your task"` — register your task (ID auto-generated)
-2. `writ seal -s "<summary>"` — after each unit of work (auto-scoped to your spec)
+1. `writ spec add "brief description of your task" --scope "<glob of files you will change>"` — register your task (ID auto-generated)
+2. `writ seal -s "<summary>" --paths <changed files, comma-separated>` — after each unit of work (auto-scoped to your spec)
 3. `writ spec done` — BEFORE reporting results to the user (auto-scoped to your spec)
 
 Your task is NOT complete until you have run all three.
@@ -1068,7 +1068,7 @@ Do NOT run `git commit`, `git add`, `git push`, or `writ finish`.
 
 ### Commands
 - `writ context` — structured project state (files, specs, activity). Run this FIRST.
-- `writ seal -s "<summary>"` — checkpoint your work (auto-scoped to your claimed spec)
+- `writ seal -s "<summary>" --paths <changed files, comma-separated>` — checkpoint your work (auto-scoped to your claimed spec)
 - `writ spec add "brief task description"` — create a task spec (ID auto-generated)
 - `writ spec status` — view active specs
 - `writ spec done` — mark your task complete (auto-scoped to your claimed spec)
@@ -1078,9 +1078,11 @@ Do NOT run `git commit`, `git add`, `git push`, or `writ finish`.
 
 ### Rules
 - You MUST run `writ context` before starting work
-- You MUST run `writ seal -s "<summary>"` after each meaningful unit of work
+- You MUST run `writ seal -s "<summary>" --paths <changed files, comma-separated>` after each meaningful unit of work
 - You MUST run `writ spec done` before reporting results to the user
 - You MUST include meaningful summaries in seals so other agents understand your work
+- `--scope` on `writ spec add` declares the files your task owns; `writ seal` without `--paths` then captures only those. Otherwise pass `--paths` with the files you changed: another agent's pending files are never sealed for you
+- If `writ seal` or `writ spec done` prints `left out:` or `NOT SEALED:`, read the reason and run the command it prints if those files are yours
 - Do NOT run `git add`, `git commit`, or `git push` — the user manages the git round-trip via `writ finish`
 - Do NOT run `writ finish` — this is the git integration command managed by the user or orchestrator
 
@@ -1098,15 +1100,17 @@ This project uses writ for version control. You MUST follow this workflow.
 
 ### Required Workflow
 1. BEFORE starting any work, run `writ context` to check project state
-2. Create a spec for your task: `writ spec add "brief description of your task"`
-3. AFTER each meaningful unit of work, run `writ seal -s "<summary>"` (auto-scoped to your spec)
+2. Create a spec for your task: `writ spec add "brief description of your task" --scope "<glob of files you will change>"`
+3. AFTER each meaningful unit of work, run `writ seal -s "<summary>" --paths <changed files, comma-separated>` (auto-scoped to your spec)
 4. When complete, run `writ spec done` BEFORE reporting results (auto-scoped to your spec)
 
 Your task is NOT complete until you have sealed your work.
+`--scope` declares the files your task owns; without it, pass `--paths` with the files you changed.
+If a seal prints `left out:` or `NOT SEALED:`, run the command it prints if those files are yours.
 
 ### Commands
 - `writ context` — structured project state. Run this FIRST.
-- `writ seal -s "<summary>"` — checkpoint work (auto-scoped to your spec)
+- `writ seal -s "<summary>" --paths <changed files, comma-separated>` — checkpoint work (auto-scoped to your spec)
 - `writ spec add "task description"` — create a spec (ID auto-generated)
 - `writ spec done` — mark task complete (auto-scoped)
 - `writ status` — project overview
@@ -1136,9 +1140,9 @@ This project uses writ for version control. The `writ` CLI is available in PATH.
 You MUST follow these steps. They are not optional.
 
 1. BEFORE starting any work, run `writ context` to check project state
-2. If no spec is assigned to you, create one: `writ spec add "brief description of your task"`
+2. If no spec is assigned to you, create one: `writ spec add "brief description of your task" --scope "<glob of files you will change>"`
 3. Do your work in small increments
-4. AFTER each meaningful unit of work, run `writ seal -s "<summary>"` to checkpoint (auto-scoped to your spec)
+4. AFTER each meaningful unit of work, run `writ seal -s "<summary>" --paths <changed files, comma-separated>` to checkpoint (auto-scoped to your spec)
 5. Check `writ context` periodically to see what other agents have done
 6. When task is complete, run `writ spec done` BEFORE reporting results (auto-scoped to your spec)
 
@@ -1173,7 +1177,7 @@ Available formats:
 
 - `writ context` — structured project state
 - `writ context --spec <id>` — context scoped to a specific task
-- `writ seal -s "<summary>"` — checkpoint work (auto-scoped to your spec)
+- `writ seal -s "<summary>" --paths <changed files, comma-separated>` — checkpoint work (auto-scoped to your spec)
 - `writ spec add "brief task description"` — create a task spec (ID auto-generated)
 - `writ spec status` — view active specs
 - `writ spec done` — mark your task complete (auto-scoped to your spec)
@@ -1185,10 +1189,12 @@ Available formats:
 ## Rules
 
 - You MUST run `writ context` before starting work
-- You MUST run `writ seal -s "<summary>" --agent claude-code` after each meaningful unit of work
+- You MUST run `writ seal -s "<summary>" --agent claude-code --paths <changed files, comma-separated>` after each meaningful unit of work
 - You MUST run `writ spec done` before reporting results to the user
 - Your task is NOT complete until sealed
 - Include meaningful summaries in seals for other agents' context
+- `--scope` on `writ spec add` declares the files your task owns; `writ seal` without `--paths` then captures only those. Otherwise pass `--paths` with the files you changed: another agent's pending files are never sealed for you
+- If `writ seal` or `writ spec done` prints `left out:` or `NOT SEALED:`, read the reason and run the command it prints if those files are yours
 - Include test results when available: `--tests-passed N --tests-failed M`
 - Do NOT run `git add`, `git commit`, or `git push` — the user manages git via `writ finish`
 - Do NOT run `writ finish` — this is the git integration command managed by the user or orchestrator
@@ -1198,7 +1204,7 @@ Available formats:
 ### System Prompt Snippet
 Add to your agent's system prompt:
 "MANDATORY: This project uses writ for version control. You MUST run `writ context`
-before starting work. You MUST run `writ seal -s '<summary>' --agent claude-code` after each unit of work.
+before starting work. You MUST run `writ seal -s '<summary>' --paths <changed files, comma-separated> --agent claude-code` after each unit of work.
 You MUST run `writ spec done <id>` before reporting results. Your task is NOT complete
 until sealed. NEVER run git commit or writ finish."
 

@@ -63,6 +63,7 @@ def diverged_repo(tmp_path):
         agent_type="agent",
         spec_id="spec-a",
         status="in-progress",
+        paths=["module_a.py"],
     )
 
     # Step 2: Agent B writes module_b.py, seals under spec-b
@@ -73,6 +74,7 @@ def diverged_repo(tmp_path):
         agent_type="agent",
         spec_id="spec-b",
         status="in-progress",
+        paths=["module_b.py"],
     )
 
     # Step 3: Agent A seals under spec-a AGAIN — this forks the chain!
@@ -86,6 +88,7 @@ def diverged_repo(tmp_path):
         agent_type="agent",
         spec_id="spec-a",
         status="in-progress",
+        paths=["module_a.py"],
     )
 
     return repo, tmp_path
@@ -131,6 +134,7 @@ def conflicting_repo(tmp_path):
         agent_type="agent",
         spec_id="spec-b",
         status="in-progress",
+        paths=["shared.py"],
     )
 
     # Step 3: Agent A seals under spec-a AGAIN — forks the chain!
@@ -143,6 +147,7 @@ def conflicting_repo(tmp_path):
         agent_type="agent",
         spec_id="spec-a",
         status="in-progress",
+        paths=["shared.py", "spec_a_extra.txt"],
     )
 
     return repo, tmp_path

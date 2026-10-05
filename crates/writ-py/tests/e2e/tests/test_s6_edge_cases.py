@@ -146,7 +146,9 @@ class TestConcurrency:
             return subprocess.run(
                 [writ_bin, "seal", "-s", f"concurrent seal {idx}",
                  "--agent", f"agent-{idx}",
-                 "--spec", f"concurrent-{idx}"],
+                 "--spec", f"concurrent-{idx}",
+                 # S.1: each agent names the file it wrote.
+                 "--paths", f"concurrent_{idx}.py"],
                 cwd=writ_project, capture_output=True, text=True,
             )
 
@@ -188,7 +190,8 @@ class TestPerformance:
             (writ_project / f"perf_{i}.py").write_text(f"# {i}\n")
             writ_cmd(writ_bin, writ_project,
                      "seal", "-s", f"perf {i}",
-                     "--agent", f"agent-{i % 3}", "--spec", f"perf-{i}")
+                     "--agent", f"agent-{i % 3}", "--spec", f"perf-{i}",
+                     "--paths", f"perf_{i}.py")
 
         start = time.monotonic()
         ctx = writ_context(writ_bin, writ_project)

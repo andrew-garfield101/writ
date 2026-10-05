@@ -171,8 +171,19 @@ impl ScenarioBuilder {
                 }
             }
 
-            // Seal the agent's work (allow_empty handles identical-change scenarios)
-            let seal_result = repo.seal(
+            // Seal exactly the files this agent touched, as an agent passes
+            // --paths under the S.1 default seal scope. Other files differ
+            // from the index only because the baseline was restored above.
+            let paths: Vec<String> = agent_work
+                .changes
+                .iter()
+                .map(|c| match c {
+                    FileChange::Write(p, _) | FileChange::Append(p, _) | FileChange::Delete(p) => {
+                        p.clone()
+                    }
+                })
+                .collect();
+            let seal_result = repo.seal_paths(
                 AgentIdentity {
                     id: agent_work.agent_id.clone(),
                     agent_type: AgentType::Agent,
@@ -181,6 +192,7 @@ impl ScenarioBuilder {
                 Some(agent_work.spec_id.clone()),
                 writ_core::seal::TaskStatus::InProgress,
                 Verification::default(),
+                &paths,
                 true, // allow_empty — handles cases where changes match prior state
             );
             // NothingToSeal is ok for scenarios with identical changes

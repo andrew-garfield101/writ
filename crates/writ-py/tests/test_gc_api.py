@@ -65,6 +65,7 @@ def gc_repo_with_specs(tmp_path):
         agent_type="agent",
         spec_id="feat-cancel",
         status="in-progress",
+        paths=["cancel.py"],
     )
 
     return repo, tmp_path
@@ -373,6 +374,7 @@ class TestCompleteSpecContract:
             agent_type="agent",
             spec_id="feat-active",
             status="complete",
+            paths=["done.py"],
         )
         # Now lifecycle completion should succeed
         repo.complete_spec("feat-active")
@@ -420,6 +422,7 @@ class TestGcAfterTransitions:
             agent_type="agent",
             spec_id="feat-active",
             status="complete",
+            paths=["done.py"],
         )
         repo.complete_spec("feat-active")
         result = repo.gc()

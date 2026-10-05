@@ -6,8 +6,28 @@
 use crate::{WritError, WritResult};
 use std::path::{Path, PathBuf};
 
+/// One path for [`GitOps::stage_contents`]: `content: None` stages a deletion.
+#[derive(Debug, Clone)]
+pub struct StageEntry {
+    pub path: String,
+    pub content: Option<Vec<u8>>,
+}
+
+/// Result of [`GitOps::stage_contents`].
+#[derive(Debug, Clone, Default)]
+pub struct StageOutcome {
+    /// Paths written to the git index.
+    pub staged: Vec<String>,
+    /// Paths git would not take, with the reason (finding 44).
+    pub refused: Vec<(String, String)>,
+}
+
 /// Abstraction over git operations needed by `writ finish`.
 pub trait GitOps {
+    /// Stage exact contents (not the working tree) for each entry. A path
+    /// git cannot take is reported in `refused`, never silently dropped.
+    fn stage_contents(&self, entries: &[StageEntry]) -> WritResult<StageOutcome>;
+
     /// Stage specific files. Returns the number of files staged.
     fn stage_files(&self, paths: &[&str]) -> WritResult<usize>;
 
@@ -60,6 +80,24 @@ mod git2_impl {
                 .map_err(|e| WritError::Other(format!("failed to open git repository: {e}")))
         }
 
+        /// Git file mode for `path`: the tracked mode, else executable when
+        /// the working-tree file is, else a regular blob.
+        fn file_mode(&self, index: &git2::Index, path: &Path) -> u32 {
+            if let Some(existing) = index.get_path(path, 0) {
+                return existing.mode;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(self.root.join(path)) {
+                    if meta.permissions().mode() & 0o111 != 0 {
+                        return 0o100755;
+                    }
+                }
+            }
+            0o100644
+        }
+
         fn default_signature(repo: &Repository) -> WritResult<Signature<'static>> {
             repo.signature().map_err(|e| {
                 WritError::Other(format!(
@@ -70,6 +108,43 @@ mod git2_impl {
     }
 
     impl GitOps for Git2Ops {
+        fn stage_contents(&self, entries: &[StageEntry]) -> WritResult<StageOutcome> {
+            let repo = self.repo()?;
+            let mut index = repo
+                .index()
+                .map_err(|e| WritError::Other(format!("failed to read git index: {e}")))?;
+            let mut outcome = StageOutcome::default();
+            for entry in entries {
+                let path = Path::new(&entry.path);
+                let tracked = index.get_path(path, 0).is_some();
+                let result = match entry.content {
+                    None if !tracked => continue, // never in git: nothing to delete
+                    None => index.remove_path(path).map_err(|e| e.message().to_string()),
+                    Some(ref content) => {
+                        if !tracked && ignored_by_git(&repo, &entry.path) {
+                            outcome.refused.push((
+                                entry.path.clone(),
+                                "ignored by .gitignore and not tracked by git; \
+                                 run `git add -f` to commit it"
+                                    .to_string(),
+                            ));
+                            continue;
+                        }
+                        let mode = self.file_mode(&index, path);
+                        index_entry_add(&mut index, &entry.path, mode, content)
+                    }
+                };
+                match result {
+                    Ok(()) => outcome.staged.push(entry.path.clone()),
+                    Err(reason) => outcome.refused.push((entry.path.clone(), reason)),
+                }
+            }
+            index
+                .write()
+                .map_err(|e| WritError::Other(format!("failed to write git index: {e}")))?;
+            Ok(outcome)
+        }
+
         fn stage_files(&self, paths: &[&str]) -> WritResult<usize> {
             let repo = self.repo()?;
             let mut index = repo
@@ -239,6 +314,56 @@ mod git2_impl {
     }
 }
 
+/// True when git would refuse `git add path` as ignored: the path itself or
+/// any ancestor directory matches an ignore rule. A directory excluded
+/// wholesale hides negations inside it, as git does.
+#[cfg(feature = "bridge")]
+fn ignored_by_git(repo: &git2::Repository, path: &str) -> bool {
+    let ignored = |p: &str| repo.is_path_ignored(Path::new(p)).unwrap_or(false);
+    let mut prefix = String::new();
+    for part in path
+        .split('/')
+        .collect::<Vec<_>>()
+        .split_last()
+        .map(|(_, dirs)| dirs)
+        .unwrap_or(&[])
+    {
+        prefix.push_str(part);
+        prefix.push('/');
+        if ignored(&prefix) {
+            return true;
+        }
+    }
+    ignored(path)
+}
+
+/// Add `content` at `path` to the git index as a blob.
+#[cfg(feature = "bridge")]
+fn index_entry_add(
+    index: &mut git2::Index,
+    path: &str,
+    mode: u32,
+    content: &[u8],
+) -> Result<(), String> {
+    let entry = git2::IndexEntry {
+        ctime: git2::IndexTime::new(0, 0),
+        mtime: git2::IndexTime::new(0, 0),
+        dev: 0,
+        ino: 0,
+        mode,
+        uid: 0,
+        gid: 0,
+        file_size: content.len() as u32,
+        id: git2::Oid::zero(),
+        flags: 0,
+        flags_extended: 0,
+        path: path.as_bytes().to_vec(),
+    };
+    index
+        .add_frombuffer(&entry, content)
+        .map_err(|e| e.message().to_string())
+}
+
 #[cfg(feature = "bridge")]
 pub use git2_impl::Git2Ops;
 
@@ -367,5 +492,81 @@ mod tests {
         init_git_repo(dir.path());
         let ops = Git2Ops::open(dir.path()).unwrap();
         assert_eq!(ops.root(), dir.path());
+    }
+
+    fn head_blob(repo: &git2::Repository, path: &str) -> Option<String> {
+        let tree = repo.head().ok()?.peel_to_tree().ok()?;
+        let entry = tree.get_path(Path::new(path)).ok()?;
+        let blob = repo.find_blob(entry.id()).ok()?;
+        Some(String::from_utf8_lossy(blob.content()).to_string())
+    }
+
+    #[test]
+    fn stage_contents_commits_given_content_not_disk() {
+        let dir = tempdir().unwrap();
+        let repo = init_git_repo(dir.path());
+        let ops = Git2Ops::open(dir.path()).unwrap();
+        fs::write(dir.path().join("a.txt"), "edited after seal").unwrap();
+        let out = ops
+            .stage_contents(&[StageEntry {
+                path: "a.txt".into(),
+                content: Some(b"sealed".to_vec()),
+            }])
+            .unwrap();
+        assert_eq!(out.staged, vec!["a.txt".to_string()]);
+        ops.commit("c").unwrap();
+        assert_eq!(head_blob(&repo, "a.txt").as_deref(), Some("sealed"));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "edited after seal",
+            "working tree untouched"
+        );
+    }
+
+    #[test]
+    fn stage_contents_stages_deletions_of_tracked_files() {
+        let dir = tempdir().unwrap();
+        let repo = init_git_repo(dir.path());
+        let ops = Git2Ops::open(dir.path()).unwrap();
+        fs::write(dir.path().join("gone.txt"), "x").unwrap();
+        ops.stage_files(&["gone.txt"]).unwrap();
+        ops.commit("add").unwrap();
+        fs::remove_file(dir.path().join("gone.txt")).unwrap();
+        let out = ops
+            .stage_contents(&[
+                StageEntry {
+                    path: "gone.txt".into(),
+                    content: None,
+                },
+                StageEntry {
+                    path: "never.txt".into(),
+                    content: None,
+                },
+            ])
+            .unwrap();
+        assert_eq!(out.staged, vec!["gone.txt".to_string()]);
+        ops.commit("rm").unwrap();
+        assert!(head_blob(&repo, "gone.txt").is_none());
+    }
+
+    #[test]
+    fn stage_contents_refuses_gitignored_untracked_path_with_reason() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        fs::write(dir.path().join(".gitignore"), "results/\n").unwrap();
+        fs::create_dir_all(dir.path().join("results")).unwrap();
+        // A negation inside an excluded directory does not un-ignore it.
+        fs::write(dir.path().join("results/.gitignore"), "*\n!.gitignore\n").unwrap();
+        let ops = Git2Ops::open(dir.path()).unwrap();
+        let out = ops
+            .stage_contents(&[StageEntry {
+                path: "results/.gitignore".into(),
+                content: Some(b"*".to_vec()),
+            }])
+            .unwrap();
+        assert!(out.staged.is_empty());
+        assert_eq!(out.refused.len(), 1);
+        assert_eq!(out.refused[0].0, "results/.gitignore");
+        assert!(out.refused[0].1.contains(".gitignore"), "{:?}", out.refused);
     }
 }

@@ -639,7 +639,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         fs::write(dir.path().join("shared.rs"), "// base").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -656,7 +656,7 @@ mod tests {
 
         // Agent 1 modifies shared.rs.
         fs::write(dir.path().join("shared.rs"), "// version A").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "a changes".into(),
             Some("s1".into()),
@@ -668,7 +668,7 @@ mod tests {
 
         // Agent 2 modifies shared.rs differently.
         fs::write(dir.path().join("shared.rs"), "// version B").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "b changes".into(),
             Some("s2".into()),
@@ -694,7 +694,7 @@ mod tests {
         let repo2 = Repository::init(dir2.path()).unwrap();
         fs::write(dir2.path().join("shared.rs"), "// base").unwrap();
         repo2
-            .seal(
+            .seal_all_pending(
                 agent("setup"),
                 "baseline".into(),
                 None,
@@ -717,7 +717,7 @@ mod tests {
         // Now create seals.
         fs::write(dir2.path().join("shared.rs"), "// version A").unwrap();
         repo2
-            .seal(
+            .seal_all_pending(
                 agent("a1"),
                 "a".into(),
                 Some("s1".into()),
@@ -728,7 +728,7 @@ mod tests {
             .unwrap();
         fs::write(dir2.path().join("shared.rs"), "// version B").unwrap();
         repo2
-            .seal(
+            .seal_all_pending(
                 agent("b1"),
                 "b".into(),
                 Some("s2".into()),
@@ -759,7 +759,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         fs::write(dir.path().join("base.txt"), "base").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -777,7 +777,7 @@ mod tests {
 
         // Disjoint files.
         fs::write(dir.path().join("auth.rs"), "auth code").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "auth".into(),
             Some("s1".into()),
@@ -787,7 +787,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join("pay.rs"), "pay code").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "pay".into(),
             Some("s2".into()),
@@ -827,7 +827,7 @@ mod tests {
         // Base file with 5 lines.
         let base = "line1\nline2\nline3\nline4\nline5\n";
         fs::write(dir.path().join("shared.txt"), base).unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -849,7 +849,7 @@ mod tests {
             "CHANGED_A\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "change top".into(),
             Some("s1".into()),
@@ -865,7 +865,7 @@ mod tests {
             "line1\nline2\nline3\nline4\nCHANGED_B\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "change bottom".into(),
             Some("s2".into()),
@@ -908,7 +908,7 @@ mod tests {
         let repo = Repository::init(dir.path()).unwrap();
         // Same line, different edits = true conflict.
         fs::write(dir.path().join("shared.txt"), "original line\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -926,7 +926,7 @@ mod tests {
 
         // Both agents rewrite the same line differently.
         fs::write(dir.path().join("shared.txt"), "agent A version\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "a edit".into(),
             Some("s1".into()),
@@ -936,7 +936,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join("shared.txt"), "agent B version\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "b edit".into(),
             Some("s2".into()),
@@ -1004,7 +1004,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         fs::write(dir.path().join("base.txt"), "base").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -1022,7 +1022,7 @@ mod tests {
 
         // 1 clean seal + 2 overlapping seals = 3 seals total.
         fs::write(dir.path().join("clean.txt"), "no overlap").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("c1"),
             "clean".into(),
             Some("s1".into()),
@@ -1033,7 +1033,7 @@ mod tests {
         .unwrap();
 
         fs::write(dir.path().join("shared.txt"), "version A").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "a".into(),
             Some("s1".into()),
@@ -1043,7 +1043,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join("shared.txt"), "version B").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "b".into(),
             Some("s2".into()),
@@ -1073,7 +1073,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         fs::write(dir.path().join("shared.txt"), "base").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -1090,7 +1090,7 @@ mod tests {
         let mut state = WatchState::new(&repo).unwrap();
 
         fs::write(dir.path().join("shared.txt"), "A").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "a".into(),
             Some("s1".into()),
@@ -1100,7 +1100,7 @@ mod tests {
         )
         .unwrap();
         fs::write(dir.path().join("shared.txt"), "B").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "b".into(),
             Some("s2".into()),
@@ -1147,7 +1147,7 @@ mod tests {
 
         let base = "line1\nline2\nline3\nline4\nline5\n";
         fs::write(dir.path().join("shared.txt"), base).unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -1168,7 +1168,7 @@ mod tests {
             "CHANGED_A\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "change top".into(),
             Some("s1".into()),
@@ -1183,7 +1183,7 @@ mod tests {
             "line1\nline2\nline3\nline4\nCHANGED_B\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "change bottom".into(),
             Some("s2".into()),
@@ -1241,7 +1241,7 @@ mod tests {
 
         let base = "line1\nline2\nline3\nline4\nline5\n";
         fs::write(dir.path().join("shared.txt"), base).unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -1266,7 +1266,7 @@ mod tests {
             "CHANGED_A\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "change top".into(),
             Some("s1".into()),
@@ -1282,7 +1282,7 @@ mod tests {
             "line1\nline2\nline3\nline4\nCHANGED_B\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "change bottom".into(),
             Some("s2".into()),
@@ -1307,7 +1307,7 @@ mod tests {
         // Now a third spec creates an unrelated seal — this triggers a new cycle
         // with new seals detected, but the s1/s2 overlap hasn't changed.
         fs::write(dir.path().join("unrelated.txt"), "something else").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("c1"),
             "unrelated work".into(),
             Some("s3".into()),
@@ -1335,7 +1335,7 @@ mod tests {
 
         let base = "line1\nline2\nline3\nline4\nline5\n";
         fs::write(dir.path().join("shared.txt"), base).unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -1358,7 +1358,7 @@ mod tests {
             "CHANGED_A\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "change top".into(),
             Some("s1".into()),
@@ -1374,7 +1374,7 @@ mod tests {
             "line1\nline2\nline3\nline4\nCHANGED_B\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "change bottom".into(),
             Some("s2".into()),
@@ -1402,7 +1402,7 @@ mod tests {
             "CHANGED_A_V2\nline2\nline3\nline4\nCHANGED_B\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "second edit".into(),
             Some("s1".into()),

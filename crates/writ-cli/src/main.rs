@@ -15,8 +15,9 @@ use writ_core::context::{ContextFilter, ContextLimits, ContextScope};
 use writ_core::diff::LineOp;
 use writ_core::format;
 use writ_core::seal::{AgentIdentity, AgentType, ChangeType, TaskStatus, Verification};
+use writ_core::seal_scope::{self, ScopeMode, SealScope};
 use writ_core::spec::{Spec, SpecUpdate};
-use writ_core::Repository;
+use writ_core::{Repository, WritError};
 
 #[derive(Parser)]
 #[command(name = "writ", about = "writ — AI-native version control", version)]
@@ -424,6 +425,11 @@ enum Commands {
         #[arg(long, default_value = "single")]
         strategy: String,
 
+        /// Also commit changes no completed spec sealed, and edits made
+        /// after a file was sealed (working-tree content). Off by default.
+        #[arg(long)]
+        include_unsealed: bool,
+
         /// Create a proposal instead of committing directly (propose mode).
         #[arg(long)]
         propose: bool,
@@ -586,6 +592,18 @@ enum Commands {
         /// Verify a specific seal by ID (or prefix).
         #[arg(long)]
         seal: Option<String>,
+
+        /// Output format: "human" (default from settings) or "json".
+        #[arg(long)]
+        format: Option<String>,
+    },
+
+    /// Regenerate referenced-but-missing store objects from the working tree
+    /// or git history, verified by SHA-256. Exits 1 if anything stays missing.
+    Repair {
+        /// List what is missing and what is recoverable without writing.
+        #[arg(long)]
+        dry_run: bool,
 
         /// Output format: "human" (default from settings) or "json".
         #[arg(long)]
@@ -844,6 +862,12 @@ enum SpecCommands {
         /// Agent identity for auto-claiming the created spec.
         #[arg(long)]
         agent: Option<String>,
+
+        /// Files this spec owns: a path, a `dir/` prefix, or a glob such as
+        /// `src/auth/**`. Repeatable. Sets the spec's file_scope, so
+        /// `writ seal` without --paths captures exactly these files.
+        #[arg(long = "scope", value_name = "GLOB")]
+        scope: Vec<String>,
     },
 
     /// Show all specs and their status.
@@ -877,6 +901,15 @@ enum SpecCommands {
         /// Agent ID for the final seal.
         #[arg(long)]
         agent: Option<String>,
+
+        /// Seal only these paths (comma-separated) in the final seal. Without
+        /// it, the final seal takes only files the spec owns, never others.
+        #[arg(long, value_delimiter = ',', conflicts_with = "no_seal")]
+        paths: Option<Vec<String>>,
+
+        /// Close the spec without a final seal; pending files stay pending.
+        #[arg(long)]
+        no_seal: bool,
     },
 
     /// Complete a spec's lifecycle (transitions to Completed).
@@ -1437,6 +1470,7 @@ fn main() {
             auto,
             cleanup,
             no_cleanup,
+            include_unsealed,
         } => {
             if proposals {
                 cmd_finish_proposals(&cwd)
@@ -1449,7 +1483,18 @@ fn main() {
             } else if auto {
                 cmd_finish_auto(&cwd, &strategy)
             } else {
-                cmd_finish(&cwd, full, dry_run, yes, cleanup, no_cleanup, &strategy)
+                cmd_finish(
+                    &cwd,
+                    FinishOpts {
+                        full,
+                        dry_run,
+                        yes,
+                        cleanup,
+                        no_cleanup,
+                        include_unsealed,
+                    },
+                    &strategy,
+                )
             }
         }
         Commands::Restore {
@@ -1499,6 +1544,7 @@ fn main() {
                 design_notes,
                 tech_stack,
                 agent,
+                scope,
             } => cmd_spec_add(
                 &cwd,
                 summary.as_deref(),
@@ -1509,14 +1555,26 @@ fn main() {
                 design_notes,
                 tech_stack,
                 agent.as_deref(),
+                scope,
             ),
             SpecCommands::Status { state, format } => {
                 cmd_spec_status(&cwd, state.as_deref(), &format)
             }
             SpecCommands::Cancel { id } => cmd_spec_cancel(&cwd, &id),
-            SpecCommands::Done { id, summary, agent } => {
-                cmd_spec_done(&cwd, id.as_deref(), summary, agent.as_deref())
-            }
+            SpecCommands::Done {
+                id,
+                summary,
+                agent,
+                paths,
+                no_seal,
+            } => cmd_spec_done(
+                &cwd,
+                id.as_deref(),
+                summary,
+                agent.as_deref(),
+                paths,
+                no_seal,
+            ),
             SpecCommands::Complete { id } => cmd_spec_complete(&cwd, &id),
             SpecCommands::Show { id } => cmd_spec_show(&cwd, &id),
             SpecCommands::Update {
@@ -1574,6 +1632,10 @@ fn main() {
         } => {
             let format = resolve_format(format.as_deref(), &cwd, "human");
             cmd_verify(&cwd, chain, all_chains, seal.as_deref(), &format)
+        }
+        Commands::Repair { dry_run, format } => {
+            let format = resolve_format(format.as_deref(), &cwd, "human");
+            cmd_repair(&cwd, dry_run, &format)
         }
         Commands::Agent { action } => match action {
             AgentCommands::Register {
@@ -2600,7 +2662,11 @@ fn cmd_seal(
     }
 
     let mut repo = Repository::open_from_dir(cwd)?;
-    repo.set_enforce_scope(enforce_scope);
+    // The flag can only turn enforcement on; `[security] scope_enforcement`
+    // in config.toml is honoured when the flag is absent (finding 35).
+    if enforce_scope {
+        repo.set_enforce_scope(true);
+    }
 
     // SK.3b: Auto-scope spec for agents. If --spec is omitted, try to find
     // the agent's single claimed in-progress spec. Falls back to C.13
@@ -2658,6 +2724,7 @@ fn cmd_seal(
         linted,
     };
 
+    let mut left_out_scope: Option<SealScope> = None;
     let (seal, conflict_warning) = if let Some(paths) = paths {
         let s = repo.seal_paths(
             agent,
@@ -2670,7 +2737,7 @@ fn cmd_seal(
         )?;
         (s, None)
     } else if expected_head.is_some() {
-        repo.seal_with_check(
+        match repo.seal_with_check_scoped(
             agent,
             summary.to_string(),
             spec_id,
@@ -2678,17 +2745,38 @@ fn cmd_seal(
             verification,
             allow_empty,
             expected_head,
-        )?
+        ) {
+            Ok((s, warning, scope)) => {
+                left_out_scope = scope;
+                (s, warning)
+            }
+            Err(WritError::NothingInScope { spec_id, scope }) => {
+                print_nothing_in_scope(&spec_id, &scope, summary, agent_id, false);
+                process::exit(1);
+            }
+            Err(e) => return Err(e.into()),
+        }
     } else {
-        let s = repo.seal(
+        let result = repo.seal_scoped(
             agent,
             summary.to_string(),
             spec_id,
             task_status,
             verification,
             allow_empty,
-        )?;
-        (s, None)
+            ScopeMode::Seal,
+        );
+        match result {
+            Ok((s, scope)) => {
+                left_out_scope = scope;
+                (s, None)
+            }
+            Err(WritError::NothingInScope { spec_id, scope }) => {
+                print_nothing_in_scope(&spec_id, &scope, summary, agent_id, false);
+                process::exit(1);
+            }
+            Err(e) => return Err(e.into()),
+        }
     };
 
     let spec_slug_display = seal
@@ -2759,6 +2847,20 @@ fn cmd_seal(
         println!("    {marker} {}", c.path);
     }
 
+    // Seal warnings not shown elsewhere (FILE_SCOPE prints as SCOPE below,
+    // GHOST_WORK as a HINT): CLAIM, SHARED, AGENT_SCOPE, CHAIN_BREAK, ...
+    for w in seal
+        .warnings
+        .iter()
+        .filter(|w| !w.starts_with("FILE_SCOPE:") && !w.starts_with("GHOST_WORK:"))
+    {
+        println!("  {} {}", "warning:".yellow().bold(), w);
+    }
+
+    if let (Some(scope), Some(sid)) = (&left_out_scope, seal.spec_id.as_deref()) {
+        print_left_out(scope, sid, summary, agent_id, false);
+    }
+
     // Show seal-triggered convergence result if convergence was attempted.
     if let Some(ref conv) = seal.convergence {
         if conv.attempted {
@@ -2823,6 +2925,58 @@ fn cmd_seal(
     }
 
     Ok(())
+}
+
+/// Print each file a default-scope seal left out, why, and paste-ready
+/// commands to seal them explicitly (S.1). Agents read stdout and retry.
+fn print_left_out(scope: &SealScope, spec_id: &str, summary: &str, agent_id: &str, done: bool) {
+    if !scope.has_left_out() {
+        return;
+    }
+    let count = scope.other_specs.len() + scope.unowned.len();
+    println!(
+        "  {} {} pending file(s) not in this seal:",
+        "left out:".yellow().bold(),
+        count
+    );
+    for line in scope.left_out_lines() {
+        println!("    {} {}", "·".yellow(), line);
+    }
+    if let Some(line) = scope.retry_line(summary, spec_id, agent_id, done) {
+        if scope.retry_needs_paths() {
+            println!(
+                "  Another agent is working here, so writ cannot tell which of these are yours."
+            );
+            println!(
+                "  Replace {} with the files YOU changed (comma-separated) and run:",
+                seal_scope::PATHS_PLACEHOLDER
+            );
+        } else {
+            println!("  If you changed these files, seal them with:");
+        }
+        println!("    {line}");
+    }
+    if !scope.other_specs.is_empty() {
+        println!(
+            "  Files owned by another spec are left for it. If you edited one too, add it to --paths; it becomes shared."
+        );
+    }
+}
+
+/// Explain a seal that found nothing in its default scope, on stdout.
+fn print_nothing_in_scope(
+    spec_id: &str,
+    scope: &SealScope,
+    summary: &str,
+    agent_id: &str,
+    done: bool,
+) {
+    println!(
+        "{} nothing sealed for spec {}: every pending file is outside its default scope.",
+        "NOT SEALED:".yellow().bold(),
+        spec_id.cyan()
+    );
+    print_left_out(scope, spec_id, summary, agent_id, done);
 }
 
 fn cmd_log(
@@ -4171,7 +4325,18 @@ fn cmd_status_watch(
     match result {
         Ok(Some("finish")) => {
             println!();
-            cmd_finish(cwd, false, false, false, false, false, "single")?;
+            cmd_finish(
+                cwd,
+                FinishOpts {
+                    full: false,
+                    dry_run: false,
+                    yes: false,
+                    cleanup: false,
+                    no_cleanup: false,
+                    include_unsealed: false,
+                },
+                "single",
+            )?;
         }
         Ok(Some("diff")) => {
             println!();
@@ -4211,17 +4376,31 @@ fn print_spec_brief(brief: &writ_core::status::SpecBrief) {
     );
 }
 
-fn cmd_finish(
-    cwd: &PathBuf,
+/// Flags for `writ finish`.
+struct FinishOpts {
     full: bool,
     dry_run: bool,
     yes: bool,
     cleanup: bool,
     no_cleanup: bool,
+    include_unsealed: bool,
+}
+
+fn cmd_finish(
+    cwd: &PathBuf,
+    opts: FinishOpts,
     strategy: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
     use writ_core::git_ops::{Git2Ops, GitOps};
+    let FinishOpts {
+        full,
+        dry_run,
+        yes,
+        cleanup,
+        no_cleanup,
+        include_unsealed,
+    } = opts;
 
     let repo = Repository::open_from_dir(cwd)?;
 
@@ -4350,8 +4529,23 @@ fn cmd_finish(
         })
         .collect();
 
+    if committable.is_empty() && !specs.is_empty() && !include_unsealed {
+        // S.1: with specs in use, only completed specs' sealed work is
+        // committed. Unsealed changes need --include-unsealed.
+        let plan = repo.finish_plan(&[])?;
+        println!("Nothing to commit — no completed specs.");
+        print_finish_left_out(&plan, false);
+        println!();
+        println!(
+            "  {} Use `writ spec done <id>` to mark a spec as complete.",
+            "→".dimmed()
+        );
+        return Ok(());
+    }
+
     if committable.is_empty() {
-        // Fall back to legacy behavior: commit whatever is in the working tree
+        // No specs at all (or --include-unsealed): legacy behavior, commit
+        // whatever is in the working tree.
         let summary = repo.summary()?;
         if summary.files_to_stage.is_empty() {
             println!("Nothing to commit — no completed specs and no changes.");
@@ -4434,43 +4628,21 @@ fn cmd_finish(
     }
     println!("Strategy: {}", strategy);
 
-    // Check for unattributed files: changes in working tree not captured
-    // in any spec's seal chain. These will be committed but have no writ tracking.
-    let status_output = repo.status()?;
-    if !status_output.untracked_changes.is_empty() {
-        println!();
-        println!(
-            "{}",
-            format!(
-                "Warning: {} file{} changed but not captured in any seal:",
-                status_output.untracked_changes.len(),
-                if status_output.untracked_changes.len() == 1 {
-                    ""
-                } else {
-                    "s"
-                }
-            )
-            .yellow()
-            .bold()
-        );
-        for f in &status_output.untracked_changes {
-            println!("  {}  {}", "·".yellow(), f);
-        }
-        println!(
-            "  {}",
-            "These will be included in the git commit but have no writ attribution.".dimmed()
-        );
-    }
+    // S.1: stage only paths the completed specs sealed, with sealed content.
+    let committable_ids: Vec<String> = committable.iter().map(|s| s.id.clone()).collect();
+    let plan = repo.finish_plan(&committable_ids)?;
+    print_finish_left_out(&plan, include_unsealed);
 
     if dry_run {
         println!();
         println!("{}", "DRY RUN — no changes made.".yellow().bold());
         println!();
-        println!(
-            "Files that would be staged ({}):",
-            summary.files_to_stage.len()
-        );
-        for f in &summary.files_to_stage {
+        let mut files: Vec<&str> = plan.stage.iter().map(|(p, _)| p.as_str()).collect();
+        if include_unsealed {
+            files.extend(plan.unsealed.iter().map(|p| p.as_str()));
+        }
+        println!("Files that would be staged ({}):", files.len());
+        for f in files {
             println!("  {f}");
         }
         return Ok(());
@@ -4494,8 +4666,9 @@ fn cmd_finish(
 
     match strategy {
         "single" => {
-            // Single commit: stage all, commit once, mark all specs
-            git.stage_all()?;
+            // Single commit: stage the completed specs' sealed paths, commit
+            // once, mark all specs.
+            stage_finish_plan(&repo, &git, &plan, include_unsealed)?;
 
             if !git.has_staged_changes()? {
                 println!("Nothing to commit — working tree clean.");
@@ -4530,17 +4703,10 @@ fn cmd_finish(
             let mut sorted: Vec<_> = committable.clone();
             sorted.sort_by_key(|s| s.completed_at);
 
-            let mut staged_all = false;
             for s in &sorted {
-                if !s.file_scope.is_empty() {
-                    // Stage only this spec's files
-                    let paths: Vec<&str> = s.file_scope.iter().map(|p| p.as_str()).collect();
-                    git.stage_files(&paths)?;
-                } else if !staged_all {
-                    // No file_scope — stage everything on the first pass
-                    git.stage_all()?;
-                    staged_all = true;
-                }
+                // Stage only this spec's sealed paths (never the whole tree).
+                let spec_plan = repo.finish_plan(std::slice::from_ref(&s.id))?;
+                stage_finish_plan(&repo, &git, &spec_plan, false)?;
 
                 if !git.has_staged_changes()? {
                     continue;
@@ -4585,19 +4751,10 @@ fn cmd_finish(
             }
 
             for group in &groups {
-                // Collect all files from specs in this group
-                let files: Vec<&str> = group
-                    .specs
-                    .iter()
-                    .flat_map(|s| s.file_scope.iter().map(|f| f.as_str()))
-                    .collect();
-
-                if !files.is_empty() {
-                    git.stage_files(&files)?;
-                } else {
-                    // No file_scope on any spec in the group — stage all
-                    git.stage_all()?;
-                }
+                // Stage only the group's sealed paths (never the whole tree).
+                let ids: Vec<String> = group.specs.iter().map(|s| s.id.clone()).collect();
+                let group_plan = repo.finish_plan(&ids)?;
+                stage_finish_plan(&repo, &git, &group_plan, false)?;
 
                 if !git.has_staged_changes()? {
                     continue;
@@ -4850,6 +5007,78 @@ fn common_directory_prefix(paths: &[String]) -> String {
 }
 
 /// Legacy finish path: no spec awareness, just stage and commit.
+/// Print what `writ finish` leaves out, each list under its own heading.
+fn print_finish_left_out(plan: &writ_core::repo::FinishPlan, include_unsealed: bool) {
+    use colored::Colorize;
+    let section = |title: &str, items: &[String]| {
+        if items.is_empty() {
+            return;
+        }
+        println!();
+        println!("{}", format!("{title} ({}):", items.len()).yellow().bold());
+        for f in items {
+            println!("  {}  {}", "·".yellow(), f);
+        }
+    };
+    if include_unsealed {
+        section(
+            "Included with --include-unsealed: changed since sealed (working-tree content)",
+            &plan.drift,
+        );
+        section(
+            "Included with --include-unsealed: not sealed by any completed spec",
+            &plan.unsealed,
+        );
+    } else {
+        section(
+            "Changed after sealing: the SEALED version is committed, later edits stay uncommitted (seal them, then finish again)",
+            &plan.drift,
+        );
+        section(
+            "Left out: not sealed by any completed spec (pass --include-unsealed to commit them)",
+            &plan.unsealed,
+        );
+    }
+    let in_progress: Vec<String> = plan
+        .in_progress
+        .iter()
+        .map(|(p, spec)| format!("{p} (spec {spec})"))
+        .collect();
+    section(
+        "Left out: sealed under specs that are not done yet",
+        &in_progress,
+    );
+}
+
+/// Stage a finish plan: sealed content for sealed paths and, with
+/// `include_unsealed`, working-tree content for drifted and unsealed paths.
+/// Paths git refuses are listed under their own heading (finding 44).
+fn stage_finish_plan(
+    repo: &Repository,
+    git: &impl writ_core::git_ops::GitOps,
+    plan: &writ_core::repo::FinishPlan,
+    include_unsealed: bool,
+) -> Result<writ_core::git_ops::StageOutcome, Box<dyn std::error::Error>> {
+    use colored::Colorize;
+    let outcome = repo.stage_finish_plan(git, plan, include_unsealed)?;
+    if !outcome.refused.is_empty() {
+        println!();
+        println!(
+            "{}",
+            format!(
+                "Sealed but NOT staged — git refused ({}):",
+                outcome.refused.len()
+            )
+            .red()
+            .bold()
+        );
+        for (path, reason) in &outcome.refused {
+            println!("  {}  {}: {}", "·".red(), path, reason);
+        }
+    }
+    Ok(outcome)
+}
+
 fn finish_legacy(
     cwd: &PathBuf,
     commit_message: &str,
@@ -5158,7 +5387,11 @@ fn cmd_finish_auto(cwd: &PathBuf, strategy: &str) -> Result<(), Box<dyn std::err
     let mut total_committed = 0;
 
     for (i, batch) in batches.iter().enumerate() {
-        git.stage_all()?;
+        // S.1: stage only this batch's sealed paths, with sealed content.
+        let ids: Vec<String> = batch.iter().map(|s| s.id.clone()).collect();
+        let plan = repo.finish_plan(&ids)?;
+        print_finish_left_out(&plan, false);
+        stage_finish_plan(&repo, &git, &plan, false)?;
         if !git.has_staged_changes()? {
             continue;
         }
@@ -5495,8 +5728,11 @@ fn cmd_spec_add(
     design_notes: Option<Vec<String>>,
     tech_stack: Option<Vec<String>>,
     agent: Option<&str>,
+    scope: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use writ_core::repo::{generate_spec_id, slugify_title};
+
+    let file_scope = normalize_scope_entries(&scope)?;
 
     let repo = Repository::open_from_dir(cwd)?;
 
@@ -5539,6 +5775,7 @@ fn cmd_spec_add(
     if let Some(ts) = tech_stack {
         spec.tech_stack = ts;
     }
+    spec.file_scope = file_scope;
     repo.add_spec(&spec)?;
 
     // Auto-claim for agents: use explicit --agent flag (from MCP),
@@ -5561,7 +5798,27 @@ fn cmd_spec_add(
     if !spec.tech_stack.is_empty() {
         println!("  tech stack: {}", spec.tech_stack.join(", "));
     }
+    if !spec.file_scope.is_empty() {
+        println!("  scope:      {}", spec.file_scope.join(", "));
+    }
     Ok(())
+}
+
+/// Validate `--scope` entries: repo-relative, no `..`, `./` prefix dropped.
+fn normalize_scope_entries(entries: &[String]) -> Result<Vec<String>, WritError> {
+    entries
+        .iter()
+        .map(|raw| {
+            let entry = raw.trim().trim_start_matches("./");
+            let escapes = entry.split('/').any(|part| part == "..");
+            if entry.is_empty() || entry.starts_with('/') || escapes {
+                return Err(WritError::InvalidInput(format!(
+                    "--scope '{raw}' must be a path or glob relative to the project root"
+                )));
+            }
+            Ok(entry.to_string())
+        })
+        .collect()
 }
 
 fn cmd_spec_status(
@@ -5638,6 +5895,8 @@ fn cmd_spec_done(
     id: Option<&str>,
     summary: Option<String>,
     agent: Option<&str>,
+    paths: Option<Vec<String>>,
+    no_seal: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
@@ -5733,19 +5992,30 @@ fn cmd_spec_done(
             AgentType::Agent
         },
     };
-    let verification = Verification {
-        tests_passed: None,
-        tests_failed: None,
-        linted: false,
+    let final_seal = if no_seal {
+        println!("  Closing without a final seal (--no-seal).");
+        None
+    } else {
+        final_seal_for_done(
+            &repo,
+            seal_agent,
+            &seal_summary,
+            &spec_id,
+            &agent_id,
+            paths.as_deref(),
+        )?
     };
-    let _seal = repo.seal(
-        seal_agent,
-        seal_summary,
-        Some(spec_id.clone()),
-        TaskStatus::Complete,
-        verification,
-        true, // allow empty — spec done is a metadata operation, changes may already be sealed
-    )?;
+    if let Some(ref seal) = final_seal {
+        println!(
+            "{} {} final seal, {} file(s)",
+            "sealed".green().bold(),
+            &seal.id[..12].cyan(),
+            seal.changes.len()
+        );
+        for c in &seal.changes {
+            println!("    {}", c.path);
+        }
+    }
 
     // Mark spec as done
     let spec = repo.mark_spec_done(&spec_id, summary)?;
@@ -5773,6 +6043,66 @@ fn cmd_spec_done(
     );
 
     Ok(())
+}
+
+/// The final seal of `writ spec done` (S.1): `--paths` seals exactly those
+/// paths; otherwise only files the spec owns. Never sweeps another agent's
+/// pending files. Returns `None` when there is nothing to seal; the spec
+/// still closes, and any left-out files are listed with the command that
+/// seals them.
+fn final_seal_for_done(
+    repo: &Repository,
+    agent: AgentIdentity,
+    summary: &str,
+    spec_id: &str,
+    agent_id: &str,
+    paths: Option<&[String]>,
+) -> Result<Option<writ_core::seal::Seal>, Box<dyn std::error::Error>> {
+    let verification = Verification::default();
+    if let Some(paths) = paths {
+        return match repo.seal_paths(
+            agent,
+            summary.to_string(),
+            Some(spec_id.to_string()),
+            TaskStatus::Complete,
+            verification,
+            paths,
+            false,
+        ) {
+            Ok(seal) => Ok(Some(seal)),
+            Err(WritError::NothingToSeal) => {
+                println!("  Nothing pending in the given paths; closing without a final seal.");
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        };
+    }
+    match repo.seal_scoped(
+        agent,
+        summary.to_string(),
+        Some(spec_id.to_string()),
+        TaskStatus::Complete,
+        verification,
+        false,
+        ScopeMode::Done,
+    ) {
+        Ok((seal, scope)) => {
+            if let Some(scope) = scope {
+                print_left_out(&scope, spec_id, summary, agent_id, true);
+            }
+            Ok(Some(seal))
+        }
+        Err(WritError::NothingToSeal) => {
+            println!("  Nothing pending for this spec; closing without a final seal.");
+            Ok(None)
+        }
+        Err(WritError::NothingInScope { spec_id, scope }) => {
+            print_nothing_in_scope(&spec_id, &scope, summary, agent_id, true);
+            println!("  Closing without a final seal; the files above stay pending.");
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn cmd_spec_cancel(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -9527,4 +9857,47 @@ mod tests {
         assert_eq!(groups[1].label, "src/");
         assert_eq!(groups[1].specs[0].id, "S-002");
     }
+}
+
+/// `writ repair`: regenerate missing store objects (finding 28).
+fn cmd_repair(cwd: &Path, dry_run: bool, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open_from_dir(cwd)?;
+    let report = writ_core::repair::repair_store(repo.root(), repo.writ_dir(), dry_run)?;
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if report.missing.is_empty() && report.unreadable_trees.is_empty() {
+        println!("store ok: no referenced objects are missing");
+    } else {
+        let verb = if dry_run { "recoverable" } else { "recovered" };
+        println!("missing: {}", report.missing.len());
+        println!("{verb}: {}", report.recovered.len());
+        for r in &report.recovered {
+            println!("  {}  {}  ({})", &r.hash[..12], r.path, r.source);
+        }
+        println!("unrecoverable: {}", report.unrecoverable.len());
+        for u in &report.unrecoverable {
+            println!("  {}  {}  ({})", &u.hash[..12], u.path, u.reason);
+            if u.searched_paths.len() > 1 {
+                println!("      searched: {}", u.searched_paths.join(", "));
+            }
+        }
+        for t in &report.unreadable_trees {
+            println!(
+                "unreadable tree: {}  {}  ({})",
+                &t.hash[..12],
+                t.referenced_as,
+                t.reason
+            );
+        }
+        if dry_run && !report.recovered.is_empty() {
+            println!("dry run: nothing written; run `writ repair` to write recovered objects");
+        }
+    }
+
+    if !report.is_clean() {
+        std::io::Write::flush(&mut std::io::stdout())?;
+        process::exit(1);
+    }
+    Ok(())
 }

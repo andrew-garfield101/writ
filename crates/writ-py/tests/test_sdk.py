@@ -342,7 +342,11 @@ class TestAdaptivePipeline:
 
         @p.phase("implementation", agent_id="impl")
         def impl(ctx):
-            with open(os.path.join(repo_dir, "f.txt"), "w") as f:
+            # S.1: a declared file_scope bounds the default seal, so the
+            # phase writes inside it.
+            comp = os.path.join(repo_dir, "src", "components")
+            os.makedirs(comp, exist_ok=True)
+            with open(os.path.join(comp, "f.txt"), "w") as f:
                 f.write("done")
             return {"summary": "implemented"}
 

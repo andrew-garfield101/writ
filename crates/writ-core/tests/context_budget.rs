@@ -36,13 +36,24 @@ fn write(root: &Path, rel: &str, body: &str) {
     fs::write(path, body).unwrap();
 }
 
+/// Seal every pending file explicitly. The fixture builds history for
+/// several agents in sequence, so it passes the paths the way a real agent
+/// would under the S.1 default seal scope.
 fn seal(repo: &Repository, who: &str, spec: Option<&str>, summary: &str) {
-    repo.seal(
+    let pending: Vec<String> = repo
+        .state()
+        .unwrap()
+        .changes
+        .into_iter()
+        .map(|f| f.path)
+        .collect();
+    repo.seal_paths(
         agent(who),
         summary.to_string(),
         spec.map(String::from),
         TaskStatus::InProgress,
         Verification::default(),
+        &pending,
         false,
     )
     .unwrap();

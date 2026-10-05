@@ -167,11 +167,55 @@ pub struct FrameworksConfig {
 }
 
 /// Security settings.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SecurityConfig {
     /// When true, seal() rejects out-of-scope files. When false, warnings only.
     #[serde(default)]
     pub scope_enforcement: bool,
+    /// `"warn"` (default): sealing to a spec claimed by another agent
+    /// succeeds with a warning naming the owner. `"strict"`: it is rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim_enforcement: Option<String>,
+}
+
+impl SecurityConfig {
+    /// True when `claim_enforcement = "strict"`. Any other value is treated
+    /// as `"warn"`; an unknown value prints a warning so it is never silent.
+    pub fn claims_strict(&self) -> bool {
+        match self.claim_enforcement.as_deref() {
+            None | Some("warn") => false,
+            Some("strict") => true,
+            Some(other) => {
+                eprintln!(
+                    "warning: [security] claim_enforcement = \"{other}\" is not \"warn\" or \"strict\"; using \"warn\""
+                );
+                false
+            }
+        }
+    }
+
+    /// Read the `[security]` table from `.writ/config.toml` without the
+    /// settings.json migration side effects of [`ProjectConfig::load`].
+    ///
+    /// A missing file or table yields defaults. An unparseable file prints a
+    /// warning and yields defaults (warn-only enforcement).
+    pub fn load_project(writ_dir: &Path) -> Self {
+        let path = writ_dir.join("config.toml");
+        let data = match fs::read_to_string(&path) {
+            Ok(d) => d,
+            Err(_) => return Self::default(),
+        };
+        match toml::from_str::<ProjectConfig>(&data) {
+            Ok(cfg) => cfg.security.unwrap_or_default(),
+            Err(e) => {
+                eprintln!(
+                    "warning: could not parse {} ({e}); scope and claim enforcement fall back to warnings",
+                    path.display()
+                );
+                Self::default()
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +560,7 @@ impl ProjectConfig {
         if let Some(enforce) = settings.enforce_scope {
             config.security = Some(SecurityConfig {
                 scope_enforcement: enforce,
+                claim_enforcement: None,
             });
         }
 
@@ -756,6 +801,7 @@ mod tests {
             }),
             security: Some(SecurityConfig {
                 scope_enforcement: true,
+                claim_enforcement: None,
             }),
             workflow: None,
             auto: None,

@@ -1269,13 +1269,19 @@ pub struct MissingObject {
     pub referenced_as: String,
 }
 
+/// Preview of a pending seal-tree convergence, under `.writ/`. Written by
+/// `Repository::converge_from_seal_trees`, removed by
+/// `materialize_convergence`. Its `shadow_results` are `[path, hash]` pairs.
+pub const PENDING_CONVERGENCE_FILE: &str = "convergence_v3_pending.json";
+
 /// Every object reachable from the store's roots, with one referencing
 /// location per hash.
 ///
 /// Roots: each seal's `tree` (expanded: every blob it lists), each seal's
 /// `changes[].old_hash/new_hash`, each spec's `genesis_tree` (expanded), and
 /// every workspace index (`.writ/workspaces/*/index.json`; the pre-workspace
-/// flat `.writ/index.json` is migrated away and not read). Trees are flat (`path -> {hash, size}`), so one
+/// flat `.writ/index.json` is migrated away and not read), and the merged
+/// objects listed by a pending convergence preview. Trees are flat (`path -> {hash, size}`), so one
 /// level of expansion reaches every blob.
 ///
 /// Trees that cannot be read are recorded in `unreadable_trees`, never
@@ -1312,6 +1318,7 @@ impl LiveObjects {
             live.add_spec(spec);
         }
         live.add_workspace_indexes(writ_dir)?;
+        live.add_pending_convergence(writ_dir)?;
         Ok(live)
     }
 
@@ -1352,6 +1359,34 @@ impl LiveObjects {
             for (file, entry) in &index.entries {
                 self.insert(&entry.hash, file);
             }
+        }
+        Ok(())
+    }
+
+    /// Add every merged object named by a pending convergence preview
+    /// (finding 41). Merged content is live from the moment a converge
+    /// stores it, not only once materialize writes it to the index.
+    ///
+    /// An unparseable file is an error, as for workspace indexes: without it
+    /// the live set would be incomplete. A file without `shadow_results`
+    /// (written before 0.3.0) references nothing.
+    pub fn add_pending_convergence(&mut self, writ_dir: &Path) -> WritResult<()> {
+        let path = writ_dir.join(PENDING_CONVERGENCE_FILE);
+        if !path.is_file() {
+            return Ok(());
+        }
+        let unreadable =
+            |e: String| WritError::Other(format!("cannot read {}: {e}", path.display()));
+        let data = fs::read(&path).map_err(|e| unreadable(e.to_string()))?;
+        let record: serde_json::Value =
+            serde_json::from_slice(&data).map_err(|e| unreadable(e.to_string()))?;
+        let Some(results) = record.get("shadow_results") else {
+            return Ok(());
+        };
+        let pairs: Vec<(String, String)> = serde_json::from_value(results.clone())
+            .map_err(|e| unreadable(format!("shadow_results: {e}")))?;
+        for (file, hash) in pairs {
+            self.insert(&hash, &file);
         }
         Ok(())
     }

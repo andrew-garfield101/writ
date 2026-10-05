@@ -342,6 +342,7 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
         }),
         security: Some(SecurityConfig {
             scope_enforcement: true,
+            claim_enforcement: None,
         }),
         workflow: Some(WorkflowConfig {
             commit_mode: Some(workflow_mode),

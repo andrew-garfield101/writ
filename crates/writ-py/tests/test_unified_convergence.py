@@ -45,6 +45,7 @@ def make_two_spec_overlap(tmp_path: Path):
         agent_type="agent",
         spec_id="feat-a",
         status="in-progress",
+        paths=["shared.rs"],
     )
 
     # Spec B modifies shared.rs (adds feature_b at the end)
@@ -57,6 +58,7 @@ def make_two_spec_overlap(tmp_path: Path):
         agent_type="agent",
         spec_id="feat-b",
         status="in-progress",
+        paths=["shared.rs"],
     )
 
     # Mark both specs done
@@ -91,6 +93,7 @@ def make_disjoint_specs(tmp_path: Path):
         agent_type="agent",
         spec_id="s1",
         status="in-progress",
+        paths=["a.txt"],
     )
 
     (tmp_path / "b.txt").write_text("b work\n")
@@ -100,6 +103,7 @@ def make_disjoint_specs(tmp_path: Path):
         agent_type="agent",
         spec_id="s2",
         status="in-progress",
+        paths=["b.txt"],
     )
 
     repo.spec_done("s1")
@@ -210,6 +214,7 @@ class TestSingleSpecNoConvergence:
             agent_type="agent",
             spec_id="solo",
             status="in-progress",
+            paths=["file.txt"],
         )
         repo.spec_done("solo")
 

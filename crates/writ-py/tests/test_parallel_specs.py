@@ -237,6 +237,7 @@ class TestFiveAgentParallel:
                 agent_type="agent",
                 spec_id=spec_id,
                 status="complete",
+                paths=[f"done_{i}.py"],
             )
 
         # 2 in-progress specs
@@ -250,16 +251,19 @@ class TestFiveAgentParallel:
                 agent_type="agent",
                 spec_id=spec_id,
                 status="in-progress",
+                paths=[f"wip_{i}.py"],
             )
 
-        # Current finish commits everything (doesn't filter by status)
         result = run_writ(["finish"], str(path))
         assert result.returncode == 0
 
-        # All files committed (current behavior — W.6 may change this)
+        # S.1: finish commits only the completed specs' sealed files; the
+        # in-progress specs' files are listed and left out.
         log = run_git(["diff", "--name-only", "HEAD~1..HEAD"], str(path))
         files = set(log.stdout.strip().split("\n"))
-        assert len(files) >= 5
+        assert files == {"done_0.py", "done_1.py", "done_2.py"}
+        output = result.stdout + result.stderr
+        assert "wip_0.py" in output and "wip_1.py" in output
 
     def test_context_shows_all_agent_activity(self, git_writ_repo):
         """Context accurately tracks 5 agents' work."""
@@ -276,6 +280,7 @@ class TestFiveAgentParallel:
                 agent_type="agent",
                 spec_id=spec_id,
                 status="in-progress",
+                paths=[f"module_{i}.py"],
             )
 
         ctx = repo.context()

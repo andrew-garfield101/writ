@@ -349,11 +349,11 @@ class TestConvergenceBasic:
 
         # Spec A adds a new file.
         (path / "module_a.py").write_text("# module A\n")
-        repo.seal(summary="add module a", spec_id="feat-a")
+        repo.seal(summary="add module a", spec_id="feat-a", paths=["module_a.py"])
 
         # Spec B adds a different file.
         (path / "module_b.py").write_text("# module B\n")
-        repo.seal(summary="add module b", spec_id="feat-b")
+        repo.seal(summary="add module b", spec_id="feat-b", paths=["module_b.py"])
 
         report = repo.converge("feat-a", "feat-b")
         assert isinstance(report, dict)
@@ -369,10 +369,10 @@ class TestConvergenceBasic:
 
         # Both specs change line 2 of shared.py.
         (path / "shared.py").write_text("line1\nFEATURE_A\nline3\nline4\nline5\n")
-        repo.seal(summary="feat a in shared", spec_id="feat-a")
+        repo.seal(summary="feat a in shared", spec_id="feat-a", paths=["shared.py"])
 
         (path / "shared.py").write_text("line1\nFEATURE_B\nline3\nline4\nline5\n")
-        repo.seal(summary="feat b in shared", spec_id="feat-b")
+        repo.seal(summary="feat b in shared", spec_id="feat-b", paths=["shared.py"])
 
         report = repo.converge("feat-a", "feat-b")
         assert report["is_clean"] is False
@@ -391,10 +391,10 @@ class TestConvergenceBasic:
 
         # Non-overlapping changes to shared.py.
         (path / "shared.py").write_text("CHANGED_A\nline2\nline3\nline4\nline5\n")
-        repo.seal(summary="change top", spec_id="feat-a")
+        repo.seal(summary="change top", spec_id="feat-a", paths=["shared.py"])
 
         (path / "shared.py").write_text("line1\nline2\nline3\nline4\nCHANGED_B\n")
-        repo.seal(summary="change bottom", spec_id="feat-b")
+        repo.seal(summary="change bottom", spec_id="feat-b", paths=["shared.py"])
 
         report = repo.converge("feat-a", "feat-b")
         assert report["is_clean"] is True
@@ -418,10 +418,10 @@ class TestConvergenceBasic:
         self._setup_base_and_specs(repo, path)
 
         (path / "module_a.py").write_text("# A\n")
-        repo.seal(summary="a work", spec_id="feat-a")
+        repo.seal(summary="a work", spec_id="feat-a", paths=["module_a.py"])
 
         (path / "module_b.py").write_text("# B\n")
-        repo.seal(summary="b work", spec_id="feat-b")
+        repo.seal(summary="b work", spec_id="feat-b", paths=["module_b.py"])
 
         report = repo.converge("feat-a", "feat-b")
         result = json.dumps(report)
@@ -441,19 +441,19 @@ class TestConvergeAll:
 
         # Alpha seals (stays on HEAD chain).
         (tmp_path / "alpha.txt").write_text("alpha content\n")
-        repo.seal(summary="alpha work", agent_id="alpha-dev", spec_id="alpha")
+        repo.seal(summary="alpha work", agent_id="alpha-dev", spec_id="alpha", paths=["alpha.txt"])
 
         # Beta seals — diverges from HEAD because alpha advanced it.
         (tmp_path / "beta.txt").write_text("beta content\n")
-        repo.seal(summary="beta work", agent_id="beta-dev", spec_id="beta")
+        repo.seal(summary="beta work", agent_id="beta-dev", spec_id="beta", paths=["beta.txt"])
 
         # Gamma seals — also diverges.
         (tmp_path / "gamma.txt").write_text("gamma content\n")
-        repo.seal(summary="gamma work", agent_id="gamma-dev", spec_id="gamma")
+        repo.seal(summary="gamma work", agent_id="gamma-dev", spec_id="gamma", paths=["gamma.txt"])
 
         # Alpha seals again to advance HEAD past beta/gamma.
         (tmp_path / "alpha2.txt").write_text("alpha part 2\n")
-        repo.seal(summary="alpha complete", agent_id="alpha-dev", spec_id="alpha")
+        repo.seal(summary="alpha complete", agent_id="alpha-dev", spec_id="alpha", paths=["alpha2.txt"])
 
         # Mark alpha Complete so it's eligible as base spec.
         repo.update_spec("alpha", status="complete")
@@ -497,15 +497,15 @@ class TestConvergeAll:
         repo.add_spec(id="right", title="Right")
 
         (tmp_path / "shared.txt").write_text("LEFT_VERSION\n")
-        repo.seal(summary="left change", agent_id="left-dev", spec_id="left")
+        repo.seal(summary="left change", agent_id="left-dev", spec_id="left", paths=["shared.txt"])
 
         (tmp_path / "shared.txt").write_text("RIGHT_VERSION\n")
-        repo.seal(summary="right change", agent_id="right-dev", spec_id="right")
+        repo.seal(summary="right change", agent_id="right-dev", spec_id="right", paths=["shared.txt"])
 
         # Restore LEFT on disk before left's second seal.
         (tmp_path / "shared.txt").write_text("LEFT_VERSION\n")
         (tmp_path / "left-only.txt").write_text("extra\n")
-        repo.seal(summary="left extra", agent_id="left-dev", spec_id="left")
+        repo.seal(summary="left extra", agent_id="left-dev", spec_id="left", paths=["shared.txt", "left-only.txt"])
         repo.update_spec("left", status="complete")
 
         report = repo.converge_all(strategy="most-recent", apply=True)
@@ -556,21 +556,21 @@ class TestConvergeAll:
         (tmp_path / "page.html").write_text(
             "<html>\n<body>Small</body>\n</html>\n"
         )
-        repo.seal(summary="small change", agent_id="small-dev", spec_id="small")
+        repo.seal(summary="small change", agent_id="small-dev", spec_id="small", paths=["page.html"])
 
         # Big: richer content (8 lines).
         (tmp_path / "page.html").write_text(
             "<html>\n<head><title>Big</title></head>\n<body>\n<nav>\n"
             "<li>Home</li>\n<li>About</li>\n</nav>\n</body>\n</html>\n"
         )
-        repo.seal(summary="big change", agent_id="big-dev", spec_id="big")
+        repo.seal(summary="big change", agent_id="big-dev", spec_id="big", paths=["page.html"])
 
         # Advance HEAD past big.
         (tmp_path / "page.html").write_text(
             "<html>\n<body>Small</body>\n</html>\n"
         )
         (tmp_path / "small-only.txt").write_text("extra\n")
-        repo.seal(summary="small extra", agent_id="small-dev", spec_id="small")
+        repo.seal(summary="small extra", agent_id="small-dev", spec_id="small", paths=["page.html", "small-only.txt"])
         repo.update_spec("small", status="complete")
 
         return repo
@@ -665,17 +665,17 @@ class TestConvergeAll:
             "<html><ul><li>Home</li><li>About</li><li>Blog</li>"
             "<li>Contact</li><li>FAQ</li></ul></html>\n"
         )
-        repo.seal(summary="nav items", agent_id="nav-dev", spec_id="nav")
+        repo.seal(summary="nav items", agent_id="nav-dev", spec_id="nav", paths=["index.html"])
 
         # Content agent modifies about.
         (tmp_path / "about.html").write_text(
             "<html><ul><li>Home</li><li>About</li></ul><p>Content</p></html>\n"
         )
-        repo.seal(summary="content", agent_id="content-dev", spec_id="content")
+        repo.seal(summary="content", agent_id="content-dev", spec_id="content", paths=["about.html"])
 
         # Advance HEAD.
         (tmp_path / "nav-extra.txt").write_text("x\n")
-        repo.seal(summary="extra", agent_id="nav-dev", spec_id="nav")
+        repo.seal(summary="extra", agent_id="nav-dev", spec_id="nav", paths=["nav-extra.txt"])
         repo.update_spec("nav", status="complete")
 
         report = repo.converge_all(strategy="most-recent", apply=True)
@@ -721,7 +721,8 @@ class TestEnrichedContext:
 
         ctx = repo.context()
         seal_summary = ctx["recent_seals"][0]
-        assert seal_summary["status"] == "complete"
+        # S.1: seal() defaults to in-progress (2e5005babe9d); context reports it.
+        assert seal_summary["status"] == "in-progress"
         assert seal_summary["verification"]["tests_passed"] == 42
         assert seal_summary["verification"]["linted"] is True
 
@@ -741,7 +742,8 @@ class TestEnrichedContext:
 
         ctx = repo.context()
         seal_summary = ctx["recent_seals"][0]
-        assert seal_summary["status"] == "complete"
+        # S.1: seal() defaults to in-progress (2e5005babe9d); context reports it.
+        assert seal_summary["status"] == "in-progress"
         assert "verification" not in seal_summary
 
 
@@ -1371,7 +1373,7 @@ class TestSpecScopedContextFiltering:
         os.makedirs(str(tmp_path / "src"))
         (tmp_path / "src" / "auth.py").write_text("auth code")
         (tmp_path / "readme.md").write_text("docs")
-        repo.seal(summary="base", agent_id="a1", agent_type="agent", spec_id="auth")
+        repo.seal(summary="base", agent_id="a1", agent_type="agent", spec_id="auth", paths=["src/auth.py", "readme.md"])
 
         (tmp_path / "src" / "auth.py").write_text("auth v2")
         (tmp_path / "readme.md").write_text("docs v2")
@@ -1388,7 +1390,7 @@ class TestSpecScopedContextFiltering:
 
         (tmp_path / "style.css").write_text("body {}")
         (tmp_path / "app.js").write_text("console.log()")
-        repo.seal(summary="base", agent_id="a1", agent_type="agent", spec_id="ui")
+        repo.seal(summary="base", agent_id="a1", agent_type="agent", spec_id="ui", paths=["style.css", "app.js"])
 
         (tmp_path / "style.css").write_text("body { color: red }")
         (tmp_path / "app.js").write_text("changed")
@@ -1406,7 +1408,7 @@ class TestSpecScopedContextFiltering:
 
         (tmp_path / "api.py").write_text("v1")
         (tmp_path / "other.py").write_text("v1")
-        repo.seal(summary="base", agent_id="a1", agent_type="agent", spec_id="api")
+        repo.seal(summary="base", agent_id="a1", agent_type="agent", spec_id="api", paths=["api.py", "other.py"])
 
         (tmp_path / "other.py").write_text("v2")
 
@@ -1419,10 +1421,10 @@ class TestSpecScopedContextFiltering:
         repo.add_spec(id="feat", title="Feature")
 
         (tmp_path / "feature.py").write_text("v1")
-        repo.seal(summary="impl", agent_id="a1", agent_type="agent", spec_id="feat")
+        repo.seal(summary="impl", agent_id="a1", agent_type="agent", spec_id="feat", paths=["feature.py"])
 
         (tmp_path / "unrelated.py").write_text("v1")
-        repo.seal(summary="other", agent_id="a1", agent_type="agent")
+        repo.seal(summary="other", agent_id="a2", agent_type="agent")  # a1 would auto-scope to its open spec
 
         (tmp_path / "feature.py").write_text("v2")
         (tmp_path / "unrelated.py").write_text("v2")
@@ -1566,15 +1568,15 @@ class TestLogAll:
 
         # Agent A seals on alpha.
         (tmp_path / "a.txt").write_text("a")
-        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         # Agent B seals on beta (will be diverged after next seal).
         (tmp_path / "b.txt").write_text("b")
-        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
 
         # Agent A seals on alpha again — creates divergence.
         (tmp_path / "a.txt").write_text("a2")
-        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         regular = repo.log()
         all_seals = repo.log_all()
@@ -1666,9 +1668,9 @@ class TestDivergedBranchDetection:
         repo.add_spec(id="alpha", title="Alpha")
 
         (tmp_path / "a.txt").write_text("v1")
-        repo.seal(summary="first", agent_id="dev", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="first", agent_id="dev", agent_type="agent", spec_id="alpha", paths=["a.txt"])
         (tmp_path / "a.txt").write_text("v2")
-        repo.seal(summary="second", agent_id="dev", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="second", agent_id="dev", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         ctx = repo.context()
         assert ctx.get("diverged_branches", []) == []
@@ -1681,16 +1683,16 @@ class TestDivergedBranchDetection:
 
         # Agent A seals on alpha.
         (tmp_path / "a.txt").write_text("a1")
-        repo.seal(summary="alpha first", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha first", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         # Agent B seals on beta — parent from HEAD.
         (tmp_path / "b.txt").write_text("b1")
-        repo.seal(summary="beta work", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta work", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
 
         # Agent A seals on alpha again — parent from heads/alpha, not global HEAD.
         # This makes beta's seal orphaned from the HEAD chain.
         (tmp_path / "a.txt").write_text("a2")
-        repo.seal(summary="alpha second", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha second", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         ctx = repo.context()
         diverged = ctx.get("diverged_branches", [])
@@ -1706,13 +1708,13 @@ class TestDivergedBranchDetection:
         repo.add_spec(id="feature", title="Feature")
 
         (tmp_path / "x.txt").write_text("x")
-        repo.seal(summary="main", agent_id="main-dev", agent_type="agent", spec_id="main-spec")
+        repo.seal(summary="main", agent_id="main-dev", agent_type="agent", spec_id="main-spec", paths=["x.txt"])
 
         (tmp_path / "y.txt").write_text("y")
-        repo.seal(summary="feature", agent_id="feat-dev", agent_type="agent", spec_id="feature")
+        repo.seal(summary="feature", agent_id="feat-dev", agent_type="agent", spec_id="feature", paths=["y.txt"])
 
         (tmp_path / "x.txt").write_text("x2")
-        repo.seal(summary="main done", agent_id="main-dev", agent_type="agent", spec_id="main-spec")
+        repo.seal(summary="main done", agent_id="main-dev", agent_type="agent", spec_id="main-spec", paths=["x.txt"])
 
         ctx = repo.context()
         diverged = ctx["diverged_branches"]
@@ -1727,13 +1729,13 @@ class TestDivergedBranchDetection:
         repo.add_spec(id="beta", title="Beta")
 
         (tmp_path / "a.txt").write_text("a")
-        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         (tmp_path / "b.txt").write_text("b")
-        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
 
         (tmp_path / "a.txt").write_text("a2")
-        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         ctx = repo.context()
         agent_ids = [a["agent_id"] for a in ctx["agent_activity"]]
@@ -1746,11 +1748,11 @@ class TestDivergedBranchDetection:
         repo.add_spec(id="beta", title="Beta")
 
         (tmp_path / "a.txt").write_text("a")
-        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
         (tmp_path / "b.txt").write_text("b")
-        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
         (tmp_path / "a.txt").write_text("a2")
-        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         ctx = repo.context(spec="alpha")
         # Spec-scoped context shows all diverged branches so agents can see
@@ -1766,11 +1768,11 @@ class TestDivergedBranchDetection:
         repo.add_spec(id="beta", title="Beta")
 
         (tmp_path / "a.txt").write_text("a")
-        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
         (tmp_path / "b.txt").write_text("b")
-        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
         (tmp_path / "a.txt").write_text("a2")
-        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         ctx = repo.context()
         serialized = json.dumps(ctx)
@@ -1799,11 +1801,11 @@ class TestConvergenceNudge:
         repo.add_spec(id="beta", title="Beta")
 
         (tmp_path / "a.txt").write_text("a")
-        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
         (tmp_path / "b.txt").write_text("b")
-        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
         (tmp_path / "a.txt").write_text("a2")
-        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         ctx = repo.context()
         assert ctx["convergence_recommended"] is True
@@ -1815,11 +1817,11 @@ class TestConvergenceNudge:
         repo.add_spec(id="beta", title="Beta")
 
         (tmp_path / "a.txt").write_text("a")
-        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
         (tmp_path / "b.txt").write_text("b")
-        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
         (tmp_path / "a.txt").write_text("a2")
-        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         ctx = repo.context(spec="alpha")
         # Spec-scoped context shows diverged branches and recommends convergence
@@ -1869,7 +1871,8 @@ class TestFileScopeWarning:
         (tmp_path / "src" / "main.py").write_text("in scope")
         (tmp_path / "README.md").write_text("out of scope")
         result = repo.seal(
-            summary="work", agent_id="a1", agent_type="agent", spec_id="feat"
+            summary="work", agent_id="a1", agent_type="agent", spec_id="feat",
+            paths=["src/main.py", "README.md"],
         )
         w = result.get("file_scope_warning")
         assert w is not None
@@ -1886,12 +1889,30 @@ class TestFileScopeWarning:
         (tmp_path / "main.py").write_text("python")
         (tmp_path / "styles.css").write_text("css")
         result = repo.seal(
-            summary="work", agent_id="a1", agent_type="agent", spec_id="feat"
+            summary="work", agent_id="a1", agent_type="agent", spec_id="feat",
+            paths=["main.py", "styles.css"],
         )
         w = result.get("file_scope_warning")
         assert w is not None
         assert "styles.css" in w["out_of_scope_files"]
         assert "main.py" in w["in_scope_files"]
+
+    def test_default_seal_leaves_out_of_scope_file_out(self, tmp_path):
+        """S.1: without paths, a declared file_scope bounds the seal; the
+        out-of-scope file stays pending and is reported in left_out."""
+        repo = writ.Repository.init(str(tmp_path))
+        repo.add_spec(id="feat", title="Feature")
+        repo.update_spec("feat", file_scope=["src/"])
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.py").write_text("in scope")
+        (tmp_path / "README.md").write_text("out of scope")
+        result = repo.seal(
+            summary="work", agent_id="a1", agent_type="agent", spec_id="feat"
+        )
+        assert [c["path"] for c in result["changes"]] == ["src/main.py"]
+        assert result.get("file_scope_warning") is None
+        assert "README.md" in result["left_out"]["unowned"]
+        assert result["left_out"]["unowned_reason"] == "outside_file_scope"
 
     def test_no_warning_without_spec(self, tmp_path):
         """No file scope check when sealing without a spec."""
@@ -1987,17 +2008,17 @@ class TestSpecScopedDivergedSeals:
 
         # Agent A seals on alpha.
         (tmp_path / "a.txt").write_text("a1")
-        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         # Agent B seals twice on beta.
         (tmp_path / "b.txt").write_text("b1")
-        repo.seal(summary="beta 1", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta 1", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
         (tmp_path / "b.txt").write_text("b2")
-        repo.seal(summary="beta 2", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta 2", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
 
         # Agent A seals on alpha again — diverges beta.
         (tmp_path / "a.txt").write_text("a2")
-        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         # Spec-scoped context for beta should show its seals.
         ctx = repo.context(spec="beta")
@@ -2013,11 +2034,11 @@ class TestSpecScopedDivergedSeals:
         repo.add_spec(id="beta", title="Beta")
 
         (tmp_path / "a.txt").write_text("a")
-        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
         (tmp_path / "b.txt").write_text("b")
-        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
         (tmp_path / "a.txt").write_text("a2")
-        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         ctx = repo.context(spec="beta")
         assert ctx.get("spec_progress") is not None
@@ -2030,7 +2051,7 @@ class TestSpecScopedDivergedSeals:
         repo.add_spec(id="feat", title="Feature")
 
         (tmp_path / "f.txt").write_text("work")
-        repo.seal(summary="feature", agent_id="dev", agent_type="agent", spec_id="feat")
+        repo.seal(summary="feature", agent_id="dev", agent_type="agent", spec_id="feat", paths=["f.txt"])
 
         ctx = repo.context(spec="feat")
         assert len(ctx["recent_seals"]) == 1
@@ -2043,11 +2064,11 @@ class TestSpecScopedDivergedSeals:
         repo.add_spec(id="beta", title="Beta")
 
         (tmp_path / "a.txt").write_text("a")
-        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
         (tmp_path / "b.txt").write_text("b")
-        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
         (tmp_path / "a.txt").write_text("a2")
-        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         ctx = repo.context(spec="beta")
         serialized = json.dumps(ctx)
@@ -2092,7 +2113,7 @@ class TestSummary:
         repo.add_spec(id="auth", title="Add authentication")
 
         (tmp_path / "auth.py").write_text("class Auth: pass")
-        repo.seal(summary="added auth", agent_id="dev", agent_type="agent", spec_id="auth")
+        repo.seal(summary="added auth", agent_id="dev", agent_type="agent", spec_id="auth", paths=["auth.py"])
         repo.update_spec("auth", status="complete")
 
         s = repo.summary()
@@ -2107,9 +2128,9 @@ class TestSummary:
         repo.add_spec(id="feat", title="Feature")
 
         (tmp_path / "a.txt").write_text("a")
-        repo.seal(summary="agent-1 work", agent_id="agent-1", agent_type="agent", spec_id="feat")
+        repo.seal(summary="agent-1 work", agent_id="agent-1", agent_type="agent", spec_id="feat", paths=["a.txt"])
         (tmp_path / "b.txt").write_text("b")
-        repo.seal(summary="agent-2 work", agent_id="agent-2", agent_type="agent", spec_id="feat")
+        repo.seal(summary="agent-2 work", agent_id="agent-2", agent_type="agent", spec_id="feat", paths=["b.txt"])
 
         s = repo.summary()
         assert s["total_seals"] == 2
@@ -2176,11 +2197,11 @@ class TestSummary:
         repo.add_spec(id="beta", title="Beta")
 
         (tmp_path / "a.txt").write_text("a")
-        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
         (tmp_path / "b.txt").write_text("b")
-        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta")
+        repo.seal(summary="beta", agent_id="agent-b", agent_type="agent", spec_id="beta", paths=["b.txt"])
         (tmp_path / "a.txt").write_text("a2")
-        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha")
+        repo.seal(summary="alpha 2", agent_id="agent-a", agent_type="agent", spec_id="alpha", paths=["a.txt"])
 
         s = repo.summary()
         assert s["convergence_recommended"] is True
@@ -2320,14 +2341,14 @@ class TestIntegrationRisk:
         repo.add_spec(id="spec-b", title="B")
 
         (tmp_path / "a.txt").write_text("left")
-        repo.seal(summary="left", agent_id="dev-a", agent_type="agent", spec_id="spec-a")
+        repo.seal(summary="left", agent_id="dev-a", agent_type="agent", spec_id="spec-a", paths=["a.txt"])
 
         (tmp_path / "a.txt").write_text("right")
-        repo.seal(summary="right", agent_id="dev-b", agent_type="agent", spec_id="spec-b")
+        repo.seal(summary="right", agent_id="dev-b", agent_type="agent", spec_id="spec-b", paths=["a.txt"])
 
         # Seal again on spec-a to create divergence
         (tmp_path / "a.txt").write_text("left2")
-        repo.seal(summary="left2", agent_id="dev-a", agent_type="agent", spec_id="spec-a")
+        repo.seal(summary="left2", agent_id="dev-a", agent_type="agent", spec_id="spec-a", paths=["a.txt"])
 
         ctx = repo.context()
         risk = ctx.get("integration_risk")
@@ -2347,11 +2368,11 @@ class TestIntegrationRisk:
         repo.add_spec(id="s2", title="S2")
 
         (tmp_path / "a.txt").write_text("v1")
-        repo.seal(summary="v1", agent_id="a1", agent_type="agent", spec_id="s1")
+        repo.seal(summary="v1", agent_id="a1", agent_type="agent", spec_id="s1", paths=["a.txt"])
         (tmp_path / "a.txt").write_text("v2")
-        repo.seal(summary="v2", agent_id="a2", agent_type="agent", spec_id="s2")
+        repo.seal(summary="v2", agent_id="a2", agent_type="agent", spec_id="s2", paths=["a.txt"])
         (tmp_path / "a.txt").write_text("v3")
-        repo.seal(summary="v3", agent_id="a1", agent_type="agent", spec_id="s1")
+        repo.seal(summary="v3", agent_id="a1", agent_type="agent", spec_id="s1", paths=["a.txt"])
 
         ctx = repo.context()
         risk = ctx.get("integration_risk")
@@ -2367,7 +2388,7 @@ class TestIntegrationRisk:
         repo = writ.Repository.init(str(tmp_path))
         repo.add_spec(id="feat", title="Feature")
         (tmp_path / "a.txt").write_text("hello")
-        repo.seal(summary="init", agent_id="dev", agent_type="agent", spec_id="feat")
+        repo.seal(summary="init", agent_id="dev", agent_type="agent", spec_id="feat", paths=["a.txt"])
         ctx = repo.context(spec="feat")
         risk = ctx.get("integration_risk")
         # integration_risk is omitted when low (skip_serializing_if)
@@ -2399,18 +2420,18 @@ class TestConvergence:
         # Agent A: nav changes
         nav = "<html>\n<nav>Home | Blog</nav>\n<main>Content</main>\n<footer>2026</footer>\n</html>\n"
         (tmp_path / "index.html").write_text(nav)
-        repo.seal(summary="nav links", agent_id="nav-dev", agent_type="agent", spec_id="nav-update")
+        repo.seal(summary="nav links", agent_id="nav-dev", agent_type="agent", spec_id="nav-update", paths=["index.html"])
 
         # Agent B: footer changes (from baseline, not nav version)
         footer = "<html>\n<nav>Home</nav>\n<main>Content</main>\n<footer>2026 All rights reserved</footer>\n</html>\n"
         (tmp_path / "index.html").write_text(footer)
         (tmp_path / "footer.css").write_text(".footer{}")
-        repo.seal(summary="footer", agent_id="footer-dev", agent_type="agent", spec_id="footer-update")
+        repo.seal(summary="footer", agent_id="footer-dev", agent_type="agent", spec_id="footer-update", paths=["index.html", "footer.css"])
 
         # Agent A seals again → creates divergence (HEAD forks past B's seal)
         (tmp_path / "index.html").write_text(nav)
         (tmp_path / "nav.js").write_text("// nav")
-        repo.seal(summary="nav script", agent_id="nav-dev", agent_type="agent", spec_id="nav-update")
+        repo.seal(summary="nav script", agent_id="nav-dev", agent_type="agent", spec_id="nav-update", paths=["index.html", "nav.js"])
 
         return repo
 
@@ -2480,10 +2501,10 @@ class TestConvergence:
         repo.add_spec(id="spec-b", title="B")
 
         (tmp_path / "a.txt").write_text("LEFT\n")
-        repo.seal(summary="left", agent_id="a", agent_type="agent", spec_id="spec-a")
+        repo.seal(summary="left", agent_id="a", agent_type="agent", spec_id="spec-a", paths=["a.txt"])
 
         (tmp_path / "a.txt").write_text("RIGHT\n")
-        repo.seal(summary="right", agent_id="b", agent_type="agent", spec_id="spec-b")
+        repo.seal(summary="right", agent_id="b", agent_type="agent", spec_id="spec-b", paths=["a.txt"])
 
         report = repo.converge("spec-a", "spec-b")
         assert report["is_clean"] is False
@@ -2500,10 +2521,10 @@ class TestConvergence:
         repo.add_spec(id="spec-b", title="B")
 
         (tmp_path / "a.txt").write_text("LEFT\n")
-        repo.seal(summary="left", agent_id="a", agent_type="agent", spec_id="spec-a")
+        repo.seal(summary="left", agent_id="a", agent_type="agent", spec_id="spec-a", paths=["a.txt"])
 
         (tmp_path / "a.txt").write_text("RIGHT\n")
-        repo.seal(summary="right", agent_id="b", agent_type="agent", spec_id="spec-b")
+        repo.seal(summary="right", agent_id="b", agent_type="agent", spec_id="spec-b", paths=["a.txt"])
 
         report = repo.converge("spec-a", "spec-b")
         resolutions = [{"path": "a.txt", "content": "RESOLVED\n"}]
@@ -2521,10 +2542,10 @@ class TestConvergence:
         repo.add_spec(id="spec-b", title="B")
 
         (tmp_path / "a.txt").write_text("LEFT\n")
-        repo.seal(summary="left", agent_id="a", agent_type="agent", spec_id="spec-a")
+        repo.seal(summary="left", agent_id="a", agent_type="agent", spec_id="spec-a", paths=["a.txt"])
 
         (tmp_path / "a.txt").write_text("RIGHT\n")
-        repo.seal(summary="right", agent_id="b", agent_type="agent", spec_id="spec-b")
+        repo.seal(summary="right", agent_id="b", agent_type="agent", spec_id="spec-b", paths=["a.txt"])
 
         report = repo.converge("spec-a", "spec-b")
         with pytest.raises(writ.WritError):
@@ -2574,13 +2595,13 @@ class TestConvergenceEdgeCases:
         p.write_text(base_content) if isinstance(base_content, str) \
             else p.write_bytes(base_content)
         repo.seal(summary="baseline", agent_id="setup",
-                  spec_id="base", status="complete")
+                  spec_id="base", status="complete", paths=[filename])
 
         # Left side
         p.write_text(left_content) if isinstance(left_content, str) \
             else p.write_bytes(left_content)
         repo.seal(summary="left changes", agent_id="agent-a",
-                  spec_id="spec-a", status="in-progress")
+                  spec_id="spec-a", status="in-progress", paths=[filename])
 
         # Restore to baseline, then right side
         seals = repo.log(limit=2)
@@ -2588,7 +2609,7 @@ class TestConvergenceEdgeCases:
         p.write_text(right_content) if isinstance(right_content, str) \
             else p.write_bytes(right_content)
         repo.seal(summary="right changes", agent_id="agent-b",
-                  spec_id="spec-b", status="in-progress")
+                  spec_id="spec-b", status="in-progress", paths=[filename])
 
         return repo
 
@@ -2615,17 +2636,17 @@ class TestConvergenceEdgeCases:
 
         (tmp_path / "empty.txt").write_text("")
         repo.seal(summary="baseline", agent_id="setup",
-                  spec_id="base", status="complete")
+                  spec_id="base", status="complete", paths=["empty.txt"])
 
         # Only left adds content
         (tmp_path / "empty.txt").write_text("left content\n")
         repo.seal(summary="left adds", agent_id="a", spec_id="spec-a",
-                  status="in-progress")
+                  status="in-progress", paths=["empty.txt"])
 
         # Right adds a different file (no conflict on empty.txt)
         (tmp_path / "other.txt").write_text("unrelated\n")
         repo.seal(summary="right unrelated", agent_id="b",
-                  spec_id="spec-b", status="in-progress")
+                  spec_id="spec-b", status="in-progress", paths=["other.txt"])
 
         report = repo.converge("spec-a", "spec-b")
         assert report["is_clean"] is True
@@ -2678,17 +2699,17 @@ class TestConvergenceEdgeCases:
         (tmp_path / "icon.png").write_bytes(base)
         (tmp_path / "readme.txt").write_text("hello\n")
         repo.seal(summary="baseline", agent_id="setup",
-                  spec_id="base", status="complete")
+                  spec_id="base", status="complete", paths=["icon.png", "readme.txt"])
 
         # Only left modifies the binary
         (tmp_path / "icon.png").write_bytes(header + b'\xFF' * 20)
         repo.seal(summary="left updates icon", agent_id="a",
-                  spec_id="spec-a", status="in-progress")
+                  spec_id="spec-a", status="in-progress", paths=["icon.png"])
 
         # Right modifies a text file only
         (tmp_path / "readme.txt").write_text("updated\n")
         repo.seal(summary="right updates readme", agent_id="b",
-                  spec_id="spec-b", status="in-progress")
+                  spec_id="spec-b", status="in-progress", paths=["readme.txt"])
 
         report = repo.converge("spec-a", "spec-b")
         assert report["is_clean"] is True
@@ -2717,17 +2738,17 @@ class TestConvergenceEdgeCases:
 
         (tmp_path / "code.py").write_text(base)
         repo.seal(summary="baseline", agent_id="setup",
-                  spec_id="base", status="complete")
+                  spec_id="base", status="complete", paths=["code.py"])
 
         # Left adds whitespace
         (tmp_path / "code.py").write_text("def hello():  \n    print('hi')  \n")
         repo.seal(summary="left whitespace", agent_id="a",
-                  spec_id="spec-a", status="in-progress")
+                  spec_id="spec-a", status="in-progress", paths=["code.py"])
 
         # Right adds a new file (no conflict)
         (tmp_path / "other.py").write_text("pass\n")
         repo.seal(summary="right new file", agent_id="b",
-                  spec_id="spec-b", status="in-progress")
+                  spec_id="spec-b", status="in-progress", paths=["other.py"])
 
         report = repo.converge("spec-a", "spec-b")
         assert report["is_clean"] is True

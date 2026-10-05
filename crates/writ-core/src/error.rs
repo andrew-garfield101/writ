@@ -18,6 +18,19 @@ pub enum WritError {
     ObjectNotFound(String),
     /// No changes to seal.
     NothingToSeal,
+    /// Pending changes exist, but none fall in the sealing spec's default
+    /// scope. The scope lists each left-out file and why.
+    NothingInScope {
+        spec_id: String,
+        scope: Box<crate::seal_scope::SealScope>,
+    },
+    /// Seal rejected under strict claim enforcement: the spec is claimed by
+    /// a different agent.
+    SealClaimConflict {
+        spec_id: String,
+        claimed_by: String,
+        agent: String,
+    },
     /// A seal with this ID was not found.
     SealNotFound(String),
     /// A spec with this ID was not found.
@@ -120,6 +133,19 @@ impl fmt::Display for WritError {
                 }
                 write!(f, "\nhint: use the full spec ID to disambiguate")
             }
+            WritError::NothingInScope { spec_id, scope } => write!(
+                f,
+                "nothing to seal for spec '{spec_id}' — pending changes are outside its default scope ({}). Pass --paths to seal specific files",
+                scope.left_out_summary()
+            ),
+            WritError::SealClaimConflict {
+                spec_id,
+                claimed_by,
+                agent,
+            } => write!(
+                f,
+                "spec '{spec_id}' is claimed by agent '{claimed_by}'; agent '{agent}' cannot seal to it under strict claim enforcement ([security] claim_enforcement = \"strict\")"
+            ),
             WritError::SpecAlreadyClaimed {
                 spec_id,
                 claimed_by,

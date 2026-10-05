@@ -5,7 +5,7 @@
 //! `rebuild_with_resolutions()` for reassembling a file after conflict
 //! regions have been resolved.
 
-use crate::diff::{lcs_backtrack, lcs_table, EditOp};
+use crate::diff::{diff_ops, EditOp};
 
 use super::{ConflictRegion, FileMergeResult, LineAction, RegionResolution};
 
@@ -19,8 +19,9 @@ pub(super) fn build_action_table(
     base_lines: &[&str],
     new_lines: &[&str],
 ) -> (Vec<LineAction>, Vec<Vec<String>>, Vec<String>) {
-    let table = lcs_table(base_lines, new_lines);
-    let ops = lcs_backtrack(&table, base_lines, new_lines);
+    // Bounded: falls back to a linear diff above the LCS line limit, the
+    // same cap `writ diff` uses (finding 36).
+    let ops = diff_ops(base_lines, new_lines);
 
     let base_len = base_lines.len();
     let mut actions = vec![LineAction::Keep; base_len];
@@ -803,5 +804,64 @@ mod tests {
         let (actions, _, after) = build_action_table(&base, &new);
         assert!(actions.is_empty());
         assert_eq!(after, vec!["a", "b"]);
+    }
+
+    // ── Large files (finding 36: bounded memory) ───────────────────────
+
+    /// `n` unique lines, newline terminated, with optional per-line overrides.
+    fn big_file(n: usize, edits: &[(usize, &str)]) -> String {
+        let mut lines: Vec<String> = (0..n).map(|i| format!("let v{i} = {i};")).collect();
+        for (idx, text) in edits {
+            lines[*idx] = (*text).to_string();
+        }
+        lines.join("\n") + "\n"
+    }
+
+    #[test]
+    fn test_large_file_disjoint_edits_merge_clean() {
+        // 20,000 lines: twice the LCS line limit. Before the cap this built
+        // two 3.2 GB tables; now it must finish quickly and merge correctly.
+        let n = 20_000;
+        let base = big_file(n, &[]);
+        let left = big_file(n, &[(100, "let LEFT = 1;")]);
+        let right = big_file(n, &[(n - 100, "let RIGHT = 2;")]);
+
+        let merged = assert_clean(&three_way_merge(&base, &left, &right));
+        let expected = big_file(n, &[(100, "let LEFT = 1;"), (n - 100, "let RIGHT = 2;")]);
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn test_large_file_disjoint_insert_and_delete_merge_clean() {
+        let n = 20_000;
+        let base_lines: Vec<String> = (0..n).map(|i| format!("let v{i} = {i};")).collect();
+        let base = base_lines.join("\n") + "\n";
+
+        // Left inserts three lines near the top; right deletes one near the end.
+        let mut left_lines = base_lines.clone();
+        left_lines.splice(50..50, ["a1", "a2", "a3"].map(String::from));
+        let left = left_lines.join("\n") + "\n";
+        let mut right_lines = base_lines.clone();
+        right_lines.remove(n - 50);
+        let right = right_lines.join("\n") + "\n";
+
+        let merged = assert_clean(&three_way_merge(&base, &left, &right));
+        let mut expected = left_lines.clone();
+        expected.remove(n - 50 + 3);
+        assert_eq!(merged, expected.join("\n") + "\n");
+    }
+
+    #[test]
+    fn test_large_file_overlapping_edits_conflict() {
+        let n = 20_000;
+        let base = big_file(n, &[]);
+        let left = big_file(n, &[(5_000, "let LEFT = 1;")]);
+        let right = big_file(n, &[(5_000, "let RIGHT = 2;")]);
+
+        let conflicts = assert_conflicts(&three_way_merge(&base, &left, &right));
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].base_start, 5_001);
+        assert_eq!(conflicts[0].left_lines, vec!["let LEFT = 1;"]);
+        assert_eq!(conflicts[0].right_lines, vec!["let RIGHT = 2;"]);
     }
 }

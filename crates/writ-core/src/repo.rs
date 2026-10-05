@@ -35,6 +35,7 @@ use crate::keystore::KeyStore;
 use crate::lock::RepoLock;
 use crate::object::ObjectStore;
 use crate::seal::{AgentIdentity, ChangeType, FileChange, Seal, TaskStatus, Verification};
+use crate::seal_scope::{self, ClaimHolder, ScopeMode, SealScope, SpecOwnership};
 use crate::spec::{Spec, SpecStatus, SpecUpdate};
 use crate::state::{self, FileStatus, WorkingState};
 
@@ -54,6 +55,9 @@ pub struct Repository {
     /// When true, seal() rejects files outside an agent's scope constraints.
     /// When false (default), out-of-scope files produce warnings but the seal succeeds.
     enforce_scope: bool,
+    /// When true, sealing to a spec claimed by another agent is rejected.
+    /// When false (default), it succeeds with a `CLAIM:` warning.
+    enforce_claims: bool,
     /// Persistent repository settings loaded from `.writ/settings.json`.
     settings: crate::settings::WritSettings,
     /// Active workspace name. Defaults to "main".
@@ -298,7 +302,9 @@ impl Repository {
 
         // Load persistent settings (defaults if file missing).
         let settings = crate::settings::WritSettings::load(&writ_dir).unwrap_or_default();
-        let enforce_scope = settings.enforce_scope.unwrap_or(false);
+        let security = crate::config::SecurityConfig::load_project(&writ_dir);
+        let enforce_scope = security.scope_enforcement || settings.enforce_scope.unwrap_or(false);
+        let enforce_claims = security.claims_strict();
 
         Ok(Self {
             root: root.to_path_buf(),
@@ -306,6 +312,7 @@ impl Repository {
             objects,
             last_context_head: Mutex::new(None),
             enforce_scope,
+            enforce_claims,
             settings,
             active_workspace: "main".to_string(),
         })
@@ -359,6 +366,15 @@ impl Repository {
     /// out-of-scope files produce `AGENT_SCOPE` warnings but the seal succeeds.
     pub fn set_enforce_scope(&mut self, enforce: bool) {
         self.enforce_scope = enforce;
+    }
+
+    /// Enable or disable strict claim enforcement on seal().
+    ///
+    /// When enabled, sealing to a spec claimed by a different agent returns
+    /// `WritError::SealClaimConflict`. When disabled (default), the seal
+    /// succeeds with a `CLAIM:` warning naming the owner.
+    pub fn set_enforce_claims(&mut self, enforce: bool) {
+        self.enforce_claims = enforce;
     }
 
     /// One-command setup: init writ, detect git, import baseline, install hooks.
@@ -559,7 +575,11 @@ impl Repository {
         Ok(state::compute_state(&self.root, &index, &rules))
     }
 
-    /// Create a seal from all current changes.
+    /// Create a seal from the current changes.
+    ///
+    /// Without a spec this seals every pending change (full-directory seal).
+    /// With a spec it seals only the spec's default scope; see
+    /// [`crate::seal_scope`] for the rules. Files left out stay pending.
     pub fn seal(
         &self,
         agent: AgentIdentity,
@@ -569,208 +589,379 @@ impl Repository {
         verification: Verification,
         allow_empty: bool,
     ) -> WritResult<Seal> {
-        Self::validate_agent_id(&agent.id)?;
-        // Reject seals from revoked or suspended agents
-        if let Ok(registered) = self.load_agent(&agent.id) {
-            if registered.status == AgentStatus::Revoked {
-                return Err(WritError::AgentInactive(format!(
-                    "agent '{}' is revoked and cannot create seals",
-                    agent.id
-                )));
-            }
-            if registered.status == AgentStatus::Suspended {
-                return Err(WritError::AgentInactive(format!(
-                    "agent '{}' is suspended and cannot create seals",
-                    agent.id
-                )));
-            }
+        self.seal_scoped(
+            agent,
+            summary,
+            spec_id,
+            status,
+            verification,
+            allow_empty,
+            ScopeMode::Seal,
+        )
+        .map(|(seal, _)| seal)
+    }
+
+    /// Create a seal and also return the scope decision for a spec seal.
+    ///
+    /// `mode` selects the regular seal rules or the final-seal rules used by
+    /// `writ spec done` (own files only). The returned [`SealScope`] lists
+    /// what was left out, for display; it is `None` for a seal without a spec.
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_scoped(
+        &self,
+        agent: AgentIdentity,
+        summary: String,
+        spec_id: Option<String>,
+        status: TaskStatus,
+        verification: Verification,
+        allow_empty: bool,
+        mode: ScopeMode,
+    ) -> WritResult<(Seal, Option<SealScope>)> {
+        self.check_agent_can_seal(&agent.id)?;
+        let mut warnings = Vec::new();
+        if let Some(ref sid) = spec_id {
+            warnings.extend(self.check_seal_claim(sid, &agent.id)?);
         }
-        let _lock = self.lock()?;
-        let mut index = self.load_index()?;
+        let lock = self.lock()?;
+        let index = self.load_index()?;
         let rules = self.ignore_rules();
         let working_state = state::compute_state(&self.root, &index, &rules);
 
-        // Branch based on spec-scoped vs full-directory sealing.
-        let changes = if let Some(ref sid) = spec_id {
-            // ── Spec-scoped sealing ──────────────────────────────────────
-            // Phase 1: Sync main index with disk (store new content, update index).
-            // This ensures the index reflects the current working directory state,
-            // regardless of which agent made the changes.
-            for file_state in &working_state.changes {
-                match file_state.status {
-                    FileStatus::New | FileStatus::Modified => {
-                        let content = fs::read(self.root.join(&file_state.path))?;
-                        let new_hash = self.objects.store(&content)?;
-                        let size = content.len() as u64;
-                        index.upsert(&file_state.path, new_hash, size);
-                    }
-                    FileStatus::Deleted => {
-                        index.remove(&file_state.path);
-                    }
+        let (selected, scope): (Vec<&state::FileState>, Option<SealScope>) = match spec_id {
+            Some(ref sid) => {
+                let pending: Vec<String> = working_state
+                    .changes
+                    .iter()
+                    .map(|f| f.path.clone())
+                    .collect();
+                let scope = self.compute_seal_scope(sid, &agent.id, &pending, mode)?;
+                let included: HashSet<&str> = scope.included.iter().map(|p| p.as_str()).collect();
+                let selected = working_state
+                    .changes
+                    .iter()
+                    .filter(|f| included.contains(f.path.as_str()))
+                    .collect();
+                for shared in &scope.shared {
+                    warnings.push(format!(
+                        "SHARED: {} is also owned by open spec(s) {}",
+                        shared.path,
+                        shared.also_owned_by.join(", ")
+                    ));
+                }
+                (selected, Some(scope))
+            }
+            None => (working_state.changes.iter().collect(), None),
+        };
+
+        if selected.is_empty() && !allow_empty {
+            return Err(match (&spec_id, &scope) {
+                (Some(sid), Some(s)) if s.has_left_out() => WritError::NothingInScope {
+                    spec_id: sid.clone(),
+                    scope: Box::new(s.clone()),
+                },
+                _ => WritError::NothingToSeal,
+            });
+        }
+
+        let seal = self.write_seal_locked(
+            index,
+            &selected,
+            agent,
+            summary,
+            spec_id,
+            status,
+            verification,
+            allow_empty,
+            warnings,
+        )?;
+        self.after_seal(lock, seal).map(|s| (s, scope))
+    }
+
+    /// Test helper: seal every pending file, as if the agent passed all of
+    /// them with `--paths`. Used by tests that exercise convergence and
+    /// other features where two specs deliberately touch the same files.
+    #[cfg(test)]
+    pub(crate) fn seal_all_pending(
+        &self,
+        agent: AgentIdentity,
+        summary: String,
+        spec_id: Option<String>,
+        status: TaskStatus,
+        verification: Verification,
+        allow_empty: bool,
+    ) -> WritResult<Seal> {
+        self.seal_matching(
+            agent,
+            summary,
+            spec_id,
+            status,
+            verification,
+            allow_empty,
+            |_| true,
+        )
+    }
+
+    /// Plan what `writ finish` stages for `spec_ids` (S.1 point 5).
+    ///
+    /// Stages the paths those specs' seals captured, using the sealed
+    /// content in the index (which includes materialized convergence
+    /// results). A sealed path missing from the index is a deletion.
+    pub fn finish_plan(&self, spec_ids: &[String]) -> WritResult<FinishPlan> {
+        let specs = self.list_specs()?;
+        let wanted: HashSet<&str> = spec_ids.iter().map(|s| s.as_str()).collect();
+        let mut sealed: BTreeSet<String> = BTreeSet::new();
+        let mut elsewhere: BTreeMap<String, String> = BTreeMap::new();
+        for spec in &specs {
+            let paths = self.spec_ownership(spec).sealed_paths;
+            if wanted.contains(spec.id.as_str()) {
+                sealed.extend(paths);
+            } else if spec.is_committable() || Self::spec_is_open(spec) {
+                for p in paths {
+                    elsewhere.entry(p).or_insert_with(|| spec.id.clone());
                 }
             }
+        }
 
-            // Phase 2: Build spec-scoped changes list.
-            // Strategy: When working_state has changes, only consider those files
-            // against the baseline (avoids capturing other agents' files).
-            // When working_state is clean (another agent already synced the index),
-            // fall back to full index-vs-baseline comparison to avoid NothingToSeal.
-            let baseline = self.load_spec_baseline(sid, &agent.id)?;
-            let mut scoped = Vec::new();
+        let index = self.load_index()?;
+        let working = state::compute_state(&self.root, &index, &self.ignore_rules());
+        let pending: BTreeSet<String> = working.changes.into_iter().map(|f| f.path).collect();
 
-            if !working_state.changes.is_empty() {
-                // Primary path: only check files the agent actually changed on disk
-                for file_state in &working_state.changes {
-                    let path = &file_state.path;
-                    let baseline_hash = baseline.get_hash(path);
-                    match file_state.status {
-                        FileStatus::New | FileStatus::Modified => {
-                            let current_hash = index.get_hash(path);
-                            if current_hash != baseline_hash {
-                                let change_type = if baseline_hash.is_some() {
-                                    ChangeType::Modified
-                                } else {
-                                    ChangeType::Added
-                                };
-                                scoped.push(FileChange {
-                                    path: path.clone(),
-                                    change_type,
-                                    old_hash: baseline_hash.map(String::from),
-                                    new_hash: current_hash.map(String::from),
-                                });
-                            }
-                        }
-                        FileStatus::Deleted => {
-                            if baseline_hash.is_some() {
-                                scoped.push(FileChange {
-                                    path: path.clone(),
-                                    change_type: ChangeType::Deleted,
-                                    old_hash: baseline_hash.map(String::from),
-                                    new_hash: None,
-                                });
-                            }
-                        }
-                    }
-                }
-            } else {
-                // Fallback path: working state is clean (another agent synced
-                // the index). Compare full index against baseline to recover
-                // this agent's changes that were already indexed.
-                for (path, entry) in &index.entries {
-                    let baseline_hash = baseline.get_hash(path);
-                    if baseline_hash != Some(&entry.hash) {
-                        let change_type = if baseline_hash.is_some() {
-                            ChangeType::Modified
-                        } else {
-                            ChangeType::Added
-                        };
-                        scoped.push(FileChange {
-                            path: path.clone(),
-                            change_type,
-                            old_hash: baseline_hash.map(String::from),
-                            new_hash: Some(entry.hash.clone()),
-                        });
-                    }
-                }
-
-                // Files in baseline but not in current index (deleted)
-                for path in baseline.entries.keys() {
-                    if !index.is_tracked(path) {
-                        scoped.push(FileChange {
-                            path: path.clone(),
-                            change_type: ChangeType::Deleted,
-                            old_hash: baseline.get_hash(path).map(String::from),
-                            new_hash: None,
-                        });
-                    }
-                }
+        let mut plan = FinishPlan::default();
+        for path in &sealed {
+            let hash = index.get_hash(path).map(String::from);
+            plan.stage.push((path.clone(), hash));
+            if pending.contains(path) {
+                plan.drift.push(path.clone());
             }
+        }
+        plan.unsealed = pending
+            .iter()
+            .filter(|p| !sealed.contains(*p))
+            .cloned()
+            .collect();
+        plan.in_progress = elsewhere
+            .into_iter()
+            .filter(|(p, _)| !sealed.contains(p))
+            .collect();
+        Ok(plan)
+    }
 
-            // Phase 1b: Seal-chain subtraction — reduce over-capture.
-            // Only applies on SUBSEQUENT seals (when the agent already has a
-            // previous seal for this spec). First seals allow over-capture
-            // because we can't distinguish the agent's own files from others'.
-            // After the first round, baselines catch up and subtraction
-            // correctly identifies files that belong to other specs.
-            let has_previous_seal = self
-                .find_last_seal_for_spec_and_agent(sid, &agent.id)?
-                .is_some();
-            if has_previous_seal && !scoped.is_empty() {
-                let other_hashes = self.collect_other_spec_file_hashes(sid)?;
-                scoped.retain(|change| {
-                    if let Some(ref new_hash) = change.new_hash {
-                        // If another spec's latest seal has this file with the
-                        // same content hash, the change belongs to that spec.
-                        if let Some(other_hash) = other_hashes.get(&change.path) {
-                            if other_hash == new_hash {
-                                return false; // Skip — already captured by another spec
-                            }
-                        }
-                    }
-                    true
+    /// Stage a [`FinishPlan`] into git: sealed content for sealed paths
+    /// and, with `include_unsealed`, working-tree content for drifted and
+    /// unsealed paths. Paths git refuses come back in `refused`.
+    #[cfg(feature = "bridge")]
+    pub fn stage_finish_plan(
+        &self,
+        git: &impl crate::git_ops::GitOps,
+        plan: &FinishPlan,
+        include_unsealed: bool,
+    ) -> WritResult<crate::git_ops::StageOutcome> {
+        use crate::git_ops::StageEntry;
+        let mut entries: Vec<StageEntry> = Vec::with_capacity(plan.stage.len());
+        for (path, hash) in &plan.stage {
+            let content = match hash {
+                Some(h) => Some(self.objects.retrieve(h)?),
+                None => None,
+            };
+            entries.push(StageEntry {
+                path: path.clone(),
+                content,
+            });
+        }
+        if include_unsealed {
+            for path in plan.drift.iter().chain(plan.unsealed.iter()) {
+                entries.retain(|e| &e.path != path);
+                entries.push(StageEntry {
+                    path: path.clone(),
+                    content: fs::read(self.root.join(path)).ok(),
                 });
             }
+        }
+        git.stage_contents(&entries)
+    }
 
-            scoped.sort_by(|a, b| a.path.cmp(&b.path));
+    /// Content of a stored object (sealed file content), by hash.
+    pub fn object_content(&self, hash: &str) -> WritResult<Vec<u8>> {
+        self.objects.retrieve(hash)
+    }
 
-            if scoped.is_empty() && !allow_empty {
-                return Err(WritError::NothingToSeal);
+    /// Compute the default scope of a spec seal over `pending` paths.
+    pub fn compute_seal_scope(
+        &self,
+        spec_id: &str,
+        agent_id: &str,
+        pending: &[String],
+        mode: ScopeMode,
+    ) -> WritResult<SealScope> {
+        let specs = self.list_specs()?;
+        // A seal may name a spec with no record (core API, legacy callers);
+        // it then has no own files yet.
+        let this = match specs.iter().find(|s| s.id == spec_id) {
+            Some(spec) => self.spec_ownership(spec),
+            None => SpecOwnership {
+                spec_id: spec_id.to_string(),
+                ..SpecOwnership::default()
+            },
+        };
+        let others: Vec<SpecOwnership> = specs
+            .iter()
+            .filter(|s| s.id != spec_id && Self::spec_is_open(s))
+            .map(|s| self.spec_ownership(s))
+            .collect();
+        let other_claims: Vec<ClaimHolder> = specs
+            .iter()
+            .filter(|s| s.id != spec_id && Self::spec_is_open(s))
+            .filter_map(|s| match s.claimed_by.as_deref() {
+                Some(owner) if owner != agent_id => Some(ClaimHolder {
+                    spec_id: s.id.clone(),
+                    agent: owner.to_string(),
+                }),
+                _ => None,
+            })
+            .collect();
+        Ok(seal_scope::classify(
+            pending,
+            &this,
+            &others,
+            &other_claims,
+            mode,
+        ))
+    }
+
+    /// A spec is open while its status is not complete and its lifecycle is
+    /// not cancelled, completed, or archived.
+    fn spec_is_open(spec: &Spec) -> bool {
+        use crate::spec::LifecycleState;
+        spec.status != SpecStatus::Complete
+            && !matches!(
+                spec.lifecycle_state,
+                LifecycleState::Cancelled | LifecycleState::Completed | LifecycleState::Archived
+            )
+    }
+
+    /// Own files of a spec: declared `file_scope` plus every path its seals captured.
+    ///
+    /// A seal listed in `sealed_by` that cannot be loaded contributes nothing;
+    /// ownership is advisory and must never block a seal.
+    fn spec_ownership(&self, spec: &Spec) -> SpecOwnership {
+        let sealed_paths = spec
+            .sealed_by
+            .iter()
+            .filter_map(|id| self.load_seal(id).ok())
+            .flat_map(|seal| seal.changes.into_iter().map(|c| c.path))
+            .collect();
+        SpecOwnership {
+            spec_id: spec.id.clone(),
+            file_scope: spec.file_scope.clone(),
+            sealed_paths,
+        }
+    }
+
+    /// Reject seals from revoked or suspended agents and invalid agent ids.
+    fn check_agent_can_seal(&self, agent_id: &str) -> WritResult<()> {
+        Self::validate_agent_id(agent_id)?;
+        if let Ok(registered) = self.load_agent(agent_id) {
+            let state = match registered.status {
+                AgentStatus::Revoked => Some("revoked"),
+                AgentStatus::Suspended => Some("suspended"),
+                _ => None,
+            };
+            if let Some(state) = state {
+                return Err(WritError::AgentInactive(format!(
+                    "agent '{agent_id}' is {state} and cannot create seals"
+                )));
             }
-            scoped
-        } else {
-            // ── Full-directory sealing (backward compat) ─────────────────
-            if working_state.is_clean() && !allow_empty {
-                return Err(WritError::NothingToSeal);
-            }
+        }
+        Ok(())
+    }
 
-            let mut changes = Vec::new();
-
-            for file_state in &working_state.changes {
-                match file_state.status {
-                    FileStatus::New | FileStatus::Modified => {
-                        let content = fs::read(self.root.join(&file_state.path))?;
-                        let new_hash = self.objects.store(&content)?;
-                        let old_hash = index.get_hash(&file_state.path).map(String::from);
-
-                        let change_type = if file_state.status == FileStatus::New {
-                            ChangeType::Added
-                        } else {
-                            ChangeType::Modified
-                        };
-
-                        changes.push(FileChange {
-                            path: file_state.path.clone(),
-                            change_type,
-                            old_hash,
-                            new_hash: Some(new_hash.clone()),
-                        });
-
-                        let size = content.len() as u64;
-                        index.upsert(&file_state.path, new_hash, size);
-                    }
-                    FileStatus::Deleted => {
-                        let old_hash = index.get_hash(&file_state.path).map(String::from);
-                        changes.push(FileChange {
-                            path: file_state.path.clone(),
-                            change_type: ChangeType::Deleted,
-                            old_hash,
-                            new_hash: None,
-                        });
-                        index.remove(&file_state.path);
-                    }
+    /// Seals respect claims. Sealing to a spec claimed by another agent is
+    /// rejected under strict claim enforcement and warned otherwise.
+    ///
+    /// Runs before anything is written to the store, so a rejected seal
+    /// leaves no objects behind.
+    fn check_seal_claim(&self, spec_id: &str, agent_id: &str) -> WritResult<Option<String>> {
+        let spec = match self.load_spec(spec_id) {
+            Ok(spec) => spec,
+            Err(_) => return Ok(None),
+        };
+        match spec.claimed_by {
+            Some(ref owner) if owner != agent_id => {
+                if self.enforce_claims {
+                    Err(WritError::SealClaimConflict {
+                        spec_id: spec_id.to_string(),
+                        claimed_by: owner.clone(),
+                        agent: agent_id.to_string(),
+                    })
+                } else {
+                    Ok(Some(format!(
+                        "CLAIM: spec '{spec_id}' is claimed by agent '{owner}', sealed by '{agent_id}'"
+                    )))
                 }
             }
-            changes
-        };
+            _ => Ok(None),
+        }
+    }
+
+    /// Write a seal for `selected` working-tree changes while holding the lock.
+    ///
+    /// Only the selected files are stored and written to the index; every
+    /// other pending file stays pending (finding 13b). Agent scope is checked
+    /// before any object is stored.
+    #[allow(clippy::too_many_arguments)]
+    fn write_seal_locked(
+        &self,
+        mut index: Index,
+        selected: &[&state::FileState],
+        agent: AgentIdentity,
+        summary: String,
+        spec_id: Option<String>,
+        status: TaskStatus,
+        verification: Verification,
+        allow_empty: bool,
+        mut seal_warnings: Vec<String>,
+    ) -> WritResult<Seal> {
+        let changed_paths: Vec<String> = selected.iter().map(|f| f.path.clone()).collect();
+        seal_warnings.extend(self.check_agent_scope(&agent.id, &changed_paths)?);
+
+        let mut changes = Vec::with_capacity(selected.len());
+        for file_state in selected {
+            let old_hash = index.get_hash(&file_state.path).map(String::from);
+            match file_state.status {
+                FileStatus::New | FileStatus::Modified => {
+                    let content = fs::read(self.root.join(&file_state.path))?;
+                    let new_hash = self.objects.store(&content)?;
+                    let change_type = if old_hash.is_some() {
+                        ChangeType::Modified
+                    } else {
+                        ChangeType::Added
+                    };
+                    changes.push(FileChange {
+                        path: file_state.path.clone(),
+                        change_type,
+                        old_hash,
+                        new_hash: Some(new_hash.clone()),
+                    });
+                    index.upsert(&file_state.path, new_hash, content.len() as u64);
+                }
+                FileStatus::Deleted => {
+                    changes.push(FileChange {
+                        path: file_state.path.clone(),
+                        change_type: ChangeType::Deleted,
+                        old_hash,
+                        new_hash: None,
+                    });
+                    index.remove(&file_state.path);
+                }
+            }
+        }
+        changes.sort_by(|a, b| a.path.cmp(&b.path));
 
         let tree_json = serde_json::to_string(&index.entries)?;
         let tree_hash = self.objects.store(tree_json.as_bytes())?;
         let parent = self.resolve_parent(spec_id.as_deref())?;
 
-        let mut seal_warnings: Vec<String> = Vec::new();
-
         if let Some(ref sid) = spec_id {
-            let changed_paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
             if let Some(scope_warn) = self.check_file_scope(sid, &changed_paths) {
                 seal_warnings.push(format!(
                     "FILE_SCOPE: {} file(s) outside declared scope for spec '{}': {}",
@@ -778,7 +969,6 @@ impl Repository {
                     sid,
                     scope_warn.out_of_scope_files.join(", "),
                 ));
-                // Emit security event for scope violation (best-effort, don't block seal)
                 let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
                 if let Err(e) =
                     logger.emit_scope_violation(&agent.id, sid, &scope_warn.out_of_scope_files)
@@ -794,46 +984,6 @@ impl Repository {
             );
         }
 
-        // Agent identity checks (Sprint B)
-        if let Ok(registered) = self.load_agent(&agent.id) {
-            if registered.status != AgentStatus::Active {
-                seal_warnings.push(format!(
-                    "AGENT_INACTIVE: agent '{}' status is {:?}",
-                    agent.id, registered.status
-                ));
-            }
-            let out_of_scope: Vec<&str> = changes
-                .iter()
-                .filter(|c| !crate::agent::is_in_scope(&registered.scope_constraints, &c.path))
-                .map(|c| c.path.as_str())
-                .collect();
-            if !out_of_scope.is_empty() {
-                // Always emit security event (best-effort)
-                let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
-                let _ = logger.emit_agent_scope_violation(&agent.id, &out_of_scope);
-                if self.enforce_scope {
-                    return Err(WritError::ScopeViolation(format!(
-                        "agent '{}' modified {} file(s) outside scope: {}",
-                        agent.id,
-                        out_of_scope.len(),
-                        out_of_scope.join(", ")
-                    )));
-                } else {
-                    seal_warnings.push(format!(
-                        "AGENT_SCOPE: {} file(s) outside agent '{}' scope: {}",
-                        out_of_scope.len(),
-                        agent.id,
-                        out_of_scope.join(", ")
-                    ));
-                }
-            }
-        } else {
-            // Agent not in identity store — emit unrecognized agent event
-            let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
-            let _ = logger.emit_unrecognized_agent(&agent.id);
-        }
-
-        // Look up parent seal's chain_hash for the cryptographic chain link
         let parent_seal_hash = match parent {
             Some(ref pid) => match self.load_seal(pid) {
                 Ok(s) => s.chain_hash.clone(),
@@ -862,7 +1012,6 @@ impl Repository {
         );
         seal.workspace = self.active_workspace.clone();
 
-        // Sign with agent's key if available, otherwise unsigned
         let ks = KeyStore::open(&self.writ_dir);
         let signing_key = ks.load_agent_signing_key(&seal.agent.id).ok();
         seal.secure(signing_key.as_ref());
@@ -872,53 +1021,93 @@ impl Repository {
         index.save(&self.workspace_dir().join("index.json"))?;
 
         if let Some(ref sid) = spec_id {
-            self.write_spec_head(sid, &seal.id)?;
-            if let Ok(mut spec) = self.load_spec(sid) {
-                spec.sealed_by.push(seal.id.clone());
-                let now = chrono::Utc::now();
-                spec.updated_at = now;
-                spec.last_activity = now;
+            self.record_seal_on_spec(sid, &seal)?;
+        }
+        Ok(seal)
+    }
 
-                // Auto-claim on first seal: if spec is unclaimed, claim it for this agent.
-                if spec.claimed_by.is_none() {
-                    spec.claimed_by = Some(seal.agent.id.clone());
-                }
+    /// Agent identity checks (Sprint B): inactive warning and scope constraints.
+    ///
+    /// Returns warnings, or `ScopeViolation` when scope enforcement is on.
+    fn check_agent_scope(&self, agent_id: &str, paths: &[String]) -> WritResult<Vec<String>> {
+        let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+        let registered = match self.load_agent(agent_id) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = logger.emit_unrecognized_agent(agent_id);
+                return Ok(Vec::new());
+            }
+        };
+        let mut warnings = Vec::new();
+        if registered.status != AgentStatus::Active {
+            warnings.push(format!(
+                "AGENT_INACTIVE: agent '{}' status is {:?}",
+                agent_id, registered.status
+            ));
+        }
+        let out_of_scope: Vec<&str> = paths
+            .iter()
+            .filter(|p| !crate::agent::is_in_scope(&registered.scope_constraints, p))
+            .map(|p| p.as_str())
+            .collect();
+        if !out_of_scope.is_empty() {
+            let _ = logger.emit_agent_scope_violation(agent_id, &out_of_scope);
+            let files = format!("{} file(s) outside", out_of_scope.len());
+            let list = out_of_scope.join(", ");
+            if self.enforce_scope {
+                return Err(WritError::ScopeViolation(format!(
+                    "agent '{agent_id}' modified {files} scope: {list}"
+                )));
+            }
+            let msg = format!("{files} agent '{agent_id}' scope: {list}");
+            warnings.push(format!("AGENT_SCOPE: {msg}"));
+        }
+        Ok(warnings)
+    }
 
-                let promoted = self.auto_promote_spec_status(&mut spec, &seal.status);
-                self.save_spec(&spec)?;
-
-                if promoted {
-                    self.check_all_specs_complete();
-                }
+    /// Update the spec after a seal: head, `sealed_by`, activity, auto-claim
+    /// on first seal, and status promotion.
+    fn record_seal_on_spec(&self, spec_id: &str, seal: &Seal) -> WritResult<()> {
+        self.write_spec_head(spec_id, &seal.id)?;
+        if let Ok(mut spec) = self.load_spec(spec_id) {
+            spec.sealed_by.push(seal.id.clone());
+            let now = chrono::Utc::now();
+            spec.updated_at = now;
+            spec.last_activity = now;
+            if spec.claimed_by.is_none() {
+                spec.claimed_by = Some(seal.agent.id.clone());
+            }
+            let promoted = self.auto_promote_spec_status(&mut spec, &seal.status);
+            self.save_spec(&spec)?;
+            if promoted {
+                self.check_all_specs_complete();
             }
         }
+        Ok(())
+    }
 
+    /// Post-seal work that runs outside the repo lock: storage pressure and
+    /// optional on-seal convergence.
+    fn after_seal(&self, lock: RepoLock, mut seal: Seal) -> WritResult<Seal> {
         // GC.3.3c: Lightweight storage pressure check (best-effort, never blocks seal).
         self.check_storage_pressure(&seal);
 
-        // Release the repo lock BEFORE convergence. The seal is fully
-        // committed at this point (written to disk, chain/spec updated).
-        // Convergence needs its own lock via converge_all(), so we must
-        // drop the seal lock first to avoid re-entrancy deadlock.
-        drop(_lock);
+        // Release the repo lock BEFORE convergence: convergence takes its own
+        // lock via converge_all(), so holding it here would deadlock.
+        drop(lock);
 
-        // V3: On-seal convergence is disabled by default. Convergence now
-        // fires from mark_spec_done() (completion-triggered). The seal.convergence
-        // field is retained for backward compatibility but will be None for new seals.
-        //
-        // Users can opt back in via `auto_converge_on_seal = true` in config.toml.
-        if spec_id.is_some() {
+        // V3: on-seal convergence is off by default; it fires from
+        // mark_spec_done(). Opt in with `auto_converge_on_seal = true`.
+        if seal.spec_id.is_some() {
             let auto_converge_on_seal = crate::config::ProjectConfig::load(&self.writ_dir)
                 .unwrap_or_default()
                 .watch
                 .map(|w| w.auto_converge_on_seal)
-                .unwrap_or(false); // V3: default changed from true to false
-
+                .unwrap_or(false);
             if auto_converge_on_seal {
                 seal.convergence = Some(self.try_post_seal_convergence());
             }
         }
-
         Ok(seal)
     }
 
@@ -927,6 +1116,7 @@ impl Repository {
     /// If `expected_head` is provided, checks whether HEAD moved since
     /// the agent started. The seal always proceeds, but returns a
     /// `SealConflictWarning` if another agent sealed in between.
+    #[allow(clippy::too_many_arguments)]
     pub fn seal_with_check(
         &self,
         agent: AgentIdentity,
@@ -937,13 +1127,46 @@ impl Repository {
         allow_empty: bool,
         expected_head: Option<String>,
     ) -> WritResult<(Seal, Option<SealConflictWarning>)> {
+        self.seal_with_check_scoped(
+            agent,
+            summary,
+            spec_id,
+            status,
+            verification,
+            allow_empty,
+            expected_head,
+        )
+        .map(|(seal, warning, _)| (seal, warning))
+    }
+
+    /// [`Self::seal_with_check`] that also returns the default-scope decision
+    /// (see [`Self::seal_scoped`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn seal_with_check_scoped(
+        &self,
+        agent: AgentIdentity,
+        summary: String,
+        spec_id: Option<String>,
+        status: TaskStatus,
+        verification: Verification,
+        allow_empty: bool,
+        expected_head: Option<String>,
+    ) -> WritResult<(Seal, Option<SealConflictWarning>, Option<SealScope>)> {
         let pre_seal_head = if spec_id.is_some() {
             self.resolve_parent(spec_id.as_deref())?
         } else {
             self.read_head()?
         };
 
-        let seal = self.seal(agent, summary, spec_id, status, verification, allow_empty)?;
+        let (seal, scope) = self.seal_scoped(
+            agent,
+            summary,
+            spec_id,
+            status,
+            verification,
+            allow_empty,
+            ScopeMode::Seal,
+        )?;
 
         let normalized_expected = match expected_head {
             Some(ref eh) => self.resolve_seal_id(eh).ok(),
@@ -990,7 +1213,7 @@ impl Repository {
             _ => None,
         };
 
-        Ok((seal, warning))
+        Ok((seal, warning, scope))
     }
 
     /// Get the seal history (newest first) from global HEAD.
@@ -6275,6 +6498,7 @@ impl Repository {
     ///
     /// Paths are matched exactly or as directory prefixes.
     /// Remaining changes stay pending.
+    #[allow(clippy::too_many_arguments)]
     pub fn seal_paths(
         &self,
         agent: AgentIdentity,
@@ -6285,197 +6509,65 @@ impl Repository {
         paths: &[String],
         allow_empty: bool,
     ) -> WritResult<Seal> {
-        Self::validate_agent_id(&agent.id)?;
-        // Reject seals from revoked or suspended agents
-        if let Ok(registered) = self.load_agent(&agent.id) {
-            if registered.status == AgentStatus::Revoked {
-                return Err(WritError::AgentInactive(format!(
-                    "agent '{}' is revoked and cannot create seals",
-                    agent.id
-                )));
-            }
-            if registered.status == AgentStatus::Suspended {
-                return Err(WritError::AgentInactive(format!(
-                    "agent '{}' is suspended and cannot create seals",
-                    agent.id
-                )));
-            }
+        self.seal_matching(
+            agent,
+            summary,
+            spec_id,
+            status,
+            verification,
+            allow_empty,
+            |path| {
+                paths
+                    .iter()
+                    .any(|p| path == p || path.starts_with(&format!("{p}/")))
+            },
+        )
+    }
+
+    /// Seal every pending change whose path satisfies `select`.
+    #[allow(clippy::too_many_arguments)]
+    fn seal_matching(
+        &self,
+        agent: AgentIdentity,
+        summary: String,
+        spec_id: Option<String>,
+        status: TaskStatus,
+        verification: Verification,
+        allow_empty: bool,
+        select: impl Fn(&str) -> bool,
+    ) -> WritResult<Seal> {
+        self.check_agent_can_seal(&agent.id)?;
+        let mut warnings = Vec::new();
+        if let Some(ref sid) = spec_id {
+            warnings.extend(self.check_seal_claim(sid, &agent.id)?);
         }
-        let _lock = self.lock()?;
-        let mut index = self.load_index()?;
+        let lock = self.lock()?;
+        let index = self.load_index()?;
         let rules = self.ignore_rules();
         let working_state = state::compute_state(&self.root, &index, &rules);
 
-        let matching_changes: Vec<_> = working_state
+        let selected: Vec<&state::FileState> = working_state
             .changes
             .iter()
-            .filter(|fs| {
-                paths
-                    .iter()
-                    .any(|p| fs.path == *p || fs.path.starts_with(&format!("{p}/")))
-            })
+            .filter(|fs| select(&fs.path))
             .collect();
 
-        if matching_changes.is_empty() && !allow_empty {
+        if selected.is_empty() && !allow_empty {
             return Err(WritError::NothingToSeal);
         }
 
-        let mut changes = Vec::new();
-
-        for file_state in &matching_changes {
-            match file_state.status {
-                FileStatus::New | FileStatus::Modified => {
-                    let content = fs::read(self.root.join(&file_state.path))?;
-                    let new_hash = self.objects.store(&content)?;
-                    let old_hash = index.get_hash(&file_state.path).map(String::from);
-
-                    let change_type = if file_state.status == FileStatus::New {
-                        ChangeType::Added
-                    } else {
-                        ChangeType::Modified
-                    };
-
-                    changes.push(FileChange {
-                        path: file_state.path.clone(),
-                        change_type,
-                        old_hash,
-                        new_hash: Some(new_hash.clone()),
-                    });
-
-                    let size = content.len() as u64;
-                    index.upsert(&file_state.path, new_hash, size);
-                }
-                FileStatus::Deleted => {
-                    let old_hash = index.get_hash(&file_state.path).map(String::from);
-                    changes.push(FileChange {
-                        path: file_state.path.clone(),
-                        change_type: ChangeType::Deleted,
-                        old_hash,
-                        new_hash: None,
-                    });
-                    index.remove(&file_state.path);
-                }
-            }
-        }
-
-        let tree_json = serde_json::to_string(&index.entries)?;
-        let tree_hash = self.objects.store(tree_json.as_bytes())?;
-        let parent = self.resolve_parent(spec_id.as_deref())?;
-
-        let mut seal_warnings: Vec<String> = Vec::new();
-
-        if let Some(ref sid) = spec_id {
-            let changed_paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
-            if let Some(scope_warn) = self.check_file_scope(sid, &changed_paths) {
-                seal_warnings.push(format!(
-                    "FILE_SCOPE: {} file(s) outside declared scope for spec '{}': {}",
-                    scope_warn.out_of_scope_files.len(),
-                    sid,
-                    scope_warn.out_of_scope_files.join(", "),
-                ));
-                // Emit security event for scope violation (best-effort, don't block seal)
-                let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
-                if let Err(e) =
-                    logger.emit_scope_violation(&agent.id, sid, &scope_warn.out_of_scope_files)
-                {
-                    seal_warnings.push(format!("SECURITY_LOG_FAILURE: {e}"));
-                }
-            }
-        }
-
-        if changes.is_empty() && !summary.is_empty() {
-            seal_warnings.push(
-                "GHOST_WORK: seal has a summary but 0 file changes — work may have been captured by another agent's seal".to_string(),
-            );
-        }
-
-        // Agent identity checks (Sprint B)
-        if let Ok(registered) = self.load_agent(&agent.id) {
-            if registered.status != AgentStatus::Active {
-                seal_warnings.push(format!(
-                    "AGENT_INACTIVE: agent '{}' status is {:?}",
-                    agent.id, registered.status
-                ));
-            }
-            let out_of_scope: Vec<&str> = changes
-                .iter()
-                .filter(|c| !crate::agent::is_in_scope(&registered.scope_constraints, &c.path))
-                .map(|c| c.path.as_str())
-                .collect();
-            if !out_of_scope.is_empty() {
-                let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
-                let _ = logger.emit_agent_scope_violation(&agent.id, &out_of_scope);
-                if self.enforce_scope {
-                    return Err(WritError::ScopeViolation(format!(
-                        "agent '{}' modified {} file(s) outside scope: {}",
-                        agent.id,
-                        out_of_scope.len(),
-                        out_of_scope.join(", ")
-                    )));
-                } else {
-                    seal_warnings.push(format!(
-                        "AGENT_SCOPE: {} file(s) outside agent '{}' scope: {}",
-                        out_of_scope.len(),
-                        agent.id,
-                        out_of_scope.join(", ")
-                    ));
-                }
-            }
-        } else {
-            // Agent not in identity store — emit unrecognized agent event
-            let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
-            let _ = logger.emit_unrecognized_agent(&agent.id);
-        }
-
-        let parent_seal_hash = match parent {
-            Some(ref pid) => match self.load_seal(pid) {
-                Ok(s) => s.chain_hash.clone(),
-                Err(e) => {
-                    seal_warnings.push(format!(
-                        "CHAIN_BREAK: failed to load parent seal {}: {e} — chain integrity may be compromised",
-                        &pid[..12.min(pid.len())]
-                    ));
-                    None
-                }
-            },
-            None => None,
-        };
-
-        let mut seal = Seal::new(
-            parent,
-            tree_hash,
+        let seal = self.write_seal_locked(
+            index,
+            &selected,
             agent,
-            spec_id.clone(),
-            status,
-            changes,
-            verification,
             summary,
-            seal_warnings,
-            parent_seal_hash,
-        );
-        seal.workspace = self.active_workspace.clone();
-
-        // Sign with agent's key if available, otherwise unsigned
-        let ks = KeyStore::open(&self.writ_dir);
-        let signing_key = ks.load_agent_signing_key(&seal.agent.id).ok();
-        seal.secure(signing_key.as_ref());
-
-        self.save_seal(&seal)?;
-        atomic_write(&self.workspace_dir().join("HEAD"), seal.id.as_bytes())?;
-        index.save(&self.workspace_dir().join("index.json"))?;
-
-        if let Some(ref sid) = spec_id {
-            self.write_spec_head(sid, &seal.id)?;
-            if let Ok(mut spec) = self.load_spec(sid) {
-                spec.sealed_by.push(seal.id.clone());
-                let now = chrono::Utc::now();
-                spec.updated_at = now;
-                spec.last_activity = now;
-                self.save_spec(&spec)?;
-            }
-        }
-
-        Ok(seal)
+            spec_id,
+            status,
+            verification,
+            allow_empty,
+            warnings,
+        )?;
+        self.after_seal(lock, seal)
     }
 
     // --- Internal helpers ---
@@ -6618,7 +6710,6 @@ impl Repository {
             return Ok(SealTreeConvergenceReport {
                 merged_files: Vec::new(),
                 escalations: Vec::new(),
-                convergence_seal_id: None,
                 is_clean: true,
                 specs_converged: spec_ids.to_vec(),
                 shadow_results: Vec::new(),
@@ -6660,7 +6751,6 @@ impl Repository {
             return Ok(SealTreeConvergenceReport {
                 merged_files: Vec::new(),
                 escalations: Vec::new(),
-                convergence_seal_id: None,
                 is_clean: true,
                 specs_converged: spec_ids.to_vec(),
                 shadow_results: Vec::new(),
@@ -6697,7 +6787,6 @@ impl Repository {
             return Ok(SealTreeConvergenceReport {
                 merged_files: Vec::new(),
                 escalations: Vec::new(),
-                convergence_seal_id: None,
                 is_clean: true,
                 specs_converged: spec_ids.to_vec(),
                 shadow_results: Vec::new(),
@@ -6843,31 +6932,30 @@ impl Repository {
             });
         }
 
-        // Create convergence seal recording the merge.
-        let convergence_seal_id = if !merged_files.is_empty() {
-            let seal_data = serde_json::json!({
+        // Preview record for the pending convergence. It lives only in the
+        // pending file until materialize removes it; it is not stored as an
+        // object because nothing reads one back (finding 32). The merged
+        // objects it lists are gc roots while it exists (finding 41).
+        // Attaching this report to the convergence seal is phase 4.
+        if !merged_files.is_empty() {
+            let record = serde_json::json!({
                 "type": "convergence_v3",
                 "specs": spec_ids,
                 "merged_files": merged_files.iter().map(|f| &f.path).collect::<Vec<_>>(),
+                "shadow_results": shadow_results,
                 "is_clean": all_clean,
                 "timestamp": Utc::now().to_rfc3339(),
             });
-            let seal_bytes = serde_json::to_vec(&seal_data).unwrap_or_default();
-            let hash = self.objects.store(&seal_bytes)?;
-            let record_path = self.writ_dir.join("convergence_v3_pending.json");
-            let _ = fs::write(
+            let record_path = self.writ_dir.join(crate::gc::PENDING_CONVERGENCE_FILE);
+            atomic_write(
                 &record_path,
-                serde_json::to_string_pretty(&seal_data).unwrap_or_default(),
-            );
-            Some(hash)
-        } else {
-            None
-        };
+                serde_json::to_string_pretty(&record)?.as_bytes(),
+            )?;
+        }
 
         Ok(SealTreeConvergenceReport {
             merged_files,
             escalations: all_escalations,
-            convergence_seal_id,
             is_clean: all_clean,
             specs_converged: spec_trees.iter().map(|(id, _)| id.clone()).collect(),
             shadow_results,
@@ -6984,7 +7072,6 @@ impl Repository {
             return Ok(SealTreeConvergenceReport {
                 merged_files: Vec::new(),
                 escalations: Vec::new(),
-                convergence_seal_id: None,
                 is_clean: true,
                 specs_converged: completed_ids,
                 shadow_results: Vec::new(),
@@ -7022,7 +7109,7 @@ impl Repository {
             index.save(&self.workspace_dir().join("index.json"))?;
         }
 
-        let pending_path = self.writ_dir.join("convergence_v3_pending.json");
+        let pending_path = self.writ_dir.join(crate::gc::PENDING_CONVERGENCE_FILE);
         let _ = fs::remove_file(&pending_path);
 
         Ok(())
@@ -7506,52 +7593,6 @@ impl Repository {
             current = seal.parent.clone();
         }
         Ok(None)
-    }
-
-    /// Load the baseline index for spec-scoped sealing.
-    ///
-    /// Priority: last seal by this agent for this spec → spec's genesis tree → empty index.
-    fn load_spec_baseline(&self, spec_id: &str, agent_id: &str) -> WritResult<Index> {
-        // Try: last seal for this agent on this spec
-        if let Some(seal) = self.find_last_seal_for_spec_and_agent(spec_id, agent_id)? {
-            return self.load_tree_index(&seal.tree);
-        }
-        // Try: spec's genesis tree (snapshot at spec creation)
-        if let Ok(spec) = self.load_spec(spec_id) {
-            if let Some(ref genesis_tree) = spec.genesis_tree {
-                return self.load_tree_index(genesis_tree);
-            }
-        }
-        // Fallback: empty index (captures everything — safe default for legacy specs)
-        Ok(Index::default())
-    }
-
-    /// Collect file→content_hash from the latest seal of every spec except `exclude_spec`.
-    ///
-    /// Used by seal-chain subtraction (Phase 1b) to detect files already captured
-    /// by other specs, reducing over-capture on first seals.
-    fn collect_other_spec_file_hashes(
-        &self,
-        exclude_spec: &str,
-    ) -> WritResult<std::collections::HashMap<String, String>> {
-        let mut file_hashes = std::collections::HashMap::new();
-        let specs = self.list_specs()?;
-        for spec in &specs {
-            if spec.id == exclude_spec {
-                continue;
-            }
-            // Get the latest seal for this spec (the HEAD of its chain).
-            if let Some(seal_id) = self.read_spec_head(&spec.id)? {
-                if let Ok(seal) = self.load_seal(&seal_id) {
-                    for change in &seal.changes {
-                        if let Some(ref hash) = change.new_hash {
-                            file_hashes.insert(change.path.clone(), hash.clone());
-                        }
-                    }
-                }
-            }
-        }
-        Ok(file_hashes)
     }
 
     /// Resolve a potentially-short seal ID to a full seal ID.
@@ -8786,15 +8827,7 @@ impl Repository {
         let mut out_of_scope = Vec::new();
 
         for path in changed_paths {
-            let matches = spec.file_scope.iter().any(|scope| {
-                if scope.ends_with('/') {
-                    path.starts_with(scope) || path.starts_with(&scope[..scope.len() - 1])
-                } else if scope.contains('*') {
-                    crate::ignore::glob_match(scope, path)
-                } else {
-                    path == scope || path.starts_with(&format!("{scope}/"))
-                }
-            });
+            let matches = seal_scope::path_in_scope(&spec.file_scope, path);
             if matches {
                 in_scope.push(path.clone());
             } else {
@@ -9384,8 +9417,6 @@ pub struct SealTreeConvergenceReport {
     pub merged_files: Vec<SealTreeMergeResult>,
     /// Escalations for files with true conflicts.
     pub escalations: Vec<convergence::PipelineEscalation>,
-    /// ID of the convergence seal recording this merge (if created).
-    pub convergence_seal_id: Option<String>,
     /// True if all files merged cleanly (no escalations).
     pub is_clean: bool,
     /// Specs that participated in this convergence.
@@ -10183,6 +10214,24 @@ fn build_quality_report(
         avg_confidence,
         summary,
     }
+}
+
+/// What `writ finish` stages for a set of completed specs (S.1).
+///
+/// Only paths captured by the specs' seals are staged, with the content
+/// writ last sealed for them (the index), never the working tree.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct FinishPlan {
+    /// Paths to stage with their sealed content; `None` stages a deletion.
+    pub stage: Vec<(String, Option<String>)>,
+    /// Sealed paths whose working-tree content differs from the sealed
+    /// content. The sealed content is committed; the later edits are not.
+    pub drift: Vec<String>,
+    /// Pending changes no completed spec sealed: left out.
+    pub unsealed: Vec<String>,
+    /// Paths sealed only under specs that are not complete: left out,
+    /// as `(path, spec_id)`.
+    pub in_progress: Vec<(String, String)>,
 }
 
 /// Returned by `seal()` when HEAD moved since the agent started working.
@@ -14120,7 +14169,7 @@ mod verify_all_chains_tests {
 
         // Seal on HEAD
         fs::write(dir.path().join("file.txt"), "v1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             vac_agent(),
             "head seal".to_string(),
             None,
@@ -14132,7 +14181,7 @@ mod verify_all_chains_tests {
 
         // Seal on spec branch
         fs::write(dir.path().join("file.txt"), "v2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             vac_agent(),
             "spec seal".to_string(),
             Some("test-spec".to_string()),
@@ -14187,7 +14236,7 @@ mod verify_all_chains_tests {
 
         // Seal on HEAD first
         fs::write(dir.path().join("file.txt"), "base").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             vac_agent(),
             "base seal".to_string(),
             None,
@@ -14200,7 +14249,7 @@ mod verify_all_chains_tests {
         // Seal on each spec branch
         for name in &["alpha", "beta"] {
             fs::write(dir.path().join("file.txt"), format!("{name}-v1")).unwrap();
-            repo.seal(
+            repo.seal_all_pending(
                 vac_agent(),
                 format!("{name} seal"),
                 Some(name.to_string()),
@@ -15395,7 +15444,7 @@ mod scope_constraint_tests {
 
         fs::write(dir.path().join("README.md"), "docs").unwrap();
         let seal = repo
-            .seal(
+            .seal_all_pending(
                 test_agent("worker"),
                 "out of scope".to_string(),
                 Some("feat".to_string()),
@@ -15423,7 +15472,7 @@ mod scope_constraint_tests {
         fs::write(dir.path().join("src/lib.rs"), "in scope").unwrap();
         fs::write(dir.path().join("config.toml"), "out of scope").unwrap();
         let seal = repo
-            .seal(
+            .seal_all_pending(
                 test_agent("worker"),
                 "mixed".to_string(),
                 Some("feat".to_string()),
@@ -15499,7 +15548,7 @@ mod scope_constraint_tests {
             .unwrap();
 
         fs::write(dir.path().join("secret.key"), "private").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             test_agent("worker"),
             "out of scope".to_string(),
             Some("feat".to_string()),
@@ -18378,7 +18427,7 @@ mod spec_scoped_context_tests {
 
         // Agent A seals on alpha.
         std::fs::write(dir.path().join("a.txt"), "a1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha first".into(),
             Some("alpha".into()),
@@ -18390,7 +18439,7 @@ mod spec_scoped_context_tests {
 
         // Agent B seals on beta (diverges after next alpha seal).
         std::fs::write(dir.path().join("b.txt"), "b1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta work".into(),
             Some("beta".into()),
@@ -18402,7 +18451,7 @@ mod spec_scoped_context_tests {
 
         // Agent B seals again on beta.
         std::fs::write(dir.path().join("b.txt"), "b2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta more".into(),
             Some("beta".into()),
@@ -18414,7 +18463,7 @@ mod spec_scoped_context_tests {
 
         // Agent A seals on alpha — global HEAD moves, beta branch diverges.
         std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha second".into(),
             Some("alpha".into()),
@@ -18465,7 +18514,7 @@ mod spec_scoped_context_tests {
             .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha".into(),
             Some("alpha".into()),
@@ -18476,7 +18525,7 @@ mod spec_scoped_context_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta".into(),
             Some("beta".into()),
@@ -18487,7 +18536,7 @@ mod spec_scoped_context_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha 2".into(),
             Some("alpha".into()),
@@ -18527,7 +18576,7 @@ mod spec_scoped_context_tests {
 
         // Seal on alpha (becomes global HEAD).
         std::fs::write(dir.path().join("a.txt"), "a1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha work".into(),
             Some("alpha".into()),
@@ -18539,7 +18588,7 @@ mod spec_scoped_context_tests {
 
         // Seal on beta (diverges from alpha's HEAD).
         std::fs::write(dir.path().join("b.txt"), "b1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta work".into(),
             Some("beta".into()),
@@ -18551,7 +18600,7 @@ mod spec_scoped_context_tests {
 
         // Seal again on alpha to make beta's branch diverge.
         std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha more".into(),
             Some("alpha".into()),
@@ -18592,7 +18641,7 @@ mod spec_scoped_context_tests {
         // Agent A touches auth.py and app.py.
         std::fs::write(dir.path().join("auth.py"), "v1").unwrap();
         std::fs::write(dir.path().join("app.py"), "v1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "both files".into(),
             Some("auth".into()),
@@ -18605,7 +18654,7 @@ mod spec_scoped_context_tests {
         // Agent B also touches auth.py and app.py.
         std::fs::write(dir.path().join("auth.py"), "v2").unwrap();
         std::fs::write(dir.path().join("app.py"), "v2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "also both".into(),
             Some("api".into()),
@@ -18649,7 +18698,7 @@ mod spec_scoped_context_tests {
         // Agent A seals on alpha but touches beta.py → violation for alpha.
         std::fs::write(dir.path().join("alpha.py"), "v1").unwrap();
         std::fs::write(dir.path().join("beta.py"), "v1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha work".into(),
             Some("alpha".into()),
@@ -18662,7 +18711,7 @@ mod spec_scoped_context_tests {
         // Agent B seals on beta but touches alpha.py → violation for beta.
         std::fs::write(dir.path().join("alpha.py"), "v2").unwrap();
         std::fs::write(dir.path().join("beta.py"), "v2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta work".into(),
             Some("beta".into()),
@@ -18809,7 +18858,7 @@ mod recommended_action_tests {
             .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-a"),
             "a work".into(),
             Some("a".into()),
@@ -18820,7 +18869,7 @@ mod recommended_action_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-b"),
             "b work".into(),
             Some("b".into()),
@@ -18831,7 +18880,7 @@ mod recommended_action_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-a"),
             "a more".into(),
             Some("a".into()),
@@ -19009,7 +19058,7 @@ mod recommended_action_tests {
             .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-a"),
             "a".into(),
             Some("a".into()),
@@ -19020,7 +19069,7 @@ mod recommended_action_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-b"),
             "b".into(),
             Some("b".into()),
@@ -19031,7 +19080,7 @@ mod recommended_action_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-a"),
             "a more".into(),
             Some("a".into()),
@@ -19119,7 +19168,7 @@ mod context_stress_tests {
         fs::write(dir.path().join("tests/test_api.py"), "").unwrap();
 
         // Baseline seal.
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -19163,7 +19212,7 @@ mod context_stress_tests {
             "class Base:\n    pass\n\nclass BookModel:\n    title: str\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("db-dev"),
             "schema and book model".into(),
             Some("database".into()),
@@ -19192,7 +19241,7 @@ mod context_stress_tests {
             "CREATE_TABLE = 'books'\nCREATE_INDEX = 'books_title'\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("db-dev"),
             "schema finalized".into(),
             Some("database".into()),
@@ -19236,7 +19285,7 @@ mod context_stress_tests {
             "class Base:\n    pass\n\nclass BookModel:\n    title: str\n\nclass BookResponse:\n    data: list\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("api-dev"),
             "initial routes".into(),
             Some("api".into()),
@@ -19267,7 +19316,7 @@ mod context_stress_tests {
         }
 
         // ── Step 9: api-dev seals that work ──
-        repo.seal(
+        repo.seal_all_pending(
             agent("api-dev"),
             "CRUD routes".into(),
             Some("api".into()),
@@ -19296,7 +19345,7 @@ mod context_stress_tests {
             "class Base:\n    pass\n\nclass BookModel:\n    title: str\n    isbn: str\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("db-dev"),
             "add isbn field".into(),
             Some("database".into()),
@@ -19315,7 +19364,7 @@ mod context_stress_tests {
             "from flask import Flask, request, jsonify\napp = Flask(__name__)\n\n@app.route('/books')\ndef list_books():\n    return jsonify([])\n\n@app.route('/books', methods=['POST'])\ndef create_book():\n    return jsonify({})\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("api-dev"),
             "use jsonify".into(),
             Some("api".into()),
@@ -19417,7 +19466,7 @@ mod context_stress_tests {
             "from flask import Flask, request, jsonify\napp = Flask(__name__)\n\n@app.route('/books')\ndef list_books():\n    return jsonify([])\n\n@app.route('/books', methods=['POST'])\ndef create_book():\n    return jsonify(request.json)\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("api-dev"),
             "api final polish".into(),
             Some("api".into()),
@@ -19454,7 +19503,7 @@ mod context_stress_tests {
             "class Base:\n    pass\n\nclass BookModel:\n    title: str\n    isbn: str\n\nclass TestFixture:\n    pass\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("test-dev"),
             "api tests and fixture".into(),
             Some("tests".into()),
@@ -19491,7 +19540,7 @@ mod context_stress_tests {
             "def test_book_model():\n    assert True\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("test-dev"),
             "tests finalized".into(),
             Some("tests".into()),
@@ -20119,7 +20168,7 @@ mod log_all_tests {
 
         // Agent A: seal on alpha.
         std::fs::write(dir.path().join("a.txt"), "a1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha first".into(),
             Some("alpha".into()),
@@ -20132,7 +20181,7 @@ mod log_all_tests {
         // Agent B: seal on beta — parent from HEAD.
         std::fs::write(dir.path().join("b.txt"), "b1").unwrap();
         let beta_seal = repo
-            .seal(
+            .seal_all_pending(
                 agent("agent-b"),
                 "beta work".into(),
                 Some("beta".into()),
@@ -20144,7 +20193,7 @@ mod log_all_tests {
 
         // Agent A: seal on alpha again — parent from heads/alpha, diverging from beta.
         std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha second".into(),
             Some("alpha".into()),
@@ -20209,7 +20258,7 @@ mod log_all_tests {
             .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha".into(),
             Some("alpha".into()),
@@ -20220,7 +20269,7 @@ mod log_all_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta".into(),
             Some("beta".into()),
@@ -20231,7 +20280,7 @@ mod log_all_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha 2".into(),
             Some("alpha".into()),
@@ -20626,7 +20675,7 @@ mod agent_activity_tests {
 
         // Agent A: first seal on spec alpha.
         std::fs::write(dir.path().join("a1.txt"), "a1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha first".into(),
             Some("alpha".into()),
@@ -20638,7 +20687,7 @@ mod agent_activity_tests {
 
         // Agent B: seal on spec beta — parent comes from global HEAD.
         std::fs::write(dir.path().join("b1.txt"), "b1").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta work".into(),
             Some("beta".into()),
@@ -20652,7 +20701,7 @@ mod agent_activity_tests {
         // This makes global HEAD point to this seal, with parent = first alpha seal.
         // Agent B's seal is now orphaned from the HEAD chain.
         std::fs::write(dir.path().join("a2.txt"), "a2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha second".into(),
             Some("alpha".into()),
@@ -20690,7 +20739,7 @@ mod agent_activity_tests {
 
         // Agent A: seal on alpha → HEAD + heads/alpha both point to seal1.
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha work".into(),
             Some("alpha".into()),
@@ -20702,7 +20751,7 @@ mod agent_activity_tests {
 
         // Agent B: seal on beta → HEAD + heads/beta point to seal2.
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta work".into(),
             Some("beta".into()),
@@ -20715,7 +20764,7 @@ mod agent_activity_tests {
         // Agent A: seal on alpha again → HEAD = seal3 (parent = seal1 from heads/alpha).
         // seal2 (heads/beta) is now diverged — not reachable from HEAD chain.
         std::fs::write(dir.path().join("a.txt"), "a-v2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha done".into(),
             Some("alpha".into()),
@@ -20856,7 +20905,7 @@ mod agent_activity_tests {
 
         // Create divergence as above.
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha work".into(),
             Some("alpha".into()),
@@ -20867,7 +20916,7 @@ mod agent_activity_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta work".into(),
             Some("beta".into()),
@@ -20878,7 +20927,7 @@ mod agent_activity_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a-v2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha done".into(),
             Some("alpha".into()),
@@ -20913,7 +20962,7 @@ mod agent_activity_tests {
             .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha".into(),
             Some("alpha".into()),
@@ -20924,7 +20973,7 @@ mod agent_activity_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta".into(),
             Some("beta".into()),
@@ -20935,7 +20984,7 @@ mod agent_activity_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha 2".into(),
             Some("alpha".into()),
@@ -20990,7 +21039,7 @@ mod agent_activity_tests {
             .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha".into(),
             Some("alpha".into()),
@@ -21001,7 +21050,7 @@ mod agent_activity_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta".into(),
             Some("beta".into()),
@@ -21012,7 +21061,7 @@ mod agent_activity_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha 2".into(),
             Some("alpha".into()),
@@ -21042,7 +21091,7 @@ mod agent_activity_tests {
         let repo = Repository::init(dir.path()).unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev"),
             "work".into(),
             None,
@@ -21069,7 +21118,7 @@ mod agent_activity_tests {
             .unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha".into(),
             Some("alpha".into()),
@@ -21080,7 +21129,7 @@ mod agent_activity_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("c.txt"), "c").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta".into(),
             Some("beta".into()),
@@ -21091,7 +21140,7 @@ mod agent_activity_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha 2".into(),
             Some("alpha".into()),
@@ -21329,7 +21378,7 @@ mod summary_tests {
             .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha".into(),
             Some("alpha".into()),
@@ -21340,7 +21389,7 @@ mod summary_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("b.txt"), "b").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "beta".into(),
             Some("beta".into()),
@@ -21351,7 +21400,7 @@ mod summary_tests {
         .unwrap();
 
         std::fs::write(dir.path().join("a.txt"), "a2").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "alpha 2".into(),
             Some("alpha".into()),
@@ -21886,7 +21935,7 @@ mod scale_tests {
             let fname = format!("file-{i}.txt");
             for j in 0..10 {
                 fs::write(dir.path().join(&fname), format!("spec{i}-iter{j}")).unwrap();
-                repo.seal(
+                repo.seal_all_pending(
                     agent(&format!("agent-{i}")),
                     format!("work on spec-{i}, iteration {j}"),
                     Some(format!("parallel-{i}")),
@@ -23113,7 +23162,7 @@ mod convergence_integration_tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         fs::write(dir.path().join("base.txt"), "base").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -23128,7 +23177,7 @@ mod convergence_integration_tests {
             .unwrap();
 
         fs::write(dir.path().join("a.txt"), "agent-a work").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "a work".into(),
             Some("s1".into()),
@@ -23139,7 +23188,7 @@ mod convergence_integration_tests {
         .unwrap();
 
         fs::write(dir.path().join("b.txt"), "agent-b work").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "b work".into(),
             Some("s2".into()),
@@ -23161,7 +23210,7 @@ mod convergence_integration_tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         fs::write(dir.path().join("shared.txt"), "base content").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -23177,7 +23226,7 @@ mod convergence_integration_tests {
 
         // Spec 1 modifies shared.txt
         fs::write(dir.path().join("shared.txt"), "version A").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "a changes".into(),
             Some("s1".into()),
@@ -23189,7 +23238,7 @@ mod convergence_integration_tests {
 
         // Spec 2 modifies shared.txt differently
         fs::write(dir.path().join("shared.txt"), "version B").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "b changes".into(),
             Some("s2".into()),
@@ -23218,7 +23267,7 @@ mod convergence_integration_tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         fs::write(dir.path().join("shared.txt"), "base").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -23234,7 +23283,7 @@ mod convergence_integration_tests {
 
         // Both specs write the SAME content to shared.txt
         fs::write(dir.path().join("shared.txt"), "identical content").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "a".into(),
             Some("s1".into()),
@@ -23245,13 +23294,13 @@ mod convergence_integration_tests {
         .unwrap();
 
         fs::write(dir.path().join("shared.txt"), "identical content").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b1"),
             "b".into(),
             Some("s2".into()),
             TaskStatus::InProgress,
             Verification::default(),
-            false,
+            true, // identical content is already sealed: nothing pending
         )
         .unwrap();
 
@@ -23267,7 +23316,7 @@ mod convergence_integration_tests {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         fs::write(dir.path().join("config.toml"), "[base]").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -23289,7 +23338,7 @@ mod convergence_integration_tests {
                 format!("[version-{}]", i + 1),
             )
             .unwrap();
-            repo.seal(
+            repo.seal_all_pending(
                 agent(&format!("agent-{}", i + 1)),
                 format!("agent {} changes", i + 1),
                 Some(sid.to_string()),
@@ -23547,7 +23596,7 @@ mod convergence_integration_tests {
 
         // Create baseline
         fs::write(dir.path().join("shared.txt"), "line1\nline2\nline3\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -23568,7 +23617,7 @@ mod convergence_integration_tests {
             "agent-1 header\nline1\nline2\nline3\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "a1 work".into(),
             Some("s1".into()),
@@ -23584,7 +23633,7 @@ mod convergence_integration_tests {
             "line1\nline2\nline3\nagent-2 footer\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a2"),
             "a2 work".into(),
             Some("s2".into()),
@@ -23665,7 +23714,7 @@ mod seal_tree_convergence_tests {
             "HEADER-A\nline1\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "add header".into(),
             Some("spec-a".into()),
@@ -23679,7 +23728,7 @@ mod seal_tree_convergence_tests {
             "line1\nline2\nline3\nline4\nline5\nFOOTER-B\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "add footer".into(),
             Some("spec-b".into()),
@@ -23710,6 +23759,217 @@ mod seal_tree_convergence_tests {
         assert!(merged.contains("FOOTER-B"));
     }
 
+    /// Every object hash on disk.
+    fn object_hashes(writ_dir: &std::path::Path) -> HashSet<String> {
+        let mut out = HashSet::new();
+        for shard in fs::read_dir(writ_dir.join("objects")).unwrap() {
+            let shard = shard.unwrap().path();
+            if !shard.is_dir() {
+                continue;
+            }
+            let prefix = shard.file_name().unwrap().to_string_lossy().to_string();
+            for obj in fs::read_dir(&shard).unwrap() {
+                let name = obj.unwrap().file_name().to_string_lossy().to_string();
+                out.insert(format!("{prefix}{name}"));
+            }
+        }
+        out
+    }
+
+    fn orphan_count(repo: &Repository) -> usize {
+        let seals = crate::gc::load_all_seals(&repo.writ_dir).unwrap();
+        crate::gc::find_orphaned_objects(&repo.writ_dir, &seals)
+            .unwrap()
+            .len()
+    }
+
+    fn seal_shared(repo: &Repository, dir: &std::path::Path, spec: &str, content: &str) {
+        fs::write(dir.join("shared.txt"), content).unwrap();
+        repo.seal_all_pending(
+            agent(spec),
+            format!("edit by {spec}"),
+            Some(spec.into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_seal_tree_convergence_stores_no_record_object() {
+        // Finding 32: the convergence_v3 record was stored as an object that
+        // nothing references. The only objects a convergence may add are the
+        // merged file contents materialize reads back.
+        let (dir, repo) = setup_seal_tree_repo();
+        seal_shared(
+            &repo,
+            dir.path(),
+            "spec-a",
+            "HEADER-A\nline1\nline2\nline3\nline4\nline5\n",
+        );
+        seal_shared(
+            &repo,
+            dir.path(),
+            "spec-b",
+            "line1\nline2\nline3\nline4\nline5\nFOOTER-B\n",
+        );
+        let before = object_hashes(&repo.writ_dir);
+
+        let report = repo
+            .converge_from_seal_trees(
+                &["spec-a".into(), "spec-b".into()],
+                ConvergeStrategy::Escalate,
+            )
+            .unwrap();
+
+        assert!(report.is_clean);
+        let added: HashSet<String> = object_hashes(&repo.writ_dir)
+            .difference(&before)
+            .cloned()
+            .collect();
+        let merged: HashSet<String> = report
+            .shadow_results
+            .iter()
+            .map(|(_, h)| h.clone())
+            .collect();
+        assert_eq!(
+            added, merged,
+            "convergence stored objects other than merged content"
+        );
+        // The preview record still exists, as a file.
+        let pending =
+            fs::read_to_string(repo.writ_dir.join("convergence_v3_pending.json")).unwrap();
+        assert!(pending.contains("convergence_v3"));
+        assert!(!serde_json::to_value(&report)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("convergence_seal_id"));
+    }
+
+    /// Two specs with disjoint edits to shared.txt, converged but not yet
+    /// materialized. The merged content is new, stored only as an object.
+    fn pending_merge() -> (tempfile::TempDir, Repository, SealTreeConvergenceReport) {
+        let (dir, repo) = setup_seal_tree_repo();
+        seal_shared(
+            &repo,
+            dir.path(),
+            "spec-a",
+            "HEADER-A\nline1\nline2\nline3\nline4\nline5\n",
+        );
+        seal_shared(
+            &repo,
+            dir.path(),
+            "spec-b",
+            "line1\nline2\nline3\nline4\nline5\nFOOTER-B\n",
+        );
+        let report = repo
+            .converge_from_seal_trees(
+                &["spec-a".into(), "spec-b".into()],
+                ConvergeStrategy::Escalate,
+            )
+            .unwrap();
+        assert!(report.is_clean);
+        assert_eq!(report.shadow_results.len(), 1);
+        (dir, repo, report)
+    }
+
+    #[test]
+    fn test_gc_run_between_converge_and_materialize_keeps_merged_objects() {
+        // Finding 41: merged content is live from the moment it is stored.
+        let (dir, repo, report) = pending_merge();
+        let merged_hash = report.shadow_results[0].1.clone();
+        assert_eq!(orphan_count(&repo), 0, "pending merge must not be orphaned");
+
+        let specs = repo.list_specs().unwrap();
+        let config = crate::gc::GcConfig::default();
+        let plan = crate::gc::GcPlan::generate(&repo.writ_dir, &config, &specs, &[]).unwrap();
+        crate::gc::execute_plan(&repo.writ_dir, &plan, &specs).unwrap();
+
+        assert!(repo.objects.exists(&merged_hash));
+        repo.materialize_convergence(&report).unwrap();
+        let merged = fs::read_to_string(dir.path().join("shared.txt")).unwrap();
+        assert!(merged.contains("HEADER-A") && merged.contains("FOOTER-B"));
+        assert!(!repo
+            .writ_dir
+            .join(crate::gc::PENDING_CONVERGENCE_FILE)
+            .exists());
+    }
+
+    #[test]
+    fn test_verify_clean_with_pending_merge() {
+        let (_dir, repo, _report) = pending_merge();
+        let check = repo.verify_objects().unwrap();
+        assert!(check.is_clean(), "{check:?}");
+    }
+
+    #[test]
+    fn test_verify_reports_missing_object_named_by_pending_merge() {
+        let (_dir, repo, report) = pending_merge();
+        let (path, hash) = report.shadow_results[0].clone();
+        fs::remove_file(
+            repo.writ_dir
+                .join("objects")
+                .join(&hash[..2])
+                .join(&hash[2..]),
+        )
+        .unwrap();
+
+        let check = repo.verify_objects().unwrap();
+
+        assert_eq!(check.missing_objects.len(), 1, "{check:?}");
+        assert_eq!(check.missing_objects[0].hash, hash);
+        assert_eq!(check.missing_objects[0].referenced_as, path);
+    }
+
+    #[test]
+    fn test_unparseable_pending_merge_fails_the_live_set_scan() {
+        // An unreadable root must stop gc rather than let it prune merged
+        // content it can no longer see.
+        let (_dir, repo, _report) = pending_merge();
+        fs::write(
+            repo.writ_dir.join(crate::gc::PENDING_CONVERGENCE_FILE),
+            "{not json",
+        )
+        .unwrap();
+        assert!(repo.verify_objects().is_err());
+        let seals = crate::gc::load_all_seals(&repo.writ_dir).unwrap();
+        assert!(crate::gc::find_orphaned_objects(&repo.writ_dir, &seals).is_err());
+    }
+
+    #[test]
+    fn test_seal_tree_convergence_leaves_orphan_count_unchanged() {
+        // spec-b's edit contains spec-a's, so the merge equals spec-b's
+        // sealed content: a preview converge must not add a single orphan.
+        let (dir, repo) = setup_seal_tree_repo();
+        seal_shared(
+            &repo,
+            dir.path(),
+            "spec-a",
+            "HEADER\nline1\nline2\nline3\nline4\nline5\n",
+        );
+        seal_shared(
+            &repo,
+            dir.path(),
+            "spec-b",
+            "HEADER\nline1\nline2\nline3\nline4\nline5\nFOOTER\n",
+        );
+        let before = orphan_count(&repo);
+
+        let report = repo
+            .converge_from_seal_trees(
+                &["spec-a".into(), "spec-b".into()],
+                ConvergeStrategy::Escalate,
+            )
+            .unwrap();
+
+        assert!(report.is_clean);
+        assert_eq!(report.merged_files.len(), 1, "{report:?}");
+        assert!(repo.writ_dir.join("convergence_v3_pending.json").exists());
+        assert_eq!(orphan_count(&repo), before);
+    }
+
     #[test]
     fn test_seal_tree_2spec_conflict_detection() {
         let (dir, repo) = setup_seal_tree_repo();
@@ -23718,7 +23978,7 @@ mod seal_tree_convergence_tests {
             "CHANGED-BY-A\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "change line 1".into(),
             Some("spec-a".into()),
@@ -23732,7 +23992,7 @@ mod seal_tree_convergence_tests {
             "CHANGED-BY-B\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "also change line 1".into(),
             Some("spec-b".into()),
@@ -23762,7 +24022,7 @@ mod seal_tree_convergence_tests {
             "CHANGED-BY-A\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "change line 1".into(),
             Some("spec-a".into()),
@@ -23776,7 +24036,7 @@ mod seal_tree_convergence_tests {
             "CHANGED-BY-B\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "also change line 1".into(),
             Some("spec-b".into()),
@@ -23802,7 +24062,7 @@ mod seal_tree_convergence_tests {
     fn test_seal_tree_disjoint_files_no_merge() {
         let (dir, repo) = setup_seal_tree_repo();
         fs::write(dir.path().join("only-a.txt"), "modified-a\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "a work".into(),
             Some("spec-a".into()),
@@ -23812,7 +24072,7 @@ mod seal_tree_convergence_tests {
         )
         .unwrap();
         fs::write(dir.path().join("only-b.txt"), "modified-b\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "b work".into(),
             Some("spec-b".into()),
@@ -23860,7 +24120,7 @@ mod seal_tree_convergence_tests {
             "TOP-A\nline1\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "header".into(),
             Some("spec-a".into()),
@@ -23874,7 +24134,7 @@ mod seal_tree_convergence_tests {
             "line1\nline2\nline3\nline4\nline5\nBOTTOM-B\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "footer".into(),
             Some("spec-b".into()),
@@ -23908,7 +24168,7 @@ mod seal_tree_convergence_tests {
             "header\nline1\nline2\nline3\nline4\nline5\nfooter\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -23929,7 +24189,7 @@ mod seal_tree_convergence_tests {
             "NEW-HEADER\nline1\nline2\nline3\nline4\nline5\nfooter\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "s1 header".into(),
             Some("s1".into()),
@@ -23943,7 +24203,7 @@ mod seal_tree_convergence_tests {
             "header\nline1\nline2\nline3\nline4\nline5\nNEW-FOOTER\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a2"),
             "s2 footer".into(),
             Some("s2".into()),
@@ -23957,7 +24217,7 @@ mod seal_tree_convergence_tests {
             "header\nline1\nline2\nMIDDLE-INSERT\nline3\nline4\nline5\nfooter\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a3"),
             "s3 middle".into(),
             Some("s3".into()),
@@ -23998,7 +24258,7 @@ mod seal_tree_convergence_tests {
             "line1\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -24018,7 +24278,7 @@ mod seal_tree_convergence_tests {
             "A-HEADER\nline1\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a"),
             "a header".into(),
             Some("sa".into()),
@@ -24033,7 +24293,7 @@ mod seal_tree_convergence_tests {
             "A-HEADER\nline1\nline2\nline3\nline4\nline5\nB-FOOTER\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("b"),
             "b footer (contaminated)".into(),
             Some("sb".into()),
@@ -24071,7 +24331,7 @@ mod seal_tree_convergence_tests {
             "line1\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -24090,7 +24350,7 @@ mod seal_tree_convergence_tests {
             "X-TOP\nline1\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("ax"),
             "x top".into(),
             Some("x".into()),
@@ -24104,7 +24364,7 @@ mod seal_tree_convergence_tests {
             "line1\nline2\nline3\nline4\nline5\nY-BOTTOM\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("ay"),
             "y bottom".into(),
             Some("y".into()),
@@ -24134,7 +24394,7 @@ mod seal_tree_convergence_tests {
             "A-ADDED\nline1\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "a adds header".into(),
             Some("spec-a".into()),
@@ -24148,7 +24408,7 @@ mod seal_tree_convergence_tests {
             "line1\nline2\nline3\nline4\nline5\nB-ADDED\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "b adds footer".into(),
             Some("spec-b".into()),
@@ -24183,7 +24443,7 @@ mod seal_tree_convergence_tests {
             "MAT-A\nline1\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "a".into(),
             Some("spec-a".into()),
@@ -24197,7 +24457,7 @@ mod seal_tree_convergence_tests {
             "line1\nline2\nline3\nline4\nline5\nMAT-B\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "b".into(),
             Some("spec-b".into()),
@@ -24228,7 +24488,7 @@ mod seal_tree_convergence_tests {
             "FINAL-A\nline1\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "a".into(),
             Some("spec-a".into()),
@@ -24242,7 +24502,7 @@ mod seal_tree_convergence_tests {
             "line1\nline2\nline3\nline4\nline5\nFINAL-B\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "b".into(),
             Some("spec-b".into()),
@@ -24274,7 +24534,7 @@ mod seal_tree_convergence_tests {
 
         // --- Pre-epoch: simulate specs from a previous session ---
         fs::write(dir.path().join("shared.txt"), "original\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -24291,7 +24551,7 @@ mod seal_tree_convergence_tests {
             .unwrap();
 
         fs::write(dir.path().join("shared.txt"), "old-a-version\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "old a work".into(),
             Some("old-a".into()),
@@ -24301,7 +24561,7 @@ mod seal_tree_convergence_tests {
         )
         .unwrap();
         fs::write(dir.path().join("shared.txt"), "old-b-version\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "old b work".into(),
             Some("old-b".into()),
@@ -24320,7 +24580,7 @@ mod seal_tree_convergence_tests {
             agent_type: crate::seal::AgentType::Agent,
         };
         fs::write(dir.path().join("shared.txt"), "committed-state\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             bridge_agent,
             "bridge import from git abc123".into(),
             None,
@@ -24341,7 +24601,7 @@ mod seal_tree_convergence_tests {
             "NEW-A-TOP\ncommitted-state\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "new a work".into(),
             Some("new-a".into()),
@@ -24355,7 +24615,7 @@ mod seal_tree_convergence_tests {
             "committed-state\nNEW-B-BOTTOM\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "new b work".into(),
             Some("new-b".into()),
@@ -24406,7 +24666,7 @@ mod seal_tree_convergence_tests {
             "SPEC-A\nline2\nline3\nline4\nline5\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-a"),
             "a".into(),
             Some("spec-a".into()),
@@ -24420,7 +24680,7 @@ mod seal_tree_convergence_tests {
             "line1\nline2\nline3\nline4\nSPEC-B\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-b"),
             "b".into(),
             Some("spec-b".into()),
@@ -24450,7 +24710,7 @@ mod seal_tree_convergence_tests {
         .unwrap();
 
         fs::write(dir.path().join("shared.txt"), "original\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -24468,7 +24728,7 @@ mod seal_tree_convergence_tests {
 
         // Seal work for all 3
         fs::write(dir.path().join("shared.txt"), "OLD-A\noriginal\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent"),
             "old a".into(),
             Some("spec-old-a".into()),
@@ -24478,7 +24738,7 @@ mod seal_tree_convergence_tests {
         )
         .unwrap();
         fs::write(dir.path().join("shared.txt"), "original\nOLD-B\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent"),
             "old b".into(),
             Some("spec-old-b".into()),
@@ -24488,7 +24748,7 @@ mod seal_tree_convergence_tests {
         )
         .unwrap();
         fs::write(dir.path().join("shared.txt"), "original\nline2\nNEW\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent"),
             "new work".into(),
             Some("spec-new".into()),
@@ -26655,7 +26915,7 @@ mod convergence_metadata_tests {
         // Baseline.
         fs::write(dir.path().join("shared.py"), "x = 1\n").unwrap();
         fs::write(dir.path().join("only_alpha.py"), "a = 1\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -26667,7 +26927,7 @@ mod convergence_metadata_tests {
 
         // Alpha seals first (establishes alpha spec head).
         fs::write(dir.path().join("only_alpha.py"), "a = 2\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-a"),
             "alpha initial".into(),
             Some("alpha".into()),
@@ -26680,7 +26940,7 @@ mod convergence_metadata_tests {
         // Beta seals with a replacement change to shared.py (not just an append).
         fs::write(dir.path().join("shared.py"), "x = 'beta_value'\n").unwrap();
         fs::write(dir.path().join("only_beta.py"), "b = 1\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-b"),
             "beta work".into(),
             Some("beta".into()),
@@ -26701,7 +26961,7 @@ mod convergence_metadata_tests {
         // Alpha seals again with a DIFFERENT replacement to shared.py — creates
         // divergence AND a real conflict (both branches replaced x differently).
         fs::write(dir.path().join("shared.py"), "x = 'alpha_value'\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-a"),
             "alpha with shared change".into(),
             Some("alpha".into()),
@@ -26844,7 +27104,7 @@ mod convergence_metadata_tests {
 
         // Baseline seal.
         fs::write(dir.path().join("base.py"), "base\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -26856,7 +27116,7 @@ mod convergence_metadata_tests {
 
         // Alpha seals first (establishes alpha spec head).
         fs::write(dir.path().join("alpha.py"), "alpha\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-a"),
             "alpha initial".into(),
             Some("alpha".into()),
@@ -26868,7 +27128,7 @@ mod convergence_metadata_tests {
 
         // Beta seals (establishes beta spec head — child of alpha's seal on main chain).
         fs::write(dir.path().join("beta.py"), "beta\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-b"),
             "beta file".into(),
             Some("beta".into()),
@@ -26888,7 +27148,7 @@ mod convergence_metadata_tests {
 
         // Alpha seals again — creates divergence (parent is alpha spec head, not beta's seal).
         fs::write(dir.path().join("alpha.py"), "alpha v2\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("dev-a"),
             "alpha complete".into(),
             Some("alpha".into()),
@@ -26980,7 +27240,7 @@ mod convergence_events_integration_tests {
             id: "setup".into(),
             agent_type: crate::seal::AgentType::Agent,
         };
-        repo.seal(
+        repo.seal_all_pending(
             agent.clone(),
             "baseline".into(),
             None,
@@ -26998,7 +27258,7 @@ mod convergence_events_integration_tests {
 
         // Alpha seals on HEAD (stays on main chain)
         fs::write(dir.path().join("alpha.txt"), "alpha content\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             AgentIdentity {
                 id: "alpha-agent".into(),
                 agent_type: crate::seal::AgentType::Agent,
@@ -27013,7 +27273,7 @@ mod convergence_events_integration_tests {
 
         // Beta creates divergence: seal, add file, seal again
         fs::write(dir.path().join("beta.txt"), "beta content\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             AgentIdentity {
                 id: "beta-agent".into(),
                 agent_type: crate::seal::AgentType::Agent,
@@ -27028,7 +27288,7 @@ mod convergence_events_integration_tests {
 
         // Fork: seal alpha again (forces beta to diverge)
         fs::write(dir.path().join("alpha2.txt"), "more alpha\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             AgentIdentity {
                 id: "alpha-agent".into(),
                 agent_type: crate::seal::AgentType::Agent,
@@ -27086,7 +27346,7 @@ mod convergence_events_integration_tests {
             id: "setup".into(),
             agent_type: crate::seal::AgentType::Agent,
         };
-        repo.seal(
+        repo.seal_all_pending(
             agent,
             "baseline".into(),
             None,
@@ -27103,7 +27363,7 @@ mod convergence_events_integration_tests {
 
         // Create divergence
         fs::write(dir.path().join("s1.txt"), "s1\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             AgentIdentity {
                 id: "a1".into(),
                 agent_type: crate::seal::AgentType::Agent,
@@ -27117,7 +27377,7 @@ mod convergence_events_integration_tests {
         .unwrap();
 
         fs::write(dir.path().join("s2.txt"), "s2\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             AgentIdentity {
                 id: "a2".into(),
                 agent_type: crate::seal::AgentType::Agent,
@@ -27132,7 +27392,7 @@ mod convergence_events_integration_tests {
 
         // Fork
         fs::write(dir.path().join("s1b.txt"), "s1b\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             AgentIdentity {
                 id: "a1".into(),
                 agent_type: crate::seal::AgentType::Agent,
@@ -27347,7 +27607,7 @@ mod agent_scoped_context_tests {
 
         // Create contention on a payments file (pay-dev and auth-dev both touch it).
         fs::write(dir.path().join("payments.py"), "# auth-dev was here\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("auth-dev"),
             "cross-cutting change".into(),
             Some("auth".into()),
@@ -32566,109 +32826,7 @@ mod workspace_tests {
         assert!(none.is_none());
     }
 
-    // ─── MS.5 Over-Capture Behavior (2 tests) ───────────────────────
-
-    #[test]
-    fn test_first_seal_may_over_capture_safely() {
-        // Both agents write files before either seals. First seal captures
-        // all changes since genesis (including the other agent's files).
-        let dir = tempdir().unwrap();
-        let repo = Repository::init(dir.path()).unwrap();
-
-        let spec_a = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
-        let spec_b = crate::spec::Spec::new("pay".into(), "Pay".into(), "".into());
-        repo.add_spec(&spec_a).unwrap();
-        repo.add_spec(&spec_b).unwrap();
-
-        // Both agents write before sealing
-        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
-        fs::write(dir.path().join("pay.rs"), "fn charge() {}").unwrap();
-
-        // Agent-1 seals for auth — captures both files (over-capture)
-        let seal_a = repo
-            .seal(
-                agent("agent-1"),
-                "auth".into(),
-                Some("auth".into()),
-                TaskStatus::InProgress,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-        assert!(
-            seal_a.changes.len() >= 1,
-            "should capture at least auth.rs (may over-capture pay.rs)"
-        );
-
-        // Agent-2 seals for pay — also captures both files (over-capture)
-        let seal_b = repo
-            .seal(
-                agent("agent-2"),
-                "pay".into(),
-                Some("pay".into()),
-                TaskStatus::InProgress,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-        assert!(
-            seal_b.changes.len() >= 1,
-            "should capture at least pay.rs (may over-capture auth.rs)"
-        );
-        // Key: both agents CAN seal. No "no changes" error.
-    }
-
-    #[test]
-    fn test_over_capture_resolves_after_first_round() {
-        // After both agents seal once, subsequent seals are precise.
-        let dir = tempdir().unwrap();
-        let repo = Repository::init(dir.path()).unwrap();
-
-        let spec_a = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
-        let spec_b = crate::spec::Spec::new("pay".into(), "Pay".into(), "".into());
-        repo.add_spec(&spec_a).unwrap();
-        repo.add_spec(&spec_b).unwrap();
-
-        // Both write and seal (first round — may over-capture)
-        fs::write(dir.path().join("auth.rs"), "v1").unwrap();
-        fs::write(dir.path().join("pay.rs"), "v1").unwrap();
-
-        repo.seal(
-            agent("agent-1"),
-            "round1".into(),
-            Some("auth".into()),
-            TaskStatus::InProgress,
-            Verification::default(),
-            false,
-        )
-        .unwrap();
-        repo.seal(
-            agent("agent-2"),
-            "round1".into(),
-            Some("pay".into()),
-            TaskStatus::InProgress,
-            Verification::default(),
-            false,
-        )
-        .unwrap();
-
-        // Second round: each agent modifies only its own file
-        fs::write(dir.path().join("auth.rs"), "v2").unwrap();
-        let seal_a2 = repo
-            .seal(
-                agent("agent-1"),
-                "round2".into(),
-                Some("auth".into()),
-                TaskStatus::InProgress,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-
-        // Agent-1's second seal should ONLY contain auth.rs
-        let paths: Vec<&str> = seal_a2.changes.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(paths, vec!["auth.rs"], "second round should be precise");
-    }
+    // MS.5 over-capture tests replaced by seal_isolation_tests (S.1).
 
     // ─── MS.5 Edge Cases (7 tests) ──────────────────────────────────
 
@@ -32719,7 +32877,7 @@ mod workspace_tests {
         // Agent-1 writes to shared file
         fs::write(dir.path().join("auth.rs"), "fn login_google() {}").unwrap();
         let seal_a = repo
-            .seal(
+            .seal_all_pending(
                 agent("agent-1"),
                 "google auth".into(),
                 Some("auth".into()),
@@ -32737,7 +32895,7 @@ mod workspace_tests {
         )
         .unwrap();
         let seal_b = repo
-            .seal(
+            .seal_all_pending(
                 agent("agent-2"),
                 "github auth".into(),
                 Some("oauth".into()),
@@ -32816,41 +32974,6 @@ mod workspace_tests {
     }
 
     #[test]
-    fn test_seal_race_two_agents_seal_simultaneously() {
-        // Sequential seals (simulating near-simultaneous) — both succeed.
-        let dir = tempdir().unwrap();
-        let repo = Repository::init(dir.path()).unwrap();
-
-        let spec_a = crate::spec::Spec::new("a".into(), "A".into(), "".into());
-        let spec_b = crate::spec::Spec::new("b".into(), "B".into(), "".into());
-        repo.add_spec(&spec_a).unwrap();
-        repo.add_spec(&spec_b).unwrap();
-
-        fs::write(dir.path().join("a.rs"), "a").unwrap();
-        fs::write(dir.path().join("b.rs"), "b").unwrap();
-
-        let seal_a = repo.seal(
-            agent("agent-1"),
-            "a work".into(),
-            Some("a".into()),
-            TaskStatus::InProgress,
-            Verification::default(),
-            false,
-        );
-        let seal_b = repo.seal(
-            agent("agent-2"),
-            "b work".into(),
-            Some("b".into()),
-            TaskStatus::InProgress,
-            Verification::default(),
-            false,
-        );
-
-        assert!(seal_a.is_ok(), "agent-1 should seal successfully");
-        assert!(seal_b.is_ok(), "agent-2 should seal successfully");
-    }
-
-    #[test]
     fn test_seal_genesis_snapshot_at_spec_creation() {
         // Genesis index captured when spec is created via add_spec.
         let dir = tempdir().unwrap();
@@ -32919,112 +33042,6 @@ mod workspace_tests {
     // ─── MS.5 Integration (3 tests) ─────────────────────────────────
 
     #[test]
-    fn test_four_agents_same_directory_independent_seals() {
-        // Alpha-11 scenario: 4 agents, same directory, different files.
-        let dir = tempdir().unwrap();
-        let repo = Repository::init(dir.path()).unwrap();
-
-        // Create 4 specs
-        for name in &["auth", "payments", "ui", "docs"] {
-            let spec = crate::spec::Spec::new(name.to_string(), name.to_string(), "".into());
-            repo.add_spec(&spec).unwrap();
-        }
-
-        // Each agent creates its own file
-        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
-        fs::write(dir.path().join("payments.rs"), "fn charge() {}").unwrap();
-        fs::write(dir.path().join("ui.rs"), "fn render() {}").unwrap();
-        fs::write(dir.path().join("docs.md"), "# Docs").unwrap();
-
-        // Each agent seals for its own spec
-        let seal1 = repo
-            .seal(
-                agent("agent-1"),
-                "auth".into(),
-                Some("auth".into()),
-                TaskStatus::InProgress,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-        let seal2 = repo
-            .seal(
-                agent("agent-2"),
-                "payments".into(),
-                Some("payments".into()),
-                TaskStatus::InProgress,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-        let seal3 = repo
-            .seal(
-                agent("agent-3"),
-                "ui".into(),
-                Some("ui".into()),
-                TaskStatus::InProgress,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-        let seal4 = repo
-            .seal(
-                agent("agent-4"),
-                "docs".into(),
-                Some("docs".into()),
-                TaskStatus::InProgress,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-
-        // All four agents successfully sealed — zero "no changes" errors
-        assert!(!seal1.changes.is_empty(), "agent-1 should have changes");
-        assert!(!seal2.changes.is_empty(), "agent-2 should have changes");
-        assert!(!seal3.changes.is_empty(), "agent-3 should have changes");
-        assert!(!seal4.changes.is_empty(), "agent-4 should have changes");
-
-        // After first round, each agent modifies ONLY its own file
-        fs::write(dir.path().join("auth.rs"), "fn login_v2() {}").unwrap();
-        fs::write(dir.path().join("payments.rs"), "fn charge_v2() {}").unwrap();
-
-        let seal1b = repo
-            .seal(
-                agent("agent-1"),
-                "auth v2".into(),
-                Some("auth".into()),
-                TaskStatus::InProgress,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-        let seal2b = repo
-            .seal(
-                agent("agent-2"),
-                "payments v2".into(),
-                Some("payments".into()),
-                TaskStatus::InProgress,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-
-        // Second round: agent-1's seal includes auth.rs (its own change).
-        // It may also include payments.rs if agent-2 changed it since agent-1's
-        // baseline — this is expected over-capture, safe because convergence handles it.
-        let s1_paths: Vec<&str> = seal1b.changes.iter().map(|c| c.path.as_str()).collect();
-        let s2_paths: Vec<&str> = seal2b.changes.iter().map(|c| c.path.as_str()).collect();
-        assert!(
-            s1_paths.contains(&"auth.rs"),
-            "agent-1 second seal must include auth.rs"
-        );
-        assert!(
-            s2_paths.contains(&"payments.rs"),
-            "agent-2 second seal must include payments.rs"
-        );
-    }
-
-    #[test]
     fn test_convergence_on_same_directory_seals() {
         // Convergence works without workspaces (same-directory mode).
         // Two specs with sealed work → converge_all reconciles.
@@ -33038,7 +33055,7 @@ mod workspace_tests {
 
         // Two agents seal different files (same directory, no workspaces).
         fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-1"),
             "auth work".into(),
             Some("auth".into()),
@@ -33049,7 +33066,7 @@ mod workspace_tests {
         .unwrap();
 
         fs::write(dir.path().join("pay.rs"), "fn charge() {}").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("agent-2"),
             "pay work".into(),
             Some("pay".into()),
@@ -33176,133 +33193,6 @@ mod workspace_tests {
     // ═══════════════════════════════════════════════════════════════════
 
     #[test]
-    fn test_chain_subtraction_excludes_other_agents_changes() {
-        // Scenario: Agent-1 and Agent-2 each seal once (first round, over-capture allowed).
-        // Then Agent-2 modifies pay.rs. Agent-1 seals again (second round).
-        // Subtraction should filter out pay.rs from Agent-1's seal because
-        // spec "pay" already captured it with the same hash.
-        let dir = tempdir().unwrap();
-        let repo = Repository::init(dir.path()).unwrap();
-
-        let spec_a = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
-        let spec_b = crate::spec::Spec::new("pay".into(), "Pay".into(), "".into());
-        repo.add_spec(&spec_a).unwrap();
-        repo.add_spec(&spec_b).unwrap();
-
-        // Both agents write and seal (first round — over-capture allowed)
-        fs::write(dir.path().join("auth.rs"), "fn login() {}").unwrap();
-        fs::write(dir.path().join("pay.rs"), "fn charge() {}").unwrap();
-
-        repo.seal(
-            agent("agent-1"),
-            "round 1".into(),
-            Some("auth".into()),
-            TaskStatus::InProgress,
-            Verification::default(),
-            false,
-        )
-        .unwrap();
-        repo.seal(
-            agent("agent-2"),
-            "round 1".into(),
-            Some("pay".into()),
-            TaskStatus::InProgress,
-            Verification::default(),
-            false,
-        )
-        .unwrap();
-
-        // Agent-1 modifies auth.rs. pay.rs is unchanged.
-        fs::write(dir.path().join("auth.rs"), "fn login_v2() {}").unwrap();
-
-        let seal_a2 = repo
-            .seal(
-                agent("agent-1"),
-                "round 2".into(),
-                Some("auth".into()),
-                TaskStatus::InProgress,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-
-        // Subtraction: pay.rs should be excluded because spec "pay" has it
-        // with the same content hash. Only auth.rs should remain.
-        let paths: Vec<&str> = seal_a2.changes.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(
-            paths,
-            vec!["auth.rs"],
-            "subtraction should exclude pay.rs (already captured by spec 'pay')"
-        );
-    }
-
-    #[test]
-    fn test_chain_subtraction_keeps_same_file_different_content() {
-        // Both agents modify the same file with different content.
-        // Subtraction should NOT filter it out because the content hashes differ.
-        let dir = tempdir().unwrap();
-        let repo = Repository::init(dir.path()).unwrap();
-
-        let spec_a = crate::spec::Spec::new("auth".into(), "Auth".into(), "".into());
-        let spec_b = crate::spec::Spec::new("pay".into(), "Pay".into(), "".into());
-        repo.add_spec(&spec_a).unwrap();
-        repo.add_spec(&spec_b).unwrap();
-
-        // First round: both seal
-        fs::write(dir.path().join("shared.rs"), "v1").unwrap();
-        repo.seal(
-            agent("agent-1"),
-            "round 1".into(),
-            Some("auth".into()),
-            TaskStatus::InProgress,
-            Verification::default(),
-            false,
-        )
-        .unwrap();
-        repo.seal(
-            agent("agent-2"),
-            "round 1".into(),
-            Some("pay".into()),
-            TaskStatus::InProgress,
-            Verification::default(),
-            false,
-        )
-        .unwrap();
-
-        // Agent-2 modifies shared.rs to "v2" and seals
-        fs::write(dir.path().join("shared.rs"), "v2-by-agent2").unwrap();
-        repo.seal(
-            agent("agent-2"),
-            "round 2".into(),
-            Some("pay".into()),
-            TaskStatus::InProgress,
-            Verification::default(),
-            false,
-        )
-        .unwrap();
-
-        // Agent-1 modifies shared.rs to a DIFFERENT value
-        fs::write(dir.path().join("shared.rs"), "v2-by-agent1").unwrap();
-        let seal_a2 = repo
-            .seal(
-                agent("agent-1"),
-                "round 2".into(),
-                Some("auth".into()),
-                TaskStatus::InProgress,
-                Verification::default(),
-                false,
-            )
-            .unwrap();
-
-        // Subtraction should NOT filter shared.rs — different content hashes.
-        let paths: Vec<&str> = seal_a2.changes.iter().map(|c| c.path.as_str()).collect();
-        assert!(
-            paths.contains(&"shared.rs"),
-            "subtraction must keep file when content differs from other spec's seal"
-        );
-    }
-
-    #[test]
     fn test_chain_subtraction_fallback_no_recent_seals() {
         // Only one spec exists — no other spec seals to compare against.
         // Subtraction has nothing to subtract, includes everything.
@@ -33366,7 +33256,7 @@ mod workspace_tests {
 
         // Baseline seal so specs have a common ancestor.
         fs::write(dir.path().join("shared.rs"), "// base\nfn hello() {}\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -33388,7 +33278,7 @@ mod workspace_tests {
         )
         .unwrap();
         let seal_a = repo
-            .seal(
+            .seal_all_pending(
                 agent("agent-a"),
                 "add feature_a".into(),
                 Some("feat-a".into()),
@@ -33405,7 +33295,7 @@ mod workspace_tests {
         )
         .unwrap();
         let seal_b = repo
-            .seal(
+            .seal_all_pending(
                 agent("agent-b"),
                 "add feature_b".into(),
                 Some("feat-b".into()),
@@ -33441,7 +33331,7 @@ mod workspace_tests {
         let repo = Repository::init(dir.path()).unwrap();
 
         fs::write(dir.path().join("base.txt"), "base").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -33457,7 +33347,7 @@ mod workspace_tests {
             .unwrap();
 
         fs::write(dir.path().join("a.txt"), "a work").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "a".into(),
             Some("s1".into()),
@@ -33469,7 +33359,7 @@ mod workspace_tests {
 
         fs::write(dir.path().join("b.txt"), "b work").unwrap();
         let seal_b = repo
-            .seal(
+            .seal_all_pending(
                 agent("b1"),
                 "b".into(),
                 Some("s2".into()),
@@ -33567,7 +33457,7 @@ mod workspace_tests {
         // Spec A seals again (no file changes — just another seal).
         fs::write(dir.path().join("unique_a.txt"), "extra").unwrap();
         let seal_a2 = repo
-            .seal(
+            .seal_all_pending(
                 agent("agent-a"),
                 "second a seal".into(),
                 Some("feat-a".into()),
@@ -33608,7 +33498,7 @@ mod workspace_tests {
         .unwrap();
 
         fs::write(dir.path().join("shared.rs"), "// base\nfn hello() {}\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -33630,7 +33520,7 @@ mod workspace_tests {
             "// base\nfn hello() {}\nfn s1_work() {}\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "s1 work".into(),
             Some("s1".into()),
@@ -33645,7 +33535,7 @@ mod workspace_tests {
             "// base\nfn hello() {}\nfn s2_work() {}\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a2"),
             "s2 work".into(),
             Some("s2".into()),
@@ -33661,7 +33551,7 @@ mod workspace_tests {
         )
         .unwrap();
         let seal_3 = repo
-            .seal(
+            .seal_all_pending(
                 agent("a3"),
                 "s3 work".into(),
                 Some("s3".into()),
@@ -33771,7 +33661,7 @@ mod workspace_tests {
 
         // Set up overlapping specs.
         fs::write(dir.path().join("shared.rs"), "// base\nfn hello() {}\n").unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("setup"),
             "baseline".into(),
             None,
@@ -33791,7 +33681,7 @@ mod workspace_tests {
             "// base\nfn hello() {}\nfn s1_work() {}\n",
         )
         .unwrap();
-        repo.seal(
+        repo.seal_all_pending(
             agent("a1"),
             "s1 work".into(),
             Some("s1".into()),
@@ -33807,7 +33697,7 @@ mod workspace_tests {
         )
         .unwrap();
         let seal_b = repo
-            .seal(
+            .seal_all_pending(
                 agent("a2"),
                 "s2 work".into(),
                 Some("s2".into()),
@@ -34138,5 +34028,466 @@ mod context_budget_tests {
             assert_eq!(ctx.writ_version, env!("CARGO_PKG_VERSION"), "{scope:?}");
             assert_ne!(ctx.writ_version, "0.1.0");
         }
+    }
+}
+
+/// S.1 seal-isolation: default seal scope, claims, and the Phase 1 index fix.
+#[cfg(test)]
+mod seal_isolation_tests {
+    use super::*;
+    use crate::seal::AgentType;
+    use crate::seal_scope::UnownedReason;
+    use tempfile::{tempdir, TempDir};
+
+    fn agent(id: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: id.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    fn setup(specs: &[&str]) -> (TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        for id in specs {
+            repo.add_spec(&Spec::new(id.to_string(), id.to_string(), String::new()))
+                .unwrap();
+        }
+        (dir, repo)
+    }
+
+    fn seal(repo: &Repository, who: &str, spec: &str) -> WritResult<Seal> {
+        repo.seal(
+            agent(who),
+            format!("{who} work"),
+            Some(spec.to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+    }
+
+    fn seal_paths(repo: &Repository, who: &str, spec: &str, paths: &[&str]) -> Seal {
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        repo.seal_paths(
+            agent(who),
+            format!("{who} work"),
+            Some(spec.to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            &paths,
+            false,
+        )
+        .unwrap()
+    }
+
+    fn changed(seal: &Seal) -> Vec<&str> {
+        seal.changes.iter().map(|c| c.path.as_str()).collect()
+    }
+
+    fn pending(repo: &Repository) -> Vec<String> {
+        let mut p: Vec<String> = repo
+            .state()
+            .unwrap()
+            .changes
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        p.sort();
+        p
+    }
+
+    fn object_count(dir: &Path) -> usize {
+        fn walk(p: &Path) -> usize {
+            fs::read_dir(p)
+                .map(|rd| {
+                    rd.flatten()
+                        .map(|e| {
+                            let path = e.path();
+                            if path.is_dir() {
+                                walk(&path)
+                            } else {
+                                1
+                            }
+                        })
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+        walk(&dir.join(".writ/objects"))
+    }
+
+    // ── single-agent behavior unchanged ─────────────────────────────
+
+    #[test]
+    fn solo_first_seal_captures_all_pending() {
+        let (dir, repo) = setup(&["feat"]);
+        fs::write(dir.path().join("a.rs"), "a").unwrap();
+        fs::write(dir.path().join("b.rs"), "b").unwrap();
+        let s = seal(&repo, "solo", "feat").unwrap();
+        assert_eq!(changed(&s), vec!["a.rs", "b.rs"]);
+    }
+
+    #[test]
+    fn solo_later_seal_still_captures_new_files() {
+        let (dir, repo) = setup(&["feat"]);
+        fs::write(dir.path().join("a.rs"), "a").unwrap();
+        seal(&repo, "solo", "feat").unwrap();
+
+        fs::write(dir.path().join("a.rs"), "a2").unwrap();
+        fs::write(dir.path().join("new.rs"), "new").unwrap();
+        let s = seal(&repo, "solo", "feat").unwrap();
+        assert_eq!(changed(&s), vec!["a.rs", "new.rs"]);
+        assert!(pending(&repo).is_empty());
+    }
+
+    #[test]
+    fn solo_own_claim_does_not_restrict_scope() {
+        let (dir, repo) = setup(&["feat"]);
+        repo.spec_claim("feat", "solo").unwrap();
+        fs::write(dir.path().join("a.rs"), "a").unwrap();
+        let s = seal(&repo, "solo", "feat").unwrap();
+        assert_eq!(changed(&s), vec!["a.rs"]);
+    }
+
+    #[test]
+    fn solo_sequential_specs_each_capture_their_new_files() {
+        let (dir, repo) = setup(&["one", "two"]);
+        fs::write(dir.path().join("a.rs"), "a").unwrap();
+        seal(&repo, "solo", "one").unwrap();
+        fs::write(dir.path().join("b.rs"), "b").unwrap();
+        let s = seal(&repo, "solo", "two").unwrap();
+        assert_eq!(changed(&s), vec!["b.rs"]);
+    }
+
+    #[test]
+    fn seal_without_spec_still_captures_everything() {
+        let (dir, repo) = setup(&["a", "b"]);
+        repo.spec_claim("a", "x").unwrap();
+        repo.spec_claim("b", "y").unwrap();
+        fs::write(dir.path().join("f.rs"), "f").unwrap();
+        fs::write(dir.path().join("g.rs"), "g").unwrap();
+        let s = repo
+            .seal(
+                agent("human"),
+                "all".into(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(changed(&s), vec!["f.rs", "g.rs"]);
+    }
+
+    // ── two agents ──────────────────────────────────────────────────
+
+    #[test]
+    fn first_seal_with_other_claim_leaves_unowned_files_and_names_holder() {
+        let (dir, repo) = setup(&["auth", "pay"]);
+        repo.spec_claim("auth", "agent-1").unwrap();
+        repo.spec_claim("pay", "agent-2").unwrap();
+        fs::write(dir.path().join("auth.rs"), "a").unwrap();
+        fs::write(dir.path().join("pay.rs"), "p").unwrap();
+        let before = object_count(dir.path());
+
+        let err = seal(&repo, "agent-1", "auth").unwrap_err();
+        match err {
+            WritError::NothingInScope { spec_id, scope } => {
+                let left_out = scope.left_out_summary();
+                assert_eq!(spec_id, "auth");
+                assert!(left_out.contains("pay.rs"));
+                assert!(left_out.contains("'agent-2' on spec pay"), "{left_out}");
+            }
+            other => panic!("expected NothingInScope, got {other:?}"),
+        }
+        assert_eq!(
+            object_count(dir.path()),
+            before,
+            "rejected seal stores nothing"
+        );
+        assert_eq!(pending(&repo), vec!["auth.rs", "pay.rs"]);
+    }
+
+    #[test]
+    fn default_seal_never_sweeps_other_agents_pending_files() {
+        let (dir, repo) = setup(&["auth", "pay"]);
+        repo.spec_claim("auth", "agent-1").unwrap();
+        repo.spec_claim("pay", "agent-2").unwrap();
+        fs::write(dir.path().join("auth.rs"), "a").unwrap();
+        fs::write(dir.path().join("pay.rs"), "p").unwrap();
+        seal_paths(&repo, "agent-1", "auth", &["auth.rs"]);
+        seal_paths(&repo, "agent-2", "pay", &["pay.rs"]);
+
+        fs::write(dir.path().join("auth.rs"), "a2").unwrap();
+        fs::write(dir.path().join("pay.rs"), "p2").unwrap();
+        let (s, scope) = repo
+            .seal_scoped(
+                agent("agent-1"),
+                "round 2".into(),
+                Some("auth".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+                ScopeMode::Seal,
+            )
+            .unwrap();
+        assert_eq!(changed(&s), vec!["auth.rs"]);
+        let scope = scope.unwrap();
+        assert_eq!(scope.other_specs.len(), 1);
+        assert_eq!(scope.other_specs[0].path, "pay.rs");
+        assert_eq!(scope.other_specs[0].spec_id, "pay");
+
+        let s2 = seal(&repo, "agent-2", "pay").unwrap();
+        assert_eq!(changed(&s2), vec!["pay.rs"]);
+    }
+
+    /// Finding 13b: a spec seal used to write every pending file into the
+    /// shared index, hiding other agents' work from pending.
+    #[test]
+    fn spec_seal_leaves_other_pending_files_out_of_the_index() {
+        let (dir, repo) = setup(&["auth", "pay"]);
+        fs::write(dir.path().join("auth.rs"), "a").unwrap();
+        seal(&repo, "agent-1", "auth").unwrap();
+        repo.spec_claim("pay", "agent-2").unwrap();
+
+        fs::write(dir.path().join("auth.rs"), "a2").unwrap();
+        fs::write(dir.path().join("pay.rs"), "p").unwrap();
+        let s = seal(&repo, "agent-1", "auth").unwrap();
+        assert_eq!(changed(&s), vec!["auth.rs"]);
+        assert_eq!(pending(&repo), vec!["pay.rs"], "pay.rs must stay pending");
+        assert!(!repo.load_index().unwrap().is_tracked("pay.rs"));
+    }
+
+    #[test]
+    fn declared_file_scope_limits_default_seal() {
+        let (dir, repo) = setup(&["web"]);
+        repo.update_spec(
+            "web",
+            SpecUpdate {
+                file_scope: Some(vec!["web/".into()]),
+                ..SpecUpdate::default()
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("web")).unwrap();
+        fs::write(dir.path().join("web/app.ts"), "x").unwrap();
+        fs::write(dir.path().join("README.md"), "r").unwrap();
+        let (s, scope) = repo
+            .seal_scoped(
+                agent("solo"),
+                "web".into(),
+                Some("web".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+                ScopeMode::Seal,
+            )
+            .unwrap();
+        assert_eq!(changed(&s), vec!["web/app.ts"]);
+        let scope = scope.unwrap();
+        assert_eq!(scope.unowned, vec!["README.md".to_string()]);
+        assert_eq!(scope.unowned_reason, Some(UnownedReason::OutsideFileScope));
+    }
+
+    #[test]
+    fn shared_file_is_sealed_with_warning() {
+        let (dir, repo) = setup(&["a", "b"]);
+        fs::write(dir.path().join("x.rs"), "1").unwrap();
+        seal_paths(&repo, "agent-1", "a", &["x.rs"]);
+        fs::write(dir.path().join("x.rs"), "2").unwrap();
+        seal_paths(&repo, "agent-2", "b", &["x.rs"]);
+        fs::write(dir.path().join("x.rs"), "3").unwrap();
+        let s = seal(&repo, "agent-1", "a").unwrap();
+        assert_eq!(changed(&s), vec!["x.rs"]);
+        assert!(s.warnings.iter().any(|w| w.starts_with("SHARED: x.rs")));
+    }
+
+    #[test]
+    fn completed_spec_does_not_own_files() {
+        let (dir, repo) = setup(&["old", "new"]);
+        fs::write(dir.path().join("x.rs"), "1").unwrap();
+        seal(&repo, "solo", "old").unwrap();
+        repo.mark_spec_done("old", None).unwrap();
+        fs::write(dir.path().join("x.rs"), "2").unwrap();
+        let s = seal(&repo, "solo", "new").unwrap();
+        assert_eq!(changed(&s), vec!["x.rs"]);
+    }
+
+    // ── final seal (spec done) ──────────────────────────────────────
+
+    #[test]
+    fn done_mode_takes_only_own_files() {
+        let (dir, repo) = setup(&["feat"]);
+        fs::write(dir.path().join("a.rs"), "a").unwrap();
+        seal(&repo, "solo", "feat").unwrap();
+        fs::write(dir.path().join("a.rs"), "a2").unwrap();
+        fs::write(dir.path().join("stray.rs"), "s").unwrap();
+        let (s, scope) = repo
+            .seal_scoped(
+                agent("solo"),
+                "done".into(),
+                Some("feat".into()),
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+                ScopeMode::Done,
+            )
+            .unwrap();
+        assert_eq!(changed(&s), vec!["a.rs"]);
+        assert_eq!(scope.unwrap().unowned, vec!["stray.rs".to_string()]);
+        assert_eq!(pending(&repo), vec!["stray.rs"]);
+    }
+
+    #[test]
+    fn done_mode_with_no_own_files_seals_nothing() {
+        let (dir, repo) = setup(&["feat"]);
+        fs::write(dir.path().join("stray.rs"), "s").unwrap();
+        let err = repo
+            .seal_scoped(
+                agent("solo"),
+                "done".into(),
+                Some("feat".into()),
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+                ScopeMode::Done,
+            )
+            .unwrap_err();
+        assert!(matches!(err, WritError::NothingInScope { .. }), "{err:?}");
+    }
+
+    // ── claims ──────────────────────────────────────────────────────
+
+    #[test]
+    fn sealing_to_another_agents_claim_warns_with_owner() {
+        let (dir, repo) = setup(&["feat"]);
+        repo.spec_claim("feat", "owner").unwrap();
+        fs::write(dir.path().join("a.rs"), "a").unwrap();
+        let s = seal(&repo, "intruder", "feat").unwrap();
+        assert!(
+            s.warnings
+                .iter()
+                .any(|w| w.contains("CLAIM: spec 'feat' is claimed by agent 'owner'")),
+            "{:?}",
+            s.warnings
+        );
+        assert_eq!(
+            repo.load_spec("feat").unwrap().claimed_by.as_deref(),
+            Some("owner")
+        );
+    }
+
+    #[test]
+    fn strict_claims_reject_before_storing_objects() {
+        let (dir, mut repo) = setup(&["feat"]);
+        repo.set_enforce_claims(true);
+        repo.spec_claim("feat", "owner").unwrap();
+        fs::write(dir.path().join("a.rs"), "a").unwrap();
+        let before = object_count(dir.path());
+        let err = seal(&repo, "intruder", "feat").unwrap_err();
+        assert!(
+            matches!(err, WritError::SealClaimConflict { .. }),
+            "{err:?}"
+        );
+        let paths = vec!["a.rs".to_string()];
+        let err = repo
+            .seal_paths(
+                agent("intruder"),
+                "x".into(),
+                Some("feat".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                &paths,
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, WritError::SealClaimConflict { .. }),
+            "{err:?}"
+        );
+        assert_eq!(object_count(dir.path()), before);
+        assert!(seal(&repo, "owner", "feat").is_ok());
+    }
+
+    #[test]
+    fn config_toml_security_keys_are_read() {
+        let (dir, _) = setup(&["feat"]);
+        let cfg = dir.path().join(".writ/config.toml");
+        let mut text = fs::read_to_string(&cfg).unwrap_or_default();
+        text = text.replace("[security]\n", "[security_old]\n");
+        text.push_str("\n[security]\nscope_enforcement = true\nclaim_enforcement = \"strict\"\n");
+        fs::write(&cfg, text).unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert!(
+            repo.enforce_scope,
+            "[security] scope_enforcement must be read"
+        );
+        assert!(
+            repo.enforce_claims,
+            "[security] claim_enforcement must be read"
+        );
+
+        fs::write(&cfg, "[security]\nclaim_enforcement = \"warn\"\n").unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert!(!repo.enforce_claims);
+        assert!(!repo.enforce_scope);
+    }
+
+    #[test]
+    fn unparseable_config_falls_back_to_warnings() {
+        let (dir, _) = setup(&[]);
+        fs::write(dir.path().join(".writ/config.toml"), "[security\nbroken").unwrap();
+        let repo = Repository::open(dir.path()).unwrap();
+        assert!(!repo.enforce_claims);
+    }
+
+    #[test]
+    fn finish_plan_stages_sealed_content_and_lists_the_rest() {
+        let (dir, repo) = setup(&["done", "wip"]);
+        fs::write(dir.path().join("a.rs"), "sealed").unwrap();
+        fs::write(dir.path().join("gone.rs"), "x").unwrap();
+        seal_paths(&repo, "agent-1", "done", &["a.rs", "gone.rs"]);
+        fs::remove_file(dir.path().join("gone.rs")).unwrap();
+        seal_paths(&repo, "agent-1", "done", &["gone.rs"]);
+        fs::write(dir.path().join("w.rs"), "wip").unwrap();
+        seal_paths(&repo, "agent-2", "wip", &["w.rs"]);
+        repo.mark_spec_done("done", None).unwrap();
+
+        fs::write(dir.path().join("a.rs"), "edited after seal").unwrap();
+        fs::write(dir.path().join("stray.rs"), "s").unwrap();
+
+        let plan = repo.finish_plan(&["done".to_string()]).unwrap();
+        let staged: Vec<&str> = plan.stage.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(staged, vec!["a.rs", "gone.rs"]);
+        let a_hash = plan.stage[0].1.clone().unwrap();
+        assert_eq!(repo.object_content(&a_hash).unwrap(), b"sealed");
+        assert_eq!(plan.stage[1].1, None, "deleted file stages a removal");
+        assert_eq!(plan.drift, vec!["a.rs".to_string()]);
+        assert_eq!(plan.unsealed, vec!["stray.rs".to_string()]);
+        assert_eq!(
+            plan.in_progress,
+            vec![("w.rs".to_string(), "wip".to_string())]
+        );
+    }
+
+    #[test]
+    fn seal_paths_auto_claims_and_promotes_like_seal() {
+        let (dir, repo) = setup(&["feat"]);
+        fs::write(dir.path().join("a.rs"), "a").unwrap();
+        let paths = vec!["a.rs".to_string()];
+        repo.seal_paths(
+            agent("solo"),
+            "x".into(),
+            Some("feat".into()),
+            TaskStatus::Complete,
+            Verification::default(),
+            &paths,
+            false,
+        )
+        .unwrap();
+        let spec = repo.load_spec("feat").unwrap();
+        assert_eq!(spec.claimed_by.as_deref(), Some("solo"));
+        assert_eq!(spec.status, SpecStatus::Complete);
     }
 }

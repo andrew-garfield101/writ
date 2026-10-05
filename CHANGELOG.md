@@ -5,16 +5,57 @@ All notable changes to writ will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — Unreleased
 
-### Changed
-
-- The repository schema is now version 3. Writ 0.3.0 upgrades a repo on first open, after which writ 0.2.x refuses it with "please update writ": 0.2.x cannot read spec records written by 0.3.0. Upgrade every machine and CI job that touches the repo together. From 0.3.0 on, an older writ opening a newer repository names the release to upgrade to before reading any record, and spec, index and bridge records ignore fields they do not know instead of failing (seal records stay strict).
-- The writ repository ships `.mcp.json`, so Claude Code picks up writ's MCP tools on clone. `writ init` never rewrites a committed `.mcp.json` and `writ uninit` never deletes one. For an untracked `.mcp.json`, init adds writ's server and uninit removes only that entry; other servers are kept.
+Two agents can now share one directory: each seal takes only its own spec's files, closing a spec never sweeps another agent's work, and `writ finish` commits only what was sealed.
 
 ### Fixed
 
+- Re-running `writ init` on an existing project is a refresh: it rewrites writ's own CLAUDE.md block, skills, SessionStart hook and settings instruction from the current template (keeping your other hooks, instructions, permissions and keys) and never seals. A moved git HEAD is reported with `writ bridge import` instead of being re-imported. An unparseable `.claude/settings.json` is reported and left unchanged instead of being replaced.
+- The generated skills teach the same `writ seal -s "..." --paths <files>` and `writ spec add "..." --scope "..."` forms as the CLAUDE.md block.
+- `--scope "app.py,models.py,tests/*"` is three entries, as agents write it; it was stored as one literal pattern that matched nothing (the repeated flag still works, and specs stored the old way match per item).
+- The SessionStart hook, the CLAUDE.md and AGENTS.md blocks, `.writ/AGENT_INSTRUCTIONS.md`, the settings instruction and the generated skills now render the workflow from one source, so the hook no longer contradicts the block on claims or `--scope`.
+- `writ spec done` without `-s` uses the spec title as the summary, so finish output and commit messages never show "(no summary)"; the templates show `writ spec done -s "<what you did>"`.
+- **Closing a spec could lose that spec's own edits to a shared file, and record another agent's edit as its own.** `writ spec done` sealed every file on disk, so if another spec's version of a shared file was there at that moment, the closing seal recorded it and the spec's earlier edit vanished from its history; convergence and `writ finish` then committed the file without it and reported no conflict. The loss happened when the spec closed, not during the merge. It affected workspaces, where specs start from a common base, and shared directories when an agent rewrote a file from a stale copy; specs in one directory whose later seals already held the earlier edits were not affected. We found it by rebuilding each spec's sealed content and checking that every added line survived into the commit; writ now runs that check itself (see Survival checks under Added). `writ spec done` now seals only the spec's own files.
+- In a shared directory, convergence could add back lines that a later spec had deliberately removed, including code another spec moved. Convergence now recognizes when one version was written on top of another and merges only genuinely concurrent versions.
+- The escalate strategy no longer settles a conflict by keeping the longer version; escalated files report no merged hash.
+- `writ finish --auto` and `writ finish --accept` honor `--strategy`; they previously ignored it and committed as `single`.
+- Diff alignment above 10,000 lines is correct again.
+- Convergence no longer writes unreferenced record objects into the store, and pending merge results are protected from garbage collection until they are written out.
 - `writ init --bare` now adds `.writ/` to `.gitignore`, so the store is never committed by `git add`.
+
+### Changed
+
+- Five behavior changes for single agent users:
+  - (a) A stale claim held by another agent id forces `--paths` on `writ seal`. Release it with `writ spec release <id>` (`--force` when you are not the holder).
+  - (b) `writ spec done` without pending files of its own makes no seal; it closes the spec and says so.
+  - (c) `writ finish` no longer commits unsealed edits by default. It stages the sealed content of completed specs and lists what it leaves out; `--include-unsealed` restores the old behavior.
+  - (d) `writ seal` no longer silently indexes untouched pending files; files it does not capture stay pending for their owner.
+  - (e) Python and MCP `seal()` default to status `in-progress`; a seal no longer completes its spec unless asked.
+- `writ seal` and `writ spec done` refuse a spec that is already committed to git (also in the Python and MCP bindings). Finish never staged such a seal and the spec could not be reopened, so the file stayed one version behind; the error names the commit and gives the `writ spec add "..." --claim` command for a new spec. Archiving a committed spec is unchanged.
+- Nested `.gitignore` files and the global git excludes file (`core.excludesFile`) are honored like git.
+- `writ init` never rewrites a committed `.mcp.json` and `writ uninit` never deletes one. For an untracked `.mcp.json`, init adds writ's server and uninit removes only that entry; other servers are kept. The writ repository ships `.mcp.json`, so Claude Code picks up writ's MCP tools on clone.
+- The repository schema is now version 3. Writ 0.3.0 upgrades a repo on first open, after which writ 0.2.x refuses it with "please update writ": 0.2.x cannot read spec records written by 0.3.0. Upgrade every machine and CI job that touches the repo together. From 0.3.0 on, an older writ opening a newer repository stops before reading any record with "this repository uses writ schema vN; upgrade to X or newer", and spec, index and bridge records ignore fields they do not know instead of failing (seal records stay strict).
+- `writ finish` runs `cargo check` on the staged tree before every commit in a Cargo project and refuses to commit a tree that does not compile; `--no-check` or `[workflow] finish_check = false` turns it off.
+- `--strategy per-spec` needs specs that compile independently; when every spec touches the same core files, nothing is committed and the default `single` strategy is the right choice.
+- `writ spec add` no longer claims the spec unless `--claim` is passed.
+- `writ finish` never cancels or archives specs; `--archive-unclaimed` does.
+- Seals respect claims: sealing to a spec another agent holds warns with the holder named, and is refused under `[security] claim_enforcement = "strict"`. The existing `[security] scope_enforcement` key is now read.
+- Existing projects get the new generated instructions, hook and skills only when `writ init` is run again in the project. It refreshes the managed CLAUDE.md block, the hook and the skills, and leaves the store and specs untouched.
+- Writ protects sealed work, not unsealed work. Until an agent's first seal, another agent can still overwrite its edits on disk. Seal early.
+
+### Added
+
+- Survival checks at seal time: a seal or `writ spec done` that would remove a line the same spec added earlier is refused, naming the file, the lines and the command to proceed; `--allow-removals <path>` lifts it for one file.
+- Survival checks at merge time: `writ finish` and `writ converge-all` check that every spec's sealed additions survive the merge or are covered by a reported conflict; a loss is escalated and nothing is staged. When a later version was written from a stale copy, lines it never saw are kept and a stale rewrite notice names them in the finish output, in the agent's next `writ context` under `stale_rewrite_notices`, and in `.writ/stale_rewrite_notices.json`.
+- `writ spec release <id> [--force]` releases a claim; also in Python and MCP.
+- `writ spec add --scope <glob>` declares a spec's files up front; a seal without `--paths` takes only files its spec owns.
+- `writ repair` regenerates referenced but missing objects from the working tree or git history, verifying every hash before writing; `--dry-run` reports what a run would recover. Available from Python as `Repository.repair(dry_run)`.
+- Faster and smaller: the working tree is scanned once per `writ context` call with a size, mtime and inode cache (275 ms to 91 ms on the writ repository), and a linear space diff replaces the quadratic table for diff and three way merge (a 34,000 line file converges in 0.06 s and 34 MB instead of about 10 s and 9 GB; the raspberry_pi profile no longer runs out of memory on large files).
+- Status truth: the `writ status` agent column shows the claim holder, every per spec count comes from that spec's own seals, and `writ spec show --format json` emits JSON.
+- One agent identity resolver for the CLI, MCP and Python: `--agent`, then `WRIT_AGENT_ID`, then `default_agent`, then the framework session, then `human`. Each Claude Code session gets its own stable id.
+
+---
 
 ## [0.2.1] — 2026-10-05
 

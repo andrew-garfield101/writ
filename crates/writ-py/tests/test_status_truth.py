@@ -66,3 +66,4 @@ def test_non_holder_spec_done_warns_naming_holder(tmp_path):
     claim = [h for h in done["hints"] if h.startswith("CLAIM")]
     assert claim and "'ada'" in claim[0], done["hints"]
     assert done["final_seal"] is None
+

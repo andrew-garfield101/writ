@@ -188,3 +188,112 @@ fn uninit_deletes_an_untracked_mcp_json_it_generated() {
 
     assert!(p.read(".mcp.json").is_none());
 }
+
+fn seal_count(p: &Project) -> usize {
+    writ_core::Repository::open(&p.root)
+        .unwrap()
+        .log_all()
+        .unwrap()
+        .len()
+}
+
+fn settings(p: &Project) -> serde_json::Value {
+    serde_json::from_str(&p.read(".claude/settings.json").unwrap()).unwrap()
+}
+
+/// Finding 71: re-running init is a refresh. No seal, index unchanged,
+/// even after git HEAD moved.
+#[test]
+fn rerun_init_never_seals_or_touches_the_index() {
+    let p = Project::new("rerun-no-seal");
+    p.init_claude();
+    let seals = seal_count(&p);
+    let index = p.read(".writ/workspaces/main/index.json").unwrap();
+    p.commit_file("later.txt", "moved HEAD\n");
+
+    let text = p.init_claude();
+
+    assert_eq!(seal_count(&p), seals, "{text}");
+    assert_eq!(p.read(".writ/workspaces/main/index.json").unwrap(), index);
+    assert!(text.contains("writ bridge import"), "{text}");
+    assert!(text.contains("nothing was sealed"), "{text}");
+}
+
+/// Finding 72: a rerun replaces writ's own hook and instruction with the
+/// current template, even hand-edited, and keeps everything of the user's.
+#[test]
+fn rerun_init_refreshes_writ_hook_and_instruction_after_a_hand_edit() {
+    let p = Project::new("rerun-refresh");
+    p.init_claude();
+    let fresh = settings(&p);
+    let mut s = fresh.clone();
+    s["hooks"]["SessionStart"][0]["hooks"][0]["command"] =
+        "echo '## Writ VCS Active' && echo 'writ spec add \"brief task description\"'".into();
+    s["instructions"][0] = "MANDATORY: This project uses writ for version control. OLD".into();
+    s["instructions"]
+        .as_array_mut()
+        .unwrap()
+        .push("user instruction".into());
+    s["hooks"]["SessionStart"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({"hooks": [{"type": "command", "command": "echo user hook"}]}));
+    s["permissions"]["allow"]
+        .as_array_mut()
+        .unwrap()
+        .push("Bash(ls *)".into());
+    s["model"] = "user-choice".into();
+    p.write(
+        ".claude/settings.json",
+        &serde_json::to_string_pretty(&s).unwrap(),
+    );
+
+    p.init_claude();
+
+    let after = settings(&p);
+    let cmds: Vec<&str> = after["hooks"]["SessionStart"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["hooks"][0]["command"].as_str().unwrap())
+        .collect();
+    let fresh_cmd = fresh["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        .as_str()
+        .unwrap();
+    assert_eq!(
+        cmds.iter().filter(|c| **c == fresh_cmd).count(),
+        1,
+        "{cmds:?}"
+    );
+    assert!(cmds.contains(&"echo user hook"), "{cmds:?}");
+    assert!(
+        !cmds.iter().any(|c| c.contains("brief task description")),
+        "{cmds:?}"
+    );
+    let instr: Vec<&str> = after["instructions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(instr[0], fresh["instructions"][0].as_str().unwrap());
+    assert_eq!(instr.len(), 2, "{instr:?}");
+    assert!(instr.contains(&"user instruction"));
+    assert!(after["permissions"]["allow"]
+        .as_array()
+        .unwrap()
+        .contains(&"Bash(ls *)".into()));
+    assert_eq!(after["model"], "user-choice");
+}
+
+#[test]
+fn rerun_init_never_overwrites_an_unparseable_settings_file() {
+    let p = Project::new("rerun-bad-json");
+    p.init_claude();
+    p.write(".claude/settings.json", "{ not json");
+
+    let text = p.init_claude();
+
+    assert_eq!(p.read(".claude/settings.json").unwrap(), "{ not json");
+    assert!(text.contains("not valid JSON"), "{text}");
+}

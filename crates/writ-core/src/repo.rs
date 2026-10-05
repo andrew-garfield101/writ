@@ -444,6 +444,17 @@ impl Repository {
     /// moves. Reports git state, framework detection, and tracked file count.
     #[cfg(feature = "bridge")]
     pub fn init_project(root: &Path) -> WritResult<InitResult> {
+        Self::init_project_with(root, true)
+    }
+
+    /// [`Self::init_project`] with control over the rerun re-import.
+    ///
+    /// With `reimport_on_rerun` false (the CLI's `writ init` on an existing
+    /// repo, finding 71) a moved git HEAD is reported in
+    /// `import_skipped_reason` with the command to sync, and nothing is
+    /// sealed: a rerun only refreshes generated files.
+    #[cfg(feature = "bridge")]
+    pub fn init_project_with(root: &Path, reimport_on_rerun: bool) -> WritResult<InitResult> {
         let repo_root = fs::canonicalize(root)
             .unwrap_or_else(|_| root.to_path_buf())
             .to_string_lossy()
@@ -509,6 +520,14 @@ impl Repository {
                     import_skipped_reason =
                         Some(format!("already synced at {}", &prev[..12.min(prev.len())]));
                     imported_seal_id = bridge_state.last_imported_seal_id.clone();
+                }
+                // HEAD moved on a rerun that must not seal (finding 71).
+                (Some(prev), Some(curr)) if !initialized && !reimport_on_rerun => {
+                    import_skipped_reason = Some(format!(
+                        "git HEAD moved since the baseline ({} -> {}); not re-imported on a rerun. Run `writ bridge import` to sync it",
+                        &prev[..12.min(prev.len())],
+                        &curr[..12.min(curr.len())]
+                    ));
                 }
                 // HEAD moved → re-import
                 (Some(prev), Some(_curr)) => {
@@ -1110,6 +1129,8 @@ impl Repository {
             Ok(spec) => spec,
             Err(_) => return Ok(None),
         };
+        // Finding 65: every seal and `spec done` passes through here.
+        Self::refuse_if_committed(&spec)?;
         match spec.claimed_by {
             Some(ref owner) if owner != agent_id => {
                 if self.enforce_claims {
@@ -1408,6 +1429,23 @@ impl Repository {
             warnings.push(format!("AGENT_SCOPE: {msg}"));
         }
         Ok(warnings)
+    }
+
+    /// Finding 65: refuse to seal onto, or close, a spec already committed
+    /// to git. Archive and other lifecycle paths do not call this.
+    fn refuse_if_committed(spec: &Spec) -> WritResult<()> {
+        use crate::spec::CommitState;
+        if matches!(
+            spec.commit_state,
+            CommitState::Committed | CommitState::Pushed
+        ) {
+            return Err(WritError::SpecAlreadyCommitted {
+                spec_id: spec.id.clone(),
+                title: spec.title.clone(),
+                commit_hash: spec.commit_hash.clone(),
+            });
+        }
+        Ok(())
     }
 
     /// Update the spec after a seal: head, `sealed_by`, activity, auto-claim
@@ -4727,7 +4765,11 @@ impl Repository {
 
         let now = chrono::Utc::now();
         spec.status = crate::spec::SpecStatus::Complete;
-        spec.completion_summary = summary;
+        // Finding 68: no summary given means the title stands in, so finish
+        // output and commit messages never say "(no summary)".
+        spec.completion_summary = summary
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| Some(spec.title.clone()));
         spec.completed_at = Some(now);
         spec.updated_at = now;
         self.save_spec(&spec)?;
@@ -4756,7 +4798,12 @@ impl Repository {
         paths: Option<&[String]>,
         no_seal: bool,
     ) -> WritResult<SpecDoneOutcome> {
-        let spec_id = self.resolve_spec(spec_id)?.id;
+        let resolved = self.resolve_spec(spec_id)?;
+        let spec_id = resolved.id;
+        // Finding 68: without -s the spec title is the summary everywhere.
+        let summary = summary
+            .filter(|s| !s.trim().is_empty())
+            .or(Some(resolved.title));
         let claim_warning = self
             .check_seal_claim(&spec_id, &agent.id)?
             .and_then(|_| self.load_spec(&spec_id).ok()?.claimed_by)
@@ -35907,6 +35954,21 @@ mod status_truth_tests {
     }
 
     #[test]
+    fn done_without_summary_uses_the_title_for_spec_and_seal() {
+        let (dir, repo) = setup(&["sa"]);
+        seal_file(&repo, &dir, "a", "sa", "a.txt", "1");
+        fs::write(dir.path().join("a.txt"), "2").unwrap();
+
+        let out = repo.spec_done(agent("a"), None, "sa", None, false).unwrap();
+
+        assert_eq!(out.spec.completion_summary.as_deref(), Some("sa"));
+        let FinalSeal::Sealed { seal, .. } = out.final_seal else {
+            panic!("expected a final seal");
+        };
+        assert_eq!(seal.summary, "sa");
+    }
+
+    #[test]
     fn holder_done_has_no_claim_warning() {
         let (_dir, repo) = setup(&["sa"]);
         repo.spec_claim("sa", "ada").unwrap();
@@ -36078,5 +36140,120 @@ mod finish_per_spec_tests {
         let plan = repo.finish_plan(&ids(&["done"])).unwrap();
 
         assert!(plan.shared_open.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod finding_65_tests {
+    //! Seals and `spec done` on a committed spec are refused before writing.
+    use super::*;
+    use crate::seal::AgentType;
+    use tempfile::{tempdir, TempDir};
+
+    fn agent(id: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: id.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    fn committed_spec() -> (TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("done".into(), "Done work".into(), String::new()))
+            .unwrap();
+        fs::write(dir.path().join("a.txt"), "1\n").unwrap();
+        repo.seal_paths(
+            agent("a"),
+            "a".into(),
+            Some("done".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            &["a.txt".to_string()],
+            false,
+        )
+        .unwrap();
+        repo.mark_spec_done("done", None).unwrap();
+        repo.mark_spec_committed("done", "0123456789abcdef0123")
+            .unwrap();
+        fs::write(dir.path().join("a.txt"), "2\n").unwrap();
+        (dir, repo)
+    }
+
+    fn assert_refused(err: WritError) {
+        let msg = err.to_string();
+        assert!(
+            matches!(err, WritError::SpecAlreadyCommitted { .. }),
+            "{msg}"
+        );
+        assert!(msg.contains("0123456789ab"), "{msg}");
+        assert!(
+            msg.contains("writ spec add \"Done work (follow-up)\" --claim"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn seal_paths_on_committed_spec_is_refused_and_writes_nothing() {
+        let (_d, repo) = committed_spec();
+        let before = repo.log_all().unwrap().len();
+
+        let err = repo
+            .seal_paths(
+                agent("a"),
+                "late".into(),
+                Some("done".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                &["a.txt".to_string()],
+                false,
+            )
+            .unwrap_err();
+
+        assert_refused(err);
+        assert_eq!(repo.log_all().unwrap().len(), before);
+    }
+
+    #[test]
+    fn default_scope_seal_on_committed_spec_is_refused() {
+        let (_d, repo) = committed_spec();
+
+        let err = repo
+            .seal(
+                agent("a"),
+                "late".into(),
+                Some("done".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap_err();
+
+        assert_refused(err);
+    }
+
+    #[test]
+    fn spec_done_on_committed_spec_is_refused_even_without_a_seal() {
+        let (_d, repo) = committed_spec();
+
+        let err = repo
+            .spec_done(agent("a"), None, "done", None, true)
+            .unwrap_err();
+
+        assert_refused(err);
+    }
+
+    #[test]
+    fn archiving_a_committed_spec_still_works() {
+        let (_d, repo) = committed_spec();
+
+        use crate::spec::LifecycleState;
+        repo.complete_spec("done").unwrap();
+        repo.transition_spec_lifecycle("done", LifecycleState::Archived)
+            .unwrap();
+        assert_eq!(
+            repo.load_spec("done").unwrap().lifecycle_state,
+            LifecycleState::Archived
+        );
     }
 }

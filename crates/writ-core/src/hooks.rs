@@ -97,26 +97,22 @@ fn ensure_claude_permissions(root: &Path) -> WritResult<Option<String>> {
     }
 
     let settings_path = claude_dir.join("settings.json");
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
+    let mut settings = read_settings(&settings_path)?;
+
+    // Navigate to permissions.allow, creating the structure if needed. A
+    // shape writ does not expect is left alone, never a panic.
+    let Some(allow_arr) = settings
+        .as_object_mut()
+        .map(|o| {
+            o.entry("permissions")
+                .or_insert_with(|| serde_json::json!({}))
+        })
+        .and_then(|p| p.as_object_mut())
+        .map(|p| p.entry("allow").or_insert_with(|| serde_json::json!([])))
+        .and_then(|a| a.as_array_mut())
+    else {
+        return Ok(None);
     };
-
-    // Navigate to permissions.allow, creating the structure if needed.
-    let permissions = settings
-        .as_object_mut()
-        .unwrap()
-        .entry("permissions")
-        .or_insert_with(|| serde_json::json!({}));
-    let allow = permissions
-        .as_object_mut()
-        .unwrap()
-        .entry("allow")
-        .or_insert_with(|| serde_json::json!([]));
-
-    let allow_arr = allow.as_array_mut().unwrap();
 
     // Add both CLI and MCP permissions if not already present.
     let mut changed = false;
@@ -201,14 +197,21 @@ fn remove_claude_permissions(root: &Path) -> WritResult<Option<String>> {
 
 /// The instruction string added to `.claude/settings.json` so agents treat writ
 /// usage as a mandatory directive, not optional project documentation.
-const WRIT_INSTRUCTION: &str = "MANDATORY: This project uses writ for version control. \
-You MUST follow this workflow — it is not optional. \
-1) BEFORE starting any work, run `writ context` to check project state. \
-2) If no spec is assigned to you, create one: `writ spec add \"brief description of your task\" --scope \"<glob of files you will change>\"`. \
-3) AFTER each meaningful unit of work, run `writ seal -s '<summary>' --paths <changed files, comma-separated>` to checkpoint (auto-scoped to your spec). \
-4) When your task is complete, run `writ spec done` BEFORE reporting results (auto-scoped to your spec). \
-Your task is NOT complete until you have sealed your work. \
-NEVER run `git commit`, `git add`, `git push`, or `writ finish` — the user handles git.";
+/// Rendered from [`crate::template`] (finding 67).
+fn writ_instruction() -> String {
+    let steps: Vec<String> = crate::template::workflow_steps()
+        .iter()
+        .enumerate()
+        .map(|(i, s)| format!("{}) {}.", i + 1, s))
+        .collect();
+    format!(
+        "MANDATORY: This project uses writ for version control. \
+         You MUST follow this workflow — it is not optional. {} \
+         Your task is NOT complete until you have sealed your work. \
+         NEVER run `git commit`, `git add`, `git push`, or `writ finish` — the user handles git.",
+        steps.join(" ")
+    )
+}
 
 /// Substring used to detect whether a writ instruction is already present.
 const WRIT_INSTRUCTION_MARKER: &str = "writ for version control";
@@ -224,37 +227,46 @@ fn ensure_claude_instructions(root: &Path) -> WritResult<Option<String>> {
     }
 
     let settings_path = claude_dir.join("settings.json");
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
+    let mut settings = read_settings(&settings_path)?;
+    let Some(obj) = settings.as_object_mut() else {
+        return Ok(None); // Top level isn't an object — don't touch it
     };
-
-    let instructions = settings
-        .as_object_mut()
-        .unwrap()
+    let original = serde_json::Value::Object(obj.clone());
+    let instructions = obj
         .entry("instructions")
         .or_insert_with(|| serde_json::json!([]));
+    let Some(arr) = instructions.as_array_mut() else {
+        return Ok(None); // Not an array — don't touch it
+    };
 
-    let arr = instructions.as_array_mut().unwrap();
-
-    // Check if a writ instruction is already present.
-    let already_has = arr.iter().any(|v| {
+    // Finding 72: writ's own entry is always the current template text. Any
+    // earlier writ instruction (older version, hand-edited) is replaced in
+    // place; the user's other instructions stay where they are.
+    let current = serde_json::Value::String(writ_instruction());
+    let is_writ = |v: &serde_json::Value| {
         v.as_str()
             .map_or(false, |s| s.contains(WRIT_INSTRUCTION_MARKER))
-    });
-
-    if already_has {
-        return Ok(None);
+    };
+    match arr.iter().position(is_writ) {
+        Some(i) => {
+            arr[i] = current;
+            let mut seen = false;
+            arr.retain(|v| {
+                if !is_writ(v) {
+                    return true;
+                }
+                let keep = !seen;
+                seen = true;
+                keep
+            });
+        }
+        None => arr.push(current),
     }
 
-    arr.push(serde_json::Value::String(WRIT_INSTRUCTION.to_string()));
-
-    let json = serde_json::to_string_pretty(&settings)
-        .map_err(|e| crate::error::WritError::Other(format!("JSON serialize: {}", e)))?;
-    atomic_write(&settings_path, format!("{}\n", json).as_bytes())?;
-
+    if settings == original {
+        return Ok(None);
+    }
+    write_settings(&settings_path, &settings)?;
     Ok(Some(".claude/settings.json".to_string()))
 }
 
@@ -317,16 +329,26 @@ fn writ_hook_command() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "writ".to_string());
+    session_start_command(&writ_path)
+}
+
+/// The SessionStart hook: the same workflow steps and claim note as the
+/// CLAUDE.md block (finding 67), then the brief context.
+fn session_start_command(writ: &str) -> String {
+    let mut lines = vec![
+        WRIT_HOOK_BANNER.to_string(),
+        "This project uses writ for version control. Follow these steps:".to_string(),
+    ];
+    lines.extend(crate::template::workflow_plain());
+    lines.push(crate::template::CLAIM_NOTE.replace('`', ""));
+    lines.push(String::new());
+    let echoes: Vec<String> = lines
+        .iter()
+        .map(|l| format!("echo '{}'", l.replace('\'', "'\\''")))
+        .collect();
     format!(
-        "echo '## Writ VCS Active' && \
-         echo 'This project uses writ for version control.' && \
-         echo 'Your FIRST action: create or claim a spec for your task.' && \
-         echo '  - If unclaimed specs exist below, claim one: writ spec claim <id>' && \
-         echo '  - If none match your task, create one: writ spec add \"brief task description\"' && \
-         echo '  - Then run writ context --spec <id> for your scoped state.' && \
-         echo '' && \
-         {writ} context --format brief 2>/dev/null || true",
-        writ = writ_path
+        "{} && {writ} context --format brief 2>/dev/null || true",
+        echoes.join(" && ")
     )
 }
 
@@ -340,6 +362,15 @@ const WRIT_HOOK_EVENT: &str = "SessionStart";
 /// from these so upgrades do not keep injecting context on every prompt.
 const LEGACY_HOOK_EVENTS: &[&str] = &["UserPromptSubmit"];
 
+/// True for a hook command writ generated, current or older, including a
+/// hand-edited one that kept either marker (finding 72).
+fn is_writ_hook_command(cmd: &str) -> bool {
+    cmd.contains(WRIT_HOOK_MARKER) || cmd.contains(WRIT_HOOK_BANNER)
+}
+
+/// First line every writ SessionStart hook prints.
+const WRIT_HOOK_BANNER: &str = "## Writ VCS Active";
+
 /// Remove writ hook entries from a hook event array. Returns true if any were removed.
 fn remove_writ_hook_entries(arr: &mut Vec<serde_json::Value>) -> bool {
     let before = arr.len();
@@ -351,7 +382,7 @@ fn remove_writ_hook_entries(arr: &mut Vec<serde_json::Value>) -> bool {
                 inner.iter().any(|hook| {
                     hook.get("command")
                         .and_then(|c| c.as_str())
-                        .map_or(false, |cmd| cmd.contains(WRIT_HOOK_MARKER))
+                        .map_or(false, is_writ_hook_command)
                 })
             })
     });
@@ -371,12 +402,7 @@ fn ensure_claude_hook(root: &Path) -> WritResult<Option<String>> {
     }
 
     let settings_path = claude_dir.join("settings.json");
-    let mut settings: serde_json::Value = if settings_path.exists() {
-        let content = fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).unwrap_or_else(|_| serde_json::json!({}))
-    } else {
-        serde_json::json!({})
-    };
+    let mut settings = read_settings(&settings_path)?;
     let Some(settings_obj) = settings.as_object_mut() else {
         return Ok(None); // Top level isn't an object — don't touch it
     };
@@ -433,6 +459,21 @@ fn remove_writ_hooks_from_event(
         hooks_obj.remove(event_name);
     }
     true
+}
+
+/// Read `.claude/settings.json`, or `{}` when absent. An unparseable file is
+/// an error, never silently replaced (it holds the user's own settings).
+fn read_settings(path: &Path) -> WritResult<serde_json::Value> {
+    if !path.exists() {
+        return Ok(serde_json::json!({}));
+    }
+    let content = fs::read_to_string(path)?;
+    serde_json::from_str(&content).map_err(|e| {
+        crate::error::WritError::Other(format!(
+            "{} is not valid JSON ({e}); left unchanged, fix it and re-run writ init",
+            path.display()
+        ))
+    })
 }
 
 fn write_settings(path: &Path, settings: &serde_json::Value) -> WritResult<()> {
@@ -1053,34 +1094,46 @@ fn is_dir_empty(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Fill a template's placeholders from [`crate::template`] (finding 67).
+trait PipeTemplate {
+    fn pipe_template(&self) -> String;
+}
+
+impl PipeTemplate for str {
+    fn pipe_template(&self) -> String {
+        self.replace("@STEPS@", &crate::template::workflow_markdown())
+            .replace("@SPEC_ADD@", crate::template::SPEC_ADD)
+            .replace("@SEAL@", crate::template::SEAL)
+            .replace("@SPEC_DONE@", crate::template::SPEC_DONE)
+            .replace("@CLAIM_NOTE@", crate::template::CLAIM_NOTE)
+    }
+}
+
 fn writ_claude_md_section() -> String {
     r#"## Writ Version Control (MANDATORY)
 
 **FIRST ACTION: Run `writ context` before doing anything else.**
 
-**EVERY TASK requires these 3 commands — no exceptions, no matter how small the task:**
-1. `writ spec add "brief description of your task" --scope "<glob of files you will change>"` — register your task (ID auto-generated)
-2. `writ seal -s "<summary>" --paths <changed files, comma-separated>` — after each unit of work (auto-scoped to your spec)
-3. `writ spec done` — BEFORE reporting results to the user (auto-scoped to your spec)
-
-Your task is NOT complete until you have run all three.
+**EVERY TASK follows these steps — no exceptions, no matter how small the task:**
+@STEPS@
+Your task is NOT complete until you have run them all.
 Do NOT run `git commit`, `git add`, `git push`, or `writ finish`.
 
 ### Commands
 - `writ context` — structured project state (files, specs, activity). Run this FIRST.
 - `writ seal -s "<summary>" --paths <changed files, comma-separated>` — checkpoint your work (auto-scoped to your claimed spec)
-- `writ spec add "brief task description"` — create a task spec (ID auto-generated)
+- `@SPEC_ADD@` — create a task spec (ID auto-generated)
 - `writ spec status` — view active specs
-- `writ spec done` — mark your task complete (auto-scoped to your claimed spec)
+- `@SPEC_DONE@` — mark your task complete (auto-scoped to your claimed spec)
 - `writ status` — project overview (agents, specs, progress)
 - `writ diff` — preview file changes
 - `writ log` — recent seal history
 
 ### Rules
 - You MUST run `writ context` before starting work
-- You MUST run `writ seal -s "<summary>" --paths <changed files, comma-separated>` after each meaningful unit of work
-- You MUST run `writ spec done` before reporting results to the user
-- You MUST include meaningful summaries in seals so other agents understand your work
+- You MUST run `@SEAL@` after each meaningful unit of work
+- You MUST run `@SPEC_DONE@` before reporting results to the user
+- You MUST include meaningful summaries in seals and in `spec done -s` so other agents understand your work
 - `--scope` on `writ spec add` declares the files your task owns; `writ seal` without `--paths` then captures only those. Otherwise pass `--paths` with the files you changed: another agent's pending files are never sealed for you
 - If `writ seal` or `writ spec done` prints `left out:` or `NOT SEALED:`, read the reason and run the command it prints if those files are yours
 - Do NOT run `git add`, `git commit`, or `git push` — the user manages the git round-trip via `writ finish`
@@ -1094,8 +1147,9 @@ Do NOT run `git commit`, `git add`, `git push`, or `writ finish`.
 ### Agent identity
 - writ names you from `WRIT_AGENT_ID`, else your framework session (e.g. `claude-code-a3f2`), else `human`. `--agent <name>` on a command overrides it.
 - Subagents inherit the parent session's identity. If you are a subagent, or several agents share one session, set your own: prefix every writ command with `WRIT_AGENT_ID=<your-name>` (each shell call is fresh) or pass `--agent <your-name>`
-- `writ spec add` does not claim the spec; your first seal does, or pass `--claim`. Release a claim you no longer need with `writ spec release <id>`
-"#.to_string()
+- @CLAIM_NOTE@ Release a claim you no longer need with `writ spec release <id>`
+"#
+    .pipe_template()
 }
 
 fn writ_agents_md_section() -> String {
@@ -1104,11 +1158,7 @@ fn writ_agents_md_section() -> String {
 This project uses writ for version control. You MUST follow this workflow.
 
 ### Required Workflow
-1. BEFORE starting any work, run `writ context` to check project state
-2. Create a spec for your task: `writ spec add "brief description of your task" --scope "<glob of files you will change>"`
-3. AFTER each meaningful unit of work, run `writ seal -s "<summary>" --paths <changed files, comma-separated>` (auto-scoped to your spec)
-4. When complete, run `writ spec done` BEFORE reporting results (auto-scoped to your spec)
-
+@STEPS@
 Your task is NOT complete until you have sealed your work.
 `--scope` declares the files your task owns; without it, pass `--paths` with the files you changed.
 If a seal prints `left out:` or `NOT SEALED:`, run the command it prints if those files are yours.
@@ -1116,8 +1166,8 @@ If a seal prints `left out:` or `NOT SEALED:`, run the command it prints if thos
 ### Commands
 - `writ context` — structured project state. Run this FIRST.
 - `writ seal -s "<summary>" --paths <changed files, comma-separated>` — checkpoint work (auto-scoped to your spec)
-- `writ spec add "task description"` — create a spec (ID auto-generated)
-- `writ spec done` — mark task complete (auto-scoped)
+- `@SPEC_ADD@` — create a spec (ID auto-generated)
+- `@SPEC_DONE@` — mark task complete (auto-scoped)
 - `writ status` — project overview
 - `writ log` — seal history
 
@@ -1125,7 +1175,7 @@ Subagents inherit the parent's identity: set `WRIT_AGENT_ID=<your-name>` on ever
 Do NOT run `git commit` or `writ finish` — the user manages the git round-trip.
 `writ restore <seal-id>` overwrites working directory files — use only when reverting to a known-good state.
 "#
-    .to_string()
+    .pipe_template()
 }
 
 /// Content for `.writ/AGENT_INSTRUCTIONS.md`.
@@ -1145,12 +1195,8 @@ This project uses writ for version control. The `writ` CLI is available in PATH.
 
 You MUST follow these steps. They are not optional.
 
-1. BEFORE starting any work, run `writ context` to check project state
-2. If no spec is assigned to you, create one: `writ spec add "brief description of your task" --scope "<glob of files you will change>"`
-3. Do your work in small increments
-4. AFTER each meaningful unit of work, run `writ seal -s "<summary>" --paths <changed files, comma-separated>` to checkpoint (auto-scoped to your spec)
-5. Check `writ context` periodically to see what other agents have done
-6. When task is complete, run `writ spec done` BEFORE reporting results (auto-scoped to your spec)
+@STEPS@
+Work in small increments, and check `writ context` periodically to see what other agents have done.
 
 ## Agent Identity
 
@@ -1161,9 +1207,8 @@ setting, then your framework session (for example `claude-code-a3f2`), then
 share one identity: give each its own with `WRIT_AGENT_ID=<name>` on every
 writ command, or `--agent <name>`.
 
-`writ spec add` records you as the creator but does not claim the spec; your
-first seal claims it, or pass `--claim`. `writ spec release <id>` gives a claim
-back (the holder only, or `--force`).
+`writ spec add` records you as the creator. @CLAIM_NOTE@
+`writ spec release <id>` gives a claim back (the holder only, or `--force`).
 
 ## Spec Lifecycle
 
@@ -1197,9 +1242,9 @@ Available formats:
 - `writ context` — structured project state
 - `writ context --spec <id>` — context scoped to a specific task
 - `writ seal -s "<summary>" --paths <changed files, comma-separated>` — checkpoint work (auto-scoped to your spec)
-- `writ spec add "brief task description"` — create a task spec (ID auto-generated)
+- `@SPEC_ADD@` — create a task spec (ID auto-generated)
 - `writ spec status` — view active specs
-- `writ spec done` — mark your task complete (auto-scoped to your spec)
+- `@SPEC_DONE@` — mark your task complete (auto-scoped to your spec)
 - `writ status` — project overview (agents, specs, progress)
 - `writ diff` — preview file changes
 - `writ log` — recent seal history
@@ -1209,7 +1254,7 @@ Available formats:
 
 - You MUST run `writ context` before starting work
 - You MUST run `writ seal -s "<summary>" --agent claude-code --paths <changed files, comma-separated>` after each meaningful unit of work
-- You MUST run `writ spec done` before reporting results to the user
+- You MUST run `@SPEC_DONE@` before reporting results to the user
 - Your task is NOT complete until sealed
 - Include meaningful summaries in seals for other agents' context
 - `--scope` on `writ spec add` declares the files your task owns; `writ seal` without `--paths` then captures only those. Otherwise pass `--paths` with the files you changed: another agent's pending files are never sealed for you
@@ -1250,7 +1295,7 @@ until sealed. NEVER run git commit or writ finish."
 }
 ```
 "#
-    .to_string()
+    .pipe_template()
 }
 
 #[cfg(test)]
@@ -1484,6 +1529,84 @@ mod tests {
 
     // --- Template content tests ---
 
+    /// Finding 67: the hook, the CLAUDE.md block, AGENTS.md, the agent
+    /// instructions and the settings instruction carry the same steps.
+    #[test]
+    fn every_surface_renders_the_same_workflow_steps() {
+        let hook = session_start_command("writ");
+        let surfaces = [
+            writ_claude_md_section(),
+            writ_agents_md_section(),
+            agent_instructions_content(),
+        ];
+        for step in crate::template::workflow_steps() {
+            for s in &surfaces {
+                assert!(s.contains(&step), "missing {step:?}");
+            }
+            assert!(writ_instruction().contains(&step), "settings: {step:?}");
+            assert!(hook.contains(&step.replace('`', "")), "hook: {step:?}");
+        }
+        for s in surfaces.iter().chain([&hook]) {
+            assert!(!s.contains('@'), "unfilled placeholder:\n{s}");
+        }
+    }
+
+    /// Finding 70: the generated skills teach the same seal, spec add and
+    /// spec done commands as the CLAUDE.md block; none teaches a bare
+    /// `writ seal -s "..."` without `--paths` or a `spec add` without
+    /// `--scope`.
+    #[test]
+    fn skills_teach_the_same_commands_as_the_block() {
+        let block = writ_claude_md_section();
+        assert!(block.contains(crate::template::SEAL));
+        let texts: Vec<(&str, &str)> = crate::skills::SKILL_TEMPLATES
+            .iter()
+            .flat_map(|t| {
+                std::iter::once((t.name, t.skill_md))
+                    .chain(t.supporting_files.iter().map(|f| (t.name, f.content)))
+            })
+            .collect();
+        let by_name = |n: &str| texts.iter().find(|(name, _)| *name == n).unwrap().1;
+        assert!(by_name("writ-seal")
+            .contains(r#"writ seal -s "what you did" --paths <changed files, comma-separated>"#));
+        assert!(by_name("writ-seal").contains(crate::template::PATHS_NOTE));
+        assert!(by_name("writ-spec-add").contains(crate::template::SPEC_ADD));
+        assert!(by_name("writ-spec-done").contains(crate::template::SPEC_DONE));
+        for (name, text) in &texts {
+            for line in text.lines() {
+                if line.contains("writ seal -s") {
+                    assert!(line.contains("--paths"), "{name}: {line}");
+                }
+                if line.contains("writ spec add \"") {
+                    assert!(line.contains("--scope"), "{name}: {line}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hook_and_block_agree_on_claims_and_the_scope_form() {
+        let hook = session_start_command("writ");
+        let block = writ_claude_md_section();
+        assert!(hook.contains("does not claim the spec; your first seal does"));
+        assert!(block.contains("does not claim the spec; your first seal does"));
+        assert!(!hook.contains("brief task description"));
+        assert!(hook.contains(r#"--scope "<files you will change, comma-separated>""#));
+        assert!(hook.contains(r#"writ spec done -s "<what you did>""#));
+    }
+
+    #[test]
+    fn hook_command_runs_in_sh_and_prints_the_steps() {
+        let out = std::process::Command::new("sh")
+            .args(["-c", &session_start_command("true")])
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success());
+        assert!(text.contains("4. When the task is complete"), "{text}");
+        assert!(text.contains("writ spec claim <id>"), "{text}");
+    }
+
     #[test]
     fn test_claude_md_section_has_spec_done_workflow() {
         let section = writ_claude_md_section();
@@ -1492,7 +1615,7 @@ mod tests {
             "missing writ spec done in workflow"
         );
         assert!(
-            section.contains("EVERY TASK requires these 3 commands"),
+            section.contains("EVERY TASK follows these steps"),
             "missing front-loaded mandatory workflow"
         );
     }

@@ -898,8 +898,9 @@ enum SpecCommands {
         #[arg(long)]
         claim: bool,
 
-        /// Files this spec owns: a path, a `dir/` prefix, or a glob such as
-        /// `src/auth/**`. Repeatable. Sets the spec's file_scope, so
+        /// Files this spec owns: paths, `dir/` prefixes, or globs such as
+        /// `src/auth/**`, comma-separated or repeated
+        /// (`--scope "app.py,tests/*"`). Sets the spec's file_scope, so
         /// `writ seal` without --paths captures exactly these files.
         #[arg(long = "scope", value_name = "GLOB")]
         scope: Vec<String>,
@@ -2143,7 +2144,8 @@ fn cmd_init(
     let plan = init::plan_init(&opts)?;
 
     // Execute: create .writ/, import baseline.
-    let result = Repository::init_project(cwd)?;
+    // Finding 71: a rerun refreshes generated files and never seals.
+    let result = Repository::init_project_with(cwd, false)?;
 
     // Save GC config from the selected profile.
     let gc_config = writ_core::gc::GcConfig::from_profile(profile)?;
@@ -2194,7 +2196,9 @@ fn cmd_init(
         // commands, CLAUDE.md, .mcp.json, etc.) so that specs created after
         // init have a genesis tree that includes these files. Without this,
         // every agent's first seal shows 20+ init artifacts as "new files."
-        if result.git_imported || result.already_imported {
+        // Finding 71: only on a first init. A rerun is a refresh of the
+        // generated files and never seals; refreshed files show as pending.
+        if result.initialized && (result.git_imported || result.already_imported) {
             let repo = Repository::open_from_dir(&cwd)?;
             let bridge_agent = writ_core::seal::AgentIdentity {
                 id: "writ-bridge".to_string(),
@@ -2209,7 +2213,11 @@ fn cmd_init(
                 true, // allow_empty in case no new files were generated
             ) {
                 Ok(_) => {}
-                Err(_) => {} // Best effort — don't fail init over this
+                // Best effort: init still succeeds, but say so.
+                Err(e) => eprintln!(
+                    "{} post-init baseline seal not made: {e}",
+                    "warning:".yellow().bold()
+                ),
             }
         }
     }
@@ -2257,6 +2265,14 @@ fn cmd_init(
                 }
             } else if result.already_imported {
                 println!("{} Git baseline already synced", "✓".green());
+            } else if let Some(ref why) = result.import_skipped_reason {
+                println!("{} {why}", "·".dimmed());
+            }
+            if !result.initialized {
+                println!(
+                    "{} Refreshed generated files only; nothing was sealed",
+                    "✓".green()
+                );
             }
 
             // Warn if working directory has changes not in git (stale from a
@@ -4690,7 +4706,8 @@ fn cmd_finish(
     println!();
     println!("{}", "Completed specs ready to commit:".bold());
     for s in &committable {
-        let summary_hint = s.completion_summary.as_deref().unwrap_or("(no summary)");
+        // Finding 68: specs closed without -s show their title.
+        let summary_hint = s.completion_summary.as_deref().unwrap_or(&s.title);
         println!("  {} {} — {}", "✓".green(), s.id.cyan(), summary_hint);
     }
 
@@ -5930,9 +5947,10 @@ fn cmd_spec_add(
     Ok(())
 }
 
-/// Validate `--scope` entries: repo-relative, no `..`, `./` prefix dropped.
+/// Validate `--scope` entries: comma-separated or repeated (finding 66),
+/// repo-relative, no `..`, `./` prefix dropped.
 fn normalize_scope_entries(entries: &[String]) -> Result<Vec<String>, WritError> {
-    entries
+    seal_scope::split_scope_entries(entries)
         .iter()
         .map(|raw| {
             let entry = raw.trim().trim_start_matches("./");
@@ -6098,7 +6116,14 @@ fn cmd_spec_done(
     // sealing someone else's claim warns or is rejected (S.1).
     let agent_id = resolve_agent(agent, cwd);
     let spec_id = repo.resolve_spec(&spec_id)?.id;
-    let seal_summary = summary.as_deref().unwrap_or("Spec completed").to_string();
+    let seal_summary = summary
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| {
+            repo.resolve_spec(&spec_id)
+                .map(|s| s.title)
+                .unwrap_or_default()
+        });
 
     let seal_agent = AgentIdentity {
         id: agent_id.to_string(),

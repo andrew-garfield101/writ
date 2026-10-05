@@ -38,6 +38,14 @@ pub enum WritError {
         claimed_by: String,
         agent: String,
     },
+    /// Finding 65: a seal or `spec done` on a spec already committed to git.
+    /// Finish never stages it and the spec cannot be reopened, so it is
+    /// refused before anything is written.
+    SpecAlreadyCommitted {
+        spec_id: String,
+        title: String,
+        commit_hash: Option<String>,
+    },
     /// A seal with this ID was not found.
     SealNotFound(String),
     /// A spec with this ID was not found.
@@ -167,6 +175,21 @@ impl fmt::Display for WritError {
                     }
                 }
                 Ok(())
+            }
+            WritError::SpecAlreadyCommitted {
+                spec_id,
+                title,
+                commit_hash,
+            } => {
+                let at = commit_hash
+                    .as_deref()
+                    .map(|h| format!(" in {}", &h[..h.len().min(12)]))
+                    .unwrap_or_default();
+                let follow_up = format!("{title} (follow-up)").replace('"', "'");
+                write!(
+                    f,
+                    "spec '{spec_id}' is already committed to git{at}; finish would never stage a new seal on it and it cannot be reopened. Start a new spec for this work:\n    writ spec add \"{follow_up}\" --claim"
+                )
             }
             WritError::SealClaimConflict {
                 spec_id,

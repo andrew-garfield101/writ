@@ -9,7 +9,9 @@ otherwise LOST.
 """
 import collections, difflib, glob, json, subprocess, sys
 
-REPO = str(__import__("pathlib").Path(__file__).resolve().parent.parent)
+# Repo to audit: this checkout, or WRIT_AUDIT_REPO (e.g. a live-run temp project).
+REPO = __import__("os").environ.get(
+    "WRIT_AUDIT_REPO", str(__import__("pathlib").Path(__file__).resolve().parent.parent))
 W = REPO + "/.writ"
 
 def blob(h):

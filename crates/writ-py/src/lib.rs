@@ -757,7 +757,7 @@ impl PyRepository {
             spec.tech_stack = ts;
         }
         if let Some(fs) = file_scope {
-            spec.file_scope = fs;
+            spec.file_scope = writ_core::seal_scope::split_scope_entries(&fs);
         }
         let creator = resolve_py_agent(&self.inner, agent_id, None)?.id;
         spec.created_by = Some(creator.clone());
@@ -1629,7 +1629,16 @@ impl PyRepository {
                     .map_err(writ_err)?
             }
         };
-        let seal_summary = summary.as_deref().unwrap_or("Spec completed").to_string();
+        // Finding 68: the title stands in for a missing summary.
+        let seal_summary = summary
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| {
+                self.inner
+                    .resolve_spec(&resolved_id)
+                    .map(|s| s.title)
+                    .unwrap_or_default()
+            });
         let agent_name = agent.id.clone();
         let outcome = self
             .inner

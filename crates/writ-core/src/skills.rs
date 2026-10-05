@@ -55,7 +55,8 @@ pub struct SkillTemplate {
 
 const WRIT_CONTEXT_SKILL: SkillTemplate = SkillTemplate {
     name: "writ-context",
-    skill_md: r#"---
+    skill_md: concat!(
+        r#"---
 name: "writ-context"
 description: "Understand the current project state, your assigned task, and recent activity. Use when starting a new task, checking what specs exist, or reviewing recent agent activity."
 ---
@@ -74,18 +75,24 @@ writ context
 
 1. **Check if you have an assigned spec** (look for `assigned_spec` or your agent ID in a spec's `claimed_by`):
    - If yes: you already have a task. Continue working on it.
-   - Seal your progress with `writ seal -s "what you did"`.
+   - Seal your progress with `"#,
+        cmd_seal_with!("what you did"),
+        r#"`.
 
 2. **Check for unclaimed specs** (the `unclaimed_specs` section):
    - If unclaimed specs exist: claim the one that matches your task.
    - Run: `writ spec claim <id>`
 
 3. **If no assigned spec and no unclaimed specs**:
-   - Create a spec from your task: `writ spec add "brief description of your task"`
+   - Create a spec from your task: `"#,
+        cmd_spec_add!(),
+        r#"`
    - Use a short summary (5-10 words), not your full prompt.
    - Writ generates the ID automatically.
 
-4. Once you have a spec, begin working. Seal your progress with `writ seal -s "what you did"`.
+4. Once you have a spec, begin working. Seal your progress with `"#,
+        cmd_seal_with!("what you did"),
+        r#"`.
 
 ## When to Re-Run Context
 
@@ -97,7 +104,8 @@ writ context
 
 Context returns data in TOON format (token-optimized, 20-33% smaller than JSON).
 Key fields: `specs` (task status), `recent_seals` (recent activity), `integration_risk` (contention warnings).
-"#,
+"#
+    ),
     supporting_files: &[SupportingFile {
         filename: "reading-context.md",
         content: r#"# Reading Writ Context Output
@@ -134,7 +142,8 @@ Files you've modified since your last seal. If this is non-empty, consider seali
 
 const WRIT_SEAL_SKILL: SkillTemplate = SkillTemplate {
     name: "writ-seal",
-    skill_md: r#"---
+    skill_md: concat!(
+        r#"---
 name: "writ-seal"
 description: "Checkpoint your current work as an immutable snapshot. Use after completing a meaningful chunk of work, implementing a feature, or fixing a bug."
 ---
@@ -146,9 +155,14 @@ Create a checkpoint after each meaningful unit of work.
 ## Command
 
 ```bash
-writ seal -s "what you accomplished"
+"#,
+        cmd_seal_with!("what you did"),
+        r#"
 ```
 
+"#,
+        paths_note!(),
+        r#"
 The `--spec` flag is optional if you have exactly one claimed spec (auto-scoped).
 
 ## When to Seal
@@ -171,8 +185,9 @@ Be specific about WHAT changed, not HOW:
 - `-s "summary"` — clear description of what you accomplished (required)
 - `--spec <id>` — the spec this work belongs to (optional if you have one claimed spec)
 - `--tests-passed N --tests-failed M` — test results for this checkpoint
-- `--paths file1,file2` — seal specific files only (default: all changes)
-"#,
+- `--paths file1,file2` — the files you changed (default: only files your spec owns)
+"#
+    ),
     supporting_files: &[SupportingFile {
         filename: "seal-checklist.md",
         content: r#"# Pre-Seal Checklist
@@ -196,7 +211,8 @@ Before sealing, verify:
 
 const WRIT_SPEC_DONE_SKILL: SkillTemplate = SkillTemplate {
     name: "writ-spec-done",
-    skill_md: r#"---
+    skill_md: concat!(
+        r#"---
 name: "writ-spec-done"
 description: "Mark your task as complete when all requirements are met. Use when your task is fully finished, tests pass, and all changes are sealed."
 ---
@@ -208,11 +224,13 @@ Mark your spec as complete when your task is fully finished.
 ## Command
 
 ```bash
-writ spec done
+"#,
+        cmd_spec_done!(),
+        r#"
 ```
 
 The spec ID is optional if you have exactly one claimed spec (auto-scoped).
-Add a summary: `writ spec done -s "what was accomplished"`
+Always pass `-s` with what you did; without it the spec title stands in.
 
 ## When to Call Spec Done
 
@@ -234,7 +252,8 @@ Do NOT call spec done if:
 5. When the user runs `writ finish`, your converged work is committed to git
 
 You do NOT need to run `writ finish` — that's the user's job.
-"#,
+"#
+    ),
     supporting_files: &[SupportingFile {
         filename: "completion-checklist.md",
         content: r#"# Completion Checklist
@@ -485,7 +504,8 @@ Shows the workspace's associated spec, owning agent, seal history, and file chan
 
 const WRIT_SPEC_ADD_SKILL: SkillTemplate = SkillTemplate {
     name: "writ-spec-add",
-    skill_md: r#"---
+    skill_md: concat!(
+        r#"---
 name: "writ-spec-add"
 description: "Create a new task spec from your task description"
 ---
@@ -497,7 +517,9 @@ Create a spec to track your task. Writ generates the ID automatically.
 ## Command
 
 ```bash
-writ spec add "brief description of your task"
+"#,
+        cmd_spec_add!(),
+        r#"
 ```
 
 Use a short summary (5-10 words). Writ generates a unique hash ID.
@@ -511,11 +533,27 @@ Use a short summary (5-10 words). Writ generates a unique hash ID.
 ## Examples
 
 ```bash
-writ spec add "OAuth2 authentication for login page"
-writ spec add "Fix payment validation for zero-amount transactions"
-writ spec add "Add responsive nav menu to Layout"
-```
 "#,
+        cmd_spec_add_with!(
+            "OAuth2 authentication for login page",
+            "src/auth/*,tests/test_auth.py"
+        ),
+        r#"
+"#,
+        cmd_spec_add_with!(
+            "Fix payment validation for zero-amount transactions",
+            "src/payments.py"
+        ),
+        r#"
+"#,
+        cmd_spec_add_with!(
+            "Add responsive nav menu to Layout",
+            "src/components/Layout.tsx"
+        ),
+        r#"
+```
+"#
+    ),
     supporting_files: &[],
 };
 
@@ -641,7 +679,8 @@ Standard JSON. Use `--format json` when you need structured output for scripts o
 
 const WRIT_RESTORE_SKILL: SkillTemplate = SkillTemplate {
     name: "writ-restore",
-    skill_md: r#"---
+    skill_md: concat!(
+        r#"---
 name: "writ-restore"
 description: "Restore working directory to a previous seal's state"
 ---
@@ -661,13 +700,17 @@ writ restore <seal-id>
 1. Find the last known-good seal: `writ log --all`
 2. Inspect it: `writ show <seal-id> --diff`
 3. Restore: `writ restore <seal-id>`
-4. Seal the rollback: `writ seal -s "rolled back to <seal-id>"`
+4. Seal the rollback: `"#,
+        cmd_seal_with!("rolled back to <seal-id>"),
+        r#"` (the restored files)
 
 Every seal is immutable. Restoring doesn't delete history — all previous seals remain in the log.
-"#,
+"#
+    ),
     supporting_files: &[SupportingFile {
         filename: "rollback-guide.md",
-        content: r#"# Rollback Guide
+        content: concat!(
+            r#"# Rollback Guide
 
 ## When to Restore
 
@@ -680,7 +723,9 @@ Every seal is immutable. Restoring doesn't delete history — all previous seals
 1. `writ log --all` — find the seal BEFORE things went wrong
 2. `writ show <seal-id> --diff` — verify it's the right state
 3. `writ restore <seal-id>` — rewind working directory
-4. `writ seal -s "rolled back to <seal-id>"` — record the rollback
+4. `"#,
+            cmd_seal_with!("rolled back to <seal-id>"),
+            r#"` — record the rollback (the restored files)
 5. Continue working from the restored state
 
 ## Important
@@ -688,7 +733,8 @@ Every seal is immutable. Restoring doesn't delete history — all previous seals
 - Restore changes your working directory files, NOT the seal history
 - All seals (including the bad ones) remain in the log for audit
 - After restoring, you're working on the restored state — seal normally from here
-"#,
+"#
+        ),
     }],
 };
 

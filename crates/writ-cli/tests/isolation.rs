@@ -861,6 +861,114 @@ fn exit_criterion_two_agents_with_declared_lanes() {
     assert_exit_criterion(&p, &text);
 }
 
+/// Variant 3, the live run's exact shape (0.3.0 exit run, 2026-10-05): both
+/// agents declare overlapping lanes as ONE comma-separated `--scope` string
+/// with `--claim`, the way the generated template led two real agents to,
+/// then seal with `--paths`. auth owns auth.py and README.md, crud owns
+/// tests/test_tasks.py, both touch the shared app.py (crud builds on auth's
+/// sealed version). Finding 66: the string must parse into its globs, so no
+/// seal reports a file outside scope, and a seal without `--paths` captures
+/// a lane-only file.
+#[test]
+fn exit_criterion_live_shape_comma_separated_scope_has_no_scope_warnings() {
+    let p = Project::new("exit-live-scope");
+    p.ok(
+        "auth",
+        &[
+            "spec",
+            "add",
+            "--id",
+            "auth",
+            "--title",
+            "auth",
+            SCOPE_FLAG,
+            "app.py,models.py,auth.py,tests/*,README.md",
+            "--claim",
+        ],
+    );
+    p.ok(
+        "crud",
+        &[
+            "spec",
+            "add",
+            "--id",
+            "crud",
+            "--title",
+            "crud",
+            SCOPE_FLAG,
+            "app.py,models.py,tests/**",
+            "--claim",
+        ],
+    );
+    assert_eq!(p.spec_state("auth").claimed_by.as_deref(), Some("auth"));
+    assert_eq!(p.spec_state("crud").claimed_by.as_deref(), Some("crud"));
+
+    p.write("app.py", "app = 1\n# auth routes\n");
+    p.write("auth.py", "def login(): ...\n");
+    p.write("tests/test_auth.py", "def test_login(): ...\n");
+    let a1 = p.seal_paths("auth", "auth", "auth", "app.py,auth.py,tests/test_auth.py");
+    p.write("app.py", "app = 1\n# auth routes\n# task routes\n");
+    p.write("tests/test_tasks.py", "def test_tasks(): ...\n");
+    let c1 = p.seal_paths("crud", "crud", "crud", "app.py,tests/test_tasks.py");
+    // Lane-only capture: README.md is in auth's lane and nobody else's.
+    p.write("README.md", "base\nauth docs\n");
+    let a2 = combined(&p.seal("auth", "auth", "docs"));
+
+    for (label, out) in [
+        ("auth seal", &a1),
+        ("crud seal", &c1),
+        ("auth lane seal", &a2),
+    ] {
+        assert!(
+            !out.contains("outside spec") && !out.contains("SCOPE:"),
+            "{label} reported files outside scope:\n{out}"
+        );
+    }
+    for s in p.all_seals().iter().filter(|s| s.spec_id.is_some()) {
+        let scope: Vec<&String> = s.warnings.iter().filter(|w| w.contains("SCOPE")).collect();
+        assert!(
+            scope.is_empty(),
+            "seal {} ({:?}) warnings: {scope:?}",
+            s.id,
+            s.spec_id
+        );
+    }
+    assert!(
+        paths(last(&p.spec_seals("auth"))).contains("README.md"),
+        "lane seal without --paths missed README.md:\n{a2}"
+    );
+    assert!(p
+        .spec_seals("auth")
+        .iter()
+        .all(|s| !paths(s).contains("tests/test_tasks.py")));
+    assert!(p
+        .spec_seals("crud")
+        .iter()
+        .all(|s| !paths(s).contains("auth.py")));
+
+    for (agent, spec) in [("auth", "auth"), ("crud", "crud")] {
+        assert!(p.done(agent, spec, &[]).status.success());
+    }
+    let text = p.ok("human", &["finish", "-y"]);
+
+    assert_eq!(
+        p.commit_files("HEAD"),
+        set(&[
+            "README.md",
+            "app.py",
+            "auth.py",
+            "tests/test_auth.py",
+            "tests/test_tasks.py"
+        ]),
+        "{text}"
+    );
+    assert_eq!(
+        p.git(&["show", "HEAD:app.py"]),
+        "app = 1\n# auth routes\n# task routes\n"
+    );
+    p.verify_clean();
+}
+
 /// Pull the first pasteable `writ seal ... --paths ...` line out of output.
 fn pasteable_seal_command(text: &str) -> Option<String> {
     text.lines().find_map(|l| {

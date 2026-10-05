@@ -4,6 +4,9 @@
 //! Its core primitives are **specs** (not branches), **seals** (not commits),
 //! and **convergence** (not merging).
 
+#[macro_use]
+pub mod template;
+
 pub mod agent;
 pub mod analytics;
 #[cfg(feature = "bridge")]

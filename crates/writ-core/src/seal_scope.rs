@@ -272,7 +272,9 @@ pub fn classify(
 /// Entries ending in `/` match as directory prefixes, entries containing `*`
 /// as globs, and anything else as an exact path or directory prefix.
 pub fn path_in_scope(file_scope: &[String], path: &str) -> bool {
-    file_scope.iter().any(|scope| {
+    // Finding 66: an entry stored as one comma-separated string (specs
+    // created before the CLI split them) still matches per item.
+    split_scope_entries(file_scope).iter().any(|scope| {
         if let Some(dir) = scope.strip_suffix('/') {
             path.starts_with(scope) || path == dir
         } else if scope.contains('*') {
@@ -281,6 +283,20 @@ pub fn path_in_scope(file_scope: &[String], path: &str) -> bool {
             path == scope || path.starts_with(&format!("{scope}/"))
         }
     })
+}
+
+/// Split `--scope` values on commas (finding 66): agents write
+/// `--scope "a.py,b.py,tests/*"`, and the repeated flag still works. Items
+/// are trimmed; empty items dropped. Globs here have no `{a,b}` braces, so a
+/// comma is never part of a pattern.
+pub fn split_scope_entries(entries: &[String]) -> Vec<String> {
+    entries
+        .iter()
+        .flat_map(|e| e.split(','))
+        .map(str::trim)
+        .filter(|e| !e.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 /// A paste-ready command that seals `paths` explicitly.
@@ -333,6 +349,18 @@ mod tests {
             file_scope: scope.iter().map(|s| s.to_string()).collect(),
             sealed_paths: sealed.iter().map(|s| s.to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn comma_separated_scope_is_split_and_matches_each_item() {
+        let one = vec!["app.py, models.py,tests/*,".to_string()];
+        assert_eq!(
+            split_scope_entries(&one),
+            vec!["app.py", "models.py", "tests/*"]
+        );
+        assert!(path_in_scope(&one, "models.py"));
+        assert!(path_in_scope(&one, "tests/test_app.py"));
+        assert!(!path_in_scope(&one, "other.py"));
     }
 
     fn busy() -> Vec<ClaimHolder> {

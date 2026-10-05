@@ -308,3 +308,101 @@ fn auto_honors_per_spec_strategy() {
 
     assert_eq!(p.commits().len(), 2);
 }
+
+/// Finding 65: once finish committed a spec, `writ seal` and `writ spec
+/// done` on it are refused with the commit and the command for a new spec.
+#[test]
+fn seal_and_done_on_a_committed_spec_are_refused_with_the_follow_up_command() {
+    let p = two_specs("committed-refused");
+    p.ok("human", &["finish", "-y"]);
+    let (_, hash) = p.commit_state("sa");
+    let hash = hash.unwrap();
+    p.write("a.txt", "late edit\n");
+
+    for args in [
+        vec![
+            "seal", "-s", "late", "--agent", "a", "--spec", "sa", "--paths", "a.txt",
+        ],
+        vec!["seal", "-s", "late", "--agent", "a", "--spec", "sa"],
+        vec!["spec", "done", "sa", "-s", "again", "--agent", "a"],
+        vec!["spec", "done", "sa", "--no-seal", "--agent", "a"],
+    ] {
+        let out = p.writ("a", &args);
+        let text = combined(&out);
+        assert!(!out.status.success(), "{args:?} succeeded:\n{text}");
+        assert!(text.contains(&hash[..12]), "{args:?}:\n{text}");
+        assert!(
+            text.contains("writ spec add \"sa (follow-up)\" --claim"),
+            "{text}"
+        );
+    }
+    assert_eq!(p.commits().len(), 1);
+}
+
+/// Finding 66: `--scope "a,b,glob"` is three entries, and the lane works:
+/// no out-of-scope warning for files inside it.
+#[test]
+fn comma_separated_scope_is_split_into_entries() {
+    let p = Project::new("scope-comma");
+    p.ok(
+        "a",
+        &[
+            "spec",
+            "add",
+            "--id",
+            "sa",
+            "--title",
+            "sa",
+            "--claim",
+            "--scope",
+            "app.py,models.py, tests/*",
+        ],
+    );
+    let scope = Repository::open(&p.root)
+        .unwrap()
+        .load_spec("sa")
+        .unwrap()
+        .file_scope;
+    assert_eq!(scope, vec!["app.py", "models.py", "tests/*"]);
+    fs::create_dir_all(p.root.join("tests")).unwrap();
+    p.write("app.py", "a\n");
+    p.write("tests/test_app.py", "t\n");
+
+    let text = p.ok("a", &["seal", "-s", "w", "--agent", "a", "--spec", "sa"]);
+
+    assert!(!text.to_lowercase().contains("outside"), "{text}");
+}
+
+/// Finding 68: `spec done` without -s uses the title; finish never prints
+/// "(no summary)" and the per-spec commit message carries the title.
+#[test]
+fn missing_done_summary_falls_back_to_the_spec_title() {
+    let p = Project::new("title-fallback");
+    p.ok(
+        "a",
+        &[
+            "spec",
+            "add",
+            "--id",
+            "sa",
+            "--title",
+            "Add login form",
+            "--claim",
+        ],
+    );
+    p.write("a.txt", "a\n");
+    p.ok(
+        "a",
+        &[
+            "seal", "-s", "w", "--agent", "a", "--spec", "sa", "--paths", "a.txt",
+        ],
+    );
+    p.ok("a", &["spec", "done", "sa", "--agent", "a"]);
+
+    let text = p.ok("human", &["finish", "-y", "--strategy", "per-spec"]);
+
+    assert!(!text.contains("(no summary)"), "{text}");
+    assert!(text.contains("sa — Add login form"), "{text}");
+    let msg = p.git(&["log", "-1", "--format=%s"]);
+    assert_eq!(msg.trim(), "sa: Add login form");
+}

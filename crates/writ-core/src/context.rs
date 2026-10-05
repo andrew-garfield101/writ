@@ -534,6 +534,11 @@ pub struct ContextOutput {
     /// after every trimmable section was reduced to its floor.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub budget_exceeded: bool,
+    /// Lines another spec added that this spec's version did not carry; the
+    /// merge kept them (finding 62). Each names the file, lines, the adding
+    /// spec and agent, and the seal command to remove them again on purpose.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stale_rewrite_notices: Vec<crate::convergence::survival::ConvergenceNotice>,
 }
 
 /// Read-only summary of a spec from another workspace that our specs depend on.

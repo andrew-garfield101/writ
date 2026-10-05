@@ -24,6 +24,13 @@ pub enum WritError {
         spec_id: String,
         scope: Box<crate::seal_scope::SealScope>,
     },
+    /// A seal would remove lines that earlier seals of the same spec added
+    /// and no later seal of that spec removed (finding 42). Sealing with
+    /// `force` records the removal on purpose.
+    OwnLinesRemoved {
+        spec_id: String,
+        losses: Vec<crate::convergence::survival::SurvivalLoss>,
+    },
     /// Seal rejected under strict claim enforcement: the spec is claimed by
     /// a different agent.
     SealClaimConflict {
@@ -138,6 +145,29 @@ impl fmt::Display for WritError {
                 "nothing to seal for spec '{spec_id}' — pending changes are outside its default scope ({}). Pass --paths to seal specific files",
                 scope.left_out_summary()
             ),
+            WritError::OwnLinesRemoved { spec_id, losses } => {
+                let n: usize = losses.iter().map(|l| l.line_count()).sum();
+                write!(
+                    f,
+                    "seal refused: it would remove {n} line(s) that earlier seals of spec '{spec_id}' added; nothing was sealed"
+                )?;
+                for l in losses {
+                    write!(f, "\n  {}: line(s) {}", l.path, l.ranges_label())?;
+                    for line in &l.lines {
+                        write!(f, "\n    - {line}")?;
+                    }
+                    if !l.foreign.is_empty() {
+                        write!(
+                            f,
+                            "\n    refused because the file also holds lines no seal recorded (another agent's unsealed work?):"
+                        )?;
+                        for line in &l.foreign {
+                            write!(f, "\n    + {line}")?;
+                        }
+                    }
+                }
+                Ok(())
+            }
             WritError::SealClaimConflict {
                 spec_id,
                 claimed_by,

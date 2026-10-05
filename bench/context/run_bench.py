@@ -54,7 +54,13 @@ CASES: list[tuple[str, list[str]]] = [
 # Budgets: case -> max bytes. Latency applies to every supported case.
 BYTE_BUDGETS = {"default": 32 * KB, "brief": 2 * KB, "budget-8192": 8 * KB}
 LATENCY_BUDGET_MS = 300
-BINARY_BUDGET_BYTES = 13 * MB
+# 14,000,000 B from 2026-10-05 (CC). Was 13,000,000 B. Measured growth from
+# 0.2.0's 11,362,176 B: live .gitignore via the ignore crate (ctx-ignore,
+# +632 KB to 11,994,208), context budgets/brief/hooks plus the 0.2.1 gc
+# reachability and verify checks (+867 KB to 12,861,536 in 0.2.1), and
+# sprint 2 seal isolation, linear-space Myers and writ repair (+105 KB to
+# 12,966,448). Any further jump is a surprise to explain.
+BINARY_BUDGET_BYTES = 14_000_000
 
 # Path prefixes that must never appear in context.
 FIXTURE_LEAK_PREFIXES = [name + "/" for name, _, _ in fixture.IGNORED_TREES]

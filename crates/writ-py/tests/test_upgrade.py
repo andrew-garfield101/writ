@@ -132,11 +132,11 @@ class TestVersionInfoBinding:
         assert "last_opened_by" in info
 
     def test_version_info_schema_is_current(self, tmp_repo):
-        """Schema version is 2 (current, after workspace sprint)."""
+        """Schema version is 3 (current, 0.3.0 spec fields)."""
         repo, path = tmp_repo
         info = repo.version_info()
 
-        assert info["schema_version"] == 2
+        assert info["schema_version"] == 3
 
     def test_version_info_has_binary_version(self, tmp_repo):
         """created_by and last_opened_by contain version strings."""
@@ -176,7 +176,7 @@ class TestLegacyRepoCompat:
 
         # After migration, version should be current
         info = repo2.version_info()
-        assert info["schema_version"] == 2
+        assert info["schema_version"] == 3
 
     def test_legacy_repo_creates_missing_dirs(self, tmp_path):
         """Auto-migration creates directories that were added post-launch."""

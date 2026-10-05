@@ -56,10 +56,10 @@ class Repository:
     def seal(
         self,
         summary: str,
-        agent_id: str = "human",
-        agent_type: str = "human",
+        agent_id: Optional[str] = None,
+        agent_type: Optional[str] = None,
         spec_id: Optional[str] = None,
-        status: str = "complete",
+        status: str = "in-progress",
         paths: Optional[List[str]] = None,
         tests_passed: Optional[int] = None,
         tests_failed: Optional[int] = None,
@@ -70,8 +70,9 @@ class Repository:
 
         Args:
             summary: Description of the changes.
-            agent_id: ID of the agent creating the seal.
-            agent_type: 'human' or 'agent'.
+            agent_id: ID of the agent creating the seal. Defaults to
+                WRIT_AGENT_ID, then the default_agent setting, then "human".
+            agent_type: 'human' or 'agent'. Defaults from the resolved ID.
             spec_id: Spec to scope the seal to. Auto-scopes if agent has 1 claimed spec.
             status: Task status ('in-progress', 'complete', etc.).
             paths: Selective seal — only include these file paths.
@@ -88,10 +89,10 @@ class Repository:
     def seal_with_check(
         self,
         summary: str,
-        agent_id: str = "human",
-        agent_type: str = "human",
+        agent_id: Optional[str] = None,
+        agent_type: Optional[str] = None,
         spec_id: Optional[str] = None,
-        status: str = "complete",
+        status: str = "in-progress",
         paths: Optional[List[str]] = None,
         tests_passed: Optional[int] = None,
         tests_failed: Optional[int] = None,
@@ -129,6 +130,15 @@ class Repository:
             spec_id: The spec to get seals for.
             limit: Max number of seals to return.
             format: Output format ('dict', 'toon', 'json').
+        """
+        ...
+
+    def spec_seals(
+        self, spec_id: str, limit: Optional[int] = None, format: str = "dict"
+    ) -> Any:
+        """The spec's own seals, newest first (from its sealed_by record).
+
+        Unlike spec_log, never includes other specs' ancestor seals.
         """
         ...
 
@@ -227,8 +237,14 @@ class Repository:
         acceptance_criteria: Optional[List[str]] = None,
         design_notes: Optional[List[str]] = None,
         tech_stack: Optional[List[str]] = None,
-    ) -> None:
+        file_scope: Optional[List[str]] = None,
+        agent_id: Optional[str] = None,
+        claim: bool = False,
+    ) -> Dict[str, Any]:
         """Add a new spec (task definition).
+
+        The spec records its creator (agent_id, resolved like seal()) and is
+        claimed only when claim=True.
 
         Args:
             id: Spec ID. If omitted, auto-generates a hash-based ID from the title.
@@ -383,6 +399,15 @@ class Repository:
         """Get storage usage report (object counts, sizes, compression)."""
         ...
 
+    def repair(self, dry_run: bool = False) -> Dict[str, Any]:
+        """Regenerate referenced-but-missing store objects (`writ repair`).
+
+        Content is recovered from the working tree or git history and written
+        only when its hash matches. Returns `dry_run`, `missing`, `recovered`,
+        `unrecoverable`, `unreadable_trees` and `is_clean`.
+        """
+        ...
+
     def gc_status(self) -> Dict[str, Any]:
         """Get garbage collection status and lifecycle states."""
         ...
@@ -441,13 +466,25 @@ class Repository:
         spec_id: Optional[str] = None,
         summary: Optional[str] = None,
         agent_id: Optional[str] = None,
+        paths: Optional[List[str]] = None,
+        no_seal: bool = False,
     ) -> Dict[str, Any]:
-        """Mark a spec as done (status -> Complete).
+        """Mark a spec as done with the same final seal as `writ spec done`.
+
+        The final seal takes `paths` when given, otherwise only files the spec
+        owns; other agents' pending files are never swept. With nothing
+        pending the spec closes without a seal.
 
         Args:
             spec_id: Spec to complete. If None, auto-scopes via agent_id.
-            summary: Optional completion summary.
-            agent_id: Agent completing the spec (for auto-scoping).
+            summary: Optional completion summary (also the final seal summary).
+            agent_id: Agent completing the spec (resolved like seal()).
+            paths: Files to include in the final seal.
+            no_seal: Close without a final seal.
+
+        Returns:
+            The spec dict plus `final_seal` (seal result dict or None) and
+            `hints` (left-out files and a paste-ready command).
         """
         ...
 
@@ -457,6 +494,15 @@ class Repository:
 
     def spec_claim(self, spec_id: str, agent_id: str) -> None:
         """Claim a spec for an agent (assigns ownership)."""
+        ...
+
+    def spec_release(
+        self, spec_id: str, agent_id: Optional[str] = None, force: bool = False
+    ) -> Optional[str]:
+        """Release a spec's claim. The holder may release; others need force=True.
+
+        Returns the previous holder, or None if the spec was unclaimed.
+        """
         ...
 
     def propose(

@@ -1090,6 +1090,11 @@ Do NOT run `git commit`, `git add`, `git push`, or `writ finish`.
 - Multiple agents can work in the same directory simultaneously
 - Seals are auto-scoped to your claimed spec — no need for explicit `--spec`
 - Check `writ context` to see other agents' activity and convergence state
+
+### Agent identity
+- writ names you from `WRIT_AGENT_ID`, else your framework session (e.g. `claude-code-a3f2`), else `human`. `--agent <name>` on a command overrides it.
+- Subagents inherit the parent session's identity. If you are a subagent, or several agents share one session, set your own: prefix every writ command with `WRIT_AGENT_ID=<your-name>` (each shell call is fresh) or pass `--agent <your-name>`
+- `writ spec add` does not claim the spec; your first seal does, or pass `--claim`. Release a claim you no longer need with `writ spec release <id>`
 "#.to_string()
 }
 
@@ -1116,6 +1121,7 @@ If a seal prints `left out:` or `NOT SEALED:`, run the command it prints if thos
 - `writ status` — project overview
 - `writ log` — seal history
 
+Subagents inherit the parent's identity: set `WRIT_AGENT_ID=<your-name>` on every writ command (or pass `--agent <your-name>`).
 Do NOT run `git commit` or `writ finish` — the user manages the git round-trip.
 `writ restore <seal-id>` overwrites working directory files — use only when reverting to a known-good state.
 "#
@@ -1145,6 +1151,19 @@ You MUST follow these steps. They are not optional.
 4. AFTER each meaningful unit of work, run `writ seal -s "<summary>" --paths <changed files, comma-separated>` to checkpoint (auto-scoped to your spec)
 5. Check `writ context` periodically to see what other agents have done
 6. When task is complete, run `writ spec done` BEFORE reporting results (auto-scoped to your spec)
+
+## Agent Identity
+
+writ resolves who you are in this order: `--agent <name>`, then the
+`WRIT_AGENT_ID` environment variable, then the project's `default_agent`
+setting, then your framework session (for example `claude-code-a3f2`), then
+`human`. Subagents spawned by a hub inherit the hub's session and would all
+share one identity: give each its own with `WRIT_AGENT_ID=<name>` on every
+writ command, or `--agent <name>`.
+
+`writ spec add` records you as the creator but does not claim the spec; your
+first seal claims it, or pass `--claim`. `writ spec release <id>` gives a claim
+back (the holder only, or `--force`).
 
 ## Spec Lifecycle
 

@@ -14,7 +14,8 @@ use crate::fsutil::atomic_write;
 
 /// A tracked file entry in the index.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// Finding 59: unknown fields are ignored, never an error, so a record
+// written by a newer writ stays readable here. Seal records stay strict.
 pub struct IndexEntry {
     /// SHA-256 hash of the file's content.
     pub hash: String,
@@ -24,7 +25,8 @@ pub struct IndexEntry {
 
 /// The full index mapping relative paths to their tracked state.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// Finding 59: unknown fields are ignored, never an error, so a record
+// written by a newer writ stays readable here. Seal records stay strict.
 pub struct Index {
     /// Map of relative file path -> index entry.
     pub entries: BTreeMap<String, IndexEntry>,

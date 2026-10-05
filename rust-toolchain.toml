@@ -1,0 +1,9 @@
+# Pinned toolchain (2026-10-05, clippy-clean). Matches the stable CI was already
+# using (rustc 1.99.0, 2026-09-28) so local builds, CI and release binaries use
+# one compiler and one clippy. ci.yml and release.yml install from this file;
+# maturin-action and cross also read it. Bump deliberately: change the version,
+# run clippy and the full gate, seal the change on its own.
+[toolchain]
+channel = "1.99.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

@@ -33,6 +33,7 @@ pub mod phase6;
 pub mod pipeline;
 #[cfg(test)]
 pub mod prop_tests;
+pub mod survival;
 #[cfg(test)]
 pub mod test_utils;
 pub mod traceability;

@@ -33,7 +33,6 @@ fn with_insert(base: &[String], at: usize, k: usize) -> String {
 }
 
 #[test]
-#[ignore = "finding 23: linear fallback misaligns after an 8+ line insert (sprint 2 diff-quality)"]
 fn test_large_file_block_insert_reports_only_inserted_lines() {
     // 10,001 unique lines; insert 8 lines after line 10.
     // git: +8 -0. writ today: +9999 -9991.
@@ -44,7 +43,6 @@ fn test_large_file_block_insert_reports_only_inserted_lines() {
 }
 
 #[test]
-#[ignore = "finding 23: crossing the 10,000-line limit flips to the lossy fallback (sprint 2 diff-quality)"]
 fn test_insert_that_crosses_line_limit_is_still_minimal() {
     // 9,999 lines (LCS path) grows to 10,019 (fallback path).
     // git: +20 -0. writ today: +10009 -9989.

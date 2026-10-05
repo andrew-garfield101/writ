@@ -48,6 +48,21 @@ pub trait GitOps {
 
     /// Get the repository root path.
     fn root(&self) -> &Path;
+
+    /// True when `path` (relative to the root) is in the git index.
+    fn is_tracked(&self, path: &str) -> WritResult<bool>;
+
+    /// Write the staged tree (the git index) to `dest`, replacing what is
+    /// there, so a build can be checked before committing (finding 48).
+    /// Returns the number of files written.
+    fn export_index(&self, dest: &Path) -> WritResult<usize>;
+
+    /// Reset the git index to HEAD without touching the working tree
+    /// (`git reset --mixed`), undoing staging when finish aborts.
+    fn reset_index_to_head(&self) -> WritResult<()>;
+
+    /// The HEAD commit hash, or None before the first commit.
+    fn head_hash(&self) -> WritResult<Option<String>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -311,7 +326,93 @@ mod git2_impl {
         fn root(&self) -> &Path {
             &self.root
         }
+
+        fn is_tracked(&self, path: &str) -> WritResult<bool> {
+            let repo = self.repo()?;
+            let index = repo
+                .index()
+                .map_err(|e| WritError::Other(format!("failed to read git index: {e}")))?;
+            Ok(index.get_path(Path::new(path), 0).is_some())
+        }
+
+        fn export_index(&self, dest: &Path) -> WritResult<usize> {
+            let repo = self.repo()?;
+            let index = repo
+                .index()
+                .map_err(|e| WritError::Other(format!("failed to read git index: {e}")))?;
+            std::fs::create_dir_all(dest)?;
+            let mut keep: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+            for entry in index.iter() {
+                let rel = String::from_utf8_lossy(&entry.path).to_string();
+                let blob = repo.find_blob(entry.id).map_err(|e| {
+                    WritError::Other(format!("staged blob for '{rel}' not found: {e}"))
+                })?;
+                let target = dest.join(&rel);
+                keep.insert(target.clone());
+                // Unchanged files keep their mtime so incremental builds
+                // in the scratch tree stay incremental.
+                if std::fs::read(&target).ok().as_deref() != Some(blob.content()) {
+                    if let Some(parent) = target.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&target, blob.content())?;
+                }
+                #[cfg(unix)]
+                if entry.mode == 0o100755 {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755))?;
+                }
+            }
+            remove_unlisted(dest, &keep)?;
+            Ok(keep.len())
+        }
+
+        fn head_hash(&self) -> WritResult<Option<String>> {
+            let repo = self.repo()?;
+            let hash = repo
+                .head()
+                .ok()
+                .and_then(|h| h.peel_to_commit().ok())
+                .map(|c| c.id().to_string());
+            Ok(hash)
+        }
+
+        fn reset_index_to_head(&self) -> WritResult<()> {
+            let repo = self.repo()?;
+            let mut index = repo
+                .index()
+                .map_err(|e| WritError::Other(format!("failed to read git index: {e}")))?;
+            match repo.head().and_then(|h| h.peel_to_tree()) {
+                Ok(tree) => index
+                    .read_tree(&tree)
+                    .map_err(|e| WritError::Other(format!("failed to reset git index: {e}")))?,
+                Err(_) => index
+                    .clear()
+                    .map_err(|e| WritError::Other(format!("failed to clear git index: {e}")))?,
+            }
+            index
+                .write()
+                .map_err(|e| WritError::Other(format!("failed to write git index: {e}")))
+        }
     }
+}
+
+/// Delete files under `dir` that are not in `keep` (a previous export's
+/// leftovers), leaving build output directories (`target`) alone.
+#[cfg(feature = "bridge")]
+fn remove_unlisted(dir: &Path, keep: &std::collections::HashSet<PathBuf>) -> WritResult<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            if path.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            remove_unlisted(&path, keep)?;
+        } else if !keep.contains(&path) {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
 }
 
 /// True when git would refuse `git add path` as ignored: the path itself or
@@ -499,6 +600,34 @@ mod tests {
         let entry = tree.get_path(Path::new(path)).ok()?;
         let blob = repo.find_blob(entry.id()).ok()?;
         Some(String::from_utf8_lossy(blob.content()).to_string())
+    }
+
+    #[test]
+    fn export_index_writes_staged_content_not_disk_and_reset_unstages() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = init_git_repo(dir.path());
+        fs::write(dir.path().join("a.txt"), "disk\n").unwrap();
+        let ops = Git2Ops::open(dir.path()).unwrap();
+        ops.stage_contents(&[StageEntry {
+            path: "a.txt".into(),
+            content: Some(b"staged\n".to_vec()),
+        }])
+        .unwrap();
+        assert!(ops.is_tracked("a.txt").unwrap());
+        assert!(!ops.is_tracked("missing.txt").unwrap());
+        let out = tempfile::tempdir().unwrap();
+        let dest = out.path().join("tree");
+
+        let n = ops.export_index(&dest).unwrap();
+
+        assert!(n >= 1);
+        assert_eq!(fs::read_to_string(dest.join("a.txt")).unwrap(), "staged\n");
+        fs::write(dest.join("stale.txt"), "old export").unwrap();
+        ops.export_index(&dest).unwrap();
+        assert!(!dest.join("stale.txt").exists(), "leftover not removed");
+        ops.reset_index_to_head().unwrap();
+        assert!(!ops.has_staged_changes().unwrap());
+        drop(repo);
     }
 
     #[test]

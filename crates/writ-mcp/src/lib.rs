@@ -52,6 +52,9 @@ pub struct SpecAddParams {
     /// Files this task owns: paths, `dir/` prefixes, or globs such as
     /// `src/auth/**`. Seals without `paths` then capture exactly these.
     pub scope: Option<Vec<String>>,
+    /// Claim the spec for yourself now (default: false; the first seal
+    /// claims an unclaimed spec).
+    pub claim: Option<bool>,
 }
 
 /// Parameters for writ_spec_done tool.
@@ -133,6 +136,16 @@ pub struct SpecShowParams {
 pub struct SpecReopenParams {
     /// The spec ID or slug to reopen.
     pub id: String,
+}
+
+/// Parameters for writ_spec_release tool.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SpecReleaseParams {
+    /// The spec ID or slug whose claim to release.
+    pub id: String,
+    /// Release a claim held by another agent. Recorded in the security
+    /// log; use only when that agent is gone.
+    pub force: Option<bool>,
 }
 
 /// Parameters for writ_finish tool.
@@ -287,18 +300,28 @@ impl ServerHandler for WritMcpServer {
 impl WritMcpServer {
     /// Create a new server instance with a unique agent identity.
     pub fn new(writ_binary: String, project_dir: String) -> Self {
-        // Generate a short unique suffix for this MCP session.
-        // Each agent process gets its own MCP server, so this ID
-        // is unique per agent within a multi-agent session.
-        let suffix: String = {
+        // S.3: the same resolver as the CLI. WRIT_AGENT_ID (or a framework
+        // session variable) names this agent; otherwise fall back to a
+        // per-process suffix so concurrent MCP servers stay distinct.
+        // A CLAUDECODE-only session resolves to the ID persisted in the
+        // project's .writ (finding 51), the same one the CLI uses.
+        let writ_dir = std::path::Path::new(&project_dir).join(".writ");
+        let resolved = writ_core::agent::resolve_agent_id_in(
+            None,
+            None,
+            true,
+            writ_dir.is_dir().then_some(writ_dir.as_path()),
+        );
+        let agent_id = if resolved.is_agent() {
+            resolved.id
+        } else {
             use std::time::SystemTime;
             let seed = SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_nanos();
-            format!("{:04x}", (seed ^ (seed >> 16)) & 0xFFFF)
+            format!("claude-code-{:04x}", (seed ^ (seed >> 16)) & 0xFFFF)
         };
-        let agent_id = format!("claude-code-{}", suffix);
 
         Self {
             tool_router: Self::tool_router(),
@@ -373,7 +396,8 @@ impl WritMcpServer {
         let unclaimed_warning = self.check_unclaimed_specs();
 
         // Agent-first flow: positional summary, auto-generated hash ID.
-        // Pass agent identity so the spec is auto-claimed by this agent.
+        // Pass agent identity so the spec records its creator; it is claimed
+        // only when the caller asks (S.3), or on its first seal.
         let mut args = vec![
             "spec".to_string(),
             "add".to_string(),
@@ -384,6 +408,9 @@ impl WritMcpServer {
 
         for glob in params.scope.unwrap_or_default() {
             args.extend(["--scope".to_string(), glob]);
+        }
+        if params.claim.unwrap_or(false) {
+            args.push("--claim".to_string());
         }
         if let Some(d) = params.description {
             args.extend(["--description".to_string(), d]);
@@ -594,6 +621,22 @@ impl WritMcpServer {
         Parameters(params): Parameters<SpecReopenParams>,
     ) -> Result<CallToolResult, McpError> {
         self.run_writ(&["spec", "reopen", &params.id])
+    }
+
+    /// Release a spec's claim so another agent can take it.
+    #[tool(
+        name = "writ_spec_release",
+        description = "Release your claim on a spec so another agent can pick it up. Releasing a claim held by another agent needs force=true and is recorded in the security log."
+    )]
+    async fn writ_spec_release(
+        &self,
+        Parameters(params): Parameters<SpecReleaseParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.run_writ_owned(&spec_release_args(
+            &params.id,
+            &self.agent_id,
+            params.force.unwrap_or(false),
+        ))
     }
 
     // ─── Round-Trip ──────────────────────────────────────────────
@@ -907,6 +950,22 @@ pub async fn run_mcp_server(
     Ok(())
 }
 
+/// CLI arguments for `writ_spec_release`: always passes the server's agent
+/// identity, so the holder check runs against the caller.
+fn spec_release_args(id: &str, agent: &str, force: bool) -> Vec<String> {
+    let mut args = vec![
+        "spec".to_string(),
+        "release".to_string(),
+        id.to_string(),
+        "--agent".to_string(),
+        agent.to_string(),
+    ];
+    if force {
+        args.push("--force".to_string());
+    }
+    args
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -973,10 +1032,24 @@ mod tests {
     }
 
     #[test]
+    fn spec_release_passes_agent_and_force_only_when_asked() {
+        assert_eq!(
+            spec_release_args("s1", "amis", false),
+            vec!["spec", "release", "s1", "--agent", "amis"]
+        );
+        assert_eq!(
+            spec_release_args("s1", "amis", true)
+                .last()
+                .map(String::as_str),
+            Some("--force")
+        );
+    }
+
+    #[test]
     fn test_tool_count() {
         let server = WritMcpServer::new("writ".to_string(), ".".to_string());
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 22, "Expected 22 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 23, "Expected 23 tools, got {}", tools.len());
     }
 
     #[test]
@@ -998,6 +1071,7 @@ mod tests {
             "writ_spec_add",
             "writ_spec_done",
             "writ_spec_reopen",
+            "writ_spec_release",
             "writ_spec_show",
             "writ_spec_status",
             "writ_status",
@@ -1269,6 +1343,7 @@ mod tests {
                 summary: "Add authentication flow".to_string(),
                 description: None,
                 scope: None,
+                claim: None,
             }))
             .await
             .unwrap();
@@ -1295,6 +1370,7 @@ mod tests {
                 summary: "Add auth".to_string(),
                 description: Some("OAuth2 flow".to_string()),
                 scope: None,
+                claim: None,
             }))
             .await
             .unwrap();

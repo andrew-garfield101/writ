@@ -73,6 +73,8 @@ jobs:
             chmod +x ../crates/writ-py/writ.data/scripts/writ
           fi
 
+      # maturin-action reads rust-toolchain.toml when `rust-toolchain` is unset,
+      # on the host (macOS, Windows) and inside the manylinux container (Linux).
       - name: Build wheel
         uses: PyO3/maturin-action@v1
         with:
@@ -164,10 +166,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      # Toolchain and components come from rust-toolchain.toml; the build target
+      # is added to that pinned toolchain. cross reads the same file and mounts
+      # this host toolchain into its container for aarch64-unknown-linux-gnu.
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        shell: bash
+        run: |
+          rustup toolchain install --no-self-update
+          rustup target add ${{ matrix.target }}
+          rustc --version
 
       - name: Install cross (for cross-compilation)
         if: matrix.cross

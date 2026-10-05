@@ -4,15 +4,14 @@
 //! which files are new, modified, or deleted.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::Path;
 
 use serde::Serialize;
 use walkdir::WalkDir;
 
-use crate::hash::hash_bytes;
 use crate::ignore::IgnoreRules;
 use crate::index::Index;
+use crate::stat_cache::StatCache;
 
 /// The type of change detected for a file.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -87,7 +86,24 @@ impl WorkingState {
 }
 
 /// Compute the working directory state by comparing files on disk to the index.
+///
+/// File hashes come from the stat cache (`.writ/stat_cache.json`): a file is
+/// read and hashed only when its size, mtime, ctime or inode changed since it
+/// was last hashed. See [`crate::stat_cache`] for the racy-file rule and the
+/// documented limit.
 pub fn compute_state(repo_root: &Path, index: &Index, rules: &IgnoreRules) -> WorkingState {
+    let mut cache = StatCache::open(repo_root);
+    let state = scan(repo_root, index, rules, &mut cache);
+    cache.save();
+    state
+}
+
+fn scan(
+    repo_root: &Path,
+    index: &Index,
+    rules: &IgnoreRules,
+    cache: &mut StatCache,
+) -> WorkingState {
     let mut changes = Vec::new();
     let mut seen: BTreeMap<String, bool> = BTreeMap::new();
 
@@ -122,13 +138,11 @@ pub fn compute_state(repo_root: &Path, index: &Index, rules: &IgnoreRules) -> Wo
 
         seen.insert(rel_path.clone(), true);
 
-        // Read and hash the file
-        let content = match fs::read(full_path) {
-            Ok(c) => c,
-            Err(_) => continue,
+        // Hash the file (cached by stat data).
+        let current_hash = match cache.hash_file(&rel_path, full_path) {
+            Some(h) => h,
+            None => continue,
         };
-        let current_hash = hash_bytes(&content);
-        let size = content.len() as u64;
 
         if let Some(indexed_hash) = index.get_hash(&rel_path) {
             // Tracked file — check if modified
@@ -147,8 +161,6 @@ pub fn compute_state(repo_root: &Path, index: &Index, rules: &IgnoreRules) -> Wo
                 hash: Some(current_hash),
             });
         }
-
-        let _ = size; // Will be used when we store to index
     }
 
     // Check for deleted files (in index but not on disk). Indexed paths that

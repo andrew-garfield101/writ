@@ -101,6 +101,7 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
                 commit_mode: Some("user".into()),
                 commit_strategy: None,
                 stale_timeout: None,
+                finish_check: None,
             }),
             watch: None,
         };
@@ -196,6 +197,7 @@ pub fn maybe_global_setup(scan: &EnvironmentScan, opts: &InitOptions) -> GlobalC
             commit_mode: Some(chosen_mode),
             commit_strategy: None,
             stale_timeout: None,
+            finish_check: None,
         }),
         watch: None,
     };
@@ -348,6 +350,7 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
             commit_mode: Some(workflow_mode),
             commit_strategy: None,
             stale_timeout: None,
+            finish_check: None,
         }),
         auto: None,
         workspace: None,

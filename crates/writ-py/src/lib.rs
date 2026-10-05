@@ -65,6 +65,26 @@ fn parse_agent_type(s: &str) -> PyResult<writ_core::seal::AgentType> {
     }
 }
 
+/// The acting agent for a binding call, through the core resolver (S.3):
+/// explicit `agent_id` > `WRIT_AGENT_ID` > `default_agent` setting > "human".
+/// Framework session variables are not consulted: a library caller inside a
+/// Claude Code session is not necessarily that session's agent.
+/// `agent_type` defaults to human for "human" and agent otherwise.
+fn resolve_py_agent(
+    repo: &writ_core::Repository,
+    agent_id: Option<&str>,
+    agent_type: Option<&str>,
+) -> PyResult<AgentIdentity> {
+    let default_agent = repo.settings().default_agent.clone();
+    let id = writ_core::agent::resolve_agent_id(agent_id, default_agent.as_deref(), false).id;
+    let agent_type = match agent_type {
+        Some(t) => parse_agent_type(t)?,
+        None if id == "human" => writ_core::seal::AgentType::Human,
+        None => writ_core::seal::AgentType::Agent,
+    };
+    Ok(AgentIdentity { id, agent_type })
+}
+
 fn parse_task_status(s: &str) -> PyResult<TaskStatus> {
     match s.to_lowercase().as_str() {
         "in-progress" | "inprogress" | "in_progress" => Ok(TaskStatus::InProgress),
@@ -181,11 +201,21 @@ struct SealResult {
     left_out: Option<writ_core::seal_scope::SealScope>,
 }
 
+/// Return value of `spec_done`: the spec plus what the final seal did.
+#[derive(serde::Serialize)]
+struct SpecDoneResult {
+    #[serde(flatten)]
+    spec: writ_core::spec::Spec,
+    final_seal: Option<SealResult>,
+    hints: Vec<String>,
+}
+
 fn build_seal_result(
     repo: &writ_core::Repository,
     seal: writ_core::seal::Seal,
     conflict_warning: Option<writ_core::repo::SealConflictWarning>,
     scope: Option<writ_core::seal_scope::SealScope>,
+    done: bool,
 ) -> SealResult {
     let file_scope_warning = seal.spec_id.as_ref().and_then(|sid| {
         let changed: Vec<String> = seal.changes.iter().map(|c| c.path.clone()).collect();
@@ -219,17 +249,7 @@ fn build_seal_result(
 
     let left_out = scope.filter(|s| s.has_left_out());
     if let (Some(scope), Some(sid)) = (&left_out, seal.spec_id.as_deref()) {
-        for line in scope.left_out_lines() {
-            hints.push(format!("LEFT_OUT: {line}"));
-        }
-        if let Some(line) = scope.retry_line(&seal.summary, sid, &seal.agent.id, false) {
-            let lead = if scope.retry_needs_paths() {
-                "Another agent is working here; replace <paths> with the files you changed and run"
-            } else {
-                "If you changed these files, seal them with"
-            };
-            hints.push(format!("{lead}: {line}"));
-        }
+        hints.extend(scope.hint_lines(&seal.summary, sid, &seal.agent.id, done));
     }
 
     SealResult {
@@ -291,13 +311,13 @@ impl PyRepository {
     /// seal, the HEAD recorded at that time is used to check whether another
     /// agent sealed in between. If so, the returned dict includes a
     /// `conflict_warning` field with details.
-    #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="in-progress", paths=None, tests_passed=None, tests_failed=None, linted=false, allow_empty=false))]
+    #[pyo3(signature = (summary, agent_id=None, agent_type=None, spec_id=None, status="in-progress", paths=None, tests_passed=None, tests_failed=None, linted=false, allow_empty=false))]
     fn seal(
         &self,
         py: Python,
         summary: &str,
-        agent_id: &str,
-        agent_type: &str,
+        agent_id: Option<&str>,
+        agent_type: Option<&str>,
         spec_id: Option<String>,
         status: &str,
         paths: Option<Vec<String>>,
@@ -306,10 +326,8 @@ impl PyRepository {
         linted: bool,
         allow_empty: bool,
     ) -> PyResult<PyObject> {
-        let agent = AgentIdentity {
-            id: agent_id.to_string(),
-            agent_type: parse_agent_type(agent_type)?,
-        };
+        let agent = resolve_py_agent(&self.inner, agent_id, agent_type)?;
+        let agent_id = agent.id.as_str();
         let task_status = parse_task_status(status)?;
         let verification = Verification {
             tests_passed,
@@ -341,7 +359,7 @@ impl PyRepository {
                 )
                 .map_err(writ_err)?;
             self.inner.clear_context_head();
-            let result = build_seal_result(&self.inner, seal, None, None);
+            let result = build_seal_result(&self.inner, seal, None, None, false);
             to_pydict(py, &result)
         } else if tracked_head.is_some() {
             let (seal, warning, scope) = self
@@ -357,7 +375,7 @@ impl PyRepository {
                 )
                 .map_err(writ_err)?;
             self.inner.clear_context_head();
-            let result = build_seal_result(&self.inner, seal, warning, scope);
+            let result = build_seal_result(&self.inner, seal, warning, scope, false);
             to_pydict(py, &result)
         } else {
             let (seal, scope) = self
@@ -372,7 +390,7 @@ impl PyRepository {
                     writ_core::seal_scope::ScopeMode::Seal,
                 )
                 .map_err(writ_err)?;
-            let result = build_seal_result(&self.inner, seal, None, scope);
+            let result = build_seal_result(&self.inner, seal, None, scope, false);
             to_pydict(py, &result)
         }
     }
@@ -380,13 +398,13 @@ impl PyRepository {
     /// Seal with optimistic conflict detection.
     ///
     /// Returns a dict with `seal` and optional `conflict_warning`.
-    #[pyo3(signature = (summary, agent_id="human", agent_type="human", spec_id=None, status="in-progress", tests_passed=None, tests_failed=None, linted=false, allow_empty=false, expected_head=None))]
+    #[pyo3(signature = (summary, agent_id=None, agent_type=None, spec_id=None, status="in-progress", tests_passed=None, tests_failed=None, linted=false, allow_empty=false, expected_head=None))]
     fn seal_with_check(
         &self,
         py: Python,
         summary: &str,
-        agent_id: &str,
-        agent_type: &str,
+        agent_id: Option<&str>,
+        agent_type: Option<&str>,
         spec_id: Option<String>,
         status: &str,
         tests_passed: Option<u32>,
@@ -395,10 +413,8 @@ impl PyRepository {
         allow_empty: bool,
         expected_head: Option<String>,
     ) -> PyResult<PyObject> {
-        let agent = AgentIdentity {
-            id: agent_id.to_string(),
-            agent_type: parse_agent_type(agent_type)?,
-        };
+        let agent = resolve_py_agent(&self.inner, agent_id, agent_type)?;
+        let agent_id = agent.id.as_str();
         let task_status = parse_task_status(status)?;
         let verification = Verification {
             tests_passed,
@@ -419,7 +435,7 @@ impl PyRepository {
             )
             .map_err(writ_err)?;
 
-        let result = build_seal_result(&self.inner, seal, warning, scope);
+        let result = build_seal_result(&self.inner, seal, warning, scope, false);
         to_pydict(py, &result)
     }
 
@@ -438,6 +454,9 @@ impl PyRepository {
 
     /// Get the seal chain for a specific spec, walking from its tip.
     ///
+    /// The chain includes ancestor seals of other specs; for the spec's own
+    /// seals use `spec_seals`.
+    ///
     /// `format` controls the return type: "dict" (default), "json",
     /// "json-compact", or "toon".
     #[pyo3(signature = (spec_id, limit=None, format="dict"))]
@@ -449,6 +468,24 @@ impl PyRepository {
         format: &str,
     ) -> PyResult<PyObject> {
         let mut seals = self.inner.spec_log(spec_id).map_err(writ_err)?;
+        if let Some(n) = limit {
+            seals.truncate(n);
+        }
+        format_seals(py, &seals, format)
+    }
+
+    /// The spec's own seals, newest first, from its `sealed_by` record
+    /// (S.4a). Unlike `spec_log`, never includes other specs' ancestor
+    /// seals; use it for per-spec counts and file lists.
+    #[pyo3(signature = (spec_id, limit=None, format="dict"))]
+    fn spec_seals(
+        &self,
+        py: Python,
+        spec_id: &str,
+        limit: Option<usize>,
+        format: &str,
+    ) -> PyResult<PyObject> {
+        let mut seals = self.inner.spec_seals(spec_id).map_err(writ_err)?;
         if let Some(n) = limit {
             seals.truncate(n);
         }
@@ -673,7 +710,10 @@ impl PyRepository {
     ///
     /// `file_scope` declares the files the spec owns (paths, `dir/`
     /// prefixes, globs); seals without `paths` then capture exactly these.
-    #[pyo3(signature = (id=None, title="", description="", acceptance_criteria=None, design_notes=None, tech_stack=None, file_scope=None))]
+    ///
+    /// The spec records its creator (`agent_id`, resolved like `seal`) and is
+    /// claimed only when `claim=True` (S.3).
+    #[pyo3(signature = (id=None, title="", description="", acceptance_criteria=None, design_notes=None, tech_stack=None, file_scope=None, agent_id=None, claim=false))]
     #[allow(clippy::too_many_arguments)]
     fn add_spec(
         &self,
@@ -685,6 +725,8 @@ impl PyRepository {
         design_notes: Option<Vec<String>>,
         tech_stack: Option<Vec<String>>,
         file_scope: Option<Vec<String>>,
+        agent_id: Option<&str>,
+        claim: bool,
     ) -> PyResult<PyObject> {
         let (final_id, final_title) = match (id, title.is_empty()) {
             // add_spec(title="OAuth2 auth") — auto-generate ID from title
@@ -717,7 +759,15 @@ impl PyRepository {
         if let Some(fs) = file_scope {
             spec.file_scope = fs;
         }
+        let creator = resolve_py_agent(&self.inner, agent_id, None)?.id;
+        spec.created_by = Some(creator.clone());
         self.inner.add_spec(&spec).map_err(writ_err)?;
+        if claim {
+            self.inner
+                .spec_claim(&spec.id, &creator)
+                .map_err(writ_err)?;
+            spec.claimed_by = Some(creator);
+        }
         to_pydict(py, &spec)
     }
 
@@ -1262,6 +1312,31 @@ impl PyRepository {
         Ok(())
     }
 
+    /// Regenerate referenced-but-missing store objects (`writ repair`).
+    ///
+    /// Searches the working tree, then git history, for each missing
+    /// object's content and writes only SHA-256-verified matches. With
+    /// `dry_run=True` nothing is written; the report says what a real run
+    /// would recover.
+    ///
+    /// Returns a dict: `dry_run`, `missing`, `recovered` (hash, path,
+    /// source), `unrecoverable` (hash, path, searched_paths, reason),
+    /// `unreadable_trees`, and `is_clean` (nothing left missing).
+    #[pyo3(signature = (dry_run=false))]
+    fn repair(&self, py: Python, dry_run: bool) -> PyResult<PyObject> {
+        #[derive(serde::Serialize)]
+        struct RepairResult {
+            #[serde(flatten)]
+            report: writ_core::repair::RepairReport,
+            is_clean: bool,
+        }
+        let report =
+            writ_core::repair::repair_store(self.inner.root(), self.inner.writ_dir(), dry_run)
+                .map_err(writ_err)?;
+        let is_clean = report.is_clean();
+        to_pydict(py, &RepairResult { report, is_clean })
+    }
+
     /// Commit completed spec work to git (programmatic `writ finish`).
     ///
     /// Parameters:
@@ -1348,9 +1423,11 @@ impl PyRepository {
                     .collect::<Vec<_>>()
                     .join("; ")
             });
+            let order = self.inner.finish_order(&spec_ids).map_err(writ_err)?;
             let commits = match strategy {
-                "per-spec" => committable
+                "per-spec" => order
                     .iter()
+                    .filter_map(|id| committable.iter().find(|s| &s.id == id))
                     .map(|s| FinishCommit {
                         hash: "(dry-run)".to_string(),
                         message: format!(
@@ -1390,25 +1467,39 @@ impl PyRepository {
 
         match strategy {
             "per-spec" => {
-                let mut sorted: Vec<_> = committable.clone();
-                sorted.sort_by_key(|s| s.completed_at);
-
-                for s in &sorted {
-                    // S.1: stage only this spec's sealed paths, sealed content.
-                    let plan = self
+                // S.2: dependency order; a path goes with the first spec's
+                // commit and later specs that sealed it still land (marked
+                // with the commit that carried it, else HEAD).
+                let order = self.inner.finish_order(&all_ids).map_err(writ_err)?;
+                let mut carried: std::collections::BTreeMap<String, String> =
+                    std::collections::BTreeMap::new();
+                let py_err = |e: writ_core::WritError| WritError::new_err(e.to_string());
+                for id in &order {
+                    let Some(s) = committable.iter().find(|s| &s.id == id) else {
+                        continue;
+                    };
+                    let mut plan = self
                         .inner
                         .finish_plan(std::slice::from_ref(&s.id))
                         .map_err(writ_err)?;
+                    let earlier: Option<String> = plan
+                        .stage
+                        .iter()
+                        .filter_map(|(p, _)| carried.get(p).cloned())
+                        .last();
+                    plan.stage.retain(|(p, _)| !carried.contains_key(p));
                     let outcome = self
                         .inner
                         .stage_finish_plan(&git, &plan, false)
                         .map_err(writ_err)?;
                     refused.extend(outcome.refused);
 
-                    if !git
-                        .has_staged_changes()
-                        .map_err(|e| WritError::new_err(e.to_string()))?
-                    {
+                    if !git.has_staged_changes().map_err(py_err)? {
+                        if let Some(hash) = earlier.or(git.head_hash().map_err(py_err)?) {
+                            self.inner
+                                .mark_spec_committed(&s.id, &hash)
+                                .map_err(writ_err)?;
+                        }
                         continue;
                     }
 
@@ -1417,10 +1508,13 @@ impl PyRepository {
                         s.id,
                         s.completion_summary.as_deref().unwrap_or(&s.title)
                     );
-                    let hash = git
-                        .commit(&msg)
-                        .map_err(|e| WritError::new_err(e.to_string()))?;
-                    let _ = self.inner.mark_spec_committed(&s.id, &hash);
+                    let hash = git.commit(&msg).map_err(py_err)?;
+                    for (path, _) in &plan.stage {
+                        carried.insert(path.clone(), hash.clone());
+                    }
+                    self.inner
+                        .mark_spec_committed(&s.id, &hash)
+                        .map_err(writ_err)?;
                     commits.push(FinishCommit {
                         hash,
                         message: msg,
@@ -1500,39 +1594,74 @@ impl PyRepository {
             .map_err(writ_err)
     }
 
-    /// Mark a spec as done: sets status to Complete, stores the optional
-    /// completion summary, and records the completion timestamp.
+    /// Mark a spec as done, making the same final seal as `writ spec done`.
     ///
-    /// If spec_id is omitted and agent_id is provided, auto-scopes to the
-    /// agent's single claimed in-progress spec (agent-first flow).
-    /// Returns the updated spec as a dict.
-    #[pyo3(signature = (spec_id=None, summary=None, agent_id=None))]
+    /// The final seal takes `paths` when given, otherwise only files the
+    /// spec owns; another agent's pending files are never swept. When
+    /// nothing is pending the spec closes without a seal. `no_seal=True`
+    /// skips the final seal.
+    ///
+    /// If spec_id is omitted, auto-scopes to the agent's single claimed
+    /// in-progress spec. Returns the updated spec as a dict with two extra
+    /// keys: `final_seal` (the seal result dict, or None) and `hints`
+    /// (left-out files and the paste-ready command that seals them).
+    #[pyo3(signature = (spec_id=None, summary=None, agent_id=None, paths=None, no_seal=false))]
     fn spec_done(
         &self,
         py: Python,
         spec_id: Option<&str>,
         summary: Option<String>,
         agent_id: Option<&str>,
+        paths: Option<Vec<String>>,
+        no_seal: bool,
     ) -> PyResult<PyObject> {
+        let agent = resolve_py_agent(&self.inner, agent_id, None)?;
         let resolved_id = match spec_id {
-            Some(id) => id.to_string(),
+            Some(id) => self.inner.resolve_spec(id).map_err(writ_err)?.id,
             None => {
-                let aid = agent_id.unwrap_or("human");
-                if aid == "human" {
+                if agent.id == "human" {
                     return Err(WritError::new_err(
                         "spec_id required for human agents — pass the spec ID or use agent_id for auto-scoping",
                     ));
                 }
                 self.inner
-                    .resolve_spec_for_agent(None, aid)
+                    .resolve_spec_for_agent(None, &agent.id)
                     .map_err(writ_err)?
             }
         };
-        let spec = self
+        let seal_summary = summary.as_deref().unwrap_or("Spec completed").to_string();
+        let agent_name = agent.id.clone();
+        let outcome = self
             .inner
-            .mark_spec_done(&resolved_id, summary)
+            .spec_done(agent, summary, &resolved_id, paths.as_deref(), no_seal)
             .map_err(writ_err)?;
-        to_pydict(py, &spec)
+        let mut hints: Vec<String> = outcome.claim_warning.iter().cloned().collect();
+        let final_seal = match outcome.final_seal {
+            writ_core::repo::FinalSeal::Sealed { seal, scope } => {
+                let result = build_seal_result(&self.inner, seal, None, scope, true);
+                hints.extend(result.hints.iter().cloned());
+                Some(result)
+            }
+            writ_core::repo::FinalSeal::NothingPending | writ_core::repo::FinalSeal::Skipped => {
+                None
+            }
+            writ_core::repo::FinalSeal::NothingInScope { scope } => {
+                hints.push(format!(
+                    "NOT_SEALED: every pending file is outside spec '{resolved_id}'; closed without a final seal"
+                ));
+                hints.extend(scope.hint_lines(&seal_summary, &resolved_id, &agent_name, true));
+                None
+            }
+        };
+        let spec = outcome.spec;
+        to_pydict(
+            py,
+            &SpecDoneResult {
+                spec,
+                final_seal,
+                hints,
+            },
+        )
     }
 
     /// Reopen a completed spec, returning it to active/in-progress state.
@@ -1555,6 +1684,23 @@ impl PyRepository {
     fn spec_claim(&self, spec_id: &str, agent_id: &str) -> PyResult<()> {
         self.inner.spec_claim(spec_id, agent_id).map_err(writ_err)?;
         Ok(())
+    }
+
+    /// Release a spec's claim (S.3). The holder may release; anyone else
+    /// needs `force=True`, which is recorded in the security log.
+    ///
+    /// Returns the previous holder, or None when the spec was unclaimed.
+    #[pyo3(signature = (spec_id, agent_id=None, force=false))]
+    fn spec_release(
+        &self,
+        spec_id: &str,
+        agent_id: Option<&str>,
+        force: bool,
+    ) -> PyResult<Option<String>> {
+        let agent = resolve_py_agent(&self.inner, agent_id, None)?;
+        self.inner
+            .spec_release(spec_id, &agent.id, force)
+            .map_err(writ_err)
     }
 
     // -- Propose mode (W.31) --
@@ -1838,7 +1984,7 @@ impl PyRepository {
         let mut paths = HashSet::new();
 
         if let Some(spec_id) = spec {
-            if let Ok(seals) = self.inner.spec_log(spec_id) {
+            if let Ok(seals) = self.inner.spec_seals(spec_id) {
                 for seal in &seals {
                     for change in &seal.changes {
                         paths.insert(change.path.clone());

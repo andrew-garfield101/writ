@@ -185,6 +185,26 @@ impl SealScope {
     pub fn retry_needs_paths(&self) -> bool {
         !self.unowned.is_empty() && !self.claim_holders.is_empty()
     }
+
+    /// Machine-readable hints for bindings: one `LEFT_OUT: path: reason`
+    /// line per left-out file, then the paste-ready command when there is
+    /// one. `done` selects the `writ spec done` form of the command.
+    pub fn hint_lines(&self, summary: &str, spec_id: &str, agent: &str, done: bool) -> Vec<String> {
+        let mut hints: Vec<String> = self
+            .left_out_lines()
+            .into_iter()
+            .map(|line| format!("LEFT_OUT: {line}"))
+            .collect();
+        if let Some(line) = self.retry_line(summary, spec_id, agent, done) {
+            let lead = if self.retry_needs_paths() {
+                "Another agent is working here; replace <paths> with the files you changed and run"
+            } else {
+                "If you changed these files, seal them with"
+            };
+            hints.push(format!("{lead}: {line}"));
+        }
+        hints
+    }
 }
 
 /// Placeholder an agent replaces with its own comma-separated paths.
@@ -498,5 +518,34 @@ mod tests {
         let other = spec("b", &[], &["y.rs"]);
         let s = classify(&paths(&["y.rs"]), &this, &[other], &busy(), ScopeMode::Seal);
         assert!(s.retry_line("s", "a", "me", false).is_none());
+    }
+
+    #[test]
+    fn hint_lines_list_left_out_files_before_the_retry_command() {
+        let this = spec("a", &[], &["x.rs"]);
+        let other = spec("b", &[], &["y.rs"]);
+        // y.rs is b's and is left out; docs/x.md is unowned and, with another
+        // claim present, needs --paths.
+        let s = classify(
+            &paths(&["y.rs", "docs/x.md"]),
+            &this,
+            &[other],
+            &busy(),
+            ScopeMode::Seal,
+        );
+        let hints = s.hint_lines("s", "a", "me", false);
+        assert!(hints.len() >= 2, "{hints:?}");
+        let last = hints.last().unwrap();
+        assert!(last.starts_with("Another agent is working here"), "{last}");
+        assert!(last.ends_with("--paths <paths>"), "{last}");
+        assert!(
+            hints[..hints.len() - 1]
+                .iter()
+                .all(|h| h.starts_with("LEFT_OUT: ")),
+            "{hints:?}"
+        );
+        assert!(hints.iter().any(|h| h.contains("y.rs")), "{hints:?}");
+        let done = s.hint_lines("s", "a", "me", true);
+        assert!(done.last().unwrap().contains("spec done"), "{done:?}");
     }
 }

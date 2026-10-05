@@ -2965,6 +2965,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "writ-core",
 ]
 
 [[package]]

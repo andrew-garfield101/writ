@@ -1,5 +1,6 @@
 //! writ CLI — the human (and agent) interface to writ.
 
+mod finish;
 mod init;
 mod watch_ui;
 
@@ -242,6 +243,16 @@ enum Commands {
         /// Reject seals that modify files outside the agent's scope constraints.
         #[arg(long)]
         enforce_scope: bool,
+
+        /// Seal even if it removes lines that earlier seals of the same spec
+        /// added (refused by default: another agent's version may be on disk).
+        #[arg(long)]
+        force: bool,
+
+        /// Allow removing this spec's own earlier lines in these files only
+        /// (comma-separated); every other file is still checked.
+        #[arg(long, value_delimiter = ',', value_name = "PATH")]
+        allow_removals: Vec<String>,
     },
 
     /// Inspect a specific seal.
@@ -429,6 +440,23 @@ enum Commands {
         /// after a file was sealed (working-tree content). Off by default.
         #[arg(long)]
         include_unsealed: bool,
+
+        /// Archive open specs that have no seals and no claim. Without this
+        /// flag finish only lists them; it never changes a spec's lifecycle.
+        #[arg(long)]
+        archive_unclaimed: bool,
+
+        /// Refuse to commit when a completed spec's own sealed version of a
+        /// file is stale (a later seal by a spec outside this finish recorded
+        /// different content); lists each path with the later spec and seal.
+        #[arg(long)]
+        strict: bool,
+
+        /// Skip the check of the staged tree before each commit
+        /// (`[workflow] finish_check`, default `cargo check` for Cargo
+        /// projects).
+        #[arg(long)]
+        no_check: bool,
 
         /// Create a proposal instead of committing directly (propose mode).
         #[arg(long)]
@@ -859,9 +887,16 @@ enum SpecCommands {
         #[arg(long, value_delimiter = ',')]
         tech_stack: Option<Vec<String>>,
 
-        /// Agent identity for auto-claiming the created spec.
+        /// Agent identity recorded as the spec's creator (and claimant with
+        /// --claim). Resolved like every command: --agent > WRIT_AGENT_ID >
+        /// default_agent > framework session > human.
         #[arg(long)]
         agent: Option<String>,
+
+        /// Claim the new spec for the resolved agent. Without it the spec is
+        /// created unclaimed.
+        #[arg(long)]
+        claim: bool,
 
         /// Files this spec owns: a path, a `dir/` prefix, or a glob such as
         /// `src/auth/**`. Repeatable. Sets the spec's file_scope, so
@@ -910,6 +945,21 @@ enum SpecCommands {
         /// Close the spec without a final seal; pending files stay pending.
         #[arg(long)]
         no_seal: bool,
+
+        /// Seal even if the final seal removes lines that earlier seals of
+        /// this spec added (refused by default).
+        #[arg(long, conflicts_with = "no_seal")]
+        force: bool,
+
+        /// Allow removing this spec's own earlier lines in these files only
+        /// (comma-separated); every other file is still checked.
+        #[arg(
+            long,
+            value_delimiter = ',',
+            value_name = "PATH",
+            conflicts_with = "no_seal"
+        )]
+        allow_removals: Vec<String>,
     },
 
     /// Complete a spec's lifecycle (transitions to Completed).
@@ -923,6 +973,10 @@ enum SpecCommands {
     Show {
         /// Spec ID to show.
         id: String,
+
+        /// Output format: "human" (default) or "json" (the spec record).
+        #[arg(long, default_value = "human")]
+        format: String,
     },
 
     /// Update a spec's status or metadata.
@@ -975,6 +1029,20 @@ enum SpecCommands {
         /// Agent ID claiming this spec (auto-detected if omitted).
         #[arg(long)]
         agent: Option<String>,
+    },
+
+    /// Release a claim on a spec. Only the holder can release, unless --force.
+    Release {
+        /// Spec ID to release.
+        id: String,
+
+        /// Agent releasing the claim (resolved like every command if omitted).
+        #[arg(long)]
+        agent: Option<String>,
+
+        /// Release a claim held by another agent (recorded in the security log).
+        #[arg(long)]
+        force: bool,
     },
 
     /// Assign a spec to a workspace. Scopes the spec to that workspace's context.
@@ -1367,6 +1435,8 @@ fn main() {
             allow_empty,
             expected_head,
             enforce_scope,
+            force,
+            allow_removals,
         } => {
             let agent = resolve_agent(agent.as_deref(), &cwd);
             cmd_seal(
@@ -1382,6 +1452,8 @@ fn main() {
                 allow_empty,
                 expected_head,
                 enforce_scope,
+                force,
+                allow_removals,
             )
         }
         Commands::Show {
@@ -1471,17 +1543,20 @@ fn main() {
             cleanup,
             no_cleanup,
             include_unsealed,
+            archive_unclaimed,
+            strict,
+            no_check,
         } => {
             if proposals {
                 cmd_finish_proposals(&cwd)
             } else if let Some(id) = accept {
-                cmd_finish_accept(&cwd, &id, &strategy)
+                cmd_finish_accept(&cwd, &id, &strategy, strict, no_check)
             } else if let Some(id) = reject {
                 cmd_finish_reject(&cwd, &id)
             } else if propose {
                 cmd_finish_propose(&cwd, full, &strategy)
             } else if auto {
-                cmd_finish_auto(&cwd, &strategy)
+                cmd_finish_auto(&cwd, &strategy, strict, no_check)
             } else {
                 cmd_finish(
                     &cwd,
@@ -1492,6 +1567,9 @@ fn main() {
                         cleanup,
                         no_cleanup,
                         include_unsealed,
+                        archive_unclaimed,
+                        strict,
+                        no_check,
                     },
                     &strategy,
                 )
@@ -1544,6 +1622,7 @@ fn main() {
                 design_notes,
                 tech_stack,
                 agent,
+                claim,
                 scope,
             } => cmd_spec_add(
                 &cwd,
@@ -1555,6 +1634,7 @@ fn main() {
                 design_notes,
                 tech_stack,
                 agent.as_deref(),
+                claim,
                 scope,
             ),
             SpecCommands::Status { state, format } => {
@@ -1567,6 +1647,8 @@ fn main() {
                 agent,
                 paths,
                 no_seal,
+                force,
+                allow_removals,
             } => cmd_spec_done(
                 &cwd,
                 id.as_deref(),
@@ -1574,9 +1656,11 @@ fn main() {
                 agent.as_deref(),
                 paths,
                 no_seal,
+                force,
+                allow_removals,
             ),
             SpecCommands::Complete { id } => cmd_spec_complete(&cwd, &id),
-            SpecCommands::Show { id } => cmd_spec_show(&cwd, &id),
+            SpecCommands::Show { id, format } => cmd_spec_show(&cwd, &id, &format),
             SpecCommands::Update {
                 id,
                 status,
@@ -1599,6 +1683,9 @@ fn main() {
             ),
             SpecCommands::Reopen { id } => cmd_spec_reopen(&cwd, &id),
             SpecCommands::Claim { id, agent } => cmd_spec_claim(&cwd, &id, agent.as_deref()),
+            SpecCommands::Release { id, agent, force } => {
+                cmd_spec_release(&cwd, &id, agent.as_deref(), force)
+            }
             SpecCommands::Assign { id, workspace } => cmd_spec_assign(&cwd, &id, &workspace),
             SpecCommands::Unassign { id } => cmd_spec_unassign(&cwd, &id),
         },
@@ -1759,6 +1846,24 @@ fn main() {
 // Shared CLI helpers
 // ---------------------------------------------------------------------------
 
+/// The invoking command line, shell-quoted, with the binary shown as `writ`.
+fn current_command_line() -> String {
+    let quote = |a: String| {
+        if !a.is_empty()
+            && a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./,=:@+".contains(c))
+        {
+            a
+        } else {
+            format!("'{}'", a.replace('\'', "'\\''"))
+        }
+    };
+    std::iter::once("writ".to_string())
+        .chain(std::env::args().skip(1).map(quote))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Resolve the effective output format using the full config resolution chain:
 /// CLI flag > WRIT_FORMAT env var > project config > global config > default.
 fn resolve_format(explicit: Option<&str>, cwd: &PathBuf, fallback: &str) -> String {
@@ -1815,72 +1920,32 @@ fn make_formatter(name: &str, cwd: &PathBuf) -> Option<Box<dyn format::OutputFor
     format::formatter_for_project(name, project_name.as_deref())
 }
 
-/// Resolve the effective agent ID for seals.
+/// Resolve the acting agent's ID through the one core resolver (S.3).
 ///
-/// Priority: explicit --agent flag > settings.default_agent > env var auto-detect > "human".
-/// Auto-detect checks for known agent framework env vars (Claude Code, Codex, etc.)
-/// and generates a session-specific ID like "claude-code-a3f2" so each agent instance
-/// is uniquely identifiable even without passing --agent.
+/// Priority: explicit --agent > WRIT_AGENT_ID > settings.default_agent >
+/// framework session variable > "human". See
+/// [`writ_core::agent::resolve_agent_id`].
 fn resolve_agent(explicit: Option<&str>, cwd: &PathBuf) -> String {
-    if let Some(a) = explicit {
-        return a.to_string();
-    }
-    if let Some(configured) = Repository::open_from_dir(cwd)
-        .ok()
-        .and_then(|r| r.settings().default_agent.clone())
-    {
-        return configured;
-    }
-    // Auto-detect agent identity from environment variables.
-    if let Some(detected) = detect_agent_from_env() {
-        return detected;
-    }
-    "human".to_string()
+    let repo = Repository::open_from_dir(cwd).ok();
+    let default_agent = repo
+        .as_ref()
+        .and_then(|r| r.settings().default_agent.clone());
+    writ_core::agent::resolve_agent_id_in(
+        explicit,
+        default_agent.as_deref(),
+        true,
+        repo.as_ref().map(|r| r.writ_dir()),
+    )
+    .id
 }
 
-/// Detect agent identity from known framework environment variables.
-/// Returns a session-specific ID like "claude-code-a3f2" for uniqueness.
+/// The agent identity from the environment alone (WRIT_AGENT_ID or a
+/// framework session variable), or None for a human at a terminal. Used to
+/// decide agent-only enforcement (C.13, C.14), never to pick a different ID
+/// than [`resolve_agent`].
 fn detect_agent_from_env() -> Option<String> {
-    // Explicit writ agent ID takes priority.
-    if let Ok(agent_id) = std::env::var("WRIT_AGENT_ID") {
-        return Some(agent_id);
-    }
-
-    // Claude Code: prefer session ID for unique suffix, fall back to PID.
-    for var in &[
-        "CLAUDE_CODE_SESSION_ID",
-        "CLAUDE_SESSION_ID",
-        "ANTHROPIC_SESSION_ID",
-    ] {
-        if let Ok(session_id) = std::env::var(var) {
-            let suffix = short_hash(&session_id);
-            return Some(format!("claude-code-{}", suffix));
-        }
-    }
-    // CLAUDECODE=1 is set by Claude Code even when session ID vars are absent.
-    if std::env::var("CLAUDECODE").is_ok() {
-        let suffix = short_hash(&std::process::id().to_string());
-        return Some(format!("claude-code-{}", suffix));
-    }
-
-    // Codex sets CODEX_SESSION or similar.
-    for var in &["CODEX_SESSION", "CODEX_SESSION_ID"] {
-        if let Ok(session_id) = std::env::var(var) {
-            let suffix = short_hash(&session_id);
-            return Some(format!("codex-{}", suffix));
-        }
-    }
-
-    None
-}
-
-/// Generate a short 4-character hash suffix from a string for agent ID uniqueness.
-fn short_hash(input: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    input.hash(&mut hasher);
-    format!("{:04x}", hasher.finish() & 0xFFFF)
+    let r = writ_core::agent::resolve_agent_id(None, None, true);
+    r.is_agent().then_some(r.id)
 }
 
 /// Check if `writ context` was run recently by reading the `.writ/.context_token` file.
@@ -1912,7 +1977,18 @@ fn resolve_strategy(explicit: Option<&str>, cwd: &PathBuf) -> String {
 }
 
 /// Return an actionable hint for a given error, or None if no hint is needed.
-fn error_hint(err: &dyn std::error::Error) -> Option<String> {
+fn error_hint(err: &(dyn std::error::Error + 'static)) -> Option<String> {
+    if let Some(writ_core::error::WritError::OwnLinesRemoved { losses, .. }) =
+        err.downcast_ref::<writ_core::error::WritError>()
+    {
+        let mut paths: Vec<&str> = losses.iter().map(|l| l.path.as_str()).collect();
+        paths.dedup();
+        return Some(format!(
+            "another agent's version of the file may be on disk. Restore your lines, or exclude the file with --paths. If the removal is yours, allow it for these files only:\n    {} --allow-removals {}",
+            current_command_line(),
+            paths.join(",")
+        ));
+    }
     let msg = err.to_string();
 
     if msg.contains("not a writ repository") {
@@ -1956,8 +2032,15 @@ fn error_hint(err: &dyn std::error::Error) -> Option<String> {
     if msg.contains("no git repository found") {
         return Some("run `git init` first, then `writ init`".into());
     }
+    if msg.contains("would lose sealed lines") {
+        return Some(
+            "inspect the listed seals with `writ show <seal> --diff`, reopen the spec with `writ spec reopen <spec>`, restore the lines, seal, and finish again".into(),
+        );
+    }
     if msg.contains("unresolved conflicts") {
-        return Some("re-run with `writ finish --auto` to auto-resolve".into());
+        return Some(
+            "preview with `writ converge-all --dry-run`, resolve the listed files, seal, and finish again".into(),
+        );
     }
     if msg.contains("push rejected") || msg.contains("Push rejected") {
         return Some("pull first with `writ pull`, resolve, then push again".into());
@@ -2072,6 +2155,12 @@ fn cmd_init(
     // MS.30: Append commented [watch] section to config.toml for discoverability.
     append_watch_config_comment(&cwd.join(".writ").join("config.toml"));
 
+    // Finding 39: .writ/ is git-ignored in every mode, --bare included;
+    // otherwise `git add -A` would commit the whole store.
+    if let Err(e) = writ_core::hooks::append_gitignore(cwd) {
+        eprintln!("{} .gitignore: {}", "warning:".yellow().bold(), e);
+    }
+
     // Install framework hooks based on user selections (not just auto-detection).
     // LE-7: Collect and display hook errors instead of silently discarding them.
     if !opts.bare {
@@ -2091,12 +2180,9 @@ fn cmd_init(
                 hook_warnings.push(format!("Generic hook: {}", e));
             }
         }
-        if let Err(e) = writ_core::hooks::append_gitignore(cwd) {
-            hook_warnings.push(format!(".gitignore: {}", e));
-        }
         // MCP.6: Generate .mcp.json when Claude Code is enabled.
         if plan.enable_claude {
-            if let Err(e) = generate_mcp_json(cwd) {
+            if let Err(e) = generate_mcp_json(cwd, true) {
                 hook_warnings.push(format!(".mcp.json: {}", e));
             }
         }
@@ -2361,8 +2447,15 @@ fn cmd_uninit(
                 println!("removed .writignore");
             }
 
-            if mcp_removed {
-                println!("removed .mcp.json");
+            match mcp_removed {
+                McpRemoval::Deleted => println!("removed .mcp.json"),
+                McpRemoval::EntryRemoved => {
+                    println!("removed writ from .mcp.json (other servers kept)")
+                }
+                McpRemoval::KeptTracked => {
+                    println!("kept .mcp.json (committed to git; edit it to remove writ)")
+                }
+                McpRemoval::Untouched => {}
             }
 
             for hook in &result.hooks_removed {
@@ -2648,6 +2741,8 @@ fn cmd_seal(
     allow_empty: bool,
     expected_head: Option<String>,
     enforce_scope: bool,
+    force: bool,
+    allow_removals: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let is_agent = detect_agent_from_env().is_some();
 
@@ -2667,6 +2762,8 @@ fn cmd_seal(
     if enforce_scope {
         repo.set_enforce_scope(true);
     }
+    repo.set_allow_own_line_removal(force);
+    repo.set_allow_removal_paths(allow_removals);
 
     // SK.3b: Auto-scope spec for agents. If --spec is omitted, try to find
     // the agent's single claimed in-progress spec. Falls back to C.13
@@ -2908,7 +3005,7 @@ fn cmd_seal(
         }
 
         if seal.status == TaskStatus::Complete {
-            let prior_seals = repo.spec_log(sid).unwrap_or_default();
+            let prior_seals = repo.spec_seals(sid).unwrap_or_default();
             let has_in_progress = prior_seals
                 .iter()
                 .any(|s| s.id != seal.id && s.status == TaskStatus::InProgress);
@@ -2988,7 +3085,7 @@ fn cmd_log(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let mut seals = match (&spec, all) {
-        (Some(spec_id), _) => repo.spec_log(spec_id)?,
+        (Some(spec_id), _) => repo.spec_seals(spec_id)?,
         (None, true) => repo.log_all()?,
         (None, false) => repo.log()?,
     };
@@ -3288,7 +3385,7 @@ fn collect_filtered_paths(
 
     if let Some(spec_id) = spec_filter {
         // Get all seals for this specific spec.
-        if let Ok(seals) = repo.spec_log(spec_id) {
+        if let Ok(seals) = repo.spec_seals(spec_id) {
             for seal in &seals {
                 for change in &seal.changes {
                     paths.insert(change.path.clone());
@@ -4334,6 +4431,9 @@ fn cmd_status_watch(
                     cleanup: false,
                     no_cleanup: false,
                     include_unsealed: false,
+                    archive_unclaimed: false,
+                    strict: false,
+                    no_check: false,
                 },
                 "single",
             )?;
@@ -4384,6 +4484,9 @@ struct FinishOpts {
     cleanup: bool,
     no_cleanup: bool,
     include_unsealed: bool,
+    archive_unclaimed: bool,
+    strict: bool,
+    no_check: bool,
 }
 
 fn cmd_finish(
@@ -4392,7 +4495,7 @@ fn cmd_finish(
     strategy: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
-    use writ_core::git_ops::{Git2Ops, GitOps};
+    use writ_core::git_ops::Git2Ops;
     let FinishOpts {
         full,
         dry_run,
@@ -4400,6 +4503,9 @@ fn cmd_finish(
         cleanup,
         no_cleanup,
         include_unsealed,
+        archive_unclaimed,
+        strict,
+        no_check,
     } = opts;
 
     let repo = Repository::open_from_dir(cwd)?;
@@ -4462,6 +4568,11 @@ fn cmd_finish(
     // haven't been converged yet. Then materializes the shadow results to disk.
     match repo.finalize_convergence() {
         Ok(conv_report) => {
+            // Finding 62: lines another spec added that a spec's version
+            // did not carry were kept; tell the user how to remove them.
+            for n in &conv_report.notices {
+                eprintln!("  {} {}", "notice:".yellow().bold(), n.message);
+            }
             if !conv_report.merged_files.is_empty() {
                 if !conv_report.escalations.is_empty() {
                     eprintln!();
@@ -4479,6 +4590,9 @@ fn cmd_finish(
                         eprintln!("  {} {}: {}", "·".red(), esc.file_path, esc.reason);
                     }
                     eprintln!();
+                    if print_survival_losses(&repo, &conv_report.escalations) {
+                        return Err("finish refused: the merge would lose sealed lines".into());
+                    }
                     eprintln!(
                         "  Resolve conflicts before finishing. Run {} to preview.",
                         "`writ converge-all --dry-run`".bold()
@@ -4598,9 +4712,6 @@ fn cmd_finish(
         }
     }
 
-    // Load summary for dry-run file listing.
-    let summary = repo.summary()?;
-
     // Generate commit message from committable specs (not all specs).
     let commit_message = {
         let titles: Vec<&str> = committable.iter().map(|s| s.title.as_str()).collect();
@@ -4664,141 +4775,40 @@ fn cmd_finish(
     // Open git repo via GitOps
     let git = Git2Ops::open(cwd)?;
 
-    match strategy {
-        "single" => {
-            // Single commit: stage the completed specs' sealed paths, commit
-            // once, mark all specs.
-            stage_finish_plan(&repo, &git, &plan, include_unsealed)?;
-
-            if !git.has_staged_changes()? {
-                println!("Nothing to commit — working tree clean.");
-                return Ok(());
-            }
-
-            let hash = git.commit(&commit_message)?;
-            let short_hash = &hash[..std::cmp::min(8, hash.len())];
-
-            // Mark all committable specs
-            for s in &committable {
-                let _ = repo.mark_spec_committed(&s.id, &hash);
-            }
-
-            println!();
-            println!(
-                "  {} Committed {} — {}",
-                "✓".green().bold(),
-                short_hash.cyan(),
-                commit_message.lines().next().unwrap_or("")
-            );
-            println!(
-                "  {} {} spec(s) marked as committed.",
-                "✓".green().bold(),
-                committable.len()
-            );
-        }
-        "per-spec" => {
-            // Per-spec commits: sort by completed_at, one commit per spec.
-            // Uses file_scope for isolation when available; falls back to
-            // stage_all for the first spec if no file_scope is set.
-            let mut sorted: Vec<_> = committable.clone();
-            sorted.sort_by_key(|s| s.completed_at);
-
-            for s in &sorted {
-                // Stage only this spec's sealed paths (never the whole tree).
-                let spec_plan = repo.finish_plan(std::slice::from_ref(&s.id))?;
-                stage_finish_plan(&repo, &git, &spec_plan, false)?;
-
-                if !git.has_staged_changes()? {
-                    continue;
-                }
-
-                let msg = s.completion_summary.as_deref().unwrap_or(&s.title);
-                let spec_msg = format!("{}: {}", s.id, msg);
-
-                let hash = git.commit(&spec_msg)?;
-                let short = &hash[..std::cmp::min(8, hash.len())];
-                let _ = repo.mark_spec_committed(&s.id, &hash);
-
-                println!("  {} {} — {} ({})", "✓".green(), short.cyan(), s.id, msg);
-            }
-        }
-        "grouped" => {
-            // Grouped commits: auto-detect logical groupings by directory prefix.
-            // Specs sharing a common directory prefix are committed together.
-            let groups = compute_spec_groups(&committable);
-
-            if groups.len() == 1 {
-                println!(
-                    "  {} All specs share the same area — committing as single group.",
-                    "→".dimmed()
-                );
-            } else {
-                println!(
-                    "  {} {} groups detected by directory prefix:",
-                    "→".dimmed(),
-                    groups.len()
-                );
-                for (i, group) in groups.iter().enumerate() {
-                    let spec_ids: Vec<&str> = group.specs.iter().map(|s| s.id.as_str()).collect();
-                    println!(
-                        "    Group {}: \"{}\" ({})",
-                        i + 1,
-                        group.label,
-                        spec_ids.join(", ")
-                    );
-                }
-                println!();
-            }
-
-            for group in &groups {
-                // Stage only the group's sealed paths (never the whole tree).
-                let ids: Vec<String> = group.specs.iter().map(|s| s.id.clone()).collect();
-                let group_plan = repo.finish_plan(&ids)?;
-                stage_finish_plan(&repo, &git, &group_plan, false)?;
-
-                if !git.has_staged_changes()? {
-                    continue;
-                }
-
-                // Build commit message from group specs
-                let summaries: Vec<String> = group
-                    .specs
-                    .iter()
-                    .map(|s| {
-                        let msg = s.completion_summary.as_deref().unwrap_or(&s.title);
-                        format!("{}: {}", s.id, msg)
-                    })
-                    .collect();
-                let group_msg = if summaries.len() == 1 {
-                    summaries[0].clone()
-                } else {
-                    format!("{}\n\n{}", group.label, summaries.join("\n"))
-                };
-
-                let hash = git.commit(&group_msg)?;
-                let short = &hash[..std::cmp::min(8, hash.len())];
-
-                for s in &group.specs {
-                    let _ = repo.mark_spec_committed(&s.id, &hash);
-                }
-
-                let spec_ids: Vec<&str> = group.specs.iter().map(|s| s.id.as_str()).collect();
-                println!(
-                    "  {} {} — {} ({})",
-                    "✓".green(),
-                    short.cyan(),
-                    group.label,
-                    spec_ids.join(", ")
-                );
-            }
-        }
-        other => {
-            eprintln!(
-                "error: unknown strategy '{}'. Use: single, per-spec, grouped",
-                other
-            );
-            std::process::exit(1);
-        }
+    // S.2: every strategy commits through one engine: sealed content only,
+    // dependency order for per-spec, staged tree checked before each commit.
+    let commit_opts = finish::CommitOptions {
+        include_unsealed,
+        strict,
+        check: finish::resolve_check(&repo, no_check),
+    };
+    let committable_specs: Vec<Spec> = committable.iter().map(|s| (*s).clone()).collect();
+    let made = finish::commit_specs(
+        &repo,
+        &git,
+        &committable_specs,
+        strategy,
+        &commit_message,
+        &commit_opts,
+    )?;
+    if made.is_empty() {
+        println!("Nothing to commit — sealed content already matches HEAD.");
+    }
+    for c in &made {
+        println!(
+            "  {} Committed {} — {}",
+            "✓".green().bold(),
+            c.hash[..c.hash.len().min(8)].cyan(),
+            c.message.lines().next().unwrap_or("")
+        );
+    }
+    let landed: usize = made.iter().map(|c| c.spec_ids.len()).sum();
+    if landed > 0 {
+        println!(
+            "  {} {} spec(s) marked as committed.",
+            "✓".green().bold(),
+            landed
+        );
     }
 
     // WV.6: Workspace cleanup after successful commit.
@@ -4843,16 +4853,33 @@ fn cmd_finish(
         }
     }
 
-    // Clean up orphaned specs (created by writ plan but never used).
-    match repo.archive_orphaned_specs() {
-        Ok(archived) if !archived.is_empty() => {
+    // Finding 46: finish never cancels or archives specs as a side effect.
+    // Zero-seal unclaimed specs are listed; --archive-unclaimed archives them.
+    let unclaimed = repo.unclaimed_zero_seal_specs().unwrap_or_default();
+    if !unclaimed.is_empty() {
+        if archive_unclaimed {
+            let archived = repo.archive_orphaned_specs()?;
             println!(
-                "  {} {} orphaned spec(s) archived (created but never claimed).",
+                "  {} {} unclaimed zero-seal spec(s) archived (--archive-unclaimed): {}",
                 "✓".green().bold(),
-                archived.len()
+                archived.len(),
+                archived.join(", ")
             );
+        } else {
+            println!();
+            println!(
+                "{}",
+                format!(
+                    "Open specs with no seals and no claim ({}), left as they are:",
+                    unclaimed.len()
+                )
+                .dimmed()
+            );
+            for s in &unclaimed {
+                println!("  {}  {} {}", "·".dimmed(), s.id, s.title.dimmed());
+            }
+            println!("  {}", "Pass --archive-unclaimed to archive them.".dimmed());
         }
-        _ => {}
     }
 
     // Auto-GC: if enabled, prune committed objects when threshold is exceeded.
@@ -5050,6 +5077,61 @@ fn print_finish_left_out(plan: &writ_core::repo::FinishPlan, include_unsealed: b
     );
 }
 
+/// Explain merge-survival escalations (a spec's own sealed lines missing
+/// from the merge): name spec, path and lines, say the merge was refused,
+/// and point at the seal and `spec reopen`. Returns true when any were
+/// printed. Never suggests `--auto`, which resolves nothing.
+fn print_survival_losses(
+    repo: &Repository,
+    escalations: &[writ_core::convergence::PipelineEscalation],
+) -> bool {
+    use colored::Colorize;
+    let losses: Vec<_> = escalations
+        .iter()
+        .filter(|e| e.conflict_class == writ_core::convergence::survival::MERGE_LOSS_CLASS)
+        .collect();
+    if losses.is_empty() {
+        return false;
+    }
+    eprintln!(
+        "{} the merge was refused so these sealed lines are not lost:",
+        "REFUSED:".red().bold()
+    );
+    for esc in &losses {
+        let spec = &esc.right_spec;
+        let seal = repo
+            .spec_seals(spec)
+            .ok()
+            .and_then(|seals| {
+                seals
+                    .into_iter()
+                    .find(|s| s.changes.iter().any(|c| c.path == esc.file_path))
+            })
+            .map(|s| s.id[..12.min(s.id.len())].to_string());
+        eprintln!(
+            "  {} spec {}, {}",
+            "·".red(),
+            spec.cyan(),
+            esc.file_path.bold()
+        );
+        eprintln!("      {}", esc.reason);
+        if let Some(lines) = esc.right_content.as_deref() {
+            for line in lines.lines().take(10) {
+                eprintln!("      | {line}");
+            }
+        }
+        match seal {
+            Some(seal) => eprintln!("      inspect: writ show {seal} --diff"),
+            None => eprintln!("      inspect: writ log --spec {spec}"),
+        }
+        eprintln!(
+            "      then:    writ spec reopen {spec}  (restore the lines, seal, finish again)"
+        );
+    }
+    eprintln!();
+    true
+}
+
 /// Stage a finish plan: sealed content for sealed paths and, with
 /// `include_unsealed`, working-tree content for drifted and unsealed paths.
 /// Paths git refuses are listed under their own heading (finding 44).
@@ -5236,45 +5318,63 @@ fn cmd_finish_accept(
     cwd: &PathBuf,
     proposal_id: &str,
     strategy: &str,
+    strict: bool,
+    no_check: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
-    use writ_core::git_ops::{Git2Ops, GitOps};
+    use writ_core::git_ops::Git2Ops;
 
     let repo = Repository::open_from_dir(cwd)?;
     let proposal = repo.accept_proposal(proposal_id)?;
+    // Finding 37: the proposal's own strategy wins; the flag is the fallback.
+    let strategy = if proposal.strategy.is_empty() {
+        strategy
+    } else {
+        proposal.strategy.as_str()
+    };
+    let specs: Vec<Spec> = proposal
+        .spec_ids
+        .iter()
+        .map(|id| repo.resolve_spec(id))
+        .collect::<Result<_, _>>()?;
 
-    // Execute the commit
+    // S.1/S.2: stage only the proposal specs' sealed content, never `git add .`.
     let git = Git2Ops::open(cwd)?;
-    git.stage_all()?;
-
-    if !git.has_staged_changes()? {
-        println!("Nothing to commit — working tree clean.");
+    let opts = finish::CommitOptions {
+        include_unsealed: false,
+        strict,
+        check: finish::resolve_check(&repo, no_check),
+    };
+    let plan = repo.finish_plan(&proposal.spec_ids)?;
+    print_finish_left_out(&plan, false);
+    let made = finish::commit_specs(&repo, &git, &specs, strategy, &proposal.message, &opts)?;
+    if made.is_empty() {
+        println!("Nothing to commit — sealed content already matches HEAD.");
         return Ok(());
     }
-
-    let hash = git.commit(&proposal.message)?;
-    let short = &hash[..std::cmp::min(8, hash.len())];
-
-    // Update proposal with actual hash
-    let _ = repo.update_proposal_hash(proposal_id, &hash);
-
-    // Mark specs as committed
-    for spec_id in &proposal.spec_ids {
-        let _ = repo.mark_spec_committed(spec_id, &hash);
+    if let Some(last) = made.last() {
+        if let Err(e) = repo.update_proposal_hash(proposal_id, &last.hash) {
+            eprintln!(
+                "{} could not record the commit on proposal {proposal_id}: {e}",
+                "warning:".yellow().bold()
+            );
+        }
     }
 
     println!();
     println!(
-        "  {} Proposal {} accepted.",
+        "  {} Proposal {} accepted ({strategy}).",
         "✓".green().bold(),
         proposal_id.cyan()
     );
-    println!(
-        "  {} Committed {} — {}",
-        "✓".green().bold(),
-        short.cyan(),
-        proposal.message.lines().next().unwrap_or("")
-    );
+    for c in &made {
+        println!(
+            "  {} Committed {} — {}",
+            "✓".green().bold(),
+            c.hash[..c.hash.len().min(8)].cyan(),
+            c.message.lines().next().unwrap_or("")
+        );
+    }
     println!(
         "  {} {} spec(s) marked as committed.",
         "✓".green().bold(),
@@ -5305,7 +5405,12 @@ fn cmd_finish_reject(cwd: &PathBuf, proposal_id: &str) -> Result<(), Box<dyn std
 }
 
 /// Auto mode: commit without prompts, with safety rails from project config.
-fn cmd_finish_auto(cwd: &PathBuf, strategy: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_finish_auto(
+    cwd: &PathBuf,
+    strategy: &str,
+    strict: bool,
+    no_check: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
     use writ_core::config::ProjectConfig;
     use writ_core::git_ops::{Git2Ops, GitOps};
@@ -5384,52 +5489,71 @@ fn cmd_finish_auto(cwd: &PathBuf, strategy: &str) -> Result<(), Box<dyn std::err
         .collect();
 
     let summary = repo.summary()?;
+    let opts = finish::CommitOptions {
+        include_unsealed: false,
+        strict,
+        check: finish::resolve_check(&repo, no_check),
+    };
     let mut total_committed = 0;
 
-    for (i, batch) in batches.iter().enumerate() {
-        // S.1: stage only this batch's sealed paths, with sealed content.
-        let ids: Vec<String> = batch.iter().map(|s| s.id.clone()).collect();
+    // Finding 37: honor the strategy. `single` keeps the
+    // max_specs_per_commit batching; per-spec and grouped split by
+    // themselves.
+    let runs: Vec<(Vec<Spec>, String)> = if strategy == "single" {
+        batches
+            .iter()
+            .enumerate()
+            .map(|(i, batch)| {
+                let message = if batches.len() == 1 {
+                    summary.headline.clone()
+                } else {
+                    format!("{} (batch {}/{})", summary.headline, i + 1, batches.len())
+                };
+                (batch.iter().map(|s| (*s).clone()).collect(), message)
+            })
+            .collect()
+    } else {
+        vec![(
+            committable.iter().map(|s| (*s).clone()).collect(),
+            summary.headline.clone(),
+        )]
+    };
+
+    for (specs, message) in &runs {
+        let ids: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
         let plan = repo.finish_plan(&ids)?;
         print_finish_left_out(&plan, false);
-        stage_finish_plan(&repo, &git, &plan, false)?;
-        if !git.has_staged_changes()? {
-            continue;
+        let made = finish::commit_specs(&repo, &git, specs, strategy, message, &opts)?;
+        for c in &made {
+            total_committed += c.spec_ids.len();
+            eprintln!(
+                "  {} {} — {} ({} specs)",
+                "✓".green(),
+                &c.hash[..c.hash.len().min(8)],
+                c.message.lines().next().unwrap_or(""),
+                c.spec_ids.len()
+            );
+
+            // Log as security event (audit trail)
+            let logger = writ_core::security::SecurityEventLogger::new(repo.writ_dir());
+            let event = writ_core::security::SecurityEvent {
+                timestamp: chrono::Utc::now(),
+                severity: writ_core::security::Severity::Info,
+                event_type: "auto_commit".to_string(),
+                agent_id: None,
+                details: format!(
+                    "Auto-committed {} specs ({strategy}): {}",
+                    c.spec_ids.len(),
+                    c.hash
+                ),
+            };
+            if let Err(e) = logger.emit_event(&event) {
+                eprintln!(
+                    "{} audit event not written: {e}",
+                    "warning:".yellow().bold()
+                );
+            }
         }
-
-        // Generate message for this batch
-        let message = if batches.len() == 1 {
-            summary.headline.clone()
-        } else {
-            format!("{} (batch {}/{})", summary.headline, i + 1, batches.len())
-        };
-
-        let hash = git.commit(&message)?;
-        let short = &hash[..std::cmp::min(8, hash.len())];
-
-        // Mark specs committed
-        for s in batch {
-            let _ = repo.mark_spec_committed(&s.id, &hash);
-        }
-
-        total_committed += batch.len();
-        eprintln!(
-            "  {} {} — {} ({} specs)",
-            "✓".green(),
-            short,
-            message.lines().next().unwrap_or(""),
-            batch.len()
-        );
-
-        // Log as security event (audit trail)
-        let logger = writ_core::security::SecurityEventLogger::new(repo.writ_dir());
-        let event = writ_core::security::SecurityEvent {
-            timestamp: chrono::Utc::now(),
-            severity: writ_core::security::Severity::Info,
-            event_type: "auto_commit".to_string(),
-            agent_id: None,
-            details: format!("Auto-committed {} specs: {}", batch.len(), hash),
-        };
-        let _ = logger.emit_event(&event);
     }
 
     // Notification
@@ -5728,6 +5852,7 @@ fn cmd_spec_add(
     design_notes: Option<Vec<String>>,
     tech_stack: Option<Vec<String>>,
     agent: Option<&str>,
+    claim: bool,
     scope: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use writ_core::repo::{generate_spec_id, slugify_title};
@@ -5776,19 +5901,20 @@ fn cmd_spec_add(
         spec.tech_stack = ts;
     }
     spec.file_scope = file_scope;
+    let creator = resolve_agent(agent, cwd);
+    spec.created_by = Some(creator.clone());
     repo.add_spec(&spec)?;
 
-    // Auto-claim for agents: use explicit --agent flag (from MCP),
-    // fall back to environment detection.
-    let agent_id = agent
-        .map(|a| a.to_string())
-        .or_else(|| detect_agent_from_env().map(|a| a.to_string()));
-    if let Some(aid) = &agent_id {
-        let _ = repo.spec_claim(&spec_id, aid);
+    // S.3: never auto-claim. `--claim` claims for the resolved identity.
+    if claim {
+        repo.spec_claim(&spec_id, &creator)?;
     }
 
     println!("spec added: {spec_id}");
     println!("  title: {spec_title}");
+    if claim {
+        println!("  claimed by: {creator}");
+    }
     if !spec.acceptance_criteria.is_empty() {
         println!("  criteria:   {}", spec.acceptance_criteria.join("; "));
     }
@@ -5897,10 +6023,14 @@ fn cmd_spec_done(
     agent: Option<&str>,
     paths: Option<Vec<String>>,
     no_seal: bool,
+    force: bool,
+    allow_removals: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
-    let repo = Repository::open_from_dir(cwd)?;
+    let mut repo = Repository::open_from_dir(cwd)?;
+    repo.set_allow_own_line_removal(force);
+    repo.set_allow_removal_paths(allow_removals);
 
     // SK.3b: Auto-scope spec ID. If an agent identity is available,
     // use resolve_spec_for_agent to find their claimed spec. Otherwise
@@ -5912,10 +6042,7 @@ fn cmd_spec_done(
         }
         None => {
             // Try agent-scoped resolution first.
-            let agent_id = agent
-                .map(|a| a.to_string())
-                .or_else(|| detect_agent_from_env().map(|a| a.to_string()))
-                .unwrap_or_else(|| "human".to_string());
+            let agent_id = resolve_agent(agent, cwd);
 
             if agent_id != "human" {
                 match repo.resolve_spec_for_agent(None, &agent_id) {
@@ -5966,22 +6093,11 @@ fn cmd_spec_done(
         }
     };
 
-    // Create final seal — prefer the spec's claimed agent over fallback "human".
-    // This prevents paired "human" seals when an agent runs `writ spec done`
-    // from CLI without an explicit --agent flag. The seal inherits the spec's
-    // agent identity for proper attribution.
-    let resolved_id = resolve_agent(agent, cwd);
-    let spec_data = repo.resolve_spec(&spec_id)?;
-    let spec_id = spec_data.id.clone();
-    let agent_id = if resolved_id == "human" {
-        // If resolve_agent fell back to "human", check if spec has a claimed agent
-        spec_data
-            .claimed_by
-            .clone()
-            .unwrap_or_else(|| resolved_id.clone())
-    } else {
-        resolved_id
-    };
+    // Final seal under the resolved identity (S.3: one resolver). The
+    // seal is never attributed to the claim holder on the caller's behalf;
+    // sealing someone else's claim warns or is rejected (S.1).
+    let agent_id = resolve_agent(agent, cwd);
+    let spec_id = repo.resolve_spec(&spec_id)?.id;
     let seal_summary = summary.as_deref().unwrap_or("Spec completed").to_string();
 
     let seal_agent = AgentIdentity {
@@ -5992,20 +6108,17 @@ fn cmd_spec_done(
             AgentType::Agent
         },
     };
-    let final_seal = if no_seal {
-        println!("  Closing without a final seal (--no-seal).");
-        None
-    } else {
-        final_seal_for_done(
-            &repo,
-            seal_agent,
-            &seal_summary,
-            &spec_id,
-            &agent_id,
-            paths.as_deref(),
-        )?
-    };
-    if let Some(ref seal) = final_seal {
+    let outcome = repo.spec_done(seal_agent, summary, &spec_id, paths.as_deref(), no_seal)?;
+    if let Some(ref warning) = outcome.claim_warning {
+        println!("{} {}", "warning:".yellow().bold(), warning);
+    }
+    if let Some(seal) = report_final_seal(
+        outcome.final_seal,
+        &spec_id,
+        &seal_summary,
+        &agent_id,
+        paths.is_some(),
+    ) {
         println!(
             "{} {} final seal, {} file(s)",
             "sealed".green().bold(),
@@ -6016,11 +6129,9 @@ fn cmd_spec_done(
             println!("    {}", c.path);
         }
     }
+    let spec = outcome.spec;
 
-    // Mark spec as done
-    let spec = repo.mark_spec_done(&spec_id, summary)?;
-
-    let seal_count = repo.spec_log(&spec_id).map(|l| l.len()).unwrap_or(0);
+    let seal_count = spec.sealed_by.len();
 
     println!();
     println!(
@@ -6045,63 +6156,41 @@ fn cmd_spec_done(
     Ok(())
 }
 
-/// The final seal of `writ spec done` (S.1): `--paths` seals exactly those
-/// paths; otherwise only files the spec owns. Never sweeps another agent's
-/// pending files. Returns `None` when there is nothing to seal; the spec
-/// still closes, and any left-out files are listed with the command that
-/// seals them.
-fn final_seal_for_done(
-    repo: &Repository,
-    agent: AgentIdentity,
-    summary: &str,
+/// Print what the final seal of `writ spec done` did (S.1) and return the
+/// seal, if one was written. Left-out files are listed with the command
+/// that seals them.
+fn report_final_seal(
+    outcome: writ_core::repo::FinalSeal,
     spec_id: &str,
+    summary: &str,
     agent_id: &str,
-    paths: Option<&[String]>,
-) -> Result<Option<writ_core::seal::Seal>, Box<dyn std::error::Error>> {
-    let verification = Verification::default();
-    if let Some(paths) = paths {
-        return match repo.seal_paths(
-            agent,
-            summary.to_string(),
-            Some(spec_id.to_string()),
-            TaskStatus::Complete,
-            verification,
-            paths,
-            false,
-        ) {
-            Ok(seal) => Ok(Some(seal)),
-            Err(WritError::NothingToSeal) => {
-                println!("  Nothing pending in the given paths; closing without a final seal.");
-                Ok(None)
-            }
-            Err(e) => Err(e.into()),
-        };
-    }
-    match repo.seal_scoped(
-        agent,
-        summary.to_string(),
-        Some(spec_id.to_string()),
-        TaskStatus::Complete,
-        verification,
-        false,
-        ScopeMode::Done,
-    ) {
-        Ok((seal, scope)) => {
+    explicit_paths: bool,
+) -> Option<writ_core::seal::Seal> {
+    use writ_core::repo::FinalSeal;
+    match outcome {
+        FinalSeal::Sealed { seal, scope } => {
             if let Some(scope) = scope {
                 print_left_out(&scope, spec_id, summary, agent_id, true);
             }
-            Ok(Some(seal))
+            Some(seal)
         }
-        Err(WritError::NothingToSeal) => {
+        FinalSeal::Skipped => {
+            println!("  Closing without a final seal (--no-seal).");
+            None
+        }
+        FinalSeal::NothingPending if explicit_paths => {
+            println!("  Nothing pending in the given paths; closing without a final seal.");
+            None
+        }
+        FinalSeal::NothingPending => {
             println!("  Nothing pending for this spec; closing without a final seal.");
-            Ok(None)
+            None
         }
-        Err(WritError::NothingInScope { spec_id, scope }) => {
-            print_nothing_in_scope(&spec_id, &scope, summary, agent_id, true);
+        FinalSeal::NothingInScope { scope } => {
+            print_nothing_in_scope(spec_id, &scope, summary, agent_id, true);
             println!("  Closing without a final seal; the files above stay pending.");
-            Ok(None)
+            None
         }
-        Err(e) => Err(e.into()),
     }
 }
 
@@ -6128,7 +6217,7 @@ fn cmd_spec_reopen(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Er
     let spec = repo.resolve_spec(id)?;
     let resolved_id = spec.id.clone();
     let title = spec.title.clone();
-    let seal_count = repo.spec_log(&resolved_id).map(|l| l.len()).unwrap_or(0);
+    let seal_count = spec.sealed_by.len();
 
     repo.reopen_spec(&resolved_id)?;
 
@@ -6152,9 +6241,30 @@ fn cmd_spec_claim(
     let repo = Repository::open_from_dir(cwd)?;
     let spec = repo.resolve_spec(id)?;
     let resolved_id = spec.id.clone();
-    let agent_id = agent.unwrap_or("claude-code");
-    repo.spec_claim(&resolved_id, agent_id)?;
+    let agent_id = resolve_agent(agent, cwd);
+    repo.spec_claim(&resolved_id, &agent_id)?;
     println!("Claimed spec '{}' for agent '{}'.", resolved_id, agent_id);
+    Ok(())
+}
+
+fn cmd_spec_release(
+    cwd: &PathBuf,
+    id: &str,
+    agent: Option<&str>,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open_from_dir(cwd)?;
+    let resolved_id = repo.resolve_spec(id)?.id;
+    let agent_id = resolve_agent(agent, cwd);
+    match repo.spec_release(&resolved_id, &agent_id, force)? {
+        Some(previous) if previous == agent_id => {
+            println!("Released spec '{resolved_id}' (was claimed by '{previous}').")
+        }
+        Some(previous) => {
+            println!("Released spec '{resolved_id}' from '{previous}' (--force by '{agent_id}').")
+        }
+        None => println!("Spec '{resolved_id}' was not claimed; nothing to release."),
+    }
     Ok(())
 }
 
@@ -7131,13 +7241,33 @@ fn resolve_single(
     Ok(())
 }
 
-fn cmd_spec_show(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_spec_show(cwd: &PathBuf, id: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let spec = repo.resolve_spec(id)?;
+
+    match format {
+        "json" => {
+            println!("{}", serde_json::to_string_pretty(&spec)?);
+            return Ok(());
+        }
+        "human" => {}
+        other => {
+            return Err(
+                format!("unknown format '{other}' for spec show (expected human or json)").into(),
+            )
+        }
+    }
 
     println!("spec: {}", spec.id);
     println!("  title:       {}", spec.title);
     println!("  status:      {:?}", spec.status);
+    println!(
+        "  claimed by:  {}",
+        spec.claimed_by.as_deref().unwrap_or("unclaimed")
+    );
+    if let Some(ref creator) = spec.created_by {
+        println!("  created by:  {creator}");
+    }
     println!(
         "  created:     {}",
         spec.created_at.format("%Y-%m-%d %H:%M:%S UTC")
@@ -7145,13 +7275,16 @@ fn cmd_spec_show(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Erro
     if !spec.description.is_empty() {
         println!("  description: {}", spec.description);
     }
+    if !spec.file_scope.is_empty() {
+        println!("  file scope:  {}", spec.file_scope.join(", "));
+    }
     if !spec.depends_on.is_empty() {
         println!("  depends on:  {}", spec.depends_on.join(", "));
     }
     if !spec.sealed_by.is_empty() {
         println!("  sealed by:   {} seal(s)", spec.sealed_by.len());
         for sid in &spec.sealed_by {
-            println!("    {}", &sid[..12]);
+            println!("    {}", &sid[..12.min(sid.len())]);
         }
     }
 
@@ -8434,6 +8567,27 @@ fn cmd_gc_committed(
     let writ_dir = cwd.join(".writ");
 
     let plan = GcPlan::generate_committed(&writ_dir, &specs, keep_days)?;
+    let json = match format {
+        "json" => true,
+        "human" => false,
+        other => return Err(format!("unknown format '{other}' (expected human or json)").into()),
+    };
+    // Finding 37: --format json prints the plan; with --yes it runs the
+    // plan and prints the result. JSON mode never prompts.
+    if json {
+        if dry_run || plan.actions.is_empty() || !yes {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+            return Ok(());
+        }
+        let result = execute_plan(&writ_dir, &plan, &specs)?;
+        let out = serde_json::json!({
+            "objects_pruned": result.objects_pruned,
+            "bytes_freed": result.bytes_freed,
+            "seals_archived": result.transitions_applied.len(),
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
 
     if plan.actions.is_empty() {
         println!(
@@ -9223,43 +9377,111 @@ fn append_watch_config_comment(config_path: &std::path::Path) {
     }
 }
 
-fn generate_mcp_json(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+/// Write writ's server into `.mcp.json`, keeping any other servers. An
+/// existing writ entry is never rewritten. With `leave_tracked` (init), a
+/// git-tracked file without a writ entry is left alone and reported;
+/// `writ mcp-install` passes false and adds the entry.
+fn generate_mcp_json(cwd: &PathBuf, leave_tracked: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mcp_path = cwd.join(".mcp.json");
-    let config = serde_json::json!({
-        "mcpServers": {
-            "writ": {
-                "command": "writ",
-                "args": ["mcp-serve"]
-            }
-        }
-    });
-    let content = format!("{}\n", serde_json::to_string_pretty(&config)?);
-
-    if mcp_path.exists() {
-        let existing = std::fs::read_to_string(&mcp_path)?;
-        if existing == content {
-            return Ok(());
-        }
+    if !mcp_path.exists() {
+        let config = serde_json::json!({ "mcpServers": { "writ": writ_mcp_entry() } });
+        std::fs::write(
+            &mcp_path,
+            format!("{}\n", serde_json::to_string_pretty(&config)?),
+        )?;
+        return Ok(());
     }
-
-    std::fs::write(&mcp_path, content)?;
+    let existing = std::fs::read_to_string(&mcp_path)?;
+    let mut config: serde_json::Value = serde_json::from_str(&existing)
+        .map_err(|e| format!("existing .mcp.json is not valid JSON ({e}); left unchanged"))?;
+    if config.pointer("/mcpServers/writ").is_some() {
+        return Ok(()); // already configured: never rewrite (it may be committed)
+    }
+    if leave_tracked && git_tracks(cwd, ".mcp.json") {
+        return Err(
+            "the committed .mcp.json has no writ server; left unchanged. Add it with `writ mcp-install` or by hand".into(),
+        );
+    }
+    // Untracked file with other servers: add writ, keep everything else.
+    let servers = config
+        .as_object_mut()
+        .ok_or("existing .mcp.json is not a JSON object; left unchanged")?
+        .entry("mcpServers")
+        .or_insert_with(|| serde_json::json!({}));
+    servers
+        .as_object_mut()
+        .ok_or("existing .mcp.json has a non-object mcpServers; left unchanged")?
+        .insert("writ".to_string(), writ_mcp_entry());
+    std::fs::write(
+        &mcp_path,
+        format!("{}\n", serde_json::to_string_pretty(&config)?),
+    )?;
     Ok(())
 }
 
-/// Remove .mcp.json if it was generated by writ.
-fn remove_mcp_json(cwd: &PathBuf) -> bool {
+/// The `.mcp.json` server entry for writ.
+fn writ_mcp_entry() -> serde_json::Value {
+    serde_json::json!({ "command": "writ", "args": ["mcp-serve"] })
+}
+
+/// True when git tracks `rel` in the repository at `cwd` (false outside git).
+fn git_tracks(cwd: &Path, rel: &str) -> bool {
+    use writ_core::git_ops::{Git2Ops, GitOps};
+    Git2Ops::open(cwd)
+        .and_then(|g| g.is_tracked(rel))
+        .unwrap_or(false)
+}
+
+/// What uninit did with `.mcp.json`.
+#[derive(Debug, PartialEq, Eq)]
+enum McpRemoval {
+    /// No file, or no writ entry in it.
+    Untouched,
+    /// Committed to git: kept as is, it belongs to the project.
+    KeptTracked,
+    /// Only the writ entry removed; other servers kept.
+    EntryRemoved,
+    /// The file held only writ's server and was deleted.
+    Deleted,
+}
+
+/// Remove writ from `.mcp.json` on uninit. A git-tracked file is never
+/// touched (a clone must not lose a committed file); an untracked one loses
+/// only writ's entry, and is deleted when nothing else is left.
+fn remove_mcp_json(cwd: &PathBuf) -> McpRemoval {
     let mcp_path = cwd.join(".mcp.json");
-    if !mcp_path.exists() {
-        return false;
+    let Ok(content) = std::fs::read_to_string(&mcp_path) else {
+        return McpRemoval::Untouched;
+    };
+    let Ok(mut config) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return McpRemoval::Untouched;
+    };
+    if config.pointer("/mcpServers/writ").is_none() {
+        return McpRemoval::Untouched;
     }
-    // Only remove if it contains our writ server entry
-    if let Ok(content) = std::fs::read_to_string(&mcp_path) {
-        if content.contains("\"writ\"") && content.contains("mcp-serve") {
-            let _ = std::fs::remove_file(&mcp_path);
-            return true;
-        }
+    if git_tracks(cwd, ".mcp.json") {
+        return McpRemoval::KeptTracked;
     }
-    false
+    let servers = config
+        .pointer_mut("/mcpServers")
+        .and_then(|v| v.as_object_mut());
+    let Some(servers) = servers else {
+        return McpRemoval::Untouched;
+    };
+    servers.remove("writ");
+    let only_writ = servers.is_empty() && config.as_object().map_or(false, |o| o.len() == 1);
+    let written = if only_writ {
+        std::fs::remove_file(&mcp_path).map(|_| McpRemoval::Deleted)
+    } else {
+        serde_json::to_string_pretty(&config)
+            .map_err(std::io::Error::other)
+            .and_then(|json| std::fs::write(&mcp_path, format!("{json}\n")))
+            .map(|_| McpRemoval::EntryRemoved)
+    };
+    written.unwrap_or_else(|e| {
+        eprintln!("{} .mcp.json not updated: {e}", "warning:".yellow().bold());
+        McpRemoval::Untouched
+    })
 }
 
 fn cmd_mcp_serve(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
@@ -9287,19 +9509,9 @@ fn cmd_mcp_install(cwd: &PathBuf, desktop: bool) -> Result<(), Box<dyn std::erro
         return Ok(());
     }
 
-    // Default: write project-level .mcp.json
+    // Default: add writ to the project-level .mcp.json, keeping other servers.
     let mcp_path = cwd.join(".mcp.json");
-    let config = serde_json::json!({
-        "mcpServers": {
-            "writ": {
-                "command": "writ",
-                "args": ["mcp-serve"]
-            }
-        }
-    });
-
-    let content = serde_json::to_string_pretty(&config)?;
-    std::fs::write(&mcp_path, format!("{}\n", content))?;
+    generate_mcp_json(cwd, false)?;
 
     println!(
         "{} Generated {} (MCP server for Claude Code)",
@@ -9789,6 +10001,7 @@ mod tests {
             workspace: None,
             claimed_by: None,
             genesis_tree: None,
+            created_by: None,
         }
     }
 

@@ -3,6 +3,7 @@
 Maps to Section 6 of the pre-beta testing guide (P2 — Fix or Document).
 """
 
+import json
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -156,9 +157,18 @@ class TestConcurrency:
             futures = [pool.submit(do_seal, i) for i in range(3)]
             results = [f.result() for f in futures]
 
-        # At least one should succeed
-        succeeded = sum(1 for r in results if r.returncode == 0)
-        assert succeeded >= 1, "At least one concurrent seal should succeed"
+        # The repo lock serialises seals (it waits, it does not fail fast), so
+        # every seal must land, and each must capture exactly its own file.
+        for idx, r in enumerate(results):
+            assert r.returncode == 0, f"seal {idx} failed:\n{r.stdout}{r.stderr}"
+        log = json.loads(writ_cmd(writ_bin, writ_project, "log", "--all",
+                                  "--format", "json").stdout)
+        seals = log if isinstance(log, list) else log.get("seals", [])
+        for idx in range(3):
+            mine = [s for s in seals if s.get("spec_id") == f"concurrent-{idx}"]
+            assert len(mine) == 1, f"concurrent-{idx}: {len(mine)} seals"
+            paths = sorted(c["path"] for c in mine[0]["changes"])
+            assert paths == [f"concurrent_{idx}.py"], f"concurrent-{idx}: {paths}"
 
         # Chain should still be valid
         try:

@@ -99,7 +99,7 @@ Written as `xfail(strict=True)` / `#[ignore = "seal-isolation"]` now so they fli
 
 | # | Layer | Check | Assertion |
 |---|---|---|---|
-| 49 | Bench | `bench/bench-context.sh target/release/writ` | Exit 0: default <= 32 KB, brief <= 2 KB, `--budget 8192` <= 8 KB, every case median <= 300 ms, binary <= 13,000,000 B, zero leaked ignored paths. |
+| 49 | Bench | `bench/bench-context.sh target/release/writ` | Exit 0: default <= 32 KB, brief <= 2 KB, `--budget 8192` <= 8 KB, every case median <= 300 ms, binary <= 14,000,000 B (raised 2026-10-05, see run_bench.py), zero leaked ignored paths. |
 | 50 | L4 | `testing/scenarios/context/messy_repo_budget.yaml` | Same fixture shape at 100-agent scale, asserting caps hold with 100 specs (brief growth is linear in specs; record bytes per spec). |
 
 Known limitations: latency medians on a shared laptop vary about 20% run to run (baseline fixture default: 212 ms and 262 ms in two runs), which is close to the 300 ms budget. CI should use `--runs 7` and the median. Seal ids and timestamps vary, so fixture byte counts jitter by a few bytes per run.

@@ -13,7 +13,34 @@ use serde::{Deserialize, Serialize};
 use crate::error::{WritError, WritResult};
 
 /// Current schema version. Bump this when the `.writ/` on-disk layout changes.
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+/// v3 (0.3.0, finding 58): spec records may carry `created_by` and other
+/// fields 0.2.x rejects (strict field checking), so a repo opened by 0.3.0
+/// is stamped v3 and 0.2.x refuses it ("please update writ") instead of
+/// failing on the first spec it reads.
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+
+/// The first writ release that reads `schema` (finding 59), for the error an
+/// older binary prints.
+pub fn min_writ_for_schema(schema: u32) -> String {
+    match schema {
+        0..=2 => "0.2.0".to_string(),
+        3 => "0.3.0".to_string(),
+        n => format!("a writ release supporting schema v{n}"),
+    }
+}
+
+/// Refuse a repository whose schema is newer than this binary (finding 59).
+/// Runs at open, before any spec, index or seal record is parsed.
+pub fn check_schema_supported(schema: u32) -> WritResult<()> {
+    if schema > CURRENT_SCHEMA_VERSION {
+        return Err(WritError::Other(format!(
+            "this repository uses writ schema v{schema}; upgrade to {} or newer (this binary is writ {} and supports up to v{CURRENT_SCHEMA_VERSION})",
+            min_writ_for_schema(schema),
+            env!("CARGO_PKG_VERSION"),
+        )));
+    }
+    Ok(())
+}
 
 /// Version metadata stored at `.writ/version.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +129,7 @@ pub fn migrate(writ_dir: &Path, from_version: u32, to_version: u32) -> WritResul
         match step {
             1 => migrate_v0_to_v1(writ_dir)?,
             2 => migrate_v1_to_v2(writ_dir)?,
+            3 => migrate_v2_to_v3(writ_dir)?,
             _ => {
                 return Err(WritError::Other(format!(
                     "unknown migration step: v{} → v{}",
@@ -162,6 +190,12 @@ fn migrate_v0_to_v1(writ_dir: &Path) -> WritResult<()> {
         default_config.save(writ_dir)?;
     }
 
+    Ok(())
+}
+
+/// v2 → v3: no data changes. The bump marks the repo as written by 0.3.0
+/// (new optional fields in spec records), which 0.2.x cannot read.
+fn migrate_v2_to_v3(_writ_dir: &Path) -> WritResult<()> {
     Ok(())
 }
 
@@ -874,8 +908,8 @@ mod tests {
             Err(e) => {
                 let err_msg = format!("{e}");
                 assert!(
-                    err_msg.contains("please update"),
-                    "error should tell user to update: {err_msg}"
+                    err_msg.contains("upgrade to"),
+                    "error should tell user to upgrade: {err_msg}"
                 );
             }
             Ok(_) => panic!("expected error for future schema version"),
@@ -1397,5 +1431,87 @@ mod tests {
             .find(|c| c.name == "workspace_layout")
             .unwrap();
         assert_eq!(ws_check.status, CheckStatus::Pass);
+    }
+}
+
+#[cfg(test)]
+mod v3_tests {
+    use super::*;
+
+    #[test]
+    fn v2_repo_migrates_to_v3_and_a_newer_schema_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::Repository::init(dir.path()).unwrap();
+        let writ_dir = dir.path().join(".writ");
+        let mut v = RepoVersion::load(&writ_dir).unwrap().unwrap();
+        v.schema_version = 2;
+        v.save(&writ_dir).unwrap();
+
+        crate::Repository::open(dir.path()).unwrap();
+
+        assert_eq!(
+            RepoVersion::load(&writ_dir)
+                .unwrap()
+                .unwrap()
+                .schema_version,
+            3
+        );
+        let mut v = RepoVersion::load(&writ_dir).unwrap().unwrap();
+        v.schema_version = 4;
+        v.save(&writ_dir).unwrap();
+        let err = crate::Repository::open(dir.path()).err().unwrap();
+        assert!(
+            err.to_string()
+                .contains("this repository uses writ schema v4; upgrade to"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod finding_59_tests {
+    use super::*;
+
+    #[test]
+    fn newer_schema_message_names_the_schema_and_release() {
+        let msg = check_schema_supported(CURRENT_SCHEMA_VERSION + 1)
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("upgrade to"), "{msg}");
+        assert_eq!(min_writ_for_schema(3), "0.3.0");
+        assert!(check_schema_supported(CURRENT_SCHEMA_VERSION).is_ok());
+    }
+
+    #[test]
+    fn schema_check_runs_before_a_spec_record_is_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::Repository::init(dir.path()).unwrap();
+        let writ_dir = dir.path().join(".writ");
+        // A spec record no version can parse, and a newer schema: the
+        // schema error must win, so the user sees "upgrade", not serde.
+        std::fs::write(writ_dir.join("specs").join("broken.json"), "{not json").unwrap();
+        let mut v = RepoVersion::load(&writ_dir).unwrap().unwrap();
+        v.schema_version = CURRENT_SCHEMA_VERSION + 1;
+        v.save(&writ_dir).unwrap();
+
+        let err = crate::Repository::open(dir.path())
+            .err()
+            .unwrap()
+            .to_string();
+
+        assert!(err.contains("uses writ schema"), "{err}");
+    }
+
+    #[test]
+    fn records_with_unknown_fields_parse_seals_stay_strict() {
+        let spec = r#"{"id":"s","title":"t","description":"","status":"pending",
+            "created_at":"2026-10-05T00:00:00Z","updated_at":"2026-10-05T00:00:00Z",
+            "field_from_the_future":1}"#;
+        let spec: crate::spec::Spec = serde_json::from_str(spec).unwrap();
+        assert_eq!(spec.id, "s");
+        let index = r#"{"entries":{},"field_from_the_future":true}"#;
+        serde_json::from_str::<crate::index::Index>(index).unwrap();
+        let agent = r#"{"id":"a","agent_type":"agent","field_from_the_future":1}"#;
+        assert!(serde_json::from_str::<crate::seal::AgentIdentity>(agent).is_err());
     }
 }

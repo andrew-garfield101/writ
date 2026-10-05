@@ -7,6 +7,15 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- The repository schema is now version 3. Writ 0.3.0 upgrades a repo on first open, after which writ 0.2.x refuses it with "please update writ": 0.2.x cannot read spec records written by 0.3.0. Upgrade every machine and CI job that touches the repo together. From 0.3.0 on, an older writ opening a newer repository names the release to upgrade to before reading any record, and spec, index and bridge records ignore fields they do not know instead of failing (seal records stay strict).
+- The writ repository ships `.mcp.json`, so Claude Code picks up writ's MCP tools on clone. `writ init` never rewrites a committed `.mcp.json` and `writ uninit` never deletes one. For an untracked `.mcp.json`, init adds writ's server and uninit removes only that entry; other servers are kept.
+
+### Fixed
+
+- `writ init --bare` now adds `.writ/` to `.gitignore`, so the store is never committed by `git add`.
+
 ## [0.2.1] — 2026-10-05
 
 **On 0.2.0, do not run `writ gc run` or `writ finish` until you upgrade.**

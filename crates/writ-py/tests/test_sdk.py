@@ -355,3 +355,12 @@ class TestAdaptivePipeline:
         repo = writ.Repository.open(repo_dir)
         spec = repo.get_spec("scoped-feat")
         assert spec["file_scope"] == ["src/components/"]
+        # The phase seal must have captured the file written inside the scope
+        # (S.1 makes file_scope bound the default seal, so a miss is silent).
+        sealed = {
+            c["path"]
+            for seal in repo.log_all()
+            if seal.get("spec_id") == "scoped-feat"
+            for c in seal["changes"]
+        }
+        assert "src/components/f.txt" in sealed, sorted(sealed)

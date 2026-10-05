@@ -823,6 +823,7 @@ mod tests {
                 "verify".into(),
             ],
             budget_exceeded: false,
+            stale_rewrite_notices: Vec::new(),
         }
     }
 
@@ -1644,6 +1645,7 @@ mod tests {
             unclaimed_specs: vec![],
             available_operations: vec![],
             budget_exceeded: false,
+            stale_rewrite_notices: Vec::new(),
         };
 
         let empty_toon = ToonFormatter::with_project("benchmark")

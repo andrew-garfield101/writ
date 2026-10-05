@@ -82,7 +82,8 @@ impl CommitState {
 
 /// A requirement specification tracked by writ.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// Finding 59: unknown fields are ignored, never an error, so a record
+// written by a newer writ stays readable here. Seal records stay strict.
 pub struct Spec {
     /// Unique spec identifier — hash-based (12 hex chars) for new specs,
     /// or legacy slug-based for pre-sprint-S specs.
@@ -148,6 +149,11 @@ pub struct Spec {
     /// Agent ID that has claimed this spec. None = unclaimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_by: Option<String>,
+    /// Agent that created the spec (`writ spec add`). Not a claim: it only
+    /// lets the default seal scope (S.1) know another agent is working on an
+    /// open, unclaimed spec. None for specs created before 0.3.0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
     /// Tree hash snapshot at spec creation time — used as baseline for
     /// spec-scoped sealing when an agent has no previous seals for this spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,6 +224,7 @@ impl Spec {
             workspace: None,
             claimed_by: None,
             genesis_tree: None,
+            created_by: None,
         }
     }
 

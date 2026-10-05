@@ -241,6 +241,13 @@ pub struct WorkflowConfig {
     /// threshold are flagged as stale. 0 disables stale detection.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stale_timeout: Option<u64>,
+
+    /// Command `writ finish` runs on the staged tree before each commit
+    /// (finding 48), from a scratch copy of that tree. Unset: `cargo check
+    /// --workspace --quiet` when the project has a root `Cargo.toml`,
+    /// otherwise no check. Empty string: no check.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finish_check: Option<String>,
 }
 
 /// Auto-mode configuration — safety rails for fully autonomous commits.
@@ -519,6 +526,11 @@ impl ProjectConfig {
     /// Get the configured stale timeout, if set.
     pub fn stale_timeout(&self) -> Option<u64> {
         self.workflow.as_ref()?.stale_timeout
+    }
+
+    /// The `[workflow] finish_check` command, if configured (finding 48).
+    pub fn finish_check(&self) -> Option<&str> {
+        self.workflow.as_ref()?.finish_check.as_deref()
     }
 
     /// Get the configured workspace root directory, defaulting to "workspaces".
@@ -1243,6 +1255,7 @@ commit_mode = "propose"
                 commit_mode: Some("auto".into()),
                 commit_strategy: Some("grouped".into()),
                 stale_timeout: Some(0),
+                finish_check: None,
             }),
             auto: Some(AutoModeConfig {
                 verify_command: Some("make test".into()),

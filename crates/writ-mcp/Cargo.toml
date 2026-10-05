@@ -6,6 +6,7 @@ license.workspace = true
 description = "MCP server for writ — native agent tool integration"
 
 [dependencies]
+writ-core = { path = "../writ-core" }
 rmcp = { version = "0.16", features = ["server", "transport-io", "schemars"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 /// Persistent bridge state stored at `.writ/bridge.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+// Finding 59: unknown fields are ignored, never an error, so a record
+// written by a newer writ stays readable here. Seal records stay strict.
 pub struct BridgeState {
     /// Git commit hash that was last imported.
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -54,7 +54,8 @@ pub struct SpecBrief {
     pub id: String,
     /// Spec title.
     pub title: String,
-    /// Primary agent working on this spec (from most recent seal or spec creator).
+    /// Who owns this spec: the claim holder, else the newest sealer, else
+    /// the non-human creator, else `unclaimed` (S.4a).
     pub agent: String,
     /// Number of seals linked to this spec.
     pub seal_count: usize,

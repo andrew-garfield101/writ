@@ -2169,6 +2169,7 @@ mod tests {
             workspace: None,
             claimed_by: None,
             genesis_tree: None,
+            created_by: None,
         }
     }
 
@@ -3677,6 +3678,7 @@ mod tests {
             workspace: None,
             claimed_by: None,
             genesis_tree: None,
+            created_by: None,
         }
     }
 

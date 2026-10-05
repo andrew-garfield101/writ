@@ -19,6 +19,11 @@ env:
 #
 # macOS pin (2026-10-04): CI uses macos-14 to match release.yml, so tests run
 # on the same image the release binaries and wheels are built on.
+#
+# Toolchain pin (2026-10-05): the Rust version comes from rust-toolchain.toml at
+# the repo root (1.99.0). Jobs install it with `rustup toolchain install`, which
+# reads that file; the runner images ship rustup. Cache keys include the file so
+# a toolchain bump starts a fresh target/ cache.
 
 jobs:
   rust-tests:
@@ -31,8 +36,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update && rustc --version
 
       - name: Cache cargo registry & build
         uses: actions/cache@v5
@@ -41,7 +46,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Run writ-core tests
@@ -50,11 +55,54 @@ jobs:
       - name: Run writ-cli tests
         run: cargo test -p writ-cli
 
+      # Wall-clock tests (finding 27, 2026-10-05): these assert time bounds, so
+      # they are #[ignore]d out of the default suite and run here alone, one
+      # thread, after the parallel suite. Names mirror TIMING_TESTS in
+      # bench/test-gate.sh; keep the two lists in sync. Linux only.
+      # TODO(2026-10-05, clippy-clean): non-blocking for now because shared
+      # runners are noisy enough to push them over their limits. Make it
+      # blocking once a few weeks of runs show it green, or once the bounds
+      # are relative to a calibration run.
+      - name: Timing tests (serial)
+        if: matrix.os == 'ubuntu-24.04'
+        continue-on-error: true
+        run: |
+          cargo test -p writ-core --all-features --lib --no-fail-fast -- \
+            --include-ignored --exact --test-threads=1 \
+            repo::scale_tests::test_scale_100_specs \
+            repo::scale_tests::test_scale_500_seals_linear_chain \
+            repo::scale_tests::test_scale_context_with_many_seals \
+            repo::scale_tests::test_scale_parallel_specs \
+            repo::scale_tests::test_scale_many_files_in_single_seal \
+            repo::chain_tests::test_chain_100_seals_performance \
+            repo::context_edge_case_tests::test_context_500_seals_all_scopes
+
+      # Store integrity gate (sprint 2, 2026-10-05). Builds the bench/context
+      # fixture (7 seals, 3 specs, 2 agents, 1,000 unsealed edits) with the CLI
+      # under test, then fails on any referenced-but-missing object, checked two
+      # independent ways: a Python walk of .writ/ and `writ verify --all-chains`.
+      # No --allow-missing on purpose: a fresh fixture must be whole. Uses the
+      # debug build the tests already compiled; zstd and python3 ship on both
+      # runner images (store_integrity.py shells out to zstd for tree objects).
+      - name: Store integrity on bench fixture
+        shell: bash
+        run: |
+          cargo build -p writ-cli
+          command -v zstd >/dev/null || { echo "zstd CLI missing on runner"; exit 2; }
+          writ_bin="$GITHUB_WORKSPACE/target/debug/writ"
+          fixture="$RUNNER_TEMP/writ-bench-fixture"
+          python3 bench/context/fixture.py "$fixture" --writ "$writ_bin" --force
+          python3 bench/store_integrity.py "$fixture"
+          python3 bench/verify_check.py "$fixture" --writ "$writ_bin"
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
         run: cargo clippy -p writ-core -p writ-cli --all-features -- -D warnings
+        # TODO(2026-10-05, clippy-clean): remove once the inventory in
+        # TEAM_WRIT_DOCS/docs/sprints/clippy-inventory.md is cleared. Fails today
+        # with 134 errors in writ-core on stable 1.99, so writ-cli is never linted.
         continue-on-error: true
 
   # TODO(bri, B.1 bench-context): uncomment once bench/bench-context.sh lands.
@@ -68,8 +116,8 @@ jobs:
   #   steps:
   #     - uses: actions/checkout@v5
   #
-  #     - name: Install Rust toolchain
-  #       uses: dtolnay/rust-toolchain@stable
+  #     - name: Install Rust toolchain (from rust-toolchain.toml)
+  #       run: rustup toolchain install --no-self-update && rustc --version
   #
   #     - name: Cache cargo registry & build
   #       uses: actions/cache@v5
@@ -78,7 +126,7 @@ jobs:
   #           ~/.cargo/registry
   #           ~/.cargo/git
   #           target
-  #         key: ${{ runner.os }}-bench-cargo-${{ hashFiles('**/Cargo.lock') }}
+  #         key: ${{ runner.os }}-bench-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
   #         restore-keys: ${{ runner.os }}-bench-cargo-
   #
   #     - name: Build release CLI
@@ -106,8 +154,8 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update && rustc --version
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v6
@@ -121,7 +169,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-py${{ matrix.python-version }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-py${{ matrix.python-version }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ${{ runner.os }}-py${{ matrix.python-version }}-cargo-
 
       - name: Create virtualenv and install dependencies
@@ -146,4 +194,4 @@ jobs:
         working-directory: crates/writ-py
         run: |
           source ${{ github.workspace }}/.venv/bin/activate
-          pytest tests/ ${{ github.workspace }}/bench/test_verify_check.py -v
+          pytest tests/ ${{ github.workspace }}/bench/test_verify_check.py ${{ github.workspace }}/bench/test_transcript_metrics.py -v

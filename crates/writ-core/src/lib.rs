@@ -40,6 +40,7 @@ pub mod settings;
 pub mod skills;
 pub mod slash_commands;
 pub mod spec;
+pub mod stat_cache;
 pub mod state;
 pub mod status;
 pub mod watch;

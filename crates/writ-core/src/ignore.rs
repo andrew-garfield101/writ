@@ -5,17 +5,29 @@
 //! (`.venv*/`), `**` globs (`**/node_modules/`, `build/**`), character classes
 //! (`*.py[cod]`), and negation (`!keep.log`).
 //!
-//! Layering, lowest to highest precedence (last match wins):
-//! 1. Repo root `.gitignore`, read fresh on every load.
-//! 2. `.writignore` if it exists, otherwise writ's built-in defaults.
+//! Layering, lowest to highest precedence, as git orders them:
+//! 1. The user's global excludes file (`core.excludesFile`, or git's
+//!    default `$XDG_CONFIG_HOME/git/ignore` when unset), then the repo's
+//!    `.git/info/exclude`.
+//! 2. Repo root `.gitignore`, read fresh on every load.
+//! 3. Nested `.gitignore` files: each applies only below its directory, and
+//!    a deeper file overrides a shallower one. Read lazily, the first time
+//!    a path below that directory is matched, so a walk never reads a
+//!    `.gitignore` inside a directory it pruned.
+//! 4. `.writignore` if it exists, otherwise writ's built-in defaults.
 //!
-//! `.writ` is ALWAYS ignored, regardless of either file (negation cannot
+//! The highest layer with a matching rule decides (within a file, the last
+//! matching line). A path under an ignored directory stays ignored, as in
+//! git. `.writ` is ALWAYS ignored, regardless of any file (negation cannot
 //! un-ignore it).
 
+use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
+use ignore::Match;
 
 /// Directory names that are ALWAYS ignored, regardless of ignore file contents.
 const ALWAYS_IGNORED_DIRS: &[&str] = &[".writ"];
@@ -49,8 +61,47 @@ pub struct InvalidPattern {
 /// A compiled, layered set of ignore rules.
 #[derive(Debug, Clone)]
 pub struct IgnoreRules {
-    matcher: Gitignore,
+    /// Global excludes file, then `.git/info/exclude`.
+    global: Gitignore,
+    /// Repo root `.gitignore`.
+    root: Gitignore,
+    /// Nested `.gitignore` files, when loaded from a repo on disk.
+    nested: Option<Nested>,
+    /// `.writignore`, or the built-in defaults.
+    writ: Gitignore,
     invalid: Vec<InvalidPattern>,
+}
+
+/// Lazily loaded `<dir>/.gitignore` matchers, keyed by repo-relative dir.
+#[derive(Debug, Clone)]
+struct Nested {
+    repo_root: PathBuf,
+    cache: Arc<Mutex<HashMap<String, Option<Arc<Gitignore>>>>>,
+}
+
+impl Nested {
+    fn new(repo_root: &Path) -> Self {
+        Nested {
+            repo_root: repo_root.to_path_buf(),
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The matcher for `<dir>/.gitignore`, `None` when there is none.
+    fn get(&self, dir: &str) -> Option<Arc<Gitignore>> {
+        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(m) = cache.get(dir) {
+            return m.clone();
+        }
+        let path = self.repo_root.join(dir).join(".gitignore");
+        let matcher = fs::read_to_string(&path).ok().map(|content| {
+            let mut b = RulesBuilder::new();
+            b.add_content(&format!("{dir}/.gitignore"), &content);
+            Arc::new(b.build_matcher())
+        });
+        cache.insert(dir.to_string(), matcher.clone());
+        matcher
+    }
 }
 
 /// Incremental builder that applies safety limits and records bad patterns.
@@ -104,48 +155,83 @@ impl RulesBuilder {
         });
     }
 
-    fn build(mut self) -> IgnoreRules {
+    /// Compile; a set that fails as a whole (unreachable in practice) is
+    /// recorded and matches nothing.
+    fn finish(mut self) -> (Gitignore, Vec<InvalidPattern>) {
         let matcher = match self.builder.build() {
             Ok(m) => m,
             Err(e) => {
-                // Only reachable if the glob set as a whole fails to compile.
                 self.reject("<all>", "", &e.to_string());
                 Gitignore::empty()
             }
         };
-        IgnoreRules {
-            matcher,
-            invalid: self.invalid,
-        }
+        (matcher, self.invalid)
+    }
+
+    /// Compile, dropping the record of rejected patterns (nested files).
+    fn build_matcher(self) -> Gitignore {
+        self.finish().0
     }
 }
 
 impl IgnoreRules {
-    /// Load live rules for a repo: root `.gitignore`, then `.writignore`
-    /// (or built-in defaults when `.writignore` is absent).
+    /// Load live rules for a repo: global excludes (git's
+    /// `core.excludesFile` resolution) and `.git/info/exclude`, root
+    /// `.gitignore`, nested `.gitignore` files, then `.writignore` (or
+    /// built-in defaults when `.writignore` is absent).
     pub fn load(repo_root: &Path) -> Self {
+        Self::load_with_excludes(repo_root, global_excludes_file().as_deref())
+    }
+
+    /// [`Self::load`] with an explicit global excludes file (`None`: none).
+    pub fn load_with_excludes(repo_root: &Path, excludes_file: Option<&Path>) -> Self {
         let mut read_errors = Vec::new();
+        let mut global = RulesBuilder::new();
+        if let Some(path) = excludes_file {
+            if let Some(content) = read_optional(path, &mut read_errors) {
+                global.add_content(&path.display().to_string(), &content);
+            }
+        }
+        let info_exclude = repo_root.join(".git").join("info").join("exclude");
+        if let Some(content) = read_optional(&info_exclude, &mut read_errors) {
+            global.add_content(".git/info/exclude", &content);
+        }
         let gitignore = read_optional(&repo_root.join(".gitignore"), &mut read_errors);
         let writignore = read_optional(&repo_root.join(".writignore"), &mut read_errors);
         let mut rules = Self::layered(gitignore.as_deref(), writignore.as_deref());
+        let (global, global_invalid) = global.finish();
+        rules.global = global;
+        rules.nested = Some(Nested::new(repo_root));
+        rules.invalid.splice(0..0, global_invalid);
         rules.invalid.extend(read_errors);
         rules
     }
 
-    /// Build rules from raw `.gitignore` and `.writignore` contents.
+    /// Build rules from raw `.gitignore` and `.writignore` contents (no
+    /// global excludes, no nested files).
     ///
     /// `.writignore` rules are layered after `.gitignore`, so they win on
     /// conflict (e.g. `!docs/` in `.writignore` re-includes a gitignored dir).
     pub fn layered(gitignore: Option<&str>, writignore: Option<&str>) -> Self {
-        let mut b = RulesBuilder::new();
+        let mut root = RulesBuilder::new();
         if let Some(content) = gitignore {
-            b.add_content(".gitignore", content);
+            root.add_content(".gitignore", content);
         }
+        let mut writ = RulesBuilder::new();
         match writignore {
-            Some(content) => b.add_content(".writignore", content),
-            None => b.add_dir_names("defaults", DEFAULT_IGNORE_DIRS),
+            Some(content) => writ.add_content(".writignore", content),
+            None => writ.add_dir_names("defaults", DEFAULT_IGNORE_DIRS),
         }
-        b.build()
+        let (root, mut invalid) = root.finish();
+        let (writ, writ_invalid) = writ.finish();
+        invalid.extend(writ_invalid);
+        IgnoreRules {
+            global: Gitignore::empty(),
+            root,
+            nested: None,
+            writ,
+            invalid,
+        }
     }
 
     /// Hardcoded defaults (used when neither ignore file exists).
@@ -160,9 +246,35 @@ impl IgnoreRules {
         Self::layered(None, Some(content))
     }
 
-    /// Patterns that failed to compile or exceeded safety limits.
+    /// Patterns that failed to compile or exceeded safety limits (global,
+    /// root and `.writignore` files; nested files are not listed).
     pub fn invalid_patterns(&self) -> &[InvalidPattern] {
         &self.invalid
+    }
+
+    /// The highest layer with a matching rule decides: ignore, whitelist,
+    /// or no opinion. Only `rel_path` itself is matched, not its parents.
+    fn decide(&self, rel_path: &str, is_dir: bool) -> Decision {
+        if let Some(d) = Decision::of(self.writ.matched(rel_path, is_dir)) {
+            return d;
+        }
+        if let Some(nested) = &self.nested {
+            // Proper ancestors, deepest first: "a/b/c" -> "a/b", "a".
+            let mut end = rel_path.len();
+            while let Some(slash) = rel_path[..end].rfind('/') {
+                let dir = &rel_path[..slash];
+                if let Some(m) = nested.get(dir) {
+                    let below = &rel_path[slash + 1..];
+                    if let Some(d) = Decision::of(m.matched(below, is_dir)) {
+                        return d;
+                    }
+                }
+                end = slash;
+            }
+        }
+        Decision::of(self.root.matched(rel_path, is_dir))
+            .or_else(|| Decision::of(self.global.matched(rel_path, is_dir)))
+            .unwrap_or(Decision::None)
     }
 
     /// Should the directory at this repo-relative path be pruned from walks?
@@ -173,7 +285,7 @@ impl IgnoreRules {
         if is_always_ignored(rel_path) {
             return true;
         }
-        self.matcher.matched(rel_path, true).is_ignore()
+        self.decide(rel_path, true) == Decision::Ignore
     }
 
     /// Should the file at this repo-relative path be ignored?
@@ -183,7 +295,7 @@ impl IgnoreRules {
         if is_always_ignored(rel_path) {
             return true;
         }
-        self.matcher.matched(rel_path, false).is_ignore()
+        self.decide(rel_path, false) == Decision::Ignore
     }
 
     /// Is this repo-relative file path ignored, either directly or because
@@ -197,10 +309,49 @@ impl IgnoreRules {
         if is_always_ignored(rel_path) {
             return true;
         }
-        self.matcher
-            .matched_path_or_any_parents(rel_path, false)
-            .is_ignore()
+        // Parents shallowest first, as a walk would prune them.
+        for (i, _) in rel_path.match_indices('/') {
+            if self.decide(&rel_path[..i], true) == Decision::Ignore {
+                return true;
+            }
+        }
+        self.decide(rel_path, false) == Decision::Ignore
     }
+}
+
+/// One layer's verdict on a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    Ignore,
+    Whitelist,
+    None,
+}
+
+impl Decision {
+    fn of<T>(m: Match<T>) -> Option<Self> {
+        match m {
+            Match::None => None,
+            Match::Ignore(_) => Some(Decision::Ignore),
+            Match::Whitelist(_) => Some(Decision::Whitelist),
+        }
+    }
+}
+
+/// Environment override for the global excludes file: a path, or empty for
+/// none. Without it, git's resolution applies (`core.excludesFile` in the
+/// global git config, else `$XDG_CONFIG_HOME/git/ignore`).
+pub const EXCLUDES_FILE_ENV: &str = "WRIT_EXCLUDES_FILE";
+
+/// The global excludes file to honor, if any. Unit tests never read the
+/// developer's git config, so results do not depend on the machine.
+fn global_excludes_file() -> Option<std::path::PathBuf> {
+    if let Some(v) = std::env::var_os(EXCLUDES_FILE_ENV) {
+        return (!v.is_empty()).then(|| v.into());
+    }
+    if cfg!(test) {
+        return None;
+    }
+    ignore::gitignore::gitconfig_excludes_path()
 }
 
 /// True when any component of the path is an always-ignored directory.
@@ -602,6 +753,111 @@ mod tests {
     //
     // The matcher tests above prove pattern semantics. These prove the
     // rules reach the places the leaks showed up: state, context, seal.
+    // ── ignore-fidelity: nested files, global excludes ─────────────
+
+    fn tree(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let t = tempfile::tempdir().unwrap();
+        for (rel, body) in files {
+            let p = t.path().join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, body).unwrap();
+        }
+        t
+    }
+
+    #[test]
+    fn test_nested_rules_apply_only_below_their_directory() {
+        let t = tree(&[("a/.gitignore", "*.log\nout/\n/top.txt\n")]);
+        let r = IgnoreRules::load_with_excludes(t.path(), None);
+        assert!(r.is_file_ignored("a/x.log"));
+        assert!(r.is_file_ignored("a/deep/y.log"));
+        assert!(r.is_dir_ignored("a/out"));
+        assert!(r.is_path_ignored("a/out/z.rs"));
+        // Anchored to a/, not to the repo root.
+        assert!(r.is_file_ignored("a/top.txt"));
+        assert!(!r.is_file_ignored("a/deep/top.txt"));
+        // Siblings and the root are untouched.
+        assert!(!r.is_file_ignored("x.log"));
+        assert!(!r.is_file_ignored("b/x.log"));
+        assert!(!r.is_dir_ignored("out"));
+        assert!(!r.is_file_ignored("top.txt"));
+    }
+
+    #[test]
+    fn test_negation_in_nested_file_overrides_root() {
+        let t = tree(&[
+            (".gitignore", "*.log\n"),
+            ("keep/.gitignore", "!important.log\n"),
+            ("keep/deeper/.gitignore", "important.log\n"),
+        ]);
+        let r = IgnoreRules::load_with_excludes(t.path(), None);
+        assert!(r.is_file_ignored("other.log"));
+        assert!(r.is_file_ignored("keep/other.log"));
+        assert!(!r.is_file_ignored("keep/important.log"));
+        assert!(!r.is_path_ignored("keep/sub/important.log"));
+        // The deeper file wins over the shallower one.
+        assert!(r.is_file_ignored("keep/deeper/important.log"));
+    }
+
+    #[test]
+    fn test_nested_cannot_reinclude_under_ignored_parent() {
+        let t = tree(&[(".gitignore", "vendor/\n"), ("vendor/.gitignore", "!*\n")]);
+        let r = IgnoreRules::load_with_excludes(t.path(), None);
+        assert!(r.is_path_ignored("vendor/lib.rs"));
+    }
+
+    #[test]
+    fn test_writignore_stays_on_top_and_writ_always_ignored() {
+        let t = tree(&[
+            ("docs/.gitignore", "*.md\n"),
+            (".writignore", "!docs/keep.md\n"),
+            ("sub/.gitignore", "!.writ\n!.writ/\n"),
+        ]);
+        let r = IgnoreRules::load_with_excludes(t.path(), None);
+        assert!(r.is_file_ignored("docs/other.md"));
+        assert!(!r.is_file_ignored("docs/keep.md"));
+        assert!(r.is_dir_ignored("sub/.writ"));
+        assert!(r.is_dir_ignored(".writ"));
+    }
+
+    #[test]
+    fn test_global_excludes_honored_and_lowest_precedence() {
+        let t = tree(&[(".gitignore", "!keep.so\n")]);
+        let global = tempfile::NamedTempFile::new().unwrap();
+        fs::write(global.path(), "*.so\n.DS_Store\n").unwrap();
+        let r = IgnoreRules::load_with_excludes(t.path(), Some(global.path()));
+        assert!(r.is_file_ignored("python/writ/_native.abi3.so"));
+        assert!(r.is_file_ignored("a/.DS_Store"));
+        // Repo files override the global file.
+        assert!(!r.is_file_ignored("keep.so"));
+    }
+
+    #[test]
+    fn test_global_excludes_disabled_when_unset() {
+        let t = tree(&[]);
+        let r = IgnoreRules::load_with_excludes(t.path(), None);
+        assert!(!r.is_file_ignored("python/writ/_native.abi3.so"));
+        // A configured path that does not exist is the same as none.
+        let r = IgnoreRules::load_with_excludes(t.path(), Some(&t.path().join("missing")));
+        assert!(!r.is_file_ignored("x.so"));
+        assert!(r.invalid_patterns().is_empty());
+    }
+
+    #[test]
+    fn test_git_info_exclude_honored() {
+        let t = tree(&[(".git/info/exclude", "secret.txt\n")]);
+        let r = IgnoreRules::load_with_excludes(t.path(), None);
+        assert!(r.is_file_ignored("secret.txt"));
+    }
+
+    #[test]
+    fn test_excludes_env_override() {
+        // Unit tests never read git config; the env var is the only way in.
+        // Resolved through global_excludes_file, read here without setting
+        // the variable process-wide (other tests run in parallel).
+        assert!(std::env::var_os(EXCLUDES_FILE_ENV).is_some() || global_excludes_file().is_none());
+    }
+
     mod repo_level {
         use std::fs;
         use std::path::Path;
@@ -895,15 +1151,31 @@ mod tests {
 
         #[test]
         fn test_nested_gitignore_file_behavior_documented() {
-            // A.1 reads the ROOT .gitignore only. Git would also honor
-            // sub/.gitignore. Pinned so a change here is a deliberate one.
+            // ignore-fidelity (findings 19, 30): sub/.gitignore is honored,
+            // as git does. Flipped from the A.1 pin (root file only).
             let (dir, repo) = repo_with("", &["sub/keep.rs", "sub/local/scratch.txt"]);
             write(dir.path(), "sub/.gitignore", "local/\n");
             let paths: Vec<String> = state_paths(&repo).into_iter().map(|(p, _)| p).collect();
             assert!(
-                paths.contains(&"sub/local/scratch.txt".to_string()),
-                "nested .gitignore now honored; update this test and the docs: {paths:?}"
+                !paths.contains(&"sub/local/scratch.txt".to_string()),
+                "nested .gitignore not honored: {paths:?}"
             );
+            assert!(paths.contains(&"sub/keep.rs".to_string()), "{paths:?}");
+        }
+
+        /// Finding 30's shape: a results directory carrying its own
+        /// `.gitignore` of `*` plus `!.gitignore` is not staged.
+        #[test]
+        fn test_nested_star_gitignore_keeps_only_itself() {
+            let (dir, repo) = repo_with("", &["bench/run.py", "bench/results/r1.json"]);
+            write(dir.path(), "bench/results/.gitignore", "*\n!.gitignore\n");
+            let paths: Vec<String> = state_paths(&repo).into_iter().map(|(p, _)| p).collect();
+            assert!(!paths.iter().any(|p| p.ends_with("r1.json")), "{paths:?}");
+            assert!(
+                paths.contains(&"bench/results/.gitignore".to_string()),
+                "{paths:?}"
+            );
+            assert!(paths.contains(&"bench/run.py".to_string()), "{paths:?}");
         }
 
         // ── Rejected seals must not write objects (finding 17 probe) ──

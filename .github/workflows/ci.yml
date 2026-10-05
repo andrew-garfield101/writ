@@ -9,6 +9,17 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Runner pin (2026-10-04): Linux jobs use ubuntu-24.04, not ubuntu-latest.
+# ubuntu-latest moves to Ubuntu 26 starting 2026-10-19
+# (https://github.com/actions/runner-images/issues/14748). The Release workflow
+# builds the x86_64 Linux CLI natively, so the runner's glibc sets the binary's
+# floor (GLIBC_2.39 today); a silent image bump would raise it for every user.
+# Pinned in all four workflows for consistency. Revisit once Ubuntu 26 has a
+# full setup-python matrix and we decide on the glibc floor deliberately.
+#
+# macOS pin (2026-10-04): CI uses macos-14 to match release.yml, so tests run
+# on the same image the release binaries and wheels are built on.
+
 jobs:
   rust-tests:
     name: Rust Tests
@@ -16,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-14]
     steps:
       - uses: actions/checkout@v5
 
@@ -46,13 +57,51 @@ jobs:
         run: cargo clippy -p writ-core -p writ-cli --all-features -- -D warnings
         continue-on-error: true
 
+  # TODO(bri, B.1 bench-context): uncomment once bench/bench-context.sh lands.
+  # Gates context cost: default <= 32 KB, brief <= 2 KB, --budget 8192 <= 8 KB,
+  # latency <= 300 ms, release binary <= 13 MB. The script must exit non-zero on
+  # any budget regression. Adjust the path if B.1 settles elsewhere.
+  # bench-context:
+  #   name: Context Benchmark
+  #   needs: rust-tests
+  #   runs-on: ubuntu-24.04
+  #   steps:
+  #     - uses: actions/checkout@v5
+  #
+  #     - name: Install Rust toolchain
+  #       uses: dtolnay/rust-toolchain@stable
+  #
+  #     - name: Cache cargo registry & build
+  #       uses: actions/cache@v5
+  #       with:
+  #         path: |
+  #           ~/.cargo/registry
+  #           ~/.cargo/git
+  #           target
+  #         key: ${{ runner.os }}-bench-cargo-${{ hashFiles('**/Cargo.lock') }}
+  #         restore-keys: ${{ runner.os }}-bench-cargo-
+  #
+  #     - name: Build release CLI
+  #       run: cargo build --release -p writ-cli
+  #
+  #     - name: Run context benchmark and budget gate
+  #       run: bash bench/bench-context.sh
+  #
+  #     - name: Upload benchmark results
+  #       if: always()
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         name: bench-context
+  #         path: bench/context/results/
+  #         if-no-files-found: warn
+
   python-tests:
     name: Python Tests
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-24.04, macos-14]
         python-version: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v5

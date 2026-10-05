@@ -292,10 +292,14 @@ class TestFinishEdgeCases:
         path = git_writ_repo
         # Seal something but don't mark any spec done
         run_writ(["spec", "add", "--id", "wip", "--title", "WIP"], str(path))
-        run_writ(
+        # A real edit: init's generated files are sealed at init (880af38), so
+        # a seal with nothing changed fails (finding 20).
+        (path / "notes.md").write_text("work in progress\n")
+        sealed = run_writ(
             ["seal", "-s", "checkpoint", "--agent", "human-dev", "--spec", "wip"],
             str(path),
         )
+        assert "notes.md" in sealed.stdout, sealed.stdout
         result = run_writ(["finish", "--dry-run"], str(path))
         assert result.returncode == 0
         assert "nothing to commit" in result.stdout.lower()

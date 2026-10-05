@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use writ_core::agent::{AgentUpdate, TrustLevel};
 use writ_core::config::{self, GlobalConfig, ProjectConfig};
-use writ_core::context::{ContextFilter, ContextScope};
+use writ_core::context::{ContextFilter, ContextLimits, ContextScope};
 use writ_core::diff::LineOp;
 use writ_core::format;
 use writ_core::seal::{AgentIdentity, AgentType, ChangeType, TaskStatus, Verification};
@@ -351,6 +351,16 @@ enum Commands {
         /// Note: context defaults to "json" unlike other commands.
         #[arg(long)]
         format: Option<String>,
+
+        /// Max entries per path list (pending changes, working state, file
+        /// scope, agent ownership). Default 50. 0 means unlimited.
+        #[arg(long)]
+        max_files: Option<usize>,
+
+        /// Trim output until it fits this many bytes in the chosen format:
+        /// file lists first, then file scope, then recent seals down to 3.
+        #[arg(long)]
+        budget: Option<usize>,
     },
 
     /// Human-readable summary of all work done in this writ session.
@@ -1378,6 +1388,8 @@ fn main() {
             status,
             agent,
             format,
+            max_files,
+            budget,
         } => {
             let format = if format.is_none() && std::io::stdout().is_terminal() {
                 // No explicit --format and stdout is a terminal → human-readable
@@ -1385,7 +1397,10 @@ fn main() {
             } else {
                 resolve_format(format.as_deref(), &cwd, "json")
             };
-            cmd_context(&cwd, spec, for_agent, seal_limit, status, agent, &format)
+            let limits = ContextLimits::from_user(max_files, budget);
+            cmd_context(
+                &cwd, spec, for_agent, seal_limit, status, agent, &format, &limits,
+            )
         }
         Commands::Summary { format } => {
             let format = resolve_format(format.as_deref(), &cwd, "human");
@@ -3171,6 +3186,7 @@ fn cmd_context(
     status: Option<String>,
     agent: Option<String>,
     format: &str,
+    limits: &ContextLimits,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
 
@@ -3208,22 +3224,23 @@ fn cmd_context(
         workspace: ws,
     };
 
-    let ctx = repo.context(scope, seal_limit, &filter)?;
+    // Budget is measured in the format being printed; formats without a
+    // serializer (human, brief) are measured as compact JSON.
+    let measure_with = make_formatter(format, cwd);
+    let measure = |c: &writ_core::context::ContextOutput| -> writ_core::WritResult<usize> {
+        match &measure_with {
+            Some(f) => Ok(f.format_context(c)?.len()),
+            None => Ok(serde_json::to_string(c)?.len()),
+        }
+    };
+    let ctx = repo.context_limited(scope, seal_limit, &filter, limits, measure)?;
 
     match format {
         "brief" => {
+            let project_name = resolve_project_name(cwd);
             println!(
-                "scope:{} tracked:{} changes:{} seals:{}",
-                ctx.active_spec
-                    .as_ref()
-                    .map(|s| s.id.as_str())
-                    .unwrap_or("full"),
-                ctx.tracked_files,
-                ctx.pending_changes
-                    .as_ref()
-                    .map(|d| d.files_changed)
-                    .unwrap_or(0),
-                ctx.recent_seals.len(),
+                "{}",
+                format::format_brief_context(&ctx, project_name.as_deref())?
             );
         }
         "human" => {

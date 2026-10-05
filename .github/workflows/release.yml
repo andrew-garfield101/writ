@@ -10,6 +10,14 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+# Runner pin (2026-10-04): Linux jobs use ubuntu-24.04, not ubuntu-latest.
+# ubuntu-latest moves to Ubuntu 26 starting 2026-10-19
+# (https://github.com/actions/runner-images/issues/14748). The Release workflow
+# builds the x86_64 Linux CLI natively, so the runner's glibc sets the binary's
+# floor (GLIBC_2.39 today); a silent image bump would raise it for every user.
+# Pinned in all four workflows for consistency. Revisit once Ubuntu 26 has a
+# full setup-python matrix and we decide on the glibc floor deliberately.
+
 jobs:
   # ── Build Python wheels for PyPI ──────────────────────────────────────
   build-wheels:
@@ -20,10 +28,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             extra-args: "--features vendored-ssl"
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             extra-args: "--features vendored-ssl"
           - os: macos-14
@@ -43,10 +51,10 @@ jobs:
 
       - name: Setup QEMU
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Download CLI binary for this target
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: cli-${{ matrix.target }}
           path: cli-artifact
@@ -74,7 +82,7 @@ jobs:
           docker-options: ${{ matrix.docker-options || '' }}
 
       - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ matrix.target }}
           path: dist/*.whl
@@ -83,7 +91,7 @@ jobs:
   # ── Build sdist ───────────────────────────────────────────────────────
   build-sdist:
     name: Build sdist
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
@@ -94,7 +102,7 @@ jobs:
           args: --out dist -m crates/writ-py/Cargo.toml
 
       - name: Upload sdist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sdist
           path: dist/*.tar.gz
@@ -104,7 +112,7 @@ jobs:
   publish-pypi:
     name: Publish to PyPI
     needs: [build-wheels, build-sdist]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: pypi
       url: https://pypi.org/p/writ-vcs
@@ -112,14 +120,14 @@ jobs:
       id-token: write
     steps:
       - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: wheel-*
           path: dist
           merge-multiple: true
 
       - name: Download sdist artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: sdist
           path: dist
@@ -136,10 +144,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             artifact: writ
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             artifact: writ
             cross: true
@@ -189,7 +197,7 @@ jobs:
           fi
 
       - name: Upload CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-${{ matrix.target }}
           path: writ-${{ matrix.target }}.*
@@ -199,19 +207,19 @@ jobs:
   github-release:
     name: GitHub Release
     needs: [build-cli, publish-pypi]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
 
       - name: Download CLI artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: cli-*
           path: release-assets
           merge-multiple: true
 
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           generate_release_notes: true
           files: release-assets/*

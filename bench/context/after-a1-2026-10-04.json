@@ -1,0 +1,445 @@
+{
+  "schema": 1,
+  "label": "AFTER, A.1 landed (ctx-ignore sealed 998a9395eb39). Dev build 19:25 from working tree that ALSO contains Amis's in-progress, unsealed A.2 caps/budget. The 'uncapped' row (--max-files 0) is the A.1-only number; capped rows include partial A.2.",
+  "captured_at": "2026-10-04T23:27:34+00:00",
+  "host": "Darwin arm64",
+  "runs": 7,
+  "binary": {
+    "path": "/Users/agarfield/git/writ/target/release/writ",
+    "resolved": "/Users/agarfield/git/writ/target/release/writ",
+    "version": "writ 0.2.0",
+    "bytes": 11994208
+  },
+  "budgets": {
+    "bytes": {
+      "default": 32768,
+      "brief": 2048,
+      "budget-8192": 8192
+    },
+    "latency_ms": 300,
+    "binary_bytes": 13000000
+  },
+  "fixture": {
+    "build": {
+      "path": "/private/var/folders/yt/9hp9qxwx2jn98g5_db1s55fr0000gn/T/writ-bench-nguds7hd/fixture",
+      "seed": 20261004,
+      "tracked_files": 1000,
+      "unsealed_modified": 1000,
+      "ignored_files": {
+        ".venv": 1500,
+        "node_modules": 1500,
+        ".venv311": 1000,
+        "build": 1000
+      },
+      "gitignore_added_after_init": [
+        "build/"
+      ],
+      "specs": [
+        "s-alpha",
+        "s-beta",
+        "s-gamma"
+      ],
+      "agents": [
+        "agent-a",
+        "agent-b"
+      ],
+      "seals": 6,
+      "build_seconds": 24.96
+    },
+    "path": "/var/folders/yt/9hp9qxwx2jn98g5_db1s55fr0000gn/T/writ-bench-nguds7hd/fixture",
+    "writ_dir_bytes": 1753292,
+    "cases": {
+      "default": {
+        "argv": [],
+        "supported": true,
+        "bytes": 13355,
+        "approx_tokens": 3338,
+        "ms_median": 126.4,
+        "ms_min": 122.1,
+        "ms_max": 131.3,
+        "leaked_paths": {
+          ".venv/": 0,
+          "node_modules/": 0,
+          ".venv311/": 0,
+          "build/": 0
+        }
+      },
+      "json": {
+        "argv": [
+          "--format",
+          "json"
+        ],
+        "supported": true,
+        "bytes": 22067,
+        "approx_tokens": 5516,
+        "ms_median": 117.7,
+        "ms_min": 116.8,
+        "ms_max": 119.6,
+        "leaked_paths": {
+          ".venv/": 0,
+          "node_modules/": 0,
+          ".venv311/": 0,
+          "build/": 0
+        }
+      },
+      "json-compact": {
+        "argv": [
+          "--format",
+          "json-compact"
+        ],
+        "supported": true,
+        "bytes": 15885,
+        "approx_tokens": 3971,
+        "ms_median": 118.2,
+        "ms_min": 116.4,
+        "ms_max": 126.1,
+        "leaked_paths": {
+          ".venv/": 0,
+          "node_modules/": 0,
+          ".venv311/": 0,
+          "build/": 0
+        }
+      },
+      "toon": {
+        "argv": [
+          "--format",
+          "toon"
+        ],
+        "supported": true,
+        "bytes": 13355,
+        "approx_tokens": 3338,
+        "ms_median": 118.9,
+        "ms_min": 116.5,
+        "ms_max": 121.2,
+        "leaked_paths": {
+          ".venv/": 0,
+          "node_modules/": 0,
+          ".venv311/": 0,
+          "build/": 0
+        }
+      },
+      "human": {
+        "argv": [
+          "--format",
+          "human"
+        ],
+        "supported": true,
+        "bytes": 1340,
+        "approx_tokens": 335,
+        "ms_median": 109.3,
+        "ms_min": 106.3,
+        "ms_max": 112.3,
+        "leaked_paths": {
+          ".venv/": 0,
+          "node_modules/": 0,
+          ".venv311/": 0,
+          "build/": 0
+        }
+      },
+      "brief": {
+        "argv": [
+          "--format",
+          "brief"
+        ],
+        "supported": true,
+        "bytes": 45,
+        "approx_tokens": 11,
+        "ms_median": 110.0,
+        "ms_min": 107.7,
+        "ms_max": 120.0,
+        "leaked_paths": {
+          ".venv/": 0,
+          "node_modules/": 0,
+          ".venv311/": 0,
+          "build/": 0
+        }
+      },
+      "spec": {
+        "argv": [
+          "--spec",
+          "s-alpha"
+        ],
+        "supported": true,
+        "bytes": 8380,
+        "approx_tokens": 2095,
+        "ms_median": 116.1,
+        "ms_min": 114.9,
+        "ms_max": 118.9,
+        "leaked_paths": {
+          ".venv/": 0,
+          "node_modules/": 0,
+          ".venv311/": 0,
+          "build/": 0
+        }
+      },
+      "for-agent": {
+        "argv": [
+          "--for-agent",
+          "agent-a"
+        ],
+        "supported": true,
+        "bytes": 11501,
+        "approx_tokens": 2875,
+        "ms_median": 121.7,
+        "ms_min": 118.0,
+        "ms_max": 130.3,
+        "leaked_paths": {
+          ".venv/": 0,
+          "node_modules/": 0,
+          ".venv311/": 0,
+          "build/": 0
+        }
+      },
+      "budget-8192": {
+        "argv": [
+          "--budget",
+          "8192"
+        ],
+        "supported": true,
+        "bytes": 8040,
+        "approx_tokens": 2010,
+        "ms_median": 124.9,
+        "ms_min": 122.2,
+        "ms_max": 135.2,
+        "leaked_paths": {
+          ".venv/": 0,
+          "node_modules/": 0,
+          ".venv311/": 0,
+          "build/": 0
+        }
+      },
+      "max-files-50": {
+        "argv": [
+          "--max-files",
+          "50"
+        ],
+        "supported": true,
+        "bytes": 13355,
+        "approx_tokens": 3338,
+        "ms_median": 123.1,
+        "ms_min": 119.2,
+        "ms_max": 128.3,
+        "leaked_paths": {
+          ".venv/": 0,
+          "node_modules/": 0,
+          ".venv311/": 0,
+          "build/": 0
+        }
+      },
+      "uncapped": {
+        "argv": [
+          "--max-files",
+          "0"
+        ],
+        "supported": true,
+        "bytes": 98225,
+        "approx_tokens": 24556,
+        "ms_median": 125.2,
+        "ms_min": 123.9,
+        "ms_max": 127.8,
+        "leaked_paths": {
+          ".venv/": 0,
+          "node_modules/": 0,
+          ".venv311/": 0,
+          "build/": 0
+        }
+      }
+    }
+  },
+  "repos": [
+    {
+      "path": "/Users/agarfield/git/writ",
+      "writ_dir_bytes": 66751581,
+      "cases": {
+        "default": {
+          "argv": [],
+          "supported": true,
+          "bytes": 11331,
+          "approx_tokens": 2832,
+          "ms_median": 810.7,
+          "ms_min": 799.9,
+          "ms_max": 831.4,
+          "leaked_paths": {
+            ".venv311/": 0,
+            ".venv/": 0,
+            "target/": 0,
+            "docs/": 0,
+            "testing/": 0,
+            "scripts/": 0,
+            "node_modules/": 0
+          }
+        },
+        "json": {
+          "argv": [
+            "--format",
+            "json"
+          ],
+          "supported": true,
+          "bytes": 14727,
+          "approx_tokens": 3681,
+          "ms_median": 806.9,
+          "ms_min": 786.7,
+          "ms_max": 1087.6,
+          "leaked_paths": {
+            ".venv311/": 0,
+            ".venv/": 0,
+            "target/": 0,
+            "docs/": 0,
+            "testing/": 0,
+            "scripts/": 0,
+            "node_modules/": 0
+          }
+        },
+        "json-compact": {
+          "argv": [
+            "--format",
+            "json-compact"
+          ],
+          "supported": true,
+          "bytes": 11488,
+          "approx_tokens": 2872,
+          "ms_median": 809.8,
+          "ms_min": 798.6,
+          "ms_max": 827.9,
+          "leaked_paths": {
+            ".venv311/": 0,
+            ".venv/": 0,
+            "target/": 0,
+            "docs/": 0,
+            "testing/": 0,
+            "scripts/": 0,
+            "node_modules/": 0
+          }
+        },
+        "toon": {
+          "argv": [
+            "--format",
+            "toon"
+          ],
+          "supported": true,
+          "bytes": 11331,
+          "approx_tokens": 2832,
+          "ms_median": 823.3,
+          "ms_min": 807.6,
+          "ms_max": 852.2,
+          "leaked_paths": {
+            ".venv311/": 0,
+            ".venv/": 0,
+            "target/": 0,
+            "docs/": 0,
+            "testing/": 0,
+            "scripts/": 0,
+            "node_modules/": 0
+          }
+        },
+        "human": {
+          "argv": [
+            "--format",
+            "human"
+          ],
+          "supported": true,
+          "bytes": 2475,
+          "approx_tokens": 618,
+          "ms_median": 821.5,
+          "ms_min": 811.9,
+          "ms_max": 841.0,
+          "leaked_paths": {
+            ".venv311/": 0,
+            ".venv/": 0,
+            "target/": 0,
+            "docs/": 0,
+            "testing/": 0,
+            "scripts/": 0,
+            "node_modules/": 0
+          }
+        },
+        "brief": {
+          "argv": [
+            "--format",
+            "brief"
+          ],
+          "supported": true,
+          "bytes": 42,
+          "approx_tokens": 10,
+          "ms_median": 806.9,
+          "ms_min": 796.5,
+          "ms_max": 827.3,
+          "leaked_paths": {
+            ".venv311/": 0,
+            ".venv/": 0,
+            "target/": 0,
+            "docs/": 0,
+            "testing/": 0,
+            "scripts/": 0,
+            "node_modules/": 0
+          }
+        },
+        "budget-8192": {
+          "argv": [
+            "--budget",
+            "8192"
+          ],
+          "supported": true,
+          "bytes": 8167,
+          "approx_tokens": 2041,
+          "ms_median": 825.9,
+          "ms_min": 812.4,
+          "ms_max": 843.0,
+          "leaked_paths": {
+            ".venv311/": 0,
+            ".venv/": 0,
+            "target/": 0,
+            "docs/": 0,
+            "testing/": 0,
+            "scripts/": 0,
+            "node_modules/": 0
+          }
+        },
+        "max-files-50": {
+          "argv": [
+            "--max-files",
+            "50"
+          ],
+          "supported": true,
+          "bytes": 11331,
+          "approx_tokens": 2832,
+          "ms_median": 819.4,
+          "ms_min": 818.1,
+          "ms_max": 832.7,
+          "leaked_paths": {
+            ".venv311/": 0,
+            ".venv/": 0,
+            "target/": 0,
+            "docs/": 0,
+            "testing/": 0,
+            "scripts/": 0,
+            "node_modules/": 0
+          }
+        },
+        "uncapped": {
+          "argv": [
+            "--max-files",
+            "0"
+          ],
+          "supported": true,
+          "bytes": 19175,
+          "approx_tokens": 4793,
+          "ms_median": 827.8,
+          "ms_min": 814.2,
+          "ms_max": 841.3,
+          "leaked_paths": {
+            ".venv311/": 0,
+            ".venv/": 0,
+            "target/": 0,
+            "docs/": 0,
+            "testing/": 0,
+            "scripts/": 0,
+            "node_modules/": 0
+          }
+        }
+      }
+    }
+  ],
+  "budget_failures": [],
+  "passed": true
+}

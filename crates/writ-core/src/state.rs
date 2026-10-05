@@ -95,8 +95,13 @@ pub fn compute_state(repo_root: &Path, index: &Index, rules: &IgnoreRules) -> Wo
     for entry in WalkDir::new(repo_root)
         .into_iter()
         .filter_entry(|e| {
-            let name = e.file_name().to_string_lossy();
-            !rules.is_dir_ignored(&name)
+            if e.depth() == 0 || !e.file_type().is_dir() {
+                return true;
+            }
+            match e.path().strip_prefix(repo_root) {
+                Ok(rel) => !rules.is_dir_ignored(&rel_path_string(rel)),
+                Err(_) => true,
+            }
         })
         .filter_map(|e| e.ok())
     {
@@ -106,7 +111,7 @@ pub fn compute_state(repo_root: &Path, index: &Index, rules: &IgnoreRules) -> Wo
 
         let full_path = entry.path();
         let rel_path = match full_path.strip_prefix(repo_root) {
-            Ok(p) => p.to_string_lossy().to_string(),
+            Ok(p) => rel_path_string(p),
             Err(_) => continue,
         };
 
@@ -146,8 +151,14 @@ pub fn compute_state(repo_root: &Path, index: &Index, rules: &IgnoreRules) -> Wo
         let _ = size; // Will be used when we store to index
     }
 
-    // Check for deleted files (in index but not on disk)
+    // Check for deleted files (in index but not on disk). Indexed paths that
+    // are now ignored were skipped by the walk on purpose; they are not deletions.
+    let mut tracked_count = 0;
     for tracked_path in index.entries.keys() {
+        if rules.is_path_ignored(tracked_path) {
+            continue;
+        }
+        tracked_count += 1;
         if !seen.contains_key(tracked_path.as_str()) {
             changes.push(FileState {
                 path: tracked_path.clone(),
@@ -162,8 +173,16 @@ pub fn compute_state(repo_root: &Path, index: &Index, rules: &IgnoreRules) -> Wo
 
     WorkingState {
         changes,
-        tracked_count: index.entries.len(),
+        tracked_count,
     }
+}
+
+/// Repo-relative path as a `/`-separated string on every platform.
+fn rel_path_string(rel: &Path) -> String {
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]

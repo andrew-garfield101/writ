@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use pyo3::prelude::*;
 
-use writ_core::context::{ContextFilter, ContextScope};
+use writ_core::context::{ContextFilter, ContextLimits, ContextOutput, ContextScope};
 use writ_core::seal::{AgentIdentity, TaskStatus, Verification};
 use writ_core::spec::{Spec, SpecUpdate};
 
@@ -545,7 +545,16 @@ impl PyRepository {
     /// - `"json"`: returns a pretty-printed JSON string
     /// - `"json-compact"`: returns a minified JSON string
     /// - `"toon"`: returns a TOON string (20-33% fewer bytes than JSON)
-    #[pyo3(signature = (spec=None, seal_limit=10, status=None, agent=None, for_agent=None, format="dict"))]
+    /// - `"brief"`: returns the task-start brief view as a TOON string
+    /// - `"brief-dict"`: returns the brief view as a dict
+    ///
+    /// Size controls:
+    /// - `max_files`: cap for every path list (default 50, `0` = unlimited).
+    ///   Truncated lists carry `truncated: True` and `omitted: N`.
+    /// - `budget`: trim until the output fits this many bytes in `format`
+    ///   (compact JSON for `"dict"`).
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (spec=None, seal_limit=10, status=None, agent=None, for_agent=None, format="dict", max_files=None, budget=None))]
     fn context(
         &self,
         py: Python,
@@ -555,6 +564,8 @@ impl PyRepository {
         agent: Option<String>,
         for_agent: Option<String>,
         format: &str,
+        max_files: Option<usize>,
+        budget: Option<usize>,
     ) -> PyResult<PyObject> {
         let scope = if let Some(id) = spec {
             ContextScope::Spec(id)
@@ -579,9 +590,17 @@ impl PyRepository {
             agent,
             workspace: None,
         };
+        let limits = ContextLimits::from_user(max_files, budget);
+        let measure_with = writ_core::format::formatter_for(format);
+        let measure = |c: &ContextOutput| -> writ_core::WritResult<usize> {
+            match &measure_with {
+                Some(f) => Ok(f.format_context(c)?.len()),
+                None => Ok(serde_json::to_string(c)?.len()),
+            }
+        };
         let ctx = self
             .inner
-            .context(scope, seal_limit, &filter)
+            .context_limited(scope, seal_limit, &filter, &limits, measure)
             .map_err(writ_err)?;
 
         match format {
@@ -594,8 +613,17 @@ impl PyRepository {
                     .map_err(|e| WritError::new_err(e.to_string()))?;
                 Ok(pyo3::types::PyString::new(py, &output).into_any().unbind())
             }
+            "brief" => {
+                let output = writ_core::format::format_brief_context(&ctx, None)
+                    .map_err(|e| WritError::new_err(e.to_string()))?;
+                Ok(pyo3::types::PyString::new(py, &output).into_any().unbind())
+            }
+            "brief-dict" => {
+                let brief = writ_core::context::BriefContext::from_context(&ctx);
+                to_pydict(py, &brief)
+            }
             other => Err(WritError::new_err(format!(
-                "unknown format: '{other}' (expected 'dict', 'json', 'json-compact', or 'toon')"
+                "unknown format: '{other}' (expected 'dict', 'json', 'json-compact', 'toon', 'brief', or 'brief-dict')"
             ))),
         }
     }

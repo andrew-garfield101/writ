@@ -36,7 +36,7 @@ class TestAgent:
     def test_agent_context_manager(self, repo_with_file):
         with Agent("test-agent", path=repo_with_file) as agent:
             ctx = agent.context
-            assert ctx["writ_version"] == "0.1.0"
+            assert ctx["writ_version"] == writ.__version__
             assert "recent_seals" in ctx
 
     def test_agent_open_explicit(self, repo_with_file):

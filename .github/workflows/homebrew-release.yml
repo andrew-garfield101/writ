@@ -15,10 +15,18 @@ on:
         required: true
         type: string
 
+# Runner pin (2026-10-04): Linux jobs use ubuntu-24.04, not ubuntu-latest.
+# ubuntu-latest moves to Ubuntu 26 starting 2026-10-19
+# (https://github.com/actions/runner-images/issues/14748). The Release workflow
+# builds the x86_64 Linux CLI natively, so the runner's glibc sets the binary's
+# floor (GLIBC_2.39 today); a silent image bump would raise it for every user.
+# Pinned in all four workflows for consistency. Revisit once Ubuntu 26 has a
+# full setup-python matrix and we decide on the glibc floor deliberately.
+
 jobs:
   update-tap:
     name: Update Homebrew formula
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     steps:
       - uses: actions/checkout@v5

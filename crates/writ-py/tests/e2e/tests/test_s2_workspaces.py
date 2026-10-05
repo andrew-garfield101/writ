@@ -106,6 +106,13 @@ class TestS2WorkspaceIsolation:
         if (ws_b / "shared.py").exists():
             assert (ws_b / "shared.py").read_text() == "original\n"
 
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "finding 20, spec workspace-seal: edits under .writ/ws/<name>/ are "
+            "ignored, so a seal from a workspace dir captures nothing"
+        ),
+    )
     def test_seals_tagged_with_workspace(
         self, writ_project: Path, writ_bin: str,
     ):

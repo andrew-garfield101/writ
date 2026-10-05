@@ -4,12 +4,21 @@
 //! combining spec details, recent seal history, working state, and
 //! pending changes into one token-efficient blob.
 
+use std::cmp::{Ordering, Reverse};
+use std::collections::{HashMap, HashSet};
+use std::time::SystemTime;
+
 use serde::{Deserialize, Serialize};
 
 use crate::diff::DiffOutput;
 use crate::seal::{Seal, TaskStatus, Verification};
 use crate::spec::{Spec, SpecStatus};
 use crate::state::{FileStatus, WorkingState};
+use crate::WritResult;
+
+/// Version stamped into every context dump (`writ_version`). Comes from the
+/// workspace `Cargo.toml`, so it can never drift from the released binary.
+pub const WRIT_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Scope of context to include.
 #[derive(Debug, Clone)]
@@ -129,13 +138,30 @@ impl SealSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkingStateSummary {
     pub clean: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub new_files: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub modified_files: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deleted_files: Vec<String>,
     pub tracked_count: usize,
+    /// True when the file lists above were capped. Counts stay exact in `counts`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// Number of paths dropped from the lists above.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub omitted: usize,
+    /// Exact per-status counts, present only when the lists were truncated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counts: Option<ChangeCounts>,
+}
+
+/// Exact per-status change counts for a truncated working state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeCounts {
+    pub new: usize,
+    pub modified: usize,
+    pub deleted: usize,
 }
 
 impl WorkingStateSummary {
@@ -162,6 +188,9 @@ impl WorkingStateSummary {
                 .map(|f| f.path.clone())
                 .collect(),
             tracked_count: state.tracked_count,
+            truncated: false,
+            omitted: 0,
+            counts: None,
         }
     }
 }
@@ -173,6 +202,12 @@ pub struct DiffSummary {
     pub total_additions: usize,
     pub total_deletions: usize,
     pub files: Vec<FileDiffSummary>,
+    /// True when `files` was capped. The totals above stay exact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub truncated: bool,
+    /// Number of file entries dropped from `files`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub omitted: usize,
 }
 
 impl DiffSummary {
@@ -192,6 +227,8 @@ impl DiffSummary {
                     deletions: f.deletions,
                 })
                 .collect(),
+            truncated: false,
+            omitted: 0,
         }
     }
 }
@@ -324,6 +361,9 @@ pub struct AgentActivity {
     pub agent_id: String,
     /// Files this agent most recently sealed (provenance — who last touched each file).
     pub files_owned: Vec<String>,
+    /// Number of paths dropped from `files_owned` by the file cap.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub files_owned_omitted: usize,
     /// Number of seals by this agent in the seal history.
     pub seal_count: usize,
     /// Summary of their most recent seal.
@@ -394,8 +434,16 @@ pub struct ContextOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seal_nudge: Option<SealNudge>,
 
-    /// Files in scope.
+    /// Files in scope (capped; see `file_scope_truncated`).
     pub file_scope: Vec<String>,
+
+    /// True when `file_scope` was capped. `tracked_files` stays exact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub file_scope_truncated: bool,
+
+    /// Number of paths dropped from `file_scope`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub file_scope_omitted: usize,
 
     /// Total tracked file count.
     pub tracked_files: usize,
@@ -481,6 +529,11 @@ pub struct ContextOutput {
 
     /// Available writ operations for agent discoverability.
     pub available_operations: Vec<String>,
+
+    /// True when `--budget` was requested and the output still exceeds it
+    /// after every trimmable section was reduced to its floor.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub budget_exceeded: bool,
 }
 
 /// Read-only summary of a spec from another workspace that our specs depend on.
@@ -620,7 +673,7 @@ pub struct ChainIntegritySummary {
 /// Tells the agent *what to do next* instead of just *what is*.
 /// Priority logic selects the single most important action:
 /// blocking dependency > convergence needed > high risk > unsealed changes > session complete.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RecommendedAction {
     /// Machine-readable action type (e.g. "converge", "seal", "wait_for_dependency").
     pub action: String,
@@ -628,6 +681,468 @@ pub struct RecommendedAction {
     pub message: String,
     /// Priority level: "high", "medium", or "low".
     pub priority: String,
+}
+
+// ── Caps and budget (ctx-budget) ─────────────────────────────────────
+
+/// Default cap for every path list in context output.
+pub const DEFAULT_MAX_FILES: usize = 50;
+
+/// `--budget` never trims `recent_seals` below this many entries.
+pub const BUDGET_SEAL_FLOOR: usize = 3;
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
+}
+
+/// Size limits applied to a context dump after it is assembled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextLimits {
+    /// Max entries per path list. `None` means unlimited (`--max-files 0`).
+    pub max_files: Option<usize>,
+    /// Target serialized size in bytes. `None` means no budget.
+    pub budget: Option<usize>,
+}
+
+impl Default for ContextLimits {
+    fn default() -> Self {
+        ContextLimits {
+            max_files: Some(DEFAULT_MAX_FILES),
+            budget: None,
+        }
+    }
+}
+
+impl ContextLimits {
+    /// Build limits from user input where `0` means unlimited.
+    pub fn from_user(max_files: Option<usize>, budget: Option<usize>) -> Self {
+        let max_files = match max_files {
+            None => Some(DEFAULT_MAX_FILES),
+            Some(0) => None,
+            Some(n) => Some(n),
+        };
+        ContextLimits { max_files, budget }
+    }
+}
+
+/// Ordering inputs for path lists: which paths matter most to the reader.
+///
+/// Pending/working-state paths: spec-touched first, then most recently
+/// modified on disk. File scope: spec-touched first, then most recently sealed.
+/// Path name breaks ties so output is deterministic.
+#[derive(Debug, Clone, Default)]
+pub struct FilePriority {
+    /// Exact paths touched by (or declared for) the scoped spec(s).
+    pub spec_files: HashSet<String>,
+    /// Declared directory scopes (entries ending in `/`).
+    pub spec_dirs: Vec<String>,
+    /// Last modification time of changed files on disk.
+    pub modified_at: HashMap<String, SystemTime>,
+    /// 0 = most recently sealed path.
+    pub sealed_rank: HashMap<String, usize>,
+}
+
+impl FilePriority {
+    /// Is this path part of the scoped spec's file set?
+    pub fn is_spec_file(&self, path: &str) -> bool {
+        self.spec_files.contains(path) || self.spec_dirs.iter().any(|d| path.starts_with(d))
+    }
+
+    fn change_order(&self, a: &str, b: &str) -> Ordering {
+        let key = |p: &str| {
+            (
+                !self.is_spec_file(p),
+                Reverse(self.modified_at.get(p).copied()),
+            )
+        };
+        key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+    }
+
+    fn scope_order(&self, a: &str, b: &str) -> Ordering {
+        let key = |p: &str| {
+            (
+                !self.is_spec_file(p),
+                self.sealed_rank.get(p).copied().unwrap_or(usize::MAX),
+            )
+        };
+        key(a).cmp(&key(b)).then_with(|| a.cmp(b))
+    }
+}
+
+impl DiffSummary {
+    fn sort_by_priority(&mut self, prio: &FilePriority) {
+        self.files
+            .sort_by(|a, b| prio.change_order(&a.path, &b.path));
+    }
+
+    /// Keep at most `max` file entries. Totals are never touched.
+    fn truncate_files(&mut self, max: usize) {
+        if self.files.len() > max {
+            self.omitted += self.files.len() - max;
+            self.files.truncate(max);
+            self.truncated = true;
+        }
+    }
+}
+
+impl WorkingStateSummary {
+    fn path_count(&self) -> usize {
+        self.new_files.len() + self.modified_files.len() + self.deleted_files.len()
+    }
+
+    fn sort_by_priority(&mut self, prio: &FilePriority) {
+        for list in [
+            &mut self.new_files,
+            &mut self.modified_files,
+            &mut self.deleted_files,
+        ] {
+            list.sort_by(|a, b| prio.change_order(a, b));
+        }
+    }
+
+    /// Keep the `max` highest-priority paths across all three lists.
+    fn truncate_files(&mut self, max: usize, prio: &FilePriority) {
+        let total = self.path_count();
+        if total <= max {
+            return;
+        }
+        if self.counts.is_none() {
+            self.counts = Some(ChangeCounts {
+                new: self.new_files.len(),
+                modified: self.modified_files.len(),
+                deleted: self.deleted_files.len(),
+            });
+        }
+        let mut all: Vec<(String, FileStatus)> = Vec::with_capacity(total);
+        all.extend(self.new_files.drain(..).map(|p| (p, FileStatus::New)));
+        all.extend(
+            self.modified_files
+                .drain(..)
+                .map(|p| (p, FileStatus::Modified)),
+        );
+        all.extend(
+            self.deleted_files
+                .drain(..)
+                .map(|p| (p, FileStatus::Deleted)),
+        );
+        all.sort_by(|a, b| prio.change_order(&a.0, &b.0));
+        all.truncate(max);
+        for (path, status) in all {
+            match status {
+                FileStatus::New => self.new_files.push(path),
+                FileStatus::Modified => self.modified_files.push(path),
+                FileStatus::Deleted => self.deleted_files.push(path),
+            }
+        }
+        self.omitted += total - max;
+        self.truncated = true;
+    }
+}
+
+impl ContextOutput {
+    /// Order every path list by priority and cap it at `max_files`.
+    ///
+    /// Lists are ordered even when unlimited so a later budget trim always
+    /// drops the least relevant paths first.
+    pub fn apply_file_cap(&mut self, max_files: Option<usize>, prio: &FilePriority) {
+        if let Some(pc) = self.pending_changes.as_mut() {
+            pc.sort_by_priority(prio);
+        }
+        self.working_state.sort_by_priority(prio);
+        self.file_scope.sort_by(|a, b| prio.scope_order(a, b));
+        for activity in &mut self.agent_activity {
+            activity.files_owned.sort_by(|a, b| prio.scope_order(a, b));
+        }
+        if let Some(max) = max_files {
+            self.truncate_change_lists(max, prio);
+            self.truncate_file_scope(max);
+        }
+    }
+
+    /// Cap pending changes, working state, and per-agent ownership lists.
+    fn truncate_change_lists(&mut self, max: usize, prio: &FilePriority) {
+        if let Some(pc) = self.pending_changes.as_mut() {
+            pc.truncate_files(max);
+        }
+        self.working_state.truncate_files(max, prio);
+        for activity in &mut self.agent_activity {
+            if activity.files_owned.len() > max {
+                activity.files_owned_omitted += activity.files_owned.len() - max;
+                activity.files_owned.truncate(max);
+            }
+        }
+    }
+
+    fn change_list_len(&self) -> usize {
+        let pending = self.pending_changes.as_ref().map_or(0, |pc| pc.files.len());
+        let owned = self
+            .agent_activity
+            .iter()
+            .map(|a| a.files_owned.len())
+            .max()
+            .unwrap_or(0);
+        pending.max(self.working_state.path_count()).max(owned)
+    }
+
+    fn truncate_file_scope(&mut self, max: usize) {
+        if self.file_scope.len() > max {
+            self.file_scope_omitted += self.file_scope.len() - max;
+            self.file_scope.truncate(max);
+            self.file_scope_truncated = true;
+        }
+    }
+
+    /// Trim progressively until `measure(self) <= budget`.
+    ///
+    /// Order: change file lists (halving to zero), then `file_scope` (halving
+    /// to zero), then `recent_seals` down to [`BUDGET_SEAL_FLOOR`], then
+    /// `available_operations` (dropped whole). Never
+    /// touches `all_specs`, `recommended_action`, `integration_risk`, or
+    /// `chain_integrity`. Sets `budget_exceeded` if the floor still does not fit.
+    /// Call [`ContextOutput::apply_file_cap`] first so lists are priority-ordered.
+    pub fn fit_to_budget<F>(
+        &mut self,
+        budget: usize,
+        prio: &FilePriority,
+        measure: F,
+    ) -> WritResult<()>
+    where
+        F: Fn(&ContextOutput) -> WritResult<usize>,
+    {
+        if measure(self)? <= budget {
+            return Ok(());
+        }
+        let mut n = self.change_list_len();
+        while n > 0 {
+            n /= 2;
+            self.truncate_change_lists(n, prio);
+            if measure(self)? <= budget {
+                return Ok(());
+            }
+        }
+        let mut n = self.file_scope.len();
+        while n > 0 {
+            n /= 2;
+            self.truncate_file_scope(n);
+            if measure(self)? <= budget {
+                return Ok(());
+            }
+        }
+        while self.recent_seals.len() > BUDGET_SEAL_FLOOR {
+            self.recent_seals.pop();
+            if measure(self)? <= budget {
+                return Ok(());
+            }
+        }
+        if !self.available_operations.is_empty() {
+            self.available_operations.clear();
+            if measure(self)? <= budget {
+                return Ok(());
+            }
+        }
+        self.budget_exceeded = true;
+        Ok(())
+    }
+}
+
+// ── Brief view (ctx-brief) ───────────────────────────────────────────
+
+/// Seals shown in the brief view.
+pub const BRIEF_SEAL_COUNT: usize = 3;
+/// Max active specs listed in the brief view.
+pub const BRIEF_SPEC_CAP: usize = 20;
+/// Max characters of a seal summary in the brief view.
+pub const BRIEF_SUMMARY_CHARS: usize = 100;
+
+/// One spec row in the brief view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BriefSpec {
+    pub id: String,
+    pub slug: String,
+    pub status: String,
+    /// Claiming agent, empty when unclaimed (kept as a string so TOON
+    /// renders the spec list as one table).
+    pub agent: String,
+    pub seals: usize,
+}
+
+/// One seal row in the brief view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BriefSeal {
+    pub id: String,
+    pub agent: String,
+    pub summary: String,
+    pub at: String,
+}
+
+/// Exact pending-change counts in the brief view.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct BriefPending {
+    pub files: usize,
+    pub new: usize,
+    pub modified: usize,
+    pub deleted: usize,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
+/// Integration risk without the factor list.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BriefRisk {
+    pub level: String,
+    pub score: u32,
+}
+
+/// The task-start view: enough to choose a spec and act, nothing per-file.
+///
+/// Built from a full [`ContextOutput`], so it reflects the same scope. Size
+/// grows with spec count only; file and seal counts do not affect it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BriefContext {
+    /// `full`, or the scoped spec id.
+    pub scope: String,
+    pub tracked: usize,
+    /// Open specs (not complete), capped at [`BRIEF_SPEC_CAP`]. In spec
+    /// scope, the scoped spec whatever its status.
+    pub specs: Vec<BriefSpec>,
+    /// Open specs beyond the cap.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub specs_omitted: usize,
+    /// Completed specs, counted rather than listed.
+    #[serde(default)]
+    pub specs_complete: usize,
+    pub seals: Vec<BriefSeal>,
+    pub pending: BriefPending,
+    pub risk: BriefRisk,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<RecommendedAction>,
+    /// Chain verification result; absent when no seals are secured yet.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chain_ok: Option<bool>,
+}
+
+impl BriefContext {
+    pub fn from_context(ctx: &ContextOutput) -> Self {
+        let (specs, specs_omitted, specs_complete) = brief_specs(ctx);
+        BriefContext {
+            scope: ctx
+                .active_spec
+                .as_ref()
+                .map_or_else(|| "full".to_string(), |s| s.id.clone()),
+            tracked: ctx.tracked_files,
+            specs,
+            specs_omitted,
+            specs_complete,
+            seals: ctx
+                .recent_seals
+                .iter()
+                .take(BRIEF_SEAL_COUNT)
+                .map(brief_seal)
+                .collect(),
+            pending: brief_pending(ctx),
+            risk: BriefRisk {
+                level: ctx.integration_risk.level.clone(),
+                score: ctx.integration_risk.score,
+            },
+            next: ctx.recommended_action.clone(),
+            chain_ok: ctx.chain_integrity.as_ref().map(|c| c.valid),
+        }
+    }
+}
+
+/// Open specs (capped), omitted count, and completed count.
+///
+/// Full and agent scope list every non-complete spec (pending, in-progress,
+/// blocked) so brief stays bounded as completed specs accumulate. Spec scope
+/// always shows the scoped spec.
+fn brief_specs(ctx: &ContextOutput) -> (Vec<BriefSpec>, usize, usize) {
+    let Some(all) = ctx.all_specs.as_deref() else {
+        let scoped = ctx.active_spec.iter().map(brief_spec).collect();
+        return (scoped, 0, 0);
+    };
+    let complete = all
+        .iter()
+        .filter(|s| s.status == SpecStatus::Complete)
+        .count();
+    let open: Vec<&Spec> = all
+        .iter()
+        .filter(|s| s.status != SpecStatus::Complete)
+        .collect();
+    let omitted = open.len().saturating_sub(BRIEF_SPEC_CAP);
+    let listed = open
+        .into_iter()
+        .take(BRIEF_SPEC_CAP)
+        .map(brief_spec)
+        .collect();
+    (listed, omitted, complete)
+}
+
+fn brief_spec(spec: &Spec) -> BriefSpec {
+    let status = match spec.status {
+        SpecStatus::Pending => "pending",
+        SpecStatus::InProgress => "in-progress",
+        SpecStatus::Complete => "complete",
+        SpecStatus::Blocked => "blocked",
+    };
+    BriefSpec {
+        id: spec.id.clone(),
+        slug: spec.slug.clone(),
+        status: status.to_string(),
+        agent: spec.claimed_by.clone().unwrap_or_default(),
+        seals: spec.sealed_by.len(),
+    }
+}
+
+fn brief_seal(seal: &SealSummary) -> BriefSeal {
+    BriefSeal {
+        id: seal.id.clone(),
+        agent: seal.agent.clone(),
+        summary: truncate_chars(&seal.summary, BRIEF_SUMMARY_CHARS),
+        at: compact_timestamp(&seal.timestamp),
+    }
+}
+
+/// RFC 3339 to whole-second UTC (`2026-10-04T23:38:04Z`); unparsable input
+/// passes through unchanged.
+fn compact_timestamp(ts: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|t| {
+            t.with_timezone(&chrono::Utc)
+                .format("%Y-%m-%dT%H:%M:%SZ")
+                .to_string()
+        })
+        .unwrap_or_else(|_| ts.to_string())
+}
+
+fn brief_pending(ctx: &ContextOutput) -> BriefPending {
+    let ws = &ctx.working_state;
+    let counts = ws.counts.unwrap_or(ChangeCounts {
+        new: ws.new_files.len(),
+        modified: ws.modified_files.len(),
+        deleted: ws.deleted_files.len(),
+    });
+    let (files, additions, deletions) = ctx.pending_changes.as_ref().map_or(
+        (counts.new + counts.modified + counts.deleted, 0, 0),
+        |pc| (pc.files_changed, pc.total_additions, pc.total_deletions),
+    );
+    BriefPending {
+        files,
+        new: counts.new,
+        modified: counts.modified,
+        deleted: counts.deleted,
+        additions,
+        deletions,
+    }
+}
+
+/// Truncate on a char boundary, marking the cut with `...`.
+fn truncate_chars(text: &str, max: usize) -> String {
+    let first_line = text.lines().next().unwrap_or("");
+    if first_line.chars().count() <= max && first_line.len() == text.len() {
+        return text.to_string();
+    }
+    let kept: String = first_line.chars().take(max.saturating_sub(3)).collect();
+    format!("{kept}...")
 }
 
 #[cfg(test)]
@@ -1038,6 +1553,9 @@ mod tests {
             modified_files: vec![],
             deleted_files: vec![],
             tracked_count: 3,
+            truncated: false,
+            omitted: 0,
+            counts: None,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(!json.contains("new_files"));
@@ -1045,5 +1563,401 @@ mod tests {
         assert!(!json.contains("deleted_files"));
         assert!(json.contains("clean"));
         assert!(json.contains("tracked_count"));
+    }
+
+    // ── Caps and budget (ctx-budget) ─────────────────────────
+
+    fn diff_entry(path: &str) -> FileDiffSummary {
+        FileDiffSummary {
+            path: path.to_string(),
+            change_type: "modified".into(),
+            additions: 1,
+            deletions: 1,
+        }
+    }
+
+    fn seal_summary(i: usize) -> SealSummary {
+        SealSummary {
+            id: format!("seal{i:08}"),
+            timestamp: "2026-10-04T00:00:00Z".into(),
+            agent: "amis".into(),
+            summary: "x".repeat(200),
+            files_changed: 1,
+            spec_id: None,
+            status: "in-progress".into(),
+            verification: None,
+            changed_paths: vec![],
+        }
+    }
+
+    /// A context with `n` modified files, `n` tracked paths, and 10 seals.
+    fn big_context(n: usize) -> ContextOutput {
+        let paths: Vec<String> = (0..n).map(|i| format!("src/f{i:04}.rs")).collect();
+        let mut ctx: ContextOutput = serde_json::from_value(serde_json::json!({
+            "writ_version": "test",
+            "working_state": {"clean": false, "tracked_count": n},
+            "recent_seals": [],
+            "file_scope": [],
+            "tracked_files": n,
+            "available_operations": [],
+        }))
+        .unwrap();
+        ctx.working_state.modified_files = paths.clone();
+        ctx.pending_changes = Some(DiffSummary {
+            files_changed: n,
+            total_additions: n,
+            total_deletions: n,
+            files: paths.iter().map(|p| diff_entry(p)).collect(),
+            truncated: false,
+            omitted: 0,
+        });
+        ctx.file_scope = paths;
+        ctx.recent_seals = (0..10).map(seal_summary).collect();
+        ctx
+    }
+
+    fn json_len(c: &ContextOutput) -> WritResult<usize> {
+        Ok(serde_json::to_string(c)?.len())
+    }
+
+    #[test]
+    fn cap_truncates_lists_and_keeps_totals_exact() {
+        let mut ctx = big_context(120);
+        ctx.apply_file_cap(Some(50), &FilePriority::default());
+
+        let pc = ctx.pending_changes.as_ref().unwrap();
+        assert_eq!(pc.files.len(), 50);
+        assert!(pc.truncated);
+        assert_eq!(pc.omitted, 70);
+        assert_eq!(pc.files_changed, 120);
+        assert_eq!(pc.total_additions, 120);
+
+        let ws = &ctx.working_state;
+        assert_eq!(ws.modified_files.len(), 50);
+        assert!(ws.truncated);
+        assert_eq!(ws.omitted, 70);
+        assert_eq!(
+            ws.counts,
+            Some(ChangeCounts {
+                new: 0,
+                modified: 120,
+                deleted: 0
+            })
+        );
+
+        assert_eq!(ctx.file_scope.len(), 50);
+        assert!(ctx.file_scope_truncated);
+        assert_eq!(ctx.file_scope_omitted, 70);
+        assert_eq!(ctx.tracked_files, 120);
+    }
+
+    #[test]
+    fn cap_under_limit_emits_no_markers() {
+        let mut ctx = big_context(10);
+        ctx.apply_file_cap(Some(50), &FilePriority::default());
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(!json.contains("truncated"));
+        assert!(!json.contains("omitted"));
+        assert!(!json.contains("counts"));
+    }
+
+    #[test]
+    fn cap_none_is_unlimited() {
+        let mut ctx = big_context(300);
+        ctx.apply_file_cap(None, &FilePriority::default());
+        assert_eq!(ctx.file_scope.len(), 300);
+        assert_eq!(ctx.pending_changes.unwrap().files.len(), 300);
+    }
+
+    #[test]
+    fn cap_orders_spec_files_first_then_recent_mtime() {
+        let mut ctx = big_context(100);
+        let mut prio = FilePriority::default();
+        prio.spec_files.insert("src/f0099.rs".into());
+        prio.spec_dirs.push("src/f009".into());
+        let base = SystemTime::UNIX_EPOCH;
+        prio.modified_at.insert(
+            "src/f0042.rs".into(),
+            base + std::time::Duration::from_secs(100),
+        );
+        prio.modified_at.insert(
+            "src/f0007.rs".into(),
+            base + std::time::Duration::from_secs(50),
+        );
+        ctx.apply_file_cap(Some(13), &prio);
+
+        let files: Vec<&str> = ctx.pending_changes.as_ref().unwrap().files[..13]
+            .iter()
+            .map(|f| f.path.as_str())
+            .collect();
+        // f0090..f0099 match the spec scope (dir prefix + exact), then mtime order.
+        assert!(files[..10].iter().all(|p| p.starts_with("src/f009")));
+        assert_eq!(files[10], "src/f0042.rs");
+        assert_eq!(files[11], "src/f0007.rs");
+        assert_eq!(ctx.working_state.modified_files[10], "src/f0042.rs");
+    }
+
+    #[test]
+    fn file_scope_orders_spec_files_then_most_recently_sealed() {
+        let mut ctx = big_context(100);
+        let mut prio = FilePriority::default();
+        prio.spec_files.insert("src/f0050.rs".into());
+        prio.sealed_rank.insert("src/f0080.rs".into(), 0);
+        prio.sealed_rank.insert("src/f0003.rs".into(), 1);
+        ctx.apply_file_cap(Some(4), &prio);
+        assert_eq!(
+            ctx.file_scope,
+            vec![
+                "src/f0050.rs",
+                "src/f0080.rs",
+                "src/f0003.rs",
+                "src/f0000.rs"
+            ]
+        );
+    }
+
+    #[test]
+    fn cap_mixes_new_modified_deleted_by_priority() {
+        let mut ctx = big_context(0);
+        ctx.working_state.new_files = vec!["a_new.rs".into(), "b_new.rs".into()];
+        ctx.working_state.modified_files = vec!["c_mod.rs".into()];
+        ctx.working_state.deleted_files = vec!["d_del.rs".into()];
+        let mut prio = FilePriority::default();
+        prio.spec_files.insert("d_del.rs".into());
+        ctx.apply_file_cap(Some(2), &prio);
+        let ws = &ctx.working_state;
+        assert_eq!(ws.deleted_files, vec!["d_del.rs"]);
+        assert_eq!(ws.new_files, vec!["a_new.rs"]);
+        assert!(ws.modified_files.is_empty());
+        assert_eq!(ws.omitted, 2);
+        assert_eq!(ws.counts.unwrap().new, 2);
+    }
+
+    #[test]
+    fn budget_trims_file_lists_before_file_scope() {
+        let mut ctx = big_context(200);
+        let prio = FilePriority::default();
+        ctx.apply_file_cap(None, &prio);
+        // Room for the file scope but not for the change lists.
+        let budget = json_len(&ctx).unwrap() - 2_000;
+        ctx.fit_to_budget(budget, &prio, json_len).unwrap();
+        assert!(json_len(&ctx).unwrap() <= budget);
+        assert!(ctx.pending_changes.as_ref().unwrap().truncated);
+        assert!(!ctx.file_scope_truncated);
+        assert_eq!(ctx.recent_seals.len(), 10);
+        assert!(!ctx.budget_exceeded);
+    }
+
+    #[test]
+    fn budget_trims_seals_last_and_never_below_floor() {
+        let mut ctx = big_context(200);
+        let prio = FilePriority::default();
+        ctx.apply_file_cap(None, &prio);
+        ctx.fit_to_budget(1_000, &prio, json_len).unwrap();
+        assert!(ctx.pending_changes.as_ref().unwrap().files.is_empty());
+        assert!(ctx.file_scope.is_empty());
+        assert_eq!(ctx.file_scope_omitted, 200);
+        assert_eq!(ctx.recent_seals.len(), BUDGET_SEAL_FLOOR);
+        assert!(ctx.budget_exceeded);
+        // Totals survive every trim.
+        assert_eq!(ctx.pending_changes.as_ref().unwrap().files_changed, 200);
+        assert_eq!(ctx.tracked_files, 200);
+    }
+
+    #[test]
+    fn budget_never_drops_protected_sections() {
+        let mut ctx = big_context(50);
+        ctx.all_specs = Some(vec![]);
+        ctx.recommended_action = Some(RecommendedAction {
+            action: "seal".into(),
+            message: "seal your work".into(),
+            priority: "high".into(),
+        });
+        ctx.chain_integrity = Some(ChainIntegritySummary {
+            valid: true,
+            total_seals: 1,
+            verified: 1,
+            unsecured: 0,
+            failures: 0,
+        });
+        let prio = FilePriority::default();
+        ctx.fit_to_budget(10, &prio, json_len).unwrap();
+        assert!(ctx.all_specs.is_some());
+        assert!(ctx.recommended_action.is_some());
+        assert!(ctx.chain_integrity.is_some());
+        assert!(ctx.budget_exceeded);
+    }
+
+    #[test]
+    fn budget_already_met_changes_nothing() {
+        let mut ctx = big_context(5);
+        let before = json_len(&ctx).unwrap();
+        ctx.fit_to_budget(before, &FilePriority::default(), json_len)
+            .unwrap();
+        assert_eq!(json_len(&ctx).unwrap(), before);
+        assert!(!ctx.budget_exceeded);
+    }
+
+    #[test]
+    fn limits_from_user_maps_zero_to_unlimited() {
+        assert_eq!(
+            ContextLimits::from_user(None, None).max_files,
+            Some(DEFAULT_MAX_FILES)
+        );
+        assert_eq!(ContextLimits::from_user(Some(0), None).max_files, None);
+        assert_eq!(ContextLimits::from_user(Some(7), Some(10)).budget, Some(10));
+    }
+
+    #[test]
+    fn budget_drops_available_operations_after_seal_floor() {
+        let mut ctx = big_context(20);
+        ctx.available_operations = (0..200).map(|i| format!("operation_{i}()")).collect();
+        let prio = FilePriority::default();
+        ctx.apply_file_cap(None, &prio);
+        let mut floor = ctx.clone();
+        floor.pending_changes.as_mut().unwrap().files.clear();
+        floor.working_state.modified_files.clear();
+        floor.file_scope.clear();
+        floor.recent_seals.truncate(BUDGET_SEAL_FLOOR);
+        floor.available_operations.clear();
+        let budget = json_len(&floor).unwrap() + 200;
+
+        ctx.fit_to_budget(budget, &prio, json_len).unwrap();
+        assert!(ctx.available_operations.is_empty());
+        assert_eq!(ctx.recent_seals.len(), BUDGET_SEAL_FLOOR);
+        assert!(!ctx.budget_exceeded);
+        assert!(json_len(&ctx).unwrap() <= budget);
+    }
+
+    // ── Brief view (ctx-brief) ──────────────────────────────
+
+    fn spec_row(id: &str, status: SpecStatus, agent: Option<&str>, seals: usize) -> Spec {
+        let mut spec = Spec::new(id.into(), format!("Title {id}"), String::new());
+        spec.status = status;
+        spec.claimed_by = agent.map(String::from);
+        spec.sealed_by = (0..seals).map(|i| format!("seal{i}")).collect();
+        spec
+    }
+
+    #[test]
+    fn brief_contains_required_sections() {
+        let mut ctx = big_context(500);
+        ctx.all_specs = Some(vec![
+            spec_row("a", SpecStatus::InProgress, Some("amis"), 2),
+            spec_row("b", SpecStatus::Pending, None, 0),
+        ]);
+        ctx.integration_risk = IntegrationRisk::compute(1, 0, 0, 0);
+        ctx.recommended_action = Some(RecommendedAction {
+            action: "seal".into(),
+            message: "seal your work".into(),
+            priority: "medium".into(),
+        });
+        ctx.chain_integrity = Some(ChainIntegritySummary {
+            valid: true,
+            total_seals: 10,
+            verified: 10,
+            unsecured: 0,
+            failures: 0,
+        });
+        ctx.apply_file_cap(Some(50), &FilePriority::default());
+
+        let brief = BriefContext::from_context(&ctx);
+        assert_eq!(brief.scope, "full");
+        assert_eq!(brief.specs.len(), 2);
+        assert_eq!(brief.specs[0].status, "in-progress");
+        assert_eq!(brief.specs[0].agent, "amis");
+        assert_eq!(brief.specs[0].seals, 2);
+        assert_eq!(brief.specs[1].agent, "");
+        assert_eq!(brief.seals.len(), BRIEF_SEAL_COUNT);
+        // Counts are exact even though the lists were capped at 50.
+        assert_eq!(brief.pending.files, 500);
+        assert_eq!(brief.pending.modified, 500);
+        assert_eq!(brief.pending.additions, 500);
+        assert_eq!(brief.risk.level, "medium");
+        assert_eq!(brief.next.as_ref().unwrap().action, "seal");
+        assert_eq!(brief.chain_ok, Some(true));
+    }
+
+    #[test]
+    fn brief_size_is_independent_of_file_count() {
+        let small = BriefContext::from_context(&big_context(10));
+        let large = BriefContext::from_context(&big_context(5_000));
+        let len = |b: &BriefContext| serde_json::to_string(b).unwrap().len();
+        // Only digit widths in the counts differ.
+        assert!(len(&large) - len(&small) < 20);
+        assert!(len(&large) < 2048);
+    }
+
+    #[test]
+    fn brief_truncates_long_and_multiline_summaries() {
+        assert_eq!(truncate_chars("short", 100), "short");
+        let long = "x".repeat(300);
+        let cut = truncate_chars(&long, BRIEF_SUMMARY_CHARS);
+        assert_eq!(cut.chars().count(), BRIEF_SUMMARY_CHARS);
+        assert!(cut.ends_with("..."));
+        assert_eq!(truncate_chars("line one\nline two", 100), "line one...");
+        // Multibyte characters never split.
+        assert_eq!(truncate_chars(&"é".repeat(10), 5), "éé...");
+    }
+
+    #[test]
+    fn brief_spec_scope_uses_active_spec() {
+        let mut ctx = big_context(0);
+        ctx.active_spec = Some(spec_row("only", SpecStatus::Blocked, Some("bri"), 1));
+        let brief = BriefContext::from_context(&ctx);
+        assert_eq!(brief.scope, "only");
+        assert_eq!(brief.specs.len(), 1);
+        assert_eq!(brief.specs[0].status, "blocked");
+        assert_eq!(brief.chain_ok, None);
+        assert!(brief.next.is_none());
+    }
+
+    #[test]
+    fn brief_timestamps_are_whole_second_utc() {
+        assert_eq!(
+            compact_timestamp("2026-10-04T23:38:04.999643+00:00"),
+            "2026-10-04T23:38:04Z"
+        );
+        assert_eq!(
+            compact_timestamp("2026-10-04T19:38:04-04:00"),
+            "2026-10-04T23:38:04Z"
+        );
+        assert_eq!(compact_timestamp("not a time"), "not a time");
+    }
+
+    #[test]
+    fn brief_lists_open_specs_and_counts_completed() {
+        let mut ctx = big_context(0);
+        ctx.all_specs = Some(vec![
+            spec_row("done1", SpecStatus::Complete, Some("a"), 3),
+            spec_row("wip", SpecStatus::InProgress, Some("a"), 1),
+            spec_row("done2", SpecStatus::Complete, None, 1),
+            spec_row("todo", SpecStatus::Pending, None, 0),
+            spec_row("stuck", SpecStatus::Blocked, Some("b"), 0),
+        ]);
+        let brief = BriefContext::from_context(&ctx);
+        let ids: Vec<&str> = brief.specs.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["wip", "todo", "stuck"]);
+        assert_eq!(brief.specs_complete, 2);
+        assert_eq!(brief.specs_omitted, 0);
+        let json = serde_json::to_string(&brief).unwrap();
+        assert!(!json.contains("specs_omitted"));
+    }
+
+    #[test]
+    fn brief_caps_open_specs_and_stays_bounded() {
+        let mut ctx = big_context(0);
+        let mut specs: Vec<Spec> = (0..30)
+            .map(|i| spec_row(&format!("open{i:02}"), SpecStatus::Pending, None, 0))
+            .collect();
+        specs.extend(
+            (0..500).map(|i| spec_row(&format!("done{i:03}"), SpecStatus::Complete, None, 2)),
+        );
+        ctx.all_specs = Some(specs);
+        let brief = BriefContext::from_context(&ctx);
+        assert_eq!(brief.specs.len(), BRIEF_SPEC_CAP);
+        assert_eq!(brief.specs_omitted, 10);
+        assert_eq!(brief.specs_complete, 500);
+        assert_eq!(brief.specs[0].id, "open00");
     }
 }

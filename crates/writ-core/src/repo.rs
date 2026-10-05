@@ -14,9 +14,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::{AgentStatus, AgentUpdate, RegisteredAgent, TrustLevel};
 use crate::context::{
-    AgentActivity, ChainIntegritySummary, ContextFilter, ContextOutput, ContextScope, DepStatus,
-    DiffSummary, DivergedBranchWarning, FileContention, FileScopeViolation, IntegrationRisk,
-    RecommendedAction, SealNudge, SealSummary, SessionSummary, SpecProgress, WorkingStateSummary,
+    AgentActivity, ChainIntegritySummary, ContextFilter, ContextLimits, ContextOutput,
+    ContextScope, DepStatus, DiffSummary, DivergedBranchWarning, FileContention, FilePriority,
+    FileScopeViolation, IntegrationRisk, RecommendedAction, SealNudge, SealSummary, SessionSummary,
+    SpecProgress, WorkingStateSummary,
 };
 use crate::convergence::{
     self,
@@ -2654,6 +2655,7 @@ impl Repository {
                 AgentActivity {
                     agent_id,
                     files_owned: files,
+                    files_owned_omitted: 0,
                     seal_count: stats.seal_count,
                     latest_summary: stats.latest_summary,
                     latest_at: stats.latest_at,
@@ -2815,11 +2817,128 @@ impl Repository {
         None
     }
 
+    /// Context with path-list caps and an optional serialized-size budget.
+    ///
+    /// Assembles the same output as [`Repository::context`], orders every path
+    /// list by relevance (spec-touched first, then most recently modified or
+    /// sealed), caps them at `limits.max_files`, then, when `limits.budget` is
+    /// set, trims until `measure` reports a size within budget. `measure` must
+    /// serialize in the caller's output format so the budget is exact.
+    pub fn context_limited<F>(
+        &self,
+        scope: ContextScope,
+        seal_limit: usize,
+        filter: &ContextFilter,
+        limits: &ContextLimits,
+        measure: F,
+    ) -> WritResult<ContextOutput>
+    where
+        F: Fn(&ContextOutput) -> WritResult<usize>,
+    {
+        let mut ctx = self.context(scope.clone(), seal_limit, filter)?;
+        let prio = self.file_priority(&scope, &ctx)?;
+        ctx.apply_file_cap(limits.max_files, &prio);
+        if let Some(budget) = limits.budget {
+            ctx.fit_to_budget(budget, &prio, measure)?;
+        }
+        Ok(ctx)
+    }
+
+    /// Specs whose files define the "spec-touched" set for a scope.
+    fn scope_specs(&self, scope: &ContextScope) -> WritResult<Vec<Spec>> {
+        match scope {
+            ContextScope::Full => Ok(Vec::new()),
+            ContextScope::Spec(id) => Ok(vec![self.load_spec(id)?]),
+            ContextScope::Agent(agent_id) => Ok(self
+                .list_specs()?
+                .into_iter()
+                .filter(|s| s.claimed_by.as_deref() == Some(agent_id.as_str()))
+                .collect()),
+        }
+    }
+
+    /// Build the ordering inputs used to cap context path lists.
+    fn file_priority(&self, scope: &ContextScope, ctx: &ContextOutput) -> WritResult<FilePriority> {
+        let mut prio = FilePriority::default();
+
+        for spec in self.scope_specs(scope)? {
+            for entry in &spec.file_scope {
+                if entry.ends_with('/') {
+                    prio.spec_dirs.push(entry.clone());
+                } else {
+                    prio.spec_files.insert(entry.clone());
+                }
+            }
+            for seal_id in &spec.sealed_by {
+                if let Ok(seal) = self.load_seal(seal_id) {
+                    prio.spec_files
+                        .extend(seal.changes.iter().map(|c| c.path.clone()));
+                }
+            }
+        }
+        if let ContextScope::Agent(agent_id) = scope {
+            for seal in self.log_all()?.iter().filter(|s| s.agent.id == *agent_id) {
+                prio.spec_files
+                    .extend(seal.changes.iter().map(|c| c.path.clone()));
+            }
+        }
+
+        let ws = &ctx.working_state;
+        let changed = ws
+            .new_files
+            .iter()
+            .chain(ws.modified_files.iter())
+            .chain(ws.deleted_files.iter());
+        for path in changed {
+            // Deleted files have no mtime and sort after everything on disk.
+            if let Ok(modified) = fs::metadata(self.root.join(path)).and_then(|m| m.modified()) {
+                prio.modified_at.insert(path.clone(), modified);
+            }
+        }
+
+        // log() is newest-first, so the first sighting of a path is its rank.
+        let mut rank = 0usize;
+        for seal in self.log()? {
+            for change in &seal.changes {
+                if !prio.sealed_rank.contains_key(&change.path) {
+                    prio.sealed_rank.insert(change.path.clone(), rank);
+                    rank += 1;
+                }
+            }
+        }
+        Ok(prio)
+    }
+
     /// Generate a structured context dump optimized for LLM consumption.
     ///
     /// `filter` narrows the seal history by status and/or agent. The filter
     /// is applied *before* `seal_limit` truncation.
     pub fn context(
+        &self,
+        scope: ContextScope,
+        seal_limit: usize,
+        filter: &ContextFilter,
+    ) -> WritResult<ContextOutput> {
+        let mut ctx = self.assemble_context(scope, seal_limit, filter)?;
+        self.drop_ignored_ownership(&mut ctx);
+        Ok(ctx)
+    }
+
+    /// Remove paths the live ignore rules exclude from per-agent ownership
+    /// and file contention.
+    ///
+    /// Seals made before an ignore rule existed (e.g. a 0.2.0 import that
+    /// swept in `.venv311/`) still list those paths; context hides them.
+    fn drop_ignored_ownership(&self, ctx: &mut ContextOutput) {
+        let rules = self.ignore_rules();
+        for activity in &mut ctx.agent_activity {
+            activity.files_owned.retain(|p| !rules.is_path_ignored(p));
+        }
+        ctx.file_contention
+            .retain(|fc| !rules.is_path_ignored(&fc.path));
+    }
+
+    fn assemble_context(
         &self,
         scope: ContextScope,
         seal_limit: usize,
@@ -2947,9 +3066,8 @@ impl Repository {
             ContextScope::Full => {
                 let specs = self.list_specs()?;
 
-                let index = self.load_index()?;
-                let file_scope: Vec<String> = index.entries.keys().cloned().collect();
-                let tracked_files = index.entries.len();
+                let file_scope = self.tracked_paths()?;
+                let tracked_files = file_scope.len();
 
                 // Walk ALL heads (global + spec branches) for agent activity,
                 // so agents on diverged branches aren't invisible.
@@ -3088,7 +3206,7 @@ impl Repository {
                 });
 
                 let mut result = ContextOutput {
-                    writ_version: "0.1.0".to_string(),
+                    writ_version: crate::context::WRIT_VERSION.to_string(),
                     task: task_ctx,
                     workspace: ws_filter.map(|s| s.to_string()),
                     active_spec: None,
@@ -3102,6 +3220,8 @@ impl Repository {
                     pending_changes,
                     seal_nudge,
                     file_scope,
+                    file_scope_truncated: false,
+                    file_scope_omitted: 0,
                     tracked_files,
                     dependency_status: None,
                     spec_progress: None,
@@ -3119,6 +3239,7 @@ impl Repository {
                     session_summary: None,
                     recommended_action: None,
                     available_operations,
+                    budget_exceeded: false,
                 };
 
                 // Check if all specs are complete and inject session summary.
@@ -3207,8 +3328,7 @@ impl Repository {
                     }
                     if inferred.is_empty() {
                         // No seals yet — fall back to all tracked files.
-                        let index = self.load_index()?;
-                        file_scope = index.entries.keys().cloned().collect();
+                        file_scope = self.tracked_paths()?;
                         has_scope_filter = false;
                     } else {
                         file_scope = inferred.into_iter().collect();
@@ -3253,6 +3373,9 @@ impl Repository {
                             .cloned()
                             .collect(),
                         tracked_count: ws_summary.tracked_count,
+                        truncated: false,
+                        omitted: 0,
+                        counts: None,
                     };
 
                     let filtered_pending = pending_changes.map(|pc| {
@@ -3268,6 +3391,8 @@ impl Repository {
                             total_additions: total_add,
                             total_deletions: total_del,
                             files: filtered_files,
+                            truncated: false,
+                            omitted: 0,
                         }
                     });
 
@@ -3442,7 +3567,7 @@ impl Repository {
                 );
 
                 Ok(ContextOutput {
-                    writ_version: "0.1.0".to_string(),
+                    writ_version: crate::context::WRIT_VERSION.to_string(),
                     task: None,
                     workspace: filter.workspace.clone(),
                     active_spec: Some(spec),
@@ -3452,6 +3577,8 @@ impl Repository {
                     pending_changes: filtered_pending,
                     seal_nudge: filtered_nudge,
                     file_scope,
+                    file_scope_truncated: false,
+                    file_scope_omitted: 0,
                     tracked_files,
                     dependency_status,
                     spec_progress,
@@ -3469,6 +3596,7 @@ impl Repository {
                     session_summary: None,
                     recommended_action,
                     available_operations,
+                    budget_exceeded: false,
                 })
             }
             ContextScope::Agent(agent_id) => {
@@ -3483,6 +3611,12 @@ impl Repository {
                             if let Some(ref sid) = seal.spec_id {
                                 spec_set.insert(sid.clone());
                             }
+                        }
+                    }
+                    // Specs the agent has claimed count even before its first seal.
+                    for spec in self.list_specs()? {
+                        if spec.claimed_by.as_deref() == Some(agent_id.as_str()) {
+                            spec_set.insert(spec.id);
                         }
                     }
                     spec_set.into_iter().collect()
@@ -3562,6 +3696,9 @@ impl Repository {
                             .cloned()
                             .collect(),
                         tracked_count: ws_summary.tracked_count,
+                        truncated: false,
+                        omitted: 0,
+                        counts: None,
                     };
 
                     let filtered_pending = pending_changes.map(|pc| {
@@ -3577,6 +3714,8 @@ impl Repository {
                             total_additions: total_add,
                             total_deletions: total_del,
                             files: filtered_files,
+                            truncated: false,
+                            omitted: 0,
                         }
                     });
 
@@ -3720,7 +3859,7 @@ impl Repository {
                 );
 
                 Ok(ContextOutput {
-                    writ_version: "0.1.0".to_string(),
+                    writ_version: crate::context::WRIT_VERSION.to_string(),
                     task: None,
                     workspace: filter.workspace.clone(),
                     active_spec: None, // agent may have multiple specs
@@ -3734,6 +3873,8 @@ impl Repository {
                     pending_changes: filtered_pending,
                     seal_nudge: filtered_nudge,
                     file_scope,
+                    file_scope_truncated: false,
+                    file_scope_omitted: 0,
                     tracked_files,
                     dependency_status,
                     spec_progress: None, // no single spec to show progress for
@@ -3751,6 +3892,7 @@ impl Repository {
                     session_summary: None,
                     recommended_action,
                     available_operations,
+                    budget_exceeded: false,
                 })
             }
         }
@@ -6876,6 +7018,22 @@ impl Repository {
 
     fn ignore_rules(&self) -> IgnoreRules {
         IgnoreRules::load(&self.root)
+    }
+
+    /// Indexed paths that are not excluded by the live ignore rules.
+    ///
+    /// The index can hold paths that were tracked before an ignore rule
+    /// covered them (e.g. `.venv*/` added to `.gitignore` after init). Those
+    /// stay in the index but are hidden from every context view.
+    fn tracked_paths(&self) -> WritResult<Vec<String>> {
+        let index = self.load_index()?;
+        let rules = self.ignore_rules();
+        Ok(index
+            .entries
+            .keys()
+            .filter(|p| !rules.is_path_ignored(p))
+            .cloned()
+            .collect())
     }
 
     /// Load the convergence engine's Ed25519 signing key.
@@ -33679,5 +33837,231 @@ mod workspace_tests {
             status.untracked_changes.is_empty(),
             "clean working dir should have no untracked changes"
         );
+    }
+}
+
+/// ctx-ignore / ctx-budget: live ignore rules and bounded context output.
+#[cfg(test)]
+mod context_budget_tests {
+    use super::*;
+    use crate::context::{ContextFilter, ContextLimits, ContextScope, DEFAULT_MAX_FILES};
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use crate::spec::Spec;
+    use tempfile::tempdir;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    fn json_len(c: &ContextOutput) -> WritResult<usize> {
+        Ok(serde_json::to_string(c)?.len())
+    }
+
+    fn limited(repo: &Repository, scope: ContextScope, limits: ContextLimits) -> ContextOutput {
+        repo.context_limited(scope, 10, &ContextFilter::default(), &limits, json_len)
+            .unwrap()
+    }
+
+    fn write_files(root: &Path, prefix: &str, n: usize) {
+        for i in 0..n {
+            let path = root.join(format!("{prefix}{i:04}.txt"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, format!("content {i}\n")).unwrap();
+        }
+    }
+
+    fn baseline(repo: &Repository) {
+        repo.seal(
+            agent("setup"),
+            "baseline".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+    }
+
+    /// Repo with 120 sealed files, 120 unsealed new files, and a 300-file
+    /// `.venv311/` covered only by a `.gitignore` glob.
+    fn big_repo() -> (tempfile::TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join(".writignore"), "target\n").unwrap();
+        fs::write(dir.path().join(".gitignore"), ".venv*/\n").unwrap();
+        write_files(dir.path(), "src/tracked_", 120);
+        baseline(&repo);
+        write_files(dir.path(), "src/pending_", 120);
+        write_files(dir.path(), ".venv311/lib/site_", 300);
+        (dir, repo)
+    }
+
+    #[test]
+    fn default_context_caps_every_list_and_keeps_totals() {
+        let (_dir, repo) = big_repo();
+        let ctx = limited(&repo, ContextScope::Full, ContextLimits::default());
+
+        let pc = ctx.pending_changes.as_ref().unwrap();
+        assert_eq!(pc.files.len(), DEFAULT_MAX_FILES);
+        assert!(pc.truncated);
+        assert_eq!(pc.omitted, 70);
+        assert_eq!(pc.files_changed, 120);
+
+        assert_eq!(ctx.working_state.new_files.len(), DEFAULT_MAX_FILES);
+        assert_eq!(ctx.working_state.counts.unwrap().new, 120);
+
+        assert_eq!(ctx.file_scope.len(), DEFAULT_MAX_FILES);
+        assert!(ctx.file_scope_truncated);
+        assert_eq!(ctx.file_scope_omitted, 122 - DEFAULT_MAX_FILES);
+        assert_eq!(ctx.tracked_files, 122); // 120 files + .gitignore + .writignore
+    }
+
+    #[test]
+    fn gitignore_glob_hides_venv_from_every_section() {
+        let (_dir, repo) = big_repo();
+        let ctx = limited(
+            &repo,
+            ContextScope::Full,
+            ContextLimits::from_user(Some(0), None),
+        );
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(!json.contains(".venv311"));
+        assert_eq!(ctx.pending_changes.unwrap().files.len(), 120);
+        assert_eq!(ctx.file_scope.len(), 122);
+    }
+
+    #[test]
+    fn max_files_zero_returns_full_lists() {
+        let (_dir, repo) = big_repo();
+        let ctx = limited(
+            &repo,
+            ContextScope::Full,
+            ContextLimits::from_user(Some(0), None),
+        );
+        assert!(!ctx.file_scope_truncated);
+        assert!(!ctx.pending_changes.unwrap().truncated);
+    }
+
+    #[test]
+    fn budget_fits_serialized_output() {
+        let (_dir, repo) = big_repo();
+        let ctx = limited(
+            &repo,
+            ContextScope::Full,
+            ContextLimits::from_user(None, Some(8192)),
+        );
+        assert!(!ctx.budget_exceeded);
+        assert!(json_len(&ctx).unwrap() <= 8192);
+        assert_eq!(ctx.pending_changes.unwrap().files_changed, 120);
+    }
+
+    #[test]
+    fn claimed_spec_scopes_agent_context() {
+        let (dir, repo) = big_repo();
+        let mut spec = Spec::new("feat".into(), "Feature".into(), "".into());
+        spec.file_scope = vec!["src/pending_0119.txt".into()];
+        spec.claimed_by = Some("amis".into());
+        repo.add_spec(&spec).unwrap();
+        fs::write(dir.path().join("src/pending_0119.txt"), "touched\n").unwrap();
+
+        let ctx = limited(
+            &repo,
+            ContextScope::Agent("amis".into()),
+            ContextLimits::default(),
+        );
+        // A claimed spec with a declared scope narrows pending changes to it.
+        let pc = ctx.pending_changes.unwrap();
+        assert_eq!(pc.files.len(), 1);
+        assert_eq!(pc.files[0].path, "src/pending_0119.txt");
+        assert_eq!(ctx.file_scope, vec!["src/pending_0119.txt".to_string()]);
+    }
+
+    #[test]
+    fn newly_ignored_tracked_paths_are_not_reported_deleted() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join(".writignore"), "target\n").unwrap();
+        write_files(dir.path(), ".venv311/lib/site_", 5);
+        write_files(dir.path(), "src/a_", 2);
+        baseline(&repo);
+
+        // .venv311 was tracked before the ignore rule existed.
+        fs::write(dir.path().join(".gitignore"), ".venv*/\n").unwrap();
+        let state = repo.state().unwrap();
+        assert_eq!(state.changes.len(), 1, "only .gitignore itself is new");
+        assert_eq!(state.changes[0].path, ".gitignore");
+        assert_eq!(state.tracked_count, 3); // .writignore + 2 src files
+
+        let ctx = limited(&repo, ContextScope::Full, ContextLimits::default());
+        assert!(ctx.file_scope.iter().all(|p| !p.starts_with(".venv311/")));
+        assert_eq!(ctx.tracked_files, 3);
+    }
+
+    #[test]
+    fn ownership_and_contention_hide_newly_ignored_paths() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join(".writignore"), "target\n").unwrap();
+        write_files(dir.path(), ".venv311/lib/site_", 3);
+        write_files(dir.path(), "src/a_", 1);
+        repo.seal(
+            agent("importer"),
+            "0.2.0-style import that swept in the venv".into(),
+            None,
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+        fs::write(dir.path().join(".gitignore"), ".venv*/\n").unwrap();
+
+        let ctx = repo
+            .context(ContextScope::Full, 10, &ContextFilter::default())
+            .unwrap();
+        let owned: Vec<&String> = ctx
+            .agent_activity
+            .iter()
+            .flat_map(|a| a.files_owned.iter())
+            .collect();
+        assert!(!owned.is_empty());
+        assert!(owned.iter().all(|p| !p.starts_with(".venv311/")));
+        assert!(ctx
+            .file_contention
+            .iter()
+            .all(|fc| !fc.path.starts_with(".venv311/")));
+    }
+
+    #[test]
+    fn brief_format_is_toon_and_small() {
+        let (_dir, repo) = big_repo();
+        let ctx = limited(&repo, ContextScope::Full, ContextLimits::default());
+        let out = crate::format::format_brief_context(&ctx, Some("t")).unwrap();
+        assert!(out.starts_with("# writ context-brief | project: t | format: toon"));
+        assert!(out.contains("pending:"));
+        assert!(out.contains("risk:"));
+        assert!(out.len() < 2048, "brief was {} bytes", out.len());
+        assert!(!out.contains("src/pending_"));
+    }
+
+    #[test]
+    fn context_writ_version_matches_crate_version_in_every_scope() {
+        let (_dir, repo) = big_repo();
+        let mut spec = Spec::new("v".into(), "Version".into(), "".into());
+        spec.claimed_by = Some("amis".into());
+        repo.add_spec(&spec).unwrap();
+        for scope in [
+            ContextScope::Full,
+            ContextScope::Spec("v".into()),
+            ContextScope::Agent("amis".into()),
+        ] {
+            let ctx = repo
+                .context(scope.clone(), 10, &ContextFilter::default())
+                .unwrap();
+            assert_eq!(ctx.writ_version, env!("CARGO_PKG_VERSION"), "{scope:?}");
+            assert_ne!(ctx.writ_version, "0.1.0");
+        }
     }
 }

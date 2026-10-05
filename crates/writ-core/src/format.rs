@@ -195,6 +195,27 @@ impl OutputFormatter for ToonFormatter {
 }
 
 // ---------------------------------------------------------------------------
+// Brief context
+// ---------------------------------------------------------------------------
+
+/// Render the task-start brief view of a context as TOON.
+///
+/// Contains specs, the last 3 seals, exact pending counts, integration risk,
+/// the recommended action, and chain integrity. No per-file lists.
+pub fn format_brief_context(
+    context: &ContextOutput,
+    project_name: Option<&str>,
+) -> WritResult<String> {
+    let brief = crate::context::BriefContext::from_context(context);
+    let formatter = match project_name {
+        Some(p) => ToonFormatter::with_project(p),
+        None => ToonFormatter::new(),
+    };
+    let val = serde_json::to_value(&brief)?;
+    formatter.encode_with_header(&val, "context-brief")
+}
+
+// ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
@@ -751,7 +772,7 @@ mod tests {
             .collect();
 
         ContextOutput {
-            writ_version: "0.1.0".into(),
+            writ_version: crate::context::WRIT_VERSION.into(),
             task: None,
             workspace: None,
             active_spec: None, // full context doesn't set active_spec
@@ -762,6 +783,9 @@ mod tests {
                 modified_files: (0..5).map(|i| format!("src/mod_{i}.rs")).collect(),
                 deleted_files: vec!["src/old_module.rs".into()],
                 tracked_count: n_files,
+                truncated: false,
+                omitted: 0,
+                counts: None,
             },
             recent_seals: make_benchmark_seal_summaries(n_seals),
             pending_changes: None,
@@ -769,6 +793,8 @@ mod tests {
             file_scope: (0..n_files)
                 .map(|i| format!("src/module_{}/file_{}.rs", i / 10, i % 10))
                 .collect(),
+            file_scope_truncated: false,
+            file_scope_omitted: 0,
             tracked_files: n_files,
             dependency_status: None,
             spec_progress: None,
@@ -796,6 +822,7 @@ mod tests {
                 "converge".into(),
                 "verify".into(),
             ],
+            budget_exceeded: false,
         }
     }
 
@@ -1574,7 +1601,7 @@ mod tests {
 
         // Measure each section independently by formatting partial contexts
         let empty_ctx = ContextOutput {
-            writ_version: "0.1.0".into(),
+            writ_version: crate::context::WRIT_VERSION.into(),
             task: None,
             workspace: None,
             active_spec: None,
@@ -1585,11 +1612,16 @@ mod tests {
                 modified_files: vec![],
                 deleted_files: vec![],
                 tracked_count: 0,
+                truncated: false,
+                omitted: 0,
+                counts: None,
             },
             recent_seals: vec![],
             pending_changes: None,
             seal_nudge: None,
             file_scope: vec![],
+            file_scope_truncated: false,
+            file_scope_omitted: 0,
             tracked_files: 0,
             dependency_status: None,
             spec_progress: None,
@@ -1611,6 +1643,7 @@ mod tests {
             dependencies: vec![],
             unclaimed_specs: vec![],
             available_operations: vec![],
+            budget_exceeded: false,
         };
 
         let empty_toon = ToonFormatter::with_project("benchmark")

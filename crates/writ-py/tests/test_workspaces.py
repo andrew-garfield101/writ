@@ -10,6 +10,7 @@ Later phase tests are marked with skip until their implementation lands.
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -66,6 +67,55 @@ def run_git(args: list, cwd: str) -> subprocess.CompletedProcess:
     )
 
 
+_SEALED_LINE = re.compile(r"^\s+[+~-] (\S+)\s*$", re.MULTILINE)
+
+
+def assert_sealed(
+    result: subprocess.CompletedProcess, root: Path, *paths: str,
+) -> None:
+    """Assert a CLI seal captured each edited path WITH its on-disk content.
+
+    Guards against vacuous passes (finding 20). Path presence alone is not
+    enough: a workspace seal can exit 0 by sweeping unrelated pending files,
+    or by re-sealing main's version of the same path via the spec baseline.
+    So the seal's diff must add the first line of the file as it is on disk
+    in ``root`` (the directory the seal ran from).
+    """
+    sealed = set(_SEALED_LINE.findall(result.stdout))
+    missing = [p for p in paths if p not in sealed]
+    assert not missing, f"seal did not capture {missing}; captured {sorted(sealed)}"
+    seal_id = result.stdout.split()[1]
+    diff = run_writ(["show", seal_id, "--diff"], str(root)).stdout
+    for rel in paths:
+        first = next(ln for ln in (Path(root) / rel).read_text().splitlines() if ln)
+        assert f"+{first}" in diff, (
+            f"seal {seal_id} captured {rel} but not the content in {root}: {first!r}"
+        )
+
+
+def assert_api_sealed(seal: dict, *paths: str) -> None:
+    """Python-binding counterpart of assert_sealed."""
+    sealed = {c["path"] for c in seal.get("changes", [])}
+    missing = [p for p in paths if p not in sealed]
+    assert not missing, f"seal did not capture {missing}; captured {sorted(sealed)}"
+
+
+# Finding 20 / sprint 2 spec workspace-seal: `writ workspace create` puts the
+# tree under .writ/ws/<name>/, which is always ignored, so a seal run there
+# captures nothing. These tests passed only by sweeping init-generated root
+# files until 880af38 sealed those at init. Retirement in favor of `writ task`
+# workspaces (workspaces/<id>/) will port them; strict so the port is noticed.
+# Two more passed vacuously by re-sealing main's copy of the same path through
+# the spec baseline; content-checking assert_sealed exposed them (18 total).
+WORKSPACE_SEAL_XFAIL = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "finding 20, spec workspace-seal: edits under .writ/ws/<name>/ are "
+        "ignored, so a seal from a workspace dir captures nothing"
+    ),
+)
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -119,13 +169,15 @@ class TestSealWorkspaceField:
         """New seals include workspace='main' in their data."""
         path = writ_repo
         repo = writ.Repository.open(str(path))
-        repo.seal(
+        (path / "src" / "app.py").write_text("print('workspace field')\n")
+        sealed = repo.seal(
             summary="test seal",
             agent_id="test-agent",
             agent_type="agent",
             spec_id=None,
             status="in-progress",
         )
+        assert_api_sealed(sealed, "src/app.py")
         seals = repo.log(format="dict")
         assert len(seals) > 0
         seal = seals[0]
@@ -139,12 +191,13 @@ class TestSealWorkspaceField:
         repo = writ.Repository.open(str(path))
         for i in range(3):
             (path / "src" / "app.py").write_text(f"version = {i}\n")
-            repo.seal(
+            sealed = repo.seal(
                 summary=f"seal {i}",
                 agent_id="test-agent",
                 agent_type="agent",
                 status="in-progress",
             )
+            assert_api_sealed(sealed, "src/app.py")
         seals = repo.log(format="dict")
         assert len(seals) >= 3
         for seal in seals:
@@ -154,10 +207,11 @@ class TestSealWorkspaceField:
         """CLI seal includes workspace in log output."""
         path = writ_repo_with_spec
         (path / "src" / "app.py").write_text("print('updated')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "test work", "--spec", "feat-1"],
             str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
         result = run_writ(["log", "--format", "json"], str(path))
         seals = json.loads(result.stdout)
         assert len(seals) > 0
@@ -219,10 +273,11 @@ class TestWorkspaceLayoutAfterSeal:
         path = writ_repo_with_spec
         head_before = (path / ".writ" / "workspaces" / "main" / "HEAD").read_text()
         (path / "src" / "app.py").write_text("print('sealed')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "workspace seal", "--spec", "feat-1"],
             str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
         head_after = (path / ".writ" / "workspaces" / "main" / "HEAD").read_text()
         assert head_after != head_before, "HEAD must update after seal"
         assert len(head_after.strip()) > 0, "HEAD must contain seal ID"
@@ -231,10 +286,11 @@ class TestWorkspaceLayoutAfterSeal:
         """Sealing updates index in workspace dir."""
         path = writ_repo_with_spec
         (path / "src" / "app.py").write_text("print('indexed')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "index test", "--spec", "feat-1"],
             str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
         index_path = path / ".writ" / "workspaces" / "main" / "index.json"
         data = json.loads(index_path.read_text())
         # Index should have file entries
@@ -244,10 +300,11 @@ class TestWorkspaceLayoutAfterSeal:
         """Spec heads live in workspace dir."""
         path = writ_repo_with_spec
         (path / "src" / "app.py").write_text("print('spec head')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "spec head test", "--spec", "feat-1"],
             str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
         spec_head = path / ".writ" / "workspaces" / "main" / "heads" / "feat-1"
         assert spec_head.exists(), "Spec head must be in workspace/main/heads/"
 
@@ -255,10 +312,11 @@ class TestWorkspaceLayoutAfterSeal:
         """Seal data goes to shared .writ/seals/, not workspace dir."""
         path = writ_repo_with_spec
         (path / "src" / "app.py").write_text("print('shared')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "shared seal", "--spec", "feat-1"],
             str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
         seals_dir = path / ".writ" / "seals"
         seal_files = list(seals_dir.glob("*.json"))
         assert len(seal_files) > 0, "Seal files must be in shared .writ/seals/"
@@ -276,10 +334,11 @@ class TestWorkspaceRegressions:
         """Seal then log shows the seal."""
         path = writ_repo_with_spec
         (path / "src" / "app.py").write_text("print('roundtrip')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "roundtrip test", "--spec", "feat-1"],
             str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
         result = run_writ(["log", "--format", "json"], str(path))
         seals = json.loads(result.stdout)
         assert len(seals) >= 1
@@ -311,10 +370,11 @@ class TestWorkspaceRegressions:
         """writ verify --chain works with workspace layout."""
         path = writ_repo_with_spec
         (path / "src" / "app.py").write_text("print('verify')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "for verify", "--spec", "feat-1"],
             str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
         result = run_writ(["verify", "--chain"], str(path))
         assert result.returncode == 0
 
@@ -322,10 +382,11 @@ class TestWorkspaceRegressions:
         """writ restore still functions with workspace layout."""
         path = writ_repo_with_spec
         (path / "src" / "app.py").write_text("print('v1')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "v1", "--spec", "feat-1"],
             str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
         result = run_writ(["log", "--format", "json"], str(path))
         seals = json.loads(result.stdout)
         # The first seal (index 0) is the most recent — we want to restore to it
@@ -333,10 +394,11 @@ class TestWorkspaceRegressions:
         seal_id = seals[0]["id"]
 
         (path / "src" / "app.py").write_text("print('v2')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "v2", "--spec", "feat-1"],
             str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
 
         # Restore to the v1 seal (--force skips interactive confirmation)
         restore_result = run_writ(
@@ -365,6 +427,7 @@ class TestWorkspaceRegressions:
             agent_type="agent",
             status="in-progress",
         )
+        assert_api_sealed(result, "src/app.py")
         assert "id" in result, "Seal result must contain seal ID"
         assert "workspace" in result, "Seal result must contain workspace"
         assert result["workspace"] == "main"
@@ -455,10 +518,11 @@ class TestMigrationFlatToWorkspace:
             str(path),
         )
         (path / "src" / "app.py").write_text("print('sealed')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "pre-migration seal", "--spec", "mig-spec"],
             str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
 
         pre_log = json.loads(
             run_writ(["log", "--format", "json"], str(path)).stdout,
@@ -730,13 +794,15 @@ class TestWorkspaceResolution:
 class TestSealTagging:
     """WS.T4: Seals record correct workspace when created from workspace dir."""
 
+    @WORKSPACE_SEAL_XFAIL
     def test_seal_from_parallel_dir_tags_workspace(self, writ_repo_with_workspace):
         """Seal from parallel workspace dir has correct workspace field."""
         path, ws_dir = writ_repo_with_workspace
         (ws_dir / "src" / "app.py").write_text("print('backend')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "backend work", "--spec", "feat-1"], str(ws_dir),
         )
+        assert_sealed(sealed, ws_dir, "src/app.py")
 
         result = run_writ(["log", "--format", "json"], str(ws_dir))
         seals = json.loads(result.stdout)
@@ -747,14 +813,16 @@ class TestSealTagging:
         """Seal from main project dir still tags 'main'."""
         path = writ_repo_with_spec
         (path / "src" / "app.py").write_text("print('main work')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "main work", "--spec", "feat-1"], str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
 
         result = run_writ(["log", "--format", "json"], str(path))
         seals = json.loads(result.stdout)
         assert seals[0]["workspace"] == "main"
 
+    @WORKSPACE_SEAL_XFAIL
     def test_seals_from_different_workspaces_have_different_tags(
         self, writ_repo_with_workspace,
     ):
@@ -763,15 +831,17 @@ class TestSealTagging:
 
         # Seal from main
         (path / "src" / "app.py").write_text("print('main')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "main work", "--spec", "feat-1"], str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
 
         # Seal from backend workspace
         (ws_dir / "src" / "app.py").write_text("print('backend')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "backend work", "--spec", "feat-1"], str(ws_dir),
         )
+        assert_sealed(sealed, ws_dir, "src/app.py")
 
         # Main log has main seals
         main_seals = json.loads(
@@ -816,6 +886,7 @@ class TestParallelWorkflow:
         # Main is untouched
         assert "hello" in (path / "src" / "app.py").read_text()
 
+    @WORKSPACE_SEAL_XFAIL
     def test_three_workspace_independent_seals(self, writ_repo_with_spec):
         """Sealing in one workspace doesn't affect others' HEAD."""
         path = writ_repo_with_spec
@@ -827,16 +898,18 @@ class TestParallelWorkflow:
 
         # Seal in auth
         (auth_dir / "src" / "app.py").write_text("print('auth work')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "auth seal", "--spec", "feat-1"], str(auth_dir),
         )
+        assert_sealed(sealed, auth_dir, "src/app.py")
 
         # Seal in payments
         (payments_dir / "src" / "app.py").write_text("print('pay work')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "payments seal", "--spec", "feat-1"],
             str(payments_dir),
         )
+        assert_sealed(sealed, payments_dir, "src/app.py")
 
         # Auth log shows only auth seals
         auth_log = json.loads(
@@ -852,6 +925,7 @@ class TestParallelWorkflow:
         assert any("payments seal" in s["summary"] for s in pay_log)
         assert not any("auth seal" in s["summary"] for s in pay_log)
 
+    @WORKSPACE_SEAL_XFAIL
     def test_three_workspace_independent_spec_heads(self, writ_repo_with_spec):
         """Spec heads in different workspaces are independent."""
         path = writ_repo_with_spec
@@ -863,15 +937,17 @@ class TestParallelWorkflow:
 
         # Seal same spec from both workspaces
         (auth_dir / "src" / "app.py").write_text("print('auth')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "auth seal", "--spec", "feat-1"], str(auth_dir),
         )
+        assert_sealed(sealed, auth_dir, "src/app.py")
 
         (payments_dir / "src" / "app.py").write_text("print('payments')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "payments seal", "--spec", "feat-1"],
             str(payments_dir),
         )
+        assert_sealed(sealed, payments_dir, "src/app.py")
 
         # Spec heads should differ between workspaces
         auth_head = (
@@ -913,14 +989,16 @@ class TestWorkspaceDelete:
         )
         assert not ws_dir.exists()
 
+    @WORKSPACE_SEAL_XFAIL
     def test_delete_preserves_seals(self, writ_repo_with_workspace):
         """Seals from deleted workspace remain in shared store."""
         path, ws_dir = writ_repo_with_workspace
         (ws_dir / "src" / "app.py").write_text("print('backend')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "backend seal", "--spec", "feat-1"],
             str(ws_dir),
         )
+        assert_sealed(sealed, ws_dir, "src/app.py")
 
         # Count seals before delete
         seals_before = list((path / ".writ" / "seals").glob("*.json"))
@@ -988,6 +1066,7 @@ class TestWorkspaceDelete:
 class TestCommandCompatFromWorkspace:
     """WS.11: All existing commands work from parallel workspace directories."""
 
+    @WORKSPACE_SEAL_XFAIL
     def test_seal_from_workspace(self, writ_repo_with_workspace):
         """writ seal works from parallel workspace dir."""
         path, ws_dir = writ_repo_with_workspace
@@ -996,6 +1075,7 @@ class TestCommandCompatFromWorkspace:
             ["seal", "-s", "ws seal test", "--spec", "feat-1"],
             str(ws_dir),
         )
+        assert_sealed(result, ws_dir, "src/app.py")
         assert result.returncode == 0
 
     def test_context_from_workspace(self, writ_repo_with_workspace):
@@ -1004,13 +1084,15 @@ class TestCommandCompatFromWorkspace:
         result = run_writ(["context"], str(ws_dir))
         assert result.returncode == 0
 
+    @WORKSPACE_SEAL_XFAIL
     def test_log_from_workspace(self, writ_repo_with_workspace):
         """writ log works from parallel workspace dir."""
         _, ws_dir = writ_repo_with_workspace
         (ws_dir / "src" / "app.py").write_text("print('for log')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "log test", "--spec", "feat-1"], str(ws_dir),
         )
+        assert_sealed(sealed, ws_dir, "src/app.py")
 
         result = run_writ(["log", "--format", "json"], str(ws_dir))
         assert result.returncode == 0
@@ -1030,13 +1112,15 @@ class TestCommandCompatFromWorkspace:
         result = run_writ(["status"], str(ws_dir))
         assert result.returncode == 0
 
+    @WORKSPACE_SEAL_XFAIL
     def test_show_from_workspace(self, writ_repo_with_workspace):
         """writ show works from parallel workspace dir."""
         _, ws_dir = writ_repo_with_workspace
         (ws_dir / "src" / "app.py").write_text("print('show')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "show test", "--spec", "feat-1"], str(ws_dir),
         )
+        assert_sealed(sealed, ws_dir, "src/app.py")
 
         log = json.loads(
             run_writ(["log", "--format", "json"], str(ws_dir)).stdout,
@@ -1059,13 +1143,15 @@ class TestCommandCompatFromWorkspace:
         result = run_writ(["spec", "show", "ws-spec"], str(ws_dir))
         assert result.returncode == 0
 
+    @WORKSPACE_SEAL_XFAIL
     def test_restore_from_workspace(self, writ_repo_with_workspace):
         """writ restore from parallel workspace restores THAT workspace's state."""
         _, ws_dir = writ_repo_with_workspace
         (ws_dir / "src" / "app.py").write_text("print('v1')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "v1", "--spec", "feat-1"], str(ws_dir),
         )
+        assert_sealed(sealed, ws_dir, "src/app.py")
 
         log = json.loads(
             run_writ(["log", "--format", "json"], str(ws_dir)).stdout,
@@ -1077,6 +1163,7 @@ class TestCommandCompatFromWorkspace:
             ["seal", "-s", "v2", "--spec", "feat-1"], str(ws_dir),
             check=False,
         )
+        assert_sealed(v2_result, ws_dir, "src/app.py")
         if v2_result.returncode != 0:
             pytest.skip(
                 f"Second seal from workspace failed: {v2_result.stderr}"
@@ -1089,13 +1176,15 @@ class TestCommandCompatFromWorkspace:
             content = (ws_dir / "src" / "app.py").read_text()
             assert "v1" in content
 
+    @WORKSPACE_SEAL_XFAIL
     def test_verify_from_workspace(self, writ_repo_with_workspace):
         """writ verify works from parallel workspace dir."""
         _, ws_dir = writ_repo_with_workspace
         (ws_dir / "src" / "app.py").write_text("print('verify')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "verify test", "--spec", "feat-1"], str(ws_dir),
         )
+        assert_sealed(sealed, ws_dir, "src/app.py")
         result = run_writ(["verify", "--chain"], str(ws_dir))
         assert result.returncode == 0
 
@@ -1316,6 +1405,7 @@ class TestScopedContext:
                 f"shared-spec should be visible from {cwd}"
             )
 
+    @WORKSPACE_SEAL_XFAIL
     def test_context_shows_only_workspace_seals(self, writ_repo):
         """Context in workspace filters seals to that workspace."""
         path = writ_repo
@@ -1327,16 +1417,18 @@ class TestScopedContext:
 
         # Seal from main
         (path / "src" / "app.py").write_text("print('main')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "main seal", "--spec", "feat"], str(path),
         )
+        assert_sealed(sealed, path, "src/app.py")
 
         # Seal from backend
         ws_dir = path / ".writ" / "ws" / "backend"
         (ws_dir / "src" / "app.py").write_text("print('backend')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "backend seal", "--spec", "feat"], str(ws_dir),
         )
+        assert_sealed(sealed, ws_dir, "src/app.py")
 
         # Context from backend should show backend seals, not main's
         result = run_writ(["context", "--format", "json"], str(ws_dir))
@@ -1527,6 +1619,7 @@ class TestWorkspaceConvergence:
 
         return path, auth_dir, payments_dir
 
+    @WORKSPACE_SEAL_XFAIL
     def test_non_overlapping_changes_merge_cleanly(self, writ_repo_with_spec):
         """Non-overlapping workspace changes converge without conflicts."""
         path, auth_dir, payments_dir = self._setup_two_workspace_divergence(
@@ -1537,19 +1630,21 @@ class TestWorkspaceConvergence:
         (auth_dir / "src" / "models.py").write_text(
             "class User: pass\nclass AuthToken: pass\n",
         )
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "auth models", "--spec", "feat-1"],
             str(auth_dir),
         )
+        assert_sealed(sealed, auth_dir, "src/models.py")
 
         # Payments changes app.py only
         (payments_dir / "src" / "app.py").write_text(
             "print('payments app')\n",
         )
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "payments app", "--spec", "feat-1"],
             str(payments_dir),
         )
+        assert_sealed(sealed, payments_dir, "src/app.py")
 
         # Converge into main
         result = run_writ(
@@ -1564,6 +1659,7 @@ class TestWorkspaceConvergence:
         output = result.stdout + result.stderr
         assert "applied" in output.lower() or result.returncode == 0
 
+    @WORKSPACE_SEAL_XFAIL
     def test_overlapping_changes_through_engine(self, writ_repo_with_spec):
         """Files changed in multiple workspaces go through convergence."""
         path, auth_dir, payments_dir = self._setup_two_workspace_divergence(
@@ -1574,18 +1670,20 @@ class TestWorkspaceConvergence:
         (auth_dir / "src" / "app.py").write_text(
             "# auth version\nprint('auth')\n",
         )
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "auth app", "--spec", "feat-1"],
             str(auth_dir),
         )
+        assert_sealed(sealed, auth_dir, "src/app.py")
 
         (payments_dir / "src" / "app.py").write_text(
             "# payments version\nprint('payments')\n",
         )
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "payments app", "--spec", "feat-1"],
             str(payments_dir),
         )
+        assert_sealed(sealed, payments_dir, "src/app.py")
 
         # Converge with most-recent strategy
         result = run_writ(
@@ -1599,6 +1697,7 @@ class TestWorkspaceConvergence:
             f"Convergence with most-recent failed: {result.stderr}"
         )
 
+    @WORKSPACE_SEAL_XFAIL
     def test_convergence_seal_records_source_workspaces(
         self, writ_repo_with_spec,
     ):
@@ -1608,16 +1707,18 @@ class TestWorkspaceConvergence:
         )
 
         (auth_dir / "src" / "models.py").write_text("class Auth: pass\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "auth work", "--spec", "feat-1"],
             str(auth_dir),
         )
+        assert_sealed(sealed, auth_dir, "src/models.py")
 
         (payments_dir / "src" / "app.py").write_text("print('pay')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "payments work", "--spec", "feat-1"],
             str(payments_dir),
         )
+        assert_sealed(sealed, payments_dir, "src/app.py")
 
         result = run_writ(
             ["converge-workspaces", "auth", "payments"], str(path),
@@ -1640,6 +1741,7 @@ class TestWorkspaceConvergence:
             log = json.loads(log_result.stdout)
             assert len(log) > 0, "Main should have at least one seal"
 
+    @WORKSPACE_SEAL_XFAIL
     def test_dry_run_previews_without_applying(self, writ_repo_with_spec):
         """--dry-run shows what would merge without changing state."""
         path, auth_dir, payments_dir = self._setup_two_workspace_divergence(
@@ -1647,16 +1749,18 @@ class TestWorkspaceConvergence:
         )
 
         (auth_dir / "src" / "models.py").write_text("class DryRun: pass\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "auth dry run", "--spec", "feat-1"],
             str(auth_dir),
         )
+        assert_sealed(sealed, auth_dir, "src/models.py")
 
         (payments_dir / "src" / "app.py").write_text("print('dry')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "payments dry run", "--spec", "feat-1"],
             str(payments_dir),
         )
+        assert_sealed(sealed, payments_dir, "src/app.py")
 
         # Capture main state before dry-run
         main_app_before = (path / "src" / "app.py").read_text()
@@ -1675,6 +1779,7 @@ class TestWorkspaceConvergence:
         assert (path / "src" / "app.py").read_text() == main_app_before
         assert (path / "src" / "models.py").read_text() == main_models_before
 
+    @WORKSPACE_SEAL_XFAIL
     def test_partial_convergence(self, writ_repo_with_spec):
         """Converging 2 of 3 workspaces works, third unaffected."""
         path = writ_repo_with_spec
@@ -1688,22 +1793,25 @@ class TestWorkspaceConvergence:
 
         # All three make changes
         (auth_dir / "src" / "models.py").write_text("class Auth: pass\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "auth work", "--spec", "feat-1"],
             str(auth_dir),
         )
+        assert_sealed(sealed, auth_dir, "src/models.py")
 
         (payments_dir / "src" / "app.py").write_text("print('pay')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "payments work", "--spec", "feat-1"],
             str(payments_dir),
         )
+        assert_sealed(sealed, payments_dir, "src/app.py")
 
         (ui_dir / "README.md").write_text("# UI Project\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "ui work", "--spec", "feat-1"],
             str(ui_dir),
         )
+        assert_sealed(sealed, ui_dir, "README.md")
 
         # Only converge auth + payments (NOT ui)
         result = run_writ(
@@ -1721,6 +1829,7 @@ class TestWorkspaceConvergence:
         # UI workspace is unaffected — still has its own state
         assert "UI Project" in (ui_dir / "README.md").read_text()
 
+    @WORKSPACE_SEAL_XFAIL
     def test_strategy_passed_to_engine(self, writ_repo_with_spec):
         """Valid strategies (three-way-merge, most-recent, escalate) accepted."""
         path, auth_dir, payments_dir = self._setup_two_workspace_divergence(
@@ -1729,16 +1838,18 @@ class TestWorkspaceConvergence:
 
         # Non-overlapping changes so any strategy succeeds
         (auth_dir / "src" / "models.py").write_text("class Strat: pass\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "auth strat", "--spec", "feat-1"],
             str(auth_dir),
         )
+        assert_sealed(sealed, auth_dir, "src/models.py")
 
         (payments_dir / "src" / "app.py").write_text("print('strat')\n")
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "pay strat", "--spec", "feat-1"],
             str(payments_dir),
         )
+        assert_sealed(sealed, payments_dir, "src/app.py")
 
         # Dry-run with each valid strategy to verify they're accepted
         for strategy in ["three-way-merge", "most-recent", "escalate"]:
@@ -1764,6 +1875,7 @@ class TestGoldenPathEndToEnd:
     writ spec done → writ converge-workspaces → verify merged result.
     """
 
+    @WORKSPACE_SEAL_XFAIL
     def test_golden_path(self, tmp_path):
         """The exact design spec workflow end-to-end.
 
@@ -1834,11 +1946,12 @@ class TestGoldenPathEndToEnd:
             "@app.route('/logout')\n"
             "def logout(): return 'logout'\n",
         )
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "added auth endpoints",
              "--spec", "auth-api"],
             str(auth_dir),
         )
+        assert_sealed(sealed, auth_dir, "src/api.py")
 
         # Payments team: adds payment models
         (pay_dir / "src" / "models.py").write_text(
@@ -1850,11 +1963,12 @@ class TestGoldenPathEndToEnd:
             "    def __init__(self, payment):\n"
             "        self.payment = payment\n",
         )
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "added payment models",
              "--spec", "payment-api"],
             str(pay_dir),
         )
+        assert_sealed(sealed, pay_dir, "src/models.py")
 
         # UI team: adds dashboard
         (ui_dir / "src" / "ui.py").write_text(
@@ -1864,11 +1978,12 @@ class TestGoldenPathEndToEnd:
             "}\n\n"
             "export default Dashboard\n",
         )
-        run_writ(
+        sealed = run_writ(
             ["seal", "-s", "added dashboard component",
              "--spec", "ui-dashboard"],
             str(ui_dir),
         )
+        assert_sealed(sealed, ui_dir, "src/ui.py")
 
         # --- Mark specs done ---
         run_writ(

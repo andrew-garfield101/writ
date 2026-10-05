@@ -362,12 +362,7 @@ class TestInitYesMode:
         assert not (tmp_path / "CLAUDE.md").exists()
         assert not (tmp_path / "AGENTS.md").exists()
 
-    @pytest.mark.xfail(
-        reason="BUG: init_project() calls install_hooks() unconditionally before "
-        "CLI respects --no-claude flag. See repo.rs:223 vs init.rs:1331. "
-        "Flagged for CC to fix (init_project should not run hooks, or CLI "
-        "should skip init_project's hook pass)."
-    )
+    # Was xfail for BRI-B1 (--no-claude ignored); passes as of A.4 (1d5cb31ae196).
     def test_init_yes_no_claude_flag(self, tmp_path: Path):
         """`--no-claude` skips Claude Code integration."""
         # Pre-create CLAUDE.md to ensure framework is detected
@@ -538,3 +533,182 @@ class TestGenericInstructions:
         second = (tmp_path / ".writ" / "AGENT_INSTRUCTIONS.md").read_text()
 
         assert first == second
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# A.4 (init-hooks): SessionStart only, brief format, replace legacy block
+# ═══════════════════════════════════════════════════════════════════════════
+
+LEGACY_CMD = "echo '## Writ VCS Active' && /opt/homebrew/bin/writ context 2>/dev/null || true"
+
+
+def _settings(root: Path) -> dict:
+    return json.loads((root / ".claude" / "settings.json").read_text())
+
+
+def _writ_hook_commands(settings: dict, event: str) -> list[str]:
+    return [
+        hook["command"]
+        for entry in settings.get("hooks", {}).get(event, [])
+        for hook in entry.get("hooks", [])
+        if "writ context" in hook.get("command", "")
+    ]
+
+
+@pytest.mark.skipif(WRIT_BIN is None, reason="writ binary not found")
+class TestInitSessionStartHook:
+    """A.4: init writes one brief SessionStart hook and no per-prompt hook."""
+
+    def test_fresh_init_writes_single_brief_session_start(self, tmp_path: Path):
+        run_writ(["init", "-y"], cwd=str(tmp_path))
+        settings = _settings(tmp_path)
+        commands = _writ_hook_commands(settings, "SessionStart")
+        assert len(commands) == 1
+        assert "--format brief" in commands[0]
+        assert "UserPromptSubmit" not in settings["hooks"]
+
+    def test_init_replaces_legacy_two_hook_block(self, tmp_path: Path):
+        legacy_entry = {"hooks": [{"type": "command", "command": LEGACY_CMD, "timeout": 10}]}
+        custom_entry = {"hooks": [{"type": "command", "command": "echo custom"}]}
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.json").write_text(json.dumps({
+            "hooks": {
+                "SessionStart": [legacy_entry],
+                "UserPromptSubmit": [legacy_entry, custom_entry],
+            }
+        }))
+
+        run_writ(["init", "-y"], cwd=str(tmp_path))
+
+        settings = _settings(tmp_path)
+        commands = _writ_hook_commands(settings, "SessionStart")
+        assert len(commands) == 1, "legacy hook replaced, not appended"
+        assert "--format brief" in commands[0]
+        assert settings["hooks"]["UserPromptSubmit"] == [custom_entry]
+
+    def test_reinit_does_not_duplicate_hook(self, tmp_path: Path):
+        run_writ(["init", "-y"], cwd=str(tmp_path))
+        run_writ(["init", "-y"], cwd=str(tmp_path))
+        assert len(_writ_hook_commands(_settings(tmp_path), "SessionStart")) == 1
+
+    def test_uninit_removes_writ_hook_and_keeps_user_hooks(self, tmp_path: Path):
+        user_hook = {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo hi"}]}
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.json").write_text(
+            json.dumps({"hooks": {"PreToolUse": [user_hook]}})
+        )
+        run_writ(["init", "-y"], cwd=str(tmp_path))
+        run_writ(["uninit", "--force"], cwd=str(tmp_path), check=False)
+
+        settings = _settings(tmp_path)
+        assert settings["hooks"] == {"PreToolUse": [user_hook]}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# B.2 A.4 group (Bri): end-to-end hook behavior and exact uninit
+# ═══════════════════════════════════════════════════════════════════════════
+
+BRIEF_HOOK_BUDGET = 2048  # bytes injected per session, preamble included
+
+
+def _init_with_dev_writ_on_path(root: Path) -> None:
+    """Run init with the dev binary first on PATH, so `which writ` finds it."""
+    env = dict(os.environ)
+    env["PATH"] = f"{Path(WRIT_BIN).parent}{os.pathsep}{env.get('PATH', '')}"
+    subprocess.run([WRIT_BIN, "init", "-y"], cwd=str(root), env=env,
+                   capture_output=True, text=True, check=True)
+
+
+def _git_repo(root: Path) -> None:
+    for args in (["init", "-q"], ["config", "user.email", "t@t"], ["config", "user.name", "t"]):
+        subprocess.run(["git", *args], cwd=str(root), check=True)
+    (root / "app.py").write_text("print('hi')\n")
+    subprocess.run(["git", "add", "."], cwd=str(root), check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=str(root), check=True)
+
+
+@pytest.mark.skipif(WRIT_BIN is None, reason="writ binary not found")
+class TestSessionStartHookEndToEnd:
+    """The hook is what every agent pays for at session start; run it for real."""
+
+    def test_session_start_hook_runs_and_emits_brief_within_budget(self, tmp_path: Path):
+        _git_repo(tmp_path)
+        _init_with_dev_writ_on_path(tmp_path)
+        (command,) = _writ_hook_commands(_settings(tmp_path), "SessionStart")
+
+        result = subprocess.run(["bash", "-c", command], cwd=str(tmp_path),
+                                capture_output=True, text=True, timeout=10)
+
+        assert result.returncode == 0, result.stderr
+        assert "context-brief" in result.stdout, result.stdout
+        assert len(result.stdout.encode()) <= BRIEF_HOOK_BUDGET, (
+            f"hook injects {len(result.stdout.encode())} B"
+        )
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "finding 24: the hook embeds `which writ` at init time, not the binary "
+            "that ran init; a stale binary earlier on PATH gets pinned, and "
+            "`2>/dev/null || true` hides its errors"
+        ),
+    )
+    def test_hook_uses_the_binary_that_ran_init(self, tmp_path: Path):
+        decoy_dir = tmp_path / "decoy-bin"
+        decoy_dir.mkdir()
+        decoy = decoy_dir / "writ"
+        decoy.write_text("#!/bin/sh\necho decoy\n")
+        decoy.chmod(0o755)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        env = dict(os.environ)
+        env["PATH"] = f"{decoy_dir}{os.pathsep}{env.get('PATH', '')}"
+
+        subprocess.run([WRIT_BIN, "init", "-y"], cwd=str(repo), env=env,
+                       capture_output=True, text=True, check=True)
+
+        (command,) = _writ_hook_commands(_settings(repo), "SessionStart")
+        assert str(decoy) not in command
+        assert str(Path(WRIT_BIN).resolve()) in command or " writ context" in command
+
+    def test_init_replaces_pathless_legacy_hooks(self, tmp_path: Path):
+        legacy = {"hooks": [{"type": "command", "command": "writ context 2>/dev/null || true"}]}
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.json").write_text(json.dumps({
+            "hooks": {"SessionStart": [legacy], "UserPromptSubmit": [legacy]},
+        }))
+
+        run_writ(["init", "-y"], cwd=str(tmp_path))
+
+        settings = _settings(tmp_path)
+        assert len(_writ_hook_commands(settings, "SessionStart")) == 1
+        assert "--format brief" in _writ_hook_commands(settings, "SessionStart")[0]
+        assert not settings["hooks"].get("UserPromptSubmit"), settings["hooks"]
+
+    def test_uninit_restores_preexisting_settings_exactly(self, tmp_path: Path):
+        original = {
+            "permissions": {"allow": ["Bash(npm test)"], "deny": ["Bash(rm -rf *)"]},
+            "env": {"FOO": "bar"},
+            "hooks": {
+                "PreToolUse": [{"matcher": "Bash",
+                                "hooks": [{"type": "command", "command": "echo pre"}]}],
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "echo mine"}]}],
+            },
+        }
+        (tmp_path / ".claude").mkdir()
+        (tmp_path / ".claude" / "settings.json").write_text(json.dumps(original))
+
+        run_writ(["init", "-y"], cwd=str(tmp_path))
+        run_writ(["uninit", "--force"], cwd=str(tmp_path), check=False)
+
+        assert _settings(tmp_path) == original
+
+    def test_uninit_after_fresh_init_leaves_no_writ_hooks(self, tmp_path: Path):
+        run_writ(["init", "-y"], cwd=str(tmp_path))
+        run_writ(["uninit", "--force"], cwd=str(tmp_path), check=False)
+
+        path = tmp_path / ".claude" / "settings.json"
+        if path.exists():
+            settings = json.loads(path.read_text())
+            for event in ("SessionStart", "UserPromptSubmit"):
+                assert not _writ_hook_commands(settings, event), event

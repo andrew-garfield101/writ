@@ -21,7 +21,6 @@ __pycache__/
 venv/
 
 # writ's own data (when dogfooding)
-.writ/
 
 # mdbook generated output
 book/book/
@@ -45,3 +44,12 @@ scripts/
 old_readmes/
 
 *.dSYM/
+
+# Writ version control state
+.writ/
+
+*.so
+
+# benchmark and e2e run outputs
+bench/context/results/
+crates/writ-py/tests/e2e/results/

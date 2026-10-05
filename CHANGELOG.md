@@ -5,7 +5,7 @@ All notable changes to writ will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.3.0] — Unreleased
+## [0.3.0] — 2026-10-05
 
 Two agents can now share one directory: each seal takes only its own spec's files, closing a spec never sweeps another agent's work, and `writ finish` commits only what was sealed.
 

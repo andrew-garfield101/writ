@@ -6,6 +6,7 @@ finding's fix_command is pasteable.
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -31,10 +32,20 @@ def _seal(repo: writ.Repository, summary: str) -> dict:
 
 
 def _writ_bin() -> str:
-    """The dev build if present, else whatever `writ` is on PATH."""
+    """A built writ CLI: target/release, then target/debug, then PATH.
+
+    Skips the calling test when none exists, which is the case on the
+    Python CI jobs (they only run maturin develop). Finding 94.
+    """
     root = Path(__file__).resolve().parents[3]
-    dev = root / "target" / "release" / "writ"
-    return str(dev) if dev.exists() else "writ"
+    for profile in ("release", "debug"):
+        dev = root / "target" / profile / "writ"
+        if dev.exists():
+            return str(dev)
+    on_path = shutil.which("writ")
+    if on_path:
+        return on_path
+    pytest.skip("writ CLI not built (target/release or target/debug) and not on PATH")
 
 
 class TestDoctorReportShape:

@@ -16,6 +16,7 @@ pub mod context;
 pub mod convergence;
 pub mod crypto;
 pub mod diff;
+pub mod doctor;
 pub mod env_scan;
 pub mod error;
 pub mod format;

@@ -77,13 +77,14 @@ const WRIT_SPEC_ADD: SlashCommandTemplate = SlashCommandTemplate {
     content: r#"Create a new task spec.
 
 ```bash
-writ spec add --id $ARGUMENTS --title "<description>"
+writ spec add --id $ARGUMENTS --title "<description>" --claim
 ```
 
 Options:
 - `--id <spec-id>` — unique identifier for the spec (required)
 - `--title "<description>"` — human-readable title (required)
 - `--description "<details>"` — optional longer description
+- `--claim` — make the spec yours, so your seals land on it
 
 After creating a spec, checkpoint your work with `writ seal` and mark it done with `writ spec done`.
 "#,

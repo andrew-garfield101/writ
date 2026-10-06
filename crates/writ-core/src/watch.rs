@@ -99,6 +99,13 @@ pub enum WatchEventKind {
         files_merged: usize,
         specs: Vec<String>,
     },
+    /// `writ doctor` ran this cycle and its result differs from the last
+    /// cycle's (the first cycle always reports). `findings` are
+    /// `(check, severity, message, fix_command)`.
+    DoctorChanged {
+        headline: String,
+        findings: Vec<(String, String, String, String)>,
+    },
 }
 
 /// Summary statistics for a completed watch session.
@@ -205,6 +212,8 @@ pub struct WatchState {
     /// True on the very first cycle. Enables retroactive overlap scanning
     /// so a late-started watch catches pre-existing unconverged overlaps.
     pub first_cycle: bool,
+    /// The doctor findings reported last cycle, to report only changes.
+    pub last_doctor: Option<Vec<crate::doctor::DoctorFinding>>,
 }
 
 /// Persisted portion of watch state (survives process restarts).
@@ -230,6 +239,7 @@ impl WatchState {
             known_seals,
             converged_fingerprints,
             first_cycle: true,
+            last_doctor: None,
         })
     }
 
@@ -262,6 +272,55 @@ impl WatchState {
 // ═══════════════════════════════════════════════════════════════════
 
 fn run_cycle(
+    repo: &Repository,
+    config: &WatchConfig,
+    state: &mut WatchState,
+    summary: &mut WatchSummary,
+    event_tx: &Sender<WatchEvent>,
+) -> WritResult<()> {
+    run_cycle_inner(repo, config, state, summary, event_tx)?;
+    doctor_cycle(repo, state, event_tx);
+    Ok(())
+}
+
+/// Run the doctor fast tier and send `DoctorChanged` when its findings
+/// differ from last cycle's. A doctor error is reported as an event, never
+/// stops the watch.
+fn doctor_cycle(repo: &Repository, state: &mut WatchState, event_tx: &Sender<WatchEvent>) {
+    let (findings, headline) = match crate::doctor::run(repo) {
+        Ok(r) => (r.findings, r.headline),
+        Err(e) => (
+            Vec::new(),
+            format!("doctor could not run ({e}); run `writ doctor`"),
+        ),
+    };
+    if state.last_doctor.as_ref() == Some(&findings) {
+        return;
+    }
+    let rows = findings
+        .iter()
+        .map(|f| {
+            (
+                f.check.clone(),
+                f.severity.as_str().to_string(),
+                f.message.clone(),
+                f.fix_command
+                    .clone()
+                    .unwrap_or_else(|| "none: needs your decision".into()),
+            )
+        })
+        .collect();
+    state.last_doctor = Some(findings);
+    let _ = event_tx.send(WatchEvent {
+        timestamp: Utc::now(),
+        kind: WatchEventKind::DoctorChanged {
+            headline,
+            findings: rows,
+        },
+    });
+}
+
+fn run_cycle_inner(
     repo: &Repository,
     config: &WatchConfig,
     state: &mut WatchState,

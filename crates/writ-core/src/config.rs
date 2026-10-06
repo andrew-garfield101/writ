@@ -81,6 +81,52 @@ pub struct OutputConfig {
 // Project config (.writ/config.toml)
 // ---------------------------------------------------------------------------
 
+/// Replace (or insert) the single-line `key = ...` inside `[table]` of a
+/// TOML document, adding the table at the end when absent. Every other line,
+/// comments and unknown tables included, is kept byte for byte. `line` is the
+/// full replacement line (`key = value`).
+pub fn set_toml_key(text: &str, table: &str, key: &str, line: &str) -> String {
+    let header = format!("[{table}]");
+    let lines: Vec<&str> = text.lines().collect();
+    let Some(h) = lines.iter().position(|l| l.trim() == header) else {
+        let sep = if text.is_empty() || text.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        return format!("{text}{sep}\n{header}\n{line}\n");
+    };
+    let end = lines[h + 1..]
+        .iter()
+        .position(|l| l.trim_start().starts_with('['))
+        .map(|i| h + 1 + i)
+        .unwrap_or(lines.len());
+    let mut out: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    let existing = (h + 1..end).find(|&i| {
+        let t = lines[i].trim_start();
+        t.starts_with(key) && t[key.len()..].trim_start().starts_with('=')
+    });
+    match existing {
+        Some(i) => out[i] = line.to_string(),
+        None => out.insert(h + 1, line.to_string()),
+    }
+    let mut joined = out.join("\n");
+    if text.ends_with('\n') || text.is_empty() {
+        joined.push('\n');
+    }
+    joined
+}
+
+/// Parse `.writ/config.toml` text; None when it does not parse.
+pub fn parse_project_config(text: &str) -> Option<ProjectConfig> {
+    toml::from_str(text).ok()
+}
+
+/// A TOML basic string literal for `v`, quoted and escaped.
+pub fn toml_string(v: &str) -> String {
+    toml::Value::String(v.to_string()).to_string()
+}
+
 /// Project-level config stored at `.writ/config.toml`. Contains settings
 /// specific to this writ repository.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -120,6 +166,11 @@ pub struct ProjectConfig {
     /// Watch daemon configuration.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watch: Option<WatchConfig>,
+
+    /// `writ doctor` thresholds and allowances. Kept here so a config save
+    /// round-trips the `[doctor]` table instead of dropping it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctor: Option<crate::doctor::DoctorConfig>,
 }
 
 /// Project metadata section.
@@ -819,9 +870,14 @@ mod tests {
             auto: None,
             workspace: None,
             watch: None,
+            doctor: Some(crate::doctor::DoctorConfig {
+                stale_claim_minutes: 45,
+                ..Default::default()
+            }),
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: ProjectConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.doctor.as_ref().unwrap().stale_claim_minutes, 45);
         assert_eq!(
             parsed.project.as_ref().unwrap().name.as_deref(),
             Some("my-project")

@@ -74,6 +74,11 @@ pub struct UnrecoverableObject {
 pub struct RepairReport {
     /// True when nothing was written.
     pub dry_run: bool,
+    /// Layout fixes made first (or, on a dry run, that would be made).
+    pub layout: Vec<String>,
+    /// True when a dry run could not scan the store because of a layout
+    /// problem a real run fixes first.
+    pub store_scan_skipped: bool,
     /// Every referenced object that was missing when the run started.
     pub missing: Vec<MissingObject>,
     /// Missing objects regenerated (or, on a dry run, regenerable).
@@ -100,9 +105,26 @@ impl RepairReport {
 /// With `dry_run`, sources are still searched and verified so the report
 /// says what a real run would recover, but nothing is written.
 pub fn repair_store(root: &Path, writ_dir: &Path, dry_run: bool) -> WritResult<RepairReport> {
+    let blocked = layout_problems(writ_dir)
+        .iter()
+        .any(LayoutProblem::blocks_store_scan);
+    let layout = repair_layout(writ_dir, dry_run)?;
+    if dry_run && blocked {
+        return Ok(RepairReport {
+            dry_run,
+            layout,
+            store_scan_skipped: true,
+            missing: Vec::new(),
+            recovered: Vec::new(),
+            unrecoverable: Vec::new(),
+            unreadable_trees: Vec::new(),
+        });
+    }
     let check = gc::check_store(writ_dir)?;
     let mut report = RepairReport {
         dry_run,
+        layout,
+        store_scan_skipped: false,
         missing: check.missing_objects.clone(),
         recovered: Vec::new(),
         unrecoverable: Vec::new(),
@@ -836,5 +858,309 @@ mod tests {
         ));
         assert!(report.is_clean());
         assert!(gc::check_store(repo.writ_dir()).unwrap().is_clean());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Layout repair (sprint 3, doctor-core)
+// ---------------------------------------------------------------------------
+
+/// Directories every `.writ` must have; an empty one is valid.
+pub const LAYOUT_DIRS: [&str; 6] = [
+    "objects",
+    "seals",
+    "specs",
+    "keys",
+    "agents",
+    "workspaces/main/heads",
+];
+
+/// Where `writ repair` moves records it cannot parse. Moved, never deleted.
+pub const QUARANTINE_DIR: &str = "quarantine";
+
+/// One thing wrong with the `.writ` layout that `writ repair` fixes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LayoutProblem {
+    /// A required directory is absent: repair creates it.
+    MissingDir { path: String },
+    /// `version.toml` absent or unparseable: repair writes a current one
+    /// (moving a corrupt file aside first).
+    VersionFile { reason: String },
+    /// Main workspace `HEAD` absent: repair points it at the newest seal no
+    /// other seal names as parent (empty when there are no seals).
+    MissingHead,
+    /// Main workspace index absent or unparseable: repair rebuilds it from
+    /// the HEAD seal's tree (empty when HEAD is empty).
+    Index { reason: String },
+    /// `config.toml` unparseable: repair moves it aside (defaults apply).
+    Config { reason: String },
+    /// A seal or spec record that does not parse: repair moves it to
+    /// `.writ/quarantine/`.
+    UnparseableRecord { path: String, reason: String },
+}
+
+impl LayoutProblem {
+    /// One line naming the problem.
+    pub fn describe(&self) -> String {
+        match self {
+            LayoutProblem::MissingDir { path } => format!("missing directory .writ/{path}"),
+            LayoutProblem::VersionFile { reason } => format!(".writ/version.toml: {reason}"),
+            LayoutProblem::MissingHead => "missing .writ/workspaces/main/HEAD".to_string(),
+            LayoutProblem::Index { reason } => {
+                format!(".writ/workspaces/main/index.json: {reason}")
+            }
+            LayoutProblem::Config { reason } => format!(".writ/config.toml: {reason}"),
+            LayoutProblem::UnparseableRecord { path, reason } => {
+                format!("unparseable record .writ/{path}: {reason}")
+            }
+        }
+    }
+
+    /// The `.writ`-relative path the problem is about.
+    pub fn path(&self) -> String {
+        match self {
+            LayoutProblem::MissingDir { path } | LayoutProblem::UnparseableRecord { path, .. } => {
+                format!(".writ/{path}")
+            }
+            LayoutProblem::VersionFile { .. } => ".writ/version.toml".into(),
+            LayoutProblem::MissingHead => ".writ/workspaces/main/HEAD".into(),
+            LayoutProblem::Index { .. } => ".writ/workspaces/main/index.json".into(),
+            LayoutProblem::Config { .. } => ".writ/config.toml".into(),
+        }
+    }
+
+    /// True when the store scan cannot run until this is fixed.
+    pub fn blocks_store_scan(&self) -> bool {
+        matches!(
+            self,
+            LayoutProblem::UnparseableRecord { .. }
+                | LayoutProblem::MissingDir { .. }
+                | LayoutProblem::Index { .. }
+        )
+    }
+}
+
+/// Inspect the `.writ` layout. Read only.
+pub fn layout_problems(writ_dir: &Path) -> Vec<LayoutProblem> {
+    let mut out = Vec::new();
+    for dir in LAYOUT_DIRS {
+        if !writ_dir.join(dir).is_dir() {
+            out.push(LayoutProblem::MissingDir { path: dir.into() });
+        }
+    }
+    match crate::migrate::RepoVersion::load(writ_dir) {
+        Ok(Some(_)) => {}
+        Ok(None) => out.push(LayoutProblem::VersionFile {
+            reason: "missing".into(),
+        }),
+        Err(e) => out.push(LayoutProblem::VersionFile {
+            reason: format!("unparseable ({e})"),
+        }),
+    }
+    let ws = writ_dir.join("workspaces").join("main");
+    if ws.is_dir() && !ws.join("HEAD").is_file() {
+        out.push(LayoutProblem::MissingHead);
+    }
+    let index = ws.join("index.json");
+    if ws.is_dir() {
+        match fs::read_to_string(&index) {
+            Err(_) => out.push(LayoutProblem::Index {
+                reason: "missing".into(),
+            }),
+            Ok(data) => {
+                if let Err(e) = serde_json::from_str::<crate::index::Index>(&data) {
+                    out.push(LayoutProblem::Index {
+                        reason: format!("unparseable ({e})"),
+                    });
+                }
+            }
+        }
+    }
+    if let Ok(data) = fs::read_to_string(writ_dir.join("config.toml")) {
+        if let Err(e) = toml::from_str::<crate::config::ProjectConfig>(&data) {
+            out.push(LayoutProblem::Config {
+                reason: format!("unparseable ({e})"),
+            });
+        }
+    }
+    out.extend(unparseable_records::<crate::seal::Seal>(writ_dir, "seals"));
+    out.extend(unparseable_records::<crate::spec::Spec>(writ_dir, "specs"));
+    out
+}
+
+fn unparseable_records<T: serde::de::DeserializeOwned>(
+    writ_dir: &Path,
+    dir: &str,
+) -> Vec<LayoutProblem> {
+    let Ok(entries) = fs::read_dir(writ_dir.join(dir)) else {
+        return Vec::new();
+    };
+    let mut out: Vec<LayoutProblem> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+        .filter_map(|p| {
+            let err = match fs::read_to_string(&p) {
+                Ok(data) => serde_json::from_str::<T>(&data).err()?.to_string(),
+                Err(e) => e.to_string(),
+            };
+            let name = p.file_name()?.to_string_lossy().to_string();
+            Some(LayoutProblem::UnparseableRecord {
+                path: format!("{dir}/{name}"),
+                reason: err,
+            })
+        })
+        .collect();
+    out.sort_by_key(|p| p.path());
+    out
+}
+
+/// Fix every layout problem (or, with `dry_run`, only list them). Returns
+/// one line per action taken (or that would be taken).
+pub fn repair_layout(writ_dir: &Path, dry_run: bool) -> WritResult<Vec<String>> {
+    let problems = layout_problems(writ_dir);
+    let mut actions = Vec::new();
+    // Records first, so HEAD and index rebuilds only see parseable seals.
+    let (records, rest): (Vec<_>, Vec<_>) = problems
+        .into_iter()
+        .partition(|p| matches!(p, LayoutProblem::UnparseableRecord { .. }));
+    for p in records.iter().chain(rest.iter()) {
+        let action = match p {
+            LayoutProblem::MissingDir { path } => {
+                if !dry_run {
+                    fs::create_dir_all(writ_dir.join(path))?;
+                }
+                format!("created .writ/{path}")
+            }
+            LayoutProblem::UnparseableRecord { path, .. } => {
+                let to = writ_dir.join(QUARANTINE_DIR).join(path);
+                if !dry_run {
+                    if let Some(parent) = to.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::rename(writ_dir.join(path), &to)?;
+                }
+                format!("moved .writ/{path} to .writ/{QUARANTINE_DIR}/{path}")
+            }
+            LayoutProblem::VersionFile { .. } => {
+                if !dry_run {
+                    move_aside(&crate::migrate::RepoVersion::path(writ_dir))?;
+                    crate::migrate::RepoVersion::new().save(writ_dir)?;
+                }
+                "wrote a current .writ/version.toml".to_string()
+            }
+            LayoutProblem::Config { .. } => {
+                if !dry_run {
+                    move_aside(&writ_dir.join("config.toml"))?;
+                }
+                "moved .writ/config.toml to .writ/config.toml.corrupt (defaults apply)".to_string()
+            }
+            LayoutProblem::MissingHead => {
+                let head = newest_tip_seal(writ_dir)?;
+                if !dry_run {
+                    let ws = writ_dir.join("workspaces").join("main");
+                    fs::create_dir_all(&ws)?;
+                    fs::write(ws.join("HEAD"), head.clone().unwrap_or_default())?;
+                }
+                match head {
+                    Some(id) => format!(
+                        "set main HEAD to newest tip seal {}",
+                        &id[..id.len().min(12)]
+                    ),
+                    None => "wrote an empty main HEAD (no seals)".to_string(),
+                }
+            }
+            LayoutProblem::Index { .. } => {
+                let ws = writ_dir.join("workspaces").join("main");
+                let head = fs::read_to_string(ws.join("HEAD"))
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .or(newest_tip_seal(writ_dir)?);
+                let index = match &head {
+                    Some(id) => index_from_seal(writ_dir, id)?,
+                    None => crate::index::Index::default(),
+                };
+                if !dry_run {
+                    fs::create_dir_all(&ws)?;
+                    move_aside(&ws.join("index.json"))?;
+                    index.save(&ws.join("index.json"))?;
+                }
+                format!(
+                    "rebuilt main index from {} ({} entries)",
+                    head.as_deref()
+                        .map(|h| format!("seal {}", &h[..h.len().min(12)]))
+                        .unwrap_or_else(|| "nothing".into()),
+                    index.entries.len()
+                )
+            }
+        };
+        actions.push(action);
+    }
+    Ok(actions)
+}
+
+/// Rename `path` to `<path>.corrupt` if it exists.
+fn move_aside(path: &Path) -> WritResult<()> {
+    if path.exists() {
+        let mut to = path.as_os_str().to_owned();
+        to.push(".corrupt");
+        fs::rename(path, PathBuf::from(to))?;
+    }
+    Ok(())
+}
+
+/// The newest seal (by timestamp) that no other seal names as its parent.
+/// Unparseable seal records are skipped (they are quarantined first on a
+/// real run).
+fn newest_tip_seal(writ_dir: &Path) -> WritResult<Option<String>> {
+    let seals: Vec<crate::seal::Seal> = match fs::read_dir(writ_dir.join("seals")) {
+        Ok(entries) => entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("json"))
+            .filter_map(|p| fs::read_to_string(p).ok())
+            .filter_map(|d| serde_json::from_str(&d).ok())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    let parents: HashSet<&str> = seals.iter().filter_map(|s| s.parent.as_deref()).collect();
+    Ok(seals
+        .iter()
+        .filter(|s| !parents.contains(s.id.as_str()))
+        .max_by_key(|s| s.timestamp)
+        .map(|s| s.id.clone()))
+}
+
+/// The index recorded by a seal's tree.
+fn index_from_seal(writ_dir: &Path, seal_id: &str) -> WritResult<crate::index::Index> {
+    let data = fs::read_to_string(writ_dir.join("seals").join(format!("{seal_id}.json")))?;
+    let seal: crate::seal::Seal = serde_json::from_str(&data)?;
+    let tree = object_store(writ_dir).retrieve(&seal.tree)?;
+    let entries = serde_json::from_slice(&tree)?;
+    Ok(crate::index::Index { entries })
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn repair_layout_fixes_every_problem_it_lists() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::Repository::init(dir.path()).unwrap();
+        let w = repo.writ_dir().to_path_buf();
+        fs::remove_dir_all(w.join("specs")).unwrap();
+        fs::remove_file(w.join("workspaces/main/index.json")).unwrap();
+        fs::write(w.join("seals/bad.json"), "{not json").unwrap();
+        fs::write(w.join("config.toml"), "[[[").unwrap();
+        assert_eq!(layout_problems(&w).len(), 4, "{:?}", layout_problems(&w));
+        let dry = repair_layout(&w, true).unwrap();
+        assert_eq!(dry.len(), 4);
+        assert_eq!(layout_problems(&w).len(), 4, "dry run wrote");
+        repair_layout(&w, false).unwrap();
+        assert!(layout_problems(&w).is_empty(), "{:?}", layout_problems(&w));
+        assert!(w.join("quarantine/seals/bad.json").is_file());
     }
 }

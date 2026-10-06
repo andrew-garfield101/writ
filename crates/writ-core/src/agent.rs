@@ -318,6 +318,19 @@ pub mod session {
     /// The session key for this process, or None when the process table
     /// cannot be read (no `ps`, non-Unix) or no session process is found.
     pub fn current_session_key() -> Option<String> {
+        current_session_process().as_ref().map(session_key)
+    }
+
+    /// The session process for this process (see [`session_process`]), or
+    /// None when the process table cannot be read.
+    pub fn current_session_process() -> Option<ProcInfo> {
+        let table = process_table()?;
+        let chain = ancestors(&table, std::process::id());
+        session_process(&chain).cloned()
+    }
+
+    /// The whole process table, or None without `ps` (non-Unix).
+    pub fn process_table() -> Option<Vec<ProcInfo>> {
         if !cfg!(unix) {
             return None;
         }
@@ -329,9 +342,15 @@ pub mod session {
         if !out.status.success() {
             return None;
         }
-        let table = parse_ps(&String::from_utf8_lossy(&out.stdout));
-        let chain = ancestors(&table, std::process::id());
-        session_process(&chain).map(session_key)
+        Some(parse_ps(&String::from_utf8_lossy(&out.stdout)))
+    }
+
+    /// This machine's host name, when it can be read.
+    pub fn host_name() -> Option<String> {
+        hostname::get()
+            .ok()
+            .map(|h| h.to_string_lossy().to_string())
+            .filter(|h| !h.is_empty())
     }
 }
 

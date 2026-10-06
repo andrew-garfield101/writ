@@ -149,6 +149,18 @@ pub struct Spec {
     /// Agent ID that has claimed this spec. None = unclaimed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_by: Option<String>,
+    /// The session process that took the claim (the agent's framework
+    /// process, e.g. `claude`, else the nearest non-shell ancestor), so
+    /// `writ doctor` can tell a claim whose holder exited (stale_claim).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_pid: Option<u32>,
+    /// Start time of `claimed_pid` as `ps -o lstart` prints it; guards
+    /// against a recycled pid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_pid_start: Option<String>,
+    /// Host the claiming process ran on; liveness is only judged on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_host: Option<String>,
     /// Agent that created the spec (`writ spec add`). Not a claim: it only
     /// lets the default seal scope (S.1) know another agent is working on an
     /// open, unclaimed spec. None for specs created before 0.3.0.
@@ -223,6 +235,9 @@ impl Spec {
             committed_at: None,
             workspace: None,
             claimed_by: None,
+            claimed_pid: None,
+            claimed_pid_start: None,
+            claimed_host: None,
             genesis_tree: None,
             created_by: None,
         }
@@ -250,6 +265,24 @@ impl Spec {
 
     /// Reopen a completed spec for further work.
     /// Clears commit state but preserves completion_summary for history.
+    /// Claim for `agent_id`, recording the current session process and host
+    /// (doctor's stale_claim signal). Used by every claim path.
+    pub fn set_claim(&mut self, agent_id: &str) {
+        self.claimed_by = Some(agent_id.to_string());
+        let proc = crate::agent::session::current_session_process();
+        self.claimed_pid = proc.as_ref().map(|p| p.pid);
+        self.claimed_pid_start = proc.map(|p| p.start);
+        self.claimed_host = crate::agent::session::host_name();
+    }
+
+    /// Drop the claim and its process record.
+    pub fn clear_claim(&mut self) {
+        self.claimed_by = None;
+        self.claimed_pid = None;
+        self.claimed_pid_start = None;
+        self.claimed_host = None;
+    }
+
     pub fn reopen(&mut self) {
         self.status = SpecStatus::InProgress;
         self.commit_state = CommitState::Uncommitted;

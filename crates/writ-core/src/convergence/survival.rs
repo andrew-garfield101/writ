@@ -654,6 +654,21 @@ pub fn additions_missing_from(base: &str, version: &str, other: &str) -> Vec<usi
 /// anyone). Lines another agent already sealed are known: capturing them
 /// loses nothing of theirs (finding 56). Without foreign content the spec
 /// is editing its own work, removals included, and passes.
+///
+/// Intentional cleanup is not a loss (finding 69, sprint 3 allowances):
+/// (b) a removed line whose content is still in `new` or `elsewhere` moved
+/// (finding 53, above); (c) a removed line whose un-marked form
+/// ([`unmark`]: `#[ignore = ".."] fn t()` → `fn t()`, `"x",  # ignored` →
+/// `"x",`) this same seal *adds* is an un-ignore. Merely lacking the marked
+/// line is not enough: a stale rewrite that happens to lack it would pass as
+/// cleanup, which is finding 42 again. A dropped *standalone* annotation
+/// (`#[ignore = ".."]` on its own line, a decorator) is excused when the
+/// code line it annotated is still in `new` and was this spec's own
+/// addition: the spec un-ignores its own test. A stale rewrite from before
+/// the spec's seal lacks that line too and stays refused; a marker the spec
+/// put on a base line is its only work there and its loss is refused.
+/// (a) cross-spec removals are passed in by the caller through
+/// [`own_line_loss_excused`].
 pub fn own_line_loss(
     spec: &str,
     path: &str,
@@ -662,6 +677,35 @@ pub fn own_line_loss(
     known: &[&str],
     new: &str,
     elsewhere: &[&str],
+) -> Option<SurvivalLoss> {
+    own_line_loss_excused(
+        spec,
+        path,
+        own_base,
+        own_last,
+        known,
+        new,
+        elsewhere,
+        &HashMap::new(),
+    )
+}
+
+/// [`own_line_loss`] with allowance (a), finding 69: `excused` counts, per
+/// line content, the copies that seals of *other* specs already removed on
+/// purpose (their recorded base held the line, see [`informed_removals`])
+/// and that postdate this spec's latest seal of the path or belong to a
+/// committed spec. A lost line is consumed from `excused` per copy; what
+/// remains is the loss.
+#[allow(clippy::too_many_arguments)]
+pub fn own_line_loss_excused(
+    spec: &str,
+    path: &str,
+    own_base: &str,
+    own_last: &str,
+    known: &[&str],
+    new: &str,
+    elsewhere: &[&str],
+    excused: &HashMap<String, usize>,
 ) -> Option<SurvivalLoss> {
     if own_last == new {
         return None;
@@ -697,22 +741,198 @@ pub fn own_line_loss(
     }
     let base_lines: HashSet<&str> = b.iter().copied().collect();
     let mut candidates: Vec<usize> = Vec::new();
+    // Lines this seal adds relative to the spec's last version, per copy:
+    // the evidence for allowance (c).
+    let mut added_now: HashMap<&str, usize> = HashMap::new();
     for hunk in hunks(&last, &n) {
+        for &j in &hunk.inserted {
+            *added_now.entry(n[j]).or_insert(0) += 1;
+        }
         let reverts = hunk.inserted.iter().all(|&j| base_lines.contains(n[j]));
         if reverts {
             candidates.extend(hunk.deleted.iter().copied().filter(|i| own.contains(i)));
         }
     }
+    // (c) Un-ignore: the removed line's un-marked form is added by this
+    // seal; or the removed line is a standalone annotation whose annotated
+    // code line is still here and was this spec's own addition.
+    let in_new = counts(n.iter().copied());
+    candidates.retain(|&i| {
+        if is_standalone_annotation(last[i]) {
+            return match annotated_line(&last, i) {
+                Some(code) => !(own.contains(&code) && in_new.contains_key(last[code])),
+                None => true,
+            };
+        }
+        let Some(unmarked) = unmark(last[i]) else {
+            return true;
+        };
+        match added_now.get_mut(unmarked.as_str()) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        }
+    });
     let pool = counts(
         n.iter()
             .copied()
             .chain(elsewhere.iter().flat_map(|t| t.lines())),
     );
-    let lost = content_gone(candidates, &last, &pool);
+    // (b) Moved content survives (finding 53).
+    let mut lost = content_gone(candidates, &last, &pool);
+    // (a) Removals other specs already sealed on purpose.
+    if !excused.is_empty() {
+        let mut left = excused.clone();
+        lost.retain(|&i| match left.get_mut(last[i]) {
+            Some(n) if *n > 0 => {
+                *n -= 1;
+                false
+            }
+            _ => true,
+        });
+    }
     (!lost.is_empty()).then(|| SurvivalLoss {
         foreign,
         ..loss(LossKind::OwnLines, spec, path, own_last, &lost)
     })
+}
+
+/// The un-marked form of an annotated line (allowance (c), finding 69).
+///
+/// Strips exactly one annotation: a leading attribute or decorator
+/// (`#[ignore = "reason"]`, `@pytest.mark.skip(...)`) followed by code on
+/// the same line, or a trailing comment (`# ...`, `// ...`, `/* ... */`)
+/// after code. Indentation is kept. `None` when the line carries no
+/// annotation, or is nothing but one: a standalone `#[ignore]` line has no
+/// un-marked form, so dropping it is never excused by this rule.
+pub fn unmark(line: &str) -> Option<String> {
+    let trimmed = line.trim_end();
+    let body = trimmed.trim_start();
+    let indent = &trimmed[..trimmed.len() - body.len()];
+    if let Some(rest) = strip_leading_annotation(body) {
+        let rest = rest.trim_start();
+        return (!rest.is_empty()).then(|| format!("{indent}{rest}"));
+    }
+    let code = strip_trailing_comment(body)?.trim_end();
+    (!code.is_empty() && code != body).then(|| format!("{indent}{code}"))
+}
+
+/// A line that is nothing but one attribute or decorator: `#[ignore]`,
+/// `#[ignore = "reason"]`, `@pytest.mark.skip(reason="x")`, `@skip`.
+pub fn is_standalone_annotation(line: &str) -> bool {
+    let body = line.trim();
+    match strip_leading_annotation(body) {
+        Some(rest) => rest.trim().is_empty(),
+        // `@skip` alone: no whitespace follows, so the strip refuses it.
+        None => {
+            body.starts_with('@')
+                && body.len() > 1
+                && body[1..]
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+        }
+    }
+}
+
+/// Index in `lines` of the code line the standalone annotation at `i`
+/// applies to: the next line that is not itself a standalone annotation,
+/// if it is not blank.
+fn annotated_line(lines: &[&str], i: usize) -> Option<usize> {
+    let mut j = i + 1;
+    while j < lines.len() && is_standalone_annotation(lines[j]) {
+        j += 1;
+    }
+    (j < lines.len() && !lines[j].trim().is_empty()).then_some(j)
+}
+
+/// `#[...]` or `@name(.name)*(...)?` at the start of `body`; the rest after it.
+fn strip_leading_annotation(body: &str) -> Option<&str> {
+    if let Some(after) = body.strip_prefix("#[") {
+        let end = matching_close(after, '[', ']')?;
+        return Some(&after[end + 1..]);
+    }
+    let after = body.strip_prefix('@')?;
+    let name_len = after
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '.'))
+        .unwrap_or(after.len());
+    if name_len == 0 {
+        return None;
+    }
+    let rest = &after[name_len..];
+    if let Some(args) = rest.strip_prefix('(') {
+        let end = matching_close(args, '(', ')')?;
+        return Some(&args[end + 1..]);
+    }
+    // A decorator without arguments must be followed by whitespace, not
+    // more code glued to it (an email address, a Razor directive).
+    rest.starts_with(char::is_whitespace).then_some(rest)
+}
+
+/// Index in `s` of the close that balances one already-open `open`,
+/// skipping quoted strings.
+fn matching_close(s: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+        } else if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+/// `body` without a trailing `# ...`, `// ...` or `/* ... */` comment that
+/// follows code and whitespace; `None` when there is no such comment.
+fn strip_trailing_comment(body: &str) -> Option<&str> {
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    let mut prev_ws = false;
+    let bytes = body.as_bytes();
+    for (i, c) in body.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == q {
+                quote = None;
+            }
+            prev_ws = false;
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+        } else if prev_ws && i > 0 {
+            let starts_comment = c == '#'
+                || (c == '/' && matches!(bytes.get(i + 1), Some(b'/')))
+                || (c == '/' && matches!(bytes.get(i + 1), Some(b'*')) && body.ends_with("*/"));
+            if starts_comment {
+                return Some(&body[..i]);
+            }
+        }
+        prev_ws = c.is_whitespace();
+    }
+    None
 }
 
 /// A spec's own view of one path across its seal chain.
@@ -759,10 +979,437 @@ pub fn own_versions<'a>(seals: impl IntoIterator<Item = &'a Seal>) -> HashMap<St
     out
 }
 
+// ── Survival audit (0.4.1 survival tier groundwork) ────────────────────
+
+/// What the sealed additions are checked against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Against {
+    /// The files on disk.
+    WorkingTree,
+    /// The files at git HEAD (needs the `bridge` feature and a repository).
+    Head,
+}
+
+/// A sealed addition the target lacks and no later seal removed on purpose.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LostLine {
+    /// 1-based line in the spec's last sealed version of the file.
+    pub line: usize,
+    pub text: String,
+}
+
+/// A sealed addition the target lacks because a later seal removed it
+/// while its recorded base held it (an informed removal; not a loss).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupersededLine {
+    pub line: usize,
+    pub text: String,
+    pub by_seal: String,
+    pub by_spec: Option<String>,
+}
+
+/// Why a file's additions were not line-checked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileAuditStatus {
+    /// Every addition was checked.
+    Checked,
+    /// The spec's last seal deleted the file, and the target lacks it too.
+    DeletedAsSealed,
+    /// The spec's last seal deleted the file, but the target still has it.
+    DeletedButPresent,
+    /// The sealed content is binary.
+    Binary,
+    /// The sealed blob is missing from the store.
+    Unreadable,
+}
+
+/// Survival of one spec's additions to one file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileSurvival {
+    pub path: String,
+    /// The spec's last seal of the path.
+    pub seal_id: String,
+    pub status: FileAuditStatus,
+    /// Added lines checked.
+    pub checked: usize,
+    pub lost: Vec<LostLine>,
+    pub superseded: Vec<SupersededLine>,
+}
+
+/// Survival of one spec's sealed additions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpecSurvival {
+    pub spec_id: String,
+    pub files: Vec<FileSurvival>,
+    pub checked: usize,
+    pub lost: usize,
+    pub superseded: usize,
+}
+
+/// Result of [`audit`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditReport {
+    pub against: Against,
+    pub specs: Vec<SpecSurvival>,
+    pub checked: usize,
+    pub lost: usize,
+    pub superseded: usize,
+    pub elapsed_ms: u64,
+}
+
+impl AuditReport {
+    /// No sealed addition is missing without a later informed removal.
+    pub fn is_green(&self) -> bool {
+        self.lost == 0
+            && self
+                .specs
+                .iter()
+                .flat_map(|s| &s.files)
+                .all(|f| f.status != FileAuditStatus::DeletedButPresent)
+    }
+}
+
+/// Added-line survival of `spec_ids` (the core of `bench/finish_audit.py`).
+///
+/// For each spec and each path its seals captured: the lines the spec's
+/// last sealed version of the file added relative to the file before the
+/// spec's first seal of it must be in the target, by content and per copy
+/// (a moved block survives, finding 53). A missing line is *superseded*
+/// when a later seal, of any spec, removed it while its recorded base held
+/// it ([`informed_removals`]); otherwise it is *lost*. A file the spec's
+/// last seal deleted counts as lost when the target still has it.
+///
+/// Not wired to `writ doctor` yet (0.4.1 survival tier).
+pub fn audit(
+    repo: &crate::Repository,
+    spec_ids: &[String],
+    against: Against,
+) -> crate::error::WritResult<AuditReport> {
+    use std::time::Instant;
+    let started = Instant::now();
+
+    // Every seal in the workspace, oldest first, for the superseded check.
+    let mut all_seals = repo.log()?;
+    all_seals.reverse();
+
+    let text = |hash: &str| -> crate::error::WritResult<Option<String>> {
+        let bytes = repo.object_content(hash)?;
+        Ok((!crate::diff::is_binary(&bytes)).then(|| String::from_utf8_lossy(&bytes).into_owned()))
+    };
+
+    let mut specs = Vec::with_capacity(spec_ids.len());
+    for spec_id in spec_ids {
+        let mut seals = repo.spec_seals(spec_id)?;
+        seals.reverse();
+        let own = own_versions(&seals);
+        let mut paths: Vec<&String> = own.keys().collect();
+        paths.sort();
+
+        let targets: HashMap<String, Vec<u8>> = match against {
+            Against::WorkingTree => paths
+                .iter()
+                .filter_map(|p| {
+                    std::fs::read(repo.root().join(p.as_str()))
+                        .ok()
+                        .map(|c| ((*p).clone(), c))
+                })
+                .collect(),
+            Against::Head => {
+                let owned: Vec<String> = paths.iter().map(|p| (*p).clone()).collect();
+                repo.git_head_blobs(&owned)?
+            }
+        };
+
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let v = &own[path];
+            let seal_id = seals
+                .iter()
+                .rev()
+                .find(|s| s.changes.iter().any(|c| &c.path == path))
+                .map(|s| s.id.clone())
+                .unwrap_or_default();
+            let last_time = v.times.last().copied().unwrap_or_default();
+            let mut file = FileSurvival {
+                path: path.clone(),
+                seal_id,
+                status: FileAuditStatus::Checked,
+                checked: 0,
+                lost: Vec::new(),
+                superseded: Vec::new(),
+            };
+            let Some(last_hash) = v.last_new.as_deref() else {
+                file.status = if targets.contains_key(path) {
+                    FileAuditStatus::DeletedButPresent
+                } else {
+                    FileAuditStatus::DeletedAsSealed
+                };
+                files.push(file);
+                continue;
+            };
+            let version = match text(last_hash) {
+                Ok(Some(t)) => t,
+                Ok(None) => {
+                    file.status = FileAuditStatus::Binary;
+                    files.push(file);
+                    continue;
+                }
+                Err(crate::error::WritError::ObjectNotFound(_)) => {
+                    file.status = FileAuditStatus::Unreadable;
+                    files.push(file);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            let base = match v.first_old.as_deref() {
+                Some(h) => match text(h) {
+                    Ok(Some(t)) => t,
+                    Ok(None) => String::new(),
+                    Err(crate::error::WritError::ObjectNotFound(_)) => String::new(),
+                    Err(e) => return Err(e),
+                },
+                None => String::new(),
+            };
+            let target = targets
+                .get(path)
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default();
+
+            let version_lines = split_lines(&version);
+            let added: Vec<usize> = additions(&base, &version)
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect();
+            file.checked = added.len();
+            let missing = content_gone(added, &version_lines, &counts(target.lines()));
+            if missing.is_empty() {
+                files.push(file);
+                continue;
+            }
+
+            // Later seals on this path, by any spec: an informed removal
+            // (base held the line, result lacks it) supersedes the addition.
+            let mut removers: Vec<(&Seal, HashMap<String, usize>)> = Vec::new();
+            for seal in all_seals.iter().filter(|s| s.timestamp > last_time) {
+                for change in seal.changes.iter().filter(|c| &c.path == path) {
+                    let Some(old) = change.old_hash.as_deref() else {
+                        continue;
+                    };
+                    let Ok(Some(old)) = text(old) else {
+                        continue;
+                    };
+                    let new = match (&change.change_type, change.new_hash.as_deref()) {
+                        (ChangeType::Deleted, _) | (_, None) => String::new(),
+                        (_, Some(h)) => match text(h) {
+                            Ok(Some(t)) => t,
+                            _ => continue,
+                        },
+                    };
+                    let removed: HashMap<String, usize> = informed_removals(&old, &new)
+                        .into_iter()
+                        .map(|(l, n)| (l.to_string(), n))
+                        .collect();
+                    if !removed.is_empty() {
+                        removers.push((seal, removed));
+                    }
+                }
+            }
+            for i in missing {
+                let line = version_lines[i];
+                let by =
+                    removers
+                        .iter_mut()
+                        .find_map(|(seal, removed)| match removed.get_mut(line) {
+                            Some(n) if *n > 0 => {
+                                *n -= 1;
+                                Some(*seal)
+                            }
+                            _ => None,
+                        });
+                match by {
+                    Some(seal) => file.superseded.push(SupersededLine {
+                        line: i + 1,
+                        text: line.to_string(),
+                        by_seal: seal.id.clone(),
+                        by_spec: seal.spec_id.clone(),
+                    }),
+                    None => file.lost.push(LostLine {
+                        line: i + 1,
+                        text: line.to_string(),
+                    }),
+                }
+            }
+            files.push(file);
+        }
+
+        let (checked, lost, superseded) = files.iter().fold((0, 0, 0), |(c, l, s), f| {
+            (c + f.checked, l + f.lost.len(), s + f.superseded.len())
+        });
+        specs.push(SpecSurvival {
+            spec_id: spec_id.clone(),
+            files,
+            checked,
+            lost,
+            superseded,
+        });
+    }
+
+    let (checked, lost, superseded) = specs.iter().fold((0, 0, 0), |(c, l, s), sp| {
+        (c + sp.checked, l + sp.lost, s + sp.superseded)
+    });
+    Ok(AuditReport {
+        against,
+        specs,
+        checked,
+        lost,
+        superseded,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::convergence::{three_way_merge, FileMergeResult};
+
+    // ── Finding 69 allowances ───────────────────────────────────────────
+
+    #[test]
+    fn unmark_strips_one_annotation_and_keeps_indent() {
+        assert_eq!(
+            unmark("    #[ignore = \"flaky\"] fn t() {}").as_deref(),
+            Some("    fn t() {}")
+        );
+        assert_eq!(
+            unmark("@pytest.mark.skip(reason=\"x)\") def t():").as_deref(),
+            Some("def t():")
+        );
+        assert_eq!(unmark("@skip def t():").as_deref(), Some("def t():"));
+        assert_eq!(
+            unmark("    \"test_x\",  # expected ignored until S.2").as_deref(),
+            Some("    \"test_x\",")
+        );
+        assert_eq!(unmark("let a = 1; // todo").as_deref(), Some("let a = 1;"));
+        assert_eq!(unmark("x = 1 /* why */").as_deref(), Some("x = 1"));
+        // A comment marker inside a string is not a comment.
+        assert_eq!(
+            unmark("s = \"a # b\"  # real").as_deref(),
+            Some("s = \"a # b\"")
+        );
+        assert_eq!(unmark("url = \"http://x\""), None);
+    }
+
+    #[test]
+    fn standalone_markers_have_no_unmarked_form() {
+        assert_eq!(unmark("#[ignore = \"not landed\"]"), None);
+        assert_eq!(unmark("    #[ignore]"), None);
+        assert_eq!(unmark("@pytest.mark.skip(reason=\"x\")"), None);
+        assert_eq!(unmark("# just a comment"), None);
+        assert_eq!(unmark("plain code"), None);
+        assert_eq!(unmark(""), None);
+        assert_eq!(unmark("user@example.com"), None);
+    }
+
+    #[test]
+    fn un_ignore_adding_the_unmarked_form_is_not_a_loss() {
+        // (c): the spec's marked entry is dropped and its un-marked form is
+        // added elsewhere in the same seal, beside new (foreign) content.
+        let base = "a\nb\nc\n";
+        let last = "a\n    \"t\",  # ignored\nb\nc\n";
+        let new = "a\nb\nNEWTEST\nc\n    \"t\",\n";
+        assert!(own_line_loss("s", "f", base, last, &[], new, &[]).is_none());
+    }
+
+    #[test]
+    fn dropping_the_marked_line_without_its_unmarked_form_is_a_loss() {
+        // The coordinator's negative case: the marker is gone, nothing
+        // un-marked was added. A stale rewrite looks exactly like this.
+        let base = "a\nb\nc\n";
+        let last = "a\n    \"t\",  # ignored\nb\n#[ignore = \"x\"]\nc\n";
+        let new = "a\nb\nc\nNEWTEST\n";
+        let l = own_line_loss("s", "f", base, last, &[], new, &[]).unwrap();
+        assert_eq!(
+            l.lines,
+            vec![
+                "    \"t\",  # ignored".to_string(),
+                "#[ignore = \"x\"]".to_string()
+            ]
+        );
+        // The un-marked form must be *added*: present already in the spec's
+        // own last version does not count.
+        let last2 = "a\n    \"t\",  # ignored\n    \"t\",\nb\n";
+        let new2 = "a\n    \"t\",\nb\nTHEIRS\n";
+        assert!(own_line_loss("s", "f", base, last2, &[], new2, &[]).is_some());
+    }
+
+    #[test]
+    fn standalone_marker_on_own_test_is_excused_when_the_test_stays() {
+        // Option B: the spec added the test and its marker; dropping the
+        // marker while the test stays, beside new content, is an un-ignore.
+        let base = "a\nb\n";
+        let last = "a\n#[test]\n#[ignore = \"x\"]\nfn t() {}\nb\n";
+        let new = "a\n#[test]\nfn t() {}\nb\nTHEIRS\n";
+        assert!(own_line_loss("s", "f", base, last, &[], new, &[]).is_none());
+        let py_last = "a\n@pytest.mark.skip(reason=\"x\")\ndef test_t():\nb\n";
+        let py_new = "a\ndef test_t():\nb\nTHEIRS\n";
+        assert!(own_line_loss("s", "f", base, py_last, &[], py_new, &[]).is_none());
+        assert!(is_standalone_annotation("    #[ignore]"));
+        assert!(is_standalone_annotation("@skip"));
+        assert!(!is_standalone_annotation("#[ignore] fn t() {}"));
+        assert!(!is_standalone_annotation("user@example.com"));
+    }
+
+    #[test]
+    fn standalone_marker_drop_is_refused_without_the_annotated_own_line() {
+        // Stale rewrite from before the spec's seal: test and marker gone.
+        let base = "a\nb\n";
+        let last = "a\n#[ignore = \"x\"]\nfn t() {}\nb\n";
+        let stale = "a\nb\nTHEIRS\n";
+        let l = own_line_loss("s", "f", base, last, &[], stale, &[]).unwrap();
+        assert_eq!(
+            l.lines,
+            vec!["#[ignore = \"x\"]".to_string(), "fn t() {}".to_string()]
+        );
+        // The marker was the spec's only work on a base line: refused.
+        let base2 = "a\nfn t() {}\nb\n";
+        let last2 = "a\n#[ignore = \"x\"]\nfn t() {}\nb\n";
+        let new2 = "a\nfn t() {}\nb\nTHEIRS\n";
+        let l = own_line_loss("s", "f", base2, last2, &[], new2, &[]).unwrap();
+        assert_eq!(l.lines, vec!["#[ignore = \"x\"]".to_string()]);
+        // A marker annotating nothing (end of file, blank line) is not excused.
+        let last3 = "a\nfn t() {}\nb\n#[ignore]\n";
+        let new3 = "a\nTHEIRS\nfn t() {}\nb\n";
+        assert!(own_line_loss("s", "f", base2, last3, &[], new3, &[]).is_some());
+    }
+
+    #[test]
+    fn cross_spec_removal_excuses_per_copy() {
+        // (a): another spec's seal removed two of the three markers.
+        let base = "a\nb\n";
+        let last = "a\nM\nM\nM\nb\n";
+        let new = "a\nb\nTHEIRS\n";
+        let mut excused = HashMap::new();
+        excused.insert("M".to_string(), 2);
+        let l = own_line_loss_excused("s", "f", base, last, &[], new, &[], &excused).unwrap();
+        assert_eq!(l.lines, vec!["M".to_string()]);
+        excused.insert("M".to_string(), 3);
+        assert!(own_line_loss_excused("s", "f", base, last, &[], new, &[], &excused).is_none());
+    }
+
+    #[test]
+    fn moved_block_beside_foreign_content_is_not_a_loss() {
+        // (b) with foreign content present, so the check gets past the
+        // capture-shape gate and must rely on content survival.
+        let base = "a\nb\nc\nd\n";
+        let last = "a\nN1\nN2\nb\nc\nd\n";
+        let moved = "a\nb\nc\nTHEIRS\nN1\nN2\nd\n";
+        assert!(own_line_loss("s", "f", base, last, &[], moved, &[]).is_none());
+        let partial = "a\nb\nc\nTHEIRS\nN1\nd\n";
+        let l = own_line_loss("s", "f", base, last, &[], partial, &[]).unwrap();
+        assert_eq!(l.lines, vec!["N2".to_string()]);
+    }
 
     fn numbered(n: usize) -> String {
         (0..n).map(|i| format!("line {i}\n")).collect()

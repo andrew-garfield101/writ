@@ -83,6 +83,20 @@ pub struct ClaimHolder {
     pub agent: String,
 }
 
+/// Finding 74: a tracked file whose newest spec seal is on a committed spec
+/// while git HEAD does not hold that content. It matches the index, so no
+/// seal sees it as changed, and finish skips committed specs, so nothing
+/// commits it. The seal paths list it as pending (`Modified`, content
+/// unchanged) so a new spec can take it; the fix is a seal of it under an
+/// open spec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StuckFile {
+    pub path: String,
+    /// The committed spec whose seal is the newest for the path.
+    pub spec_id: String,
+    pub seal_id: String,
+}
+
 /// Result of classifying the pending files for one seal.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct SealScope {

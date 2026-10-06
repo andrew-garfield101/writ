@@ -1252,7 +1252,7 @@ pub fn load_all_specs(writ_dir: &Path) -> WritResult<Vec<crate::spec::Spec>> {
 }
 
 /// A tree object the live-set scan could not expand.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnreadableTree {
     pub hash: String,
     /// The root that references it, e.g. `tree of seal 1a2b3c4d5e6f`.
@@ -1459,6 +1459,16 @@ impl LiveObjects {
     }
 
     /// Trees that could not be expanded (missing, corrupt, or not a tree).
+    /// Every referenced hash with one location that references it.
+    pub fn refs(&self) -> &std::collections::HashMap<String, String> {
+        &self.refs
+    }
+
+    /// Tree objects that were read and expanded.
+    pub fn expanded_trees(&self) -> &HashSet<String> {
+        &self.expanded_trees
+    }
+
     pub fn unreadable_trees(&self) -> &[UnreadableTree] {
         &self.unreadable_trees
     }
@@ -2168,6 +2178,9 @@ mod tests {
             committed_at: None,
             workspace: None,
             claimed_by: None,
+            claimed_pid: None,
+            claimed_pid_start: None,
+            claimed_host: None,
             genesis_tree: None,
             created_by: None,
         }
@@ -2890,6 +2903,8 @@ mod tests {
             signature: None,
             workspace: "main".to_string(),
             convergence: None,
+            forced: false,
+            allow_removals: Vec::new(),
         }
     }
 
@@ -3677,6 +3692,9 @@ mod tests {
             },
             workspace: None,
             claimed_by: None,
+            claimed_pid: None,
+            claimed_pid_start: None,
+            claimed_host: None,
             genesis_tree: None,
             created_by: None,
         }

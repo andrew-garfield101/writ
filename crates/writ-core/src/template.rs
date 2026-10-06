@@ -7,12 +7,13 @@
 //!
 //! The commands are macros so `const` templates can `concat!` them.
 
-/// Register a task. Comma form for `--scope`, the form agents write
-/// (finding 66).
+/// Register and claim a task. Comma form for `--scope`, the form agents
+/// write (finding 66); `--claim` so the next seal knows the spec is yours
+/// (finding 87).
 #[macro_export]
 macro_rules! cmd_spec_add {
     () => {
-        r#"writ spec add "brief description of your task" --scope "<files you will change, comma-separated>""#
+        r#"writ spec add "brief description of your task" --scope "<files you will change, comma-separated>" --claim"#
     };
 }
 
@@ -48,7 +49,13 @@ macro_rules! cmd_seal_with {
 #[macro_export]
 macro_rules! cmd_spec_add_with {
     ($title:literal, $scope:literal) => {
-        concat!("writ spec add \"", $title, "\" --scope \"", $scope, "\"")
+        concat!(
+            "writ spec add \"",
+            $title,
+            "\" --scope \"",
+            $scope,
+            "\" --claim"
+        )
     };
 }
 
@@ -95,7 +102,7 @@ pub fn workflow_plain() -> Vec<String> {
 }
 
 /// How claims work, the same sentence everywhere.
-pub const CLAIM_NOTE: &str = "`writ spec add` does not claim the spec; your first seal does, or pass `--claim`. To take over an existing unclaimed spec instead, run `writ spec claim <id>`.";
+pub const CLAIM_NOTE: &str = "`--claim` on `writ spec add` makes the spec yours; without it, your first seal claims the one spec you created. To take over an existing unclaimed spec instead, run `writ spec claim <id>`.";
 
 #[cfg(test)]
 mod tests {
@@ -108,5 +115,19 @@ mod tests {
         assert!(md.contains(r#"writ spec done -s "<what you did>""#));
         assert!(md.starts_with("1. BEFORE"));
         assert!(workflow_plain().iter().all(|l| !l.contains('`')));
+    }
+}
+
+#[cfg(test)]
+mod claim_tests {
+    /// Finding 87: every surface's spec add claims.
+    #[test]
+    fn spec_add_forms_carry_claim() {
+        assert!(super::SPEC_ADD.ends_with("--claim"));
+        assert!(cmd_spec_add_with!("t", "a.rs").ends_with("--claim"));
+        assert!(super::workflow_markdown().contains("--claim"));
+        assert!(super::workflow_plain()
+            .iter()
+            .any(|l| l.contains("--claim")));
     }
 }

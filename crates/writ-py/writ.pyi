@@ -528,7 +528,12 @@ class Repository:
         ...
 
     def doctor(self) -> Dict[str, Any]:
-        """Run diagnostics on the repository (integrity checks)."""
+        """Run the `writ doctor` fast tier.
+
+        Returns {headline, tier, survival_last_green, checks_run, findings,
+        clean, red, yellow, elapsed_ms}; each finding is {check, severity,
+        message, fix_command, paths}.
+        """
         ...
 
     def version_info(self) -> Dict[str, Any]:

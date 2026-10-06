@@ -19,103 +19,55 @@ import writ
 
 
 class TestDoctorBinding:
-    """repo.doctor() returns structured health check report."""
+    """repo.doctor() returns the 0.4 fast-tier report (doctor-core)."""
 
-    def test_doctor_returns_dict(self, tmp_repo):
-        """Doctor returns a dict with required keys."""
+    def test_doctor_returns_report_dict(self, tmp_repo):
+        """Doctor returns a dict with the fast-tier report keys."""
         repo, path = tmp_repo
         report = repo.doctor()
 
         assert isinstance(report, dict)
-        assert "checks" in report
-        assert "passed" in report
-        assert "failed" in report
-        assert "warnings" in report
-        assert "is_healthy" in report
+        for key in ("headline", "tier", "survival_last_green", "checks_run",
+                    "findings", "clean", "red", "yellow", "elapsed_ms"):
+            assert key in report, key
 
-    def test_doctor_checks_are_list_of_dicts(self, tmp_repo):
-        """Each check has name, status, message."""
+    def test_doctor_counts_match_findings(self, tmp_repo):
+        """red + yellow = number of findings."""
         repo, path = tmp_repo
         report = repo.doctor()
 
-        assert isinstance(report["checks"], list)
-        assert len(report["checks"]) == 9
+        assert report["red"] + report["yellow"] == len(report["findings"])
 
-        for check in report["checks"]:
-            assert "name" in check
-            assert "status" in check
-            assert "message" in check
-            assert check["status"] in ("pass", "fail", "warning")
-
-    def test_doctor_counts_sum_correctly(self, tmp_repo):
-        """Passed + failed + warnings = total checks."""
+    def test_doctor_fresh_repo_clean(self, tmp_repo):
+        """Fresh repo has no findings."""
         repo, path = tmp_repo
         report = repo.doctor()
 
-        total = report["passed"] + report["failed"] + report["warnings"]
-        assert total == len(report["checks"])
-
-    def test_doctor_fresh_repo_healthy(self, tmp_repo):
-        """Fresh repo passes all doctor checks."""
-        repo, path = tmp_repo
-        report = repo.doctor()
-
-        assert report["is_healthy"], (
-            f"fresh repo should be healthy, failures: "
-            f"{[c for c in report['checks'] if c['status'] == 'fail']}"
+        assert report["clean"], report["findings"]
+        assert report["headline"] == (
+            "fast checks clean; survival check not available until 0.4.1"
         )
-        assert report["failed"] == 0
 
     def test_doctor_detects_missing_directory(self, tmp_repo):
-        """Doctor reports failure when a required directory is removed."""
+        """A removed objects directory is a red store_integrity finding."""
         repo, path = tmp_repo
-        writ_dir = path / ".writ"
-
-        # Remove objects directory
-        shutil.rmtree(str(writ_dir / "objects"))
+        shutil.rmtree(str(path / ".writ" / "objects"))
 
         report = repo.doctor()
-        dir_check = next(c for c in report["checks"] if c["name"] == "directories")
-        assert dir_check["status"] == "fail"
-        assert "objects" in dir_check["message"]
+        hits = [f for f in report["findings"] if ".writ/objects" in f["paths"]]
+        assert hits and hits[0]["check"] == "store_integrity"
+        assert hits[0]["severity"] == "red"
+        assert hits[0]["fix_command"] == "writ repair"
 
     def test_doctor_detects_corrupt_index(self, tmp_repo):
-        """Doctor reports failure when index.json is corrupted."""
+        """A corrupt index.json is a red store_integrity finding."""
         repo, path = tmp_repo
-        writ_dir = path / ".writ"
-
-        # Find index.json — may be at top level or inside workspaces/main/
-        index_path = writ_dir / "index.json"
-        ws_index = writ_dir / "workspaces" / "main" / "index.json"
-        if ws_index.exists():
-            ws_index.write_text("not valid json")
-        if index_path.exists():
-            index_path.write_text("not valid json")
+        ws_index = path / ".writ" / "workspaces" / "main" / "index.json"
+        ws_index.write_text("not valid json")
 
         report = repo.doctor()
-        idx_check = next(c for c in report["checks"] if c["name"] == "index")
-        assert idx_check["status"] in ("fail", "warning"), (
-            f"Expected fail/warning for corrupt index, got: {idx_check}"
-        )
-
-    def test_doctor_check_names(self, tmp_repo):
-        """Doctor runs all 9 expected checks by name."""
-        repo, path = tmp_repo
-        report = repo.doctor()
-
-        names = {c["name"] for c in report["checks"]}
-        expected = {
-            "version_file",
-            "schema_version",
-            "directories",
-            "index",
-            "workspace_layout",
-            "config",
-            "master_key",
-            "specs",
-            "seals",
-        }
-        assert names == expected
+        hits = [f for f in report["findings"] if "index.json" in f["message"]]
+        assert hits and hits[0]["severity"] == "red"
 
 
 class TestVersionInfoBinding:

@@ -355,6 +355,7 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
         auto: None,
         workspace: None,
         watch: None,
+        doctor: None,
     };
 
     // Summary and confirmation (I.10)
@@ -873,4 +874,158 @@ fn display_summary(
     };
     println!("Workflow: {} mode ({})", mode.bold(), mode_desc);
     println!();
+}
+
+// ---------------------------------------------------------------------------
+// Rerun: keep the existing config (finding 82)
+// ---------------------------------------------------------------------------
+
+/// True when a flag asked to change which frameworks are enabled.
+fn frameworks_flagged(opts: &InitOptions) -> bool {
+    opts.bare || opts.frameworks.is_some() || opts.no_claude || opts.no_codex || opts.no_generic
+}
+
+/// On a rerun, keep `.writ/config.toml` as it is and change only what a
+/// flag on this command asked for: `--frameworks`/`--no-*`/`--bare` set
+/// `[frameworks]`, `--no-git` sets `[git] enabled`, `--format` sets
+/// `[output] format`, `--name` sets `[project] name`, and `--reconfigure`
+/// writes the format and workflow answers. `[project] initialized`, the
+/// git baseline, unknown tables and comments are never touched.
+///
+/// Returns the new text and the frameworks to install hooks for: the
+/// flagged values, else the existing config's (missing keys take the
+/// plan's default).
+pub fn rerun_config(
+    existing: &str,
+    planned: [bool; 3],
+    planned_config: &ProjectConfig,
+    opts: &InitOptions,
+) -> (String, [bool; 3]) {
+    let parsed = writ_core::config::parse_project_config(existing);
+    let mut text = existing.to_string();
+    let b = |v: bool| if v { "true" } else { "false" };
+    let enables = if frameworks_flagged(opts) {
+        for (key, v) in ["claude", "codex", "generic"].iter().zip(planned) {
+            text = writ_core::config::set_toml_key(
+                &text,
+                "frameworks",
+                key,
+                &format!("{key} = {}", b(v)),
+            );
+        }
+        planned
+    } else {
+        let fw = parsed.as_ref().and_then(|c| c.frameworks.clone());
+        let get = |v: Option<bool>, d: bool| v.unwrap_or(d);
+        match fw {
+            Some(f) => [
+                get(f.claude, planned[0]),
+                get(f.codex, planned[1]),
+                get(f.generic, planned[2]),
+            ],
+            None => planned,
+        }
+    };
+    let quoted = writ_core::config::toml_string;
+    if opts.no_git {
+        text = writ_core::config::set_toml_key(&text, "git", "enabled", "enabled = false");
+    }
+    if let Some(fmt) = &opts.format {
+        text = writ_core::config::set_toml_key(
+            &text,
+            "output",
+            "format",
+            &format!("format = {}", quoted(fmt)),
+        );
+    }
+    if let Some(name) = &opts.name {
+        text = writ_core::config::set_toml_key(
+            &text,
+            "project",
+            "name",
+            &format!("name = {}", quoted(name)),
+        );
+    }
+    if opts.reconfigure {
+        if let Some(fmt) = planned_config.output_format() {
+            text = writ_core::config::set_toml_key(
+                &text,
+                "output",
+                "format",
+                &format!("format = {}", quoted(fmt)),
+            );
+        }
+        if let Some(mode) = planned_config.commit_mode() {
+            text = writ_core::config::set_toml_key(
+                &text,
+                "workflow",
+                "commit_mode",
+                &format!("commit_mode = {}", quoted(mode)),
+            );
+        }
+    }
+    (text, enables)
+}
+
+#[cfg(test)]
+mod rerun_tests {
+    use super::*;
+
+    const CUSTOM: &str = r#"# my notes
+[project]
+name = "mine"
+initialized = "2026-01-01T00:00:00Z"
+
+[git]
+enabled = true
+baseline_ref = "abc123"
+
+[frameworks]
+claude = true
+codex = false
+generic = false
+
+[security]
+scope_enforcement = false
+
+[workflow]
+commit_mode = "auto"
+
+[doctor]
+# lost in the gc incident
+allow_missing = ["ae01d21c123e"]
+
+[future_table]
+x = 1
+"#;
+
+    fn run(opts: &InitOptions) -> (String, [bool; 3]) {
+        let planned = [!opts.no_claude, !opts.no_codex, !opts.no_generic];
+        rerun_config(CUSTOM, planned, &ProjectConfig::default(), opts)
+    }
+
+    #[test]
+    fn plain_rerun_keeps_config_byte_for_byte() {
+        let opts = InitOptions {
+            yes: true,
+            ..Default::default()
+        };
+        let (text, enables) = run(&opts);
+        assert_eq!(text, CUSTOM);
+        assert_eq!(enables, [true, false, false]);
+    }
+
+    #[test]
+    fn flagged_rerun_changes_only_the_flagged_keys() {
+        let opts = InitOptions {
+            yes: true,
+            no_generic: true,
+            no_codex: true,
+            format: Some("json".into()),
+            ..Default::default()
+        };
+        let (text, enables) = run(&opts);
+        assert_eq!(enables, [true, false, false]);
+        assert_eq!(text, format!("{CUSTOM}\n[output]\nformat = \"json\"\n"));
+    }
 }

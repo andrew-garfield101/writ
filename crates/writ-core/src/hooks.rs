@@ -318,6 +318,66 @@ fn remove_claude_instructions(root: &Path) -> WritResult<Option<String>> {
 /// Substring used to detect whether a writ hook is already present.
 const WRIT_HOOK_MARKER: &str = "writ context";
 
+/// Files whose writ-managed text is older than this binary's template
+/// (`writ doctor` version_skew): the CLAUDE.md marked block, and the
+/// SessionStart hook in `.claude/settings.json` (or a writ hook still on a
+/// legacy event). Only text writ already manages is checked; a project that
+/// never opted in reports nothing. `writ init -y` refreshes both.
+pub fn stale_managed_text(root: &Path) -> Vec<String> {
+    let mut stale = Vec::new();
+    if let Ok(content) = fs::read_to_string(root.join("CLAUDE.md")) {
+        if content.contains(MARKER_BEGIN) {
+            let fresh = wrap_with_markers(&writ_claude_md_section());
+            if replace_marked_section(&content, &fresh) != content {
+                stale.push("CLAUDE.md".to_string());
+            }
+        }
+    }
+    let settings_path = root.join(".claude").join("settings.json");
+    if let Ok(settings) = read_settings(&settings_path) {
+        if settings_hook_stale(&settings) {
+            stale.push(".claude/settings.json".to_string());
+        }
+    }
+    stale
+}
+
+/// True when the settings hold a writ hook that is not today's command (for
+/// whatever writ path it names) or sits on a legacy event.
+fn settings_hook_stale(settings: &serde_json::Value) -> bool {
+    let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else {
+        return false;
+    };
+    let commands = |event: &str| -> Vec<String> {
+        hooks
+            .get(event)
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.get("hooks").and_then(|h| h.as_array()))
+            .flatten()
+            .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+            .filter(|c| is_writ_hook_command(c))
+            .map(str::to_string)
+            .collect()
+    };
+    if LEGACY_HOOK_EVENTS.iter().any(|e| !commands(e).is_empty()) {
+        return true;
+    }
+    commands(WRIT_HOOK_EVENT)
+        .iter()
+        .any(|cmd| session_start_command(&hook_writ_path(cmd)) != *cmd)
+}
+
+/// The writ path a generated hook command runs (`<path> context --format brief`).
+fn hook_writ_path(cmd: &str) -> String {
+    const TAIL: &str = " context --format brief 2>/dev/null || true";
+    cmd.strip_suffix(TAIL)
+        .and_then(|head| head.rsplit("&& ").next())
+        .unwrap_or("writ")
+        .to_string()
+}
+
 /// Build the hook command with an absolute path to the writ binary.
 /// Falls back to bare `writ` if the binary can't be located.
 fn writ_hook_command() -> String {
@@ -1588,8 +1648,10 @@ mod tests {
     fn hook_and_block_agree_on_claims_and_the_scope_form() {
         let hook = session_start_command("writ");
         let block = writ_claude_md_section();
-        assert!(hook.contains("does not claim the spec; your first seal does"));
-        assert!(block.contains("does not claim the spec; your first seal does"));
+        let note = "without it, your first seal claims the one spec you created";
+        assert!(hook.contains(note));
+        assert!(block.contains(note));
+        assert!(hook.contains("--claim"));
         assert!(!hook.contains("brief task description"));
         assert!(hook.contains(r#"--scope "<files you will change, comma-separated>""#));
         assert!(hook.contains(r#"writ spec done -s "<what you did>""#));
@@ -2996,5 +3058,85 @@ mod tests {
             crate::skills::SKILL_TEMPLATES.len(),
             "init should create exactly as many skill dirs as templates"
         );
+    }
+}
+
+#[cfg(test)]
+mod stale_managed_text_tests {
+    use super::*;
+
+    #[test]
+    fn fresh_hook_and_block_are_current_and_edits_are_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        hook_claude_code(root).unwrap();
+        assert!(
+            stale_managed_text(root).is_empty(),
+            "{:?}",
+            stale_managed_text(root)
+        );
+
+        let md = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
+        fs::write(
+            root.join("CLAUDE.md"),
+            md.replace("FIRST ACTION", "FIRST STEP"),
+        )
+        .unwrap();
+        let path = root.join(".claude/settings.json");
+        let text = fs::read_to_string(&path).unwrap();
+        fs::write(&path, text.replace("Follow these steps", "Do this")).unwrap();
+        assert_eq!(
+            stale_managed_text(root),
+            vec!["CLAUDE.md".to_string(), ".claude/settings.json".to_string()]
+        );
+
+        hook_claude_code(root).unwrap();
+        assert!(stale_managed_text(root).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod claim_parity_tests {
+    use super::*;
+
+    /// Finding 88: every generated surface (CLAUDE.md, AGENTS.md, generic
+    /// instructions, settings instruction and hook, slash commands, skills)
+    /// that shows a `writ spec add` command shows it with `--claim`.
+    #[test]
+    fn every_generated_spec_add_claims() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        hook_claude_code(root).unwrap();
+        hook_codex(root).unwrap();
+        hook_generic(root).unwrap();
+        let mut checked = 0;
+        for entry in walkdir::WalkDir::new(root).into_iter().flatten() {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let Ok(text) = fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            // The settings hook is JSON: split its echo steps into lines.
+            let text = text.replace("&& echo", "\n");
+            for line in text.lines() {
+                for (i, _) in line.match_indices("writ spec add ") {
+                    let rest = &line[i + "writ spec add ".len()..];
+                    // A command, not prose: an argument follows.
+                    if !(rest.starts_with('"') || rest.starts_with("--") || rest.starts_with('\\'))
+                    {
+                        continue;
+                    }
+                    let cmd_end = rest.find('`').unwrap_or(rest.len());
+                    assert!(
+                        rest[..cmd_end].contains("--claim"),
+                        "{}: {line}",
+                        entry.path().display()
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked >= 5, "only {checked} spec add commands found");
     }
 }

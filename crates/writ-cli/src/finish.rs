@@ -87,7 +87,21 @@ pub fn commit_specs(
 ) -> CliResult<Vec<Committed>> {
     let units = plan_units(repo, specs, strategy, single_message)?;
     if opts.strict {
-        refuse_stale(repo, specs)?;
+        if let Err(e) = refuse_stale(repo, specs) {
+            let ids: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
+            let files: Vec<String> = repo
+                .finish_plan(&ids)
+                .map(|p| p.stale.iter().map(|f| f.path.clone()).collect())
+                .unwrap_or_default();
+            record_refusal(
+                repo,
+                writ_core::doctor::FinishRefusal::StrictStale,
+                &e.to_string(),
+                &ids,
+                &files,
+            );
+            return Err(e);
+        }
     }
     let last = units.len().saturating_sub(1);
     let mut carried: BTreeMap<String, (String, String)> = BTreeMap::new();
@@ -111,6 +125,14 @@ pub fn commit_specs(
         if let Some(ref cmd) = opts.check {
             if let Err(e) = check_staged_tree(repo, git, cmd) {
                 git.reset_index_to_head()?;
+                let files: Vec<String> = plan.stage.iter().map(|(p, _)| p.clone()).collect();
+                record_refusal(
+                    repo,
+                    writ_core::doctor::FinishRefusal::CompileCheck,
+                    &e.to_string(),
+                    &ids,
+                    &files,
+                );
                 return Err(format!(
                     "{e}\nnothing committed for {} ({} earlier commit(s) kept); fix the build, seal, and finish again, or pass --no-check",
                     ids.join(", "),
@@ -140,6 +162,38 @@ pub fn commit_specs(
         });
     }
     Ok(made)
+}
+
+/// Record a `finish_refused` event (finding 76). Every finish refusal goes
+/// through here, including doctor's. A failed write is reported on stderr;
+/// the refusal itself still happens.
+pub fn record_refusal(
+    repo: &Repository,
+    reason: writ_core::doctor::FinishRefusal,
+    details: &str,
+    specs: &[String],
+    files: &[String],
+) {
+    let agent = writ_core::agent::resolve_agent_id_in(
+        None,
+        repo.settings().default_agent.as_deref(),
+        true,
+        Some(repo.writ_dir()),
+    )
+    .id;
+    if let Err(e) = writ_core::doctor::record_finish_refused(
+        repo.writ_dir(),
+        Some(&agent),
+        reason,
+        details,
+        specs,
+        files,
+    ) {
+        eprintln!(
+            "{} could not record the finish refusal in .writ/security/events.jsonl: {e}",
+            "warning:".yellow().bold()
+        );
+    }
 }
 
 /// Split `specs` into commits for `strategy`.

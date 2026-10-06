@@ -76,6 +76,33 @@ verify_json="$(python3 "$ROOT/bench/verify_check.py" "$ROOT" --writ "$WRIT_BIN" 
     --allow-missing ae01d21c123e --allow-missing 50ff4a66d3af --allow-missing 80dbd0cf0eac 2>&1)" \
     || verify_rc=$?
 
+# writ doctor on this repo's own store (sprint 3, 0.4.0 exit criterion 4, 5).
+# Release binary, exit 0 required with GATE_RELEASE=1 (no red otherwise) (this repo's finding 28 blobs are excused by
+# [doctor] allow_missing in .writ/config.toml), wall time median of 5 runs
+# against a 300 ms budget. Honesty: the shipped binary and the Python package
+# never contain "safe to finish" (the release build carries no test code, so
+# the tests asserting its absence do not count). The brief must stay under
+# 2 KB and carry a `doctor:` line.
+DOCTOR_BIN="$ROOT/target/release/writ"
+doctor_json="$(dirname "$OUT")/test-gate-doctor.json"
+doctor_rc=0
+"$DOCTOR_BIN" doctor --format json >"$doctor_json" 2>&1 || doctor_rc=$?
+doctor_ms="$(python3 - "$DOCTOR_BIN" "$ROOT" <<'TIMING'
+import statistics, subprocess, sys, time
+runs = []
+for _ in range(5):
+    t = time.perf_counter()
+    subprocess.run([sys.argv[1], "doctor", "--format", "json"], cwd=sys.argv[2],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    runs.append((time.perf_counter() - t) * 1000)
+print(f"{statistics.median(runs):.0f}")
+TIMING
+)"
+safe_hits="$(LC_ALL=C grep -l -i "safe to finish" "$DOCTOR_BIN" 2>/dev/null || true)
+$(grep -rli "safe to finish" crates/writ-py/python 2>/dev/null || true)"
+brief_out="$(dirname "$OUT")/test-gate-brief.txt"
+"$DOCTOR_BIN" context --format brief >"$brief_out" 2>/dev/null || true
+
 python -m pytest crates/writ-py/tests bench/test_verify_check.py -q -p no:cacheprovider -rxXf >"$py_log" 2>&1
 py_rc=$?
 
@@ -83,6 +110,7 @@ BUILD_RC=$build_rc BUILD_LOG="$build_log" \
 TIMING_LOG="$timing_log" TIMING_RC=$timing_rc TIMING_LOAD="$timing_load" TIMING_TESTS="${TIMING_TESTS[*]}" \
 RUST_LOG="$rust_log" PY_LOG="$py_log" RUST_RC=$rust_rc PY_RC=$py_rc \
 VERIFY_JSON="$verify_json" VERIFY_RC=$verify_rc \
+DOCTOR_JSON="$doctor_json" DOCTOR_RC=$doctor_rc DOCTOR_MS="$doctor_ms" SAFE_HITS="$safe_hits" BRIEF_OUT="$brief_out" \
 BARE="$bare_ignores" OUT="$OUT" python3 - <<'PY'
 import json, os, re, datetime as dt
 
@@ -110,6 +138,11 @@ timing["seconds"] = float(m[1]) if m else None
 # Every ignored Rust test must be on this list; each names its finding.
 EXPECTED_IGNORED = {
     "ignore::tests::repo_level::test_rejected_scope_violation_seal_leaves_object_count_unchanged",  # 17
+}
+# Gate checks waiting on an implementation: reported, not failed, and a
+# problem once they pass (remove the entry then), like EXPECTED_IGNORED.
+PENDING_GATE_CHECKS = {
+
 }
 # The timing group is ignored in the default run by design (run above).
 EXPECTED_IGNORED |= set(timing_expected)
@@ -146,6 +179,47 @@ try:
 except json.JSONDecodeError:
     verify = {"verdict": "ERROR", "detail": os.environ["VERIFY_JSON"].strip()[:300]}
     problems.append(f"verify: could not run (rc {os.environ['VERIFY_RC']}): {verify['detail']}")
+# Doctor on this repo (exit criterion 4, 5).
+DOCTOR_BUDGET_MS = 300
+BRIEF_BUDGET_BYTES = 2048
+doctor = {"rc": int(os.environ["DOCTOR_RC"]), "budget_ms": DOCTOR_BUDGET_MS}
+try:
+    d = json.load(open(os.environ["DOCTOR_JSON"]))
+    doctor.update(headline=d.get("headline"), tier=d.get("tier"), clean=d.get("clean"),
+                  elapsed_ms=d.get("elapsed_ms"),
+                  findings=[f"{f['check']}/{f['severity']}: {f['message']}" for f in d.get("findings", [])])
+except (ValueError, OSError):
+    doctor["error"] = open(os.environ["DOCTOR_JSON"]).read().strip()[:300]
+doctor["wall_ms_median5"] = int(os.environ["DOCTOR_MS"]) if os.environ["DOCTOR_MS"].isdigit() else None
+# Release (GATE_RELEASE=1): exit 0 required. Mid-sprint the shared tree
+# carries other agents' in-flight work, so yellow is reported, red fails.
+doctor["release_mode"] = os.environ.get("GATE_RELEASE") == "1"
+reds = [f for f in doctor.get("findings", []) if "/red:" in f]
+if doctor.get("error") or (doctor["rc"] != 0 and (doctor["release_mode"] or reds)):
+    problems.append(f"doctor: exit {doctor['rc']} on this repo: {doctor.get('findings') or doctor.get('error')}")
+if doctor["wall_ms_median5"] is None or doctor["wall_ms_median5"] > DOCTOR_BUDGET_MS:
+    problems.append(f"doctor: {doctor['wall_ms_median5']} ms median wall time, budget {DOCTOR_BUDGET_MS} ms")
+if doctor.get("tier") != "fast" or "survival check not available until 0.4.1" not in (doctor.get("headline") or ""):
+    problems.append(f"doctor: honesty headline missing tier or survival note: {doctor.get('headline')!r}")
+safe_hits = [h for h in os.environ["SAFE_HITS"].splitlines() if h.strip()]
+if safe_hits:
+    problems.append(f"honesty: 'safe to finish' present in shipped artifacts: {safe_hits}")
+brief = open(os.environ["BRIEF_OUT"], "rb").read()
+brief_line = next((l for l in brief.decode("utf-8", "replace").splitlines()
+                   if l.strip().startswith("doctor:")), None)
+doctor["brief_bytes"] = len(brief)
+doctor["brief_line"] = brief_line
+if len(brief) >= BRIEF_BUDGET_BYTES:
+    problems.append(f"brief: {len(brief)} bytes, budget {BRIEF_BUDGET_BYTES}")
+pending = []
+if brief_line is None:
+    if "brief_doctor_line" in PENDING_GATE_CHECKS:
+        pending.append("brief_doctor_line")
+    else:
+        problems.append("brief: no doctor: line in context --format brief")
+elif "brief_doctor_line" in PENDING_GATE_CHECKS:
+    problems.append("gate: brief_doctor_line passes now, remove it from PENDING_GATE_CHECKS")
+doctor["pending"] = pending
 result_failures = re.findall(r"^test (\S+) \.\.\. FAILED", rust, re.M)
 # Finding 27 watch list: tests seen failing once under full-suite load and
 # passing alone. Still gate failures; labelled so a recurrence is recognised.
@@ -158,7 +232,7 @@ FLAKY_WATCH = {
 result = {
     "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
     "build_rc": int(os.environ["BUILD_RC"]),
-    "rust": r, "python": p, "timing": timing, "verify": verify, "bare_ignores": bare,
+    "rust": r, "python": p, "timing": timing, "verify": verify, "doctor": doctor, "bare_ignores": bare,
     "rust_failures": result_failures,
     "flaky_watch_hits": sorted(
         t for t in FLAKY_WATCH

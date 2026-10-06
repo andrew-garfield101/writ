@@ -1,15 +1,172 @@
 #!/usr/bin/env bash
 # writ scorecard v0: analytics + gc audit + latest context bench as one markdown report.
 #
-# Usage: bench/writ-scorecard.sh [REPO_DIR] [WRIT_BIN]
+# Usage: bench/writ-scorecard.sh [--hurdles] [REPO_DIR] [WRIT_BIN]
 #   REPO_DIR defaults to the repo containing this script; WRIT_BIN defaults to `writ`.
+#   --hurdles prints only the hurdle ratio section (fast; no analytics or bench).
 #   Bench section uses bench/context/results/latest.md, else the newest baseline-*.md.
 set -euo pipefail
 
+HURDLES_ONLY=0
+if [[ "${1:-}" == "--hurdles" ]]; then HURDLES_ONLY=1; shift; fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="${1:-$ROOT}"
 WRIT="${2:-writ}"
 BENCH_DIR="$ROOT/bench/context"
+
+# --- Hurdle ratio (sprint 3, doctor-harness) --------------------------------
+# Forced seals, survival allowances, refusals, hand recoveries and stale-rewrite
+# notices per sprint and agent. Sources, in order of trust:
+#   1. structured fields on seal records (`forced`, `allow_removals`) and
+#      refusal events in .writ/security/events.jsonl, when writ records them
+#      (0.3.0 records neither: a refused seal writes nothing, a forced seal
+#      looks like any other);
+#   2. the seal log (`writ log --all --format json`): summaries that say the
+#      seal itself used the flag, "(..., --force)" or "--allow-removals:";
+#      specs titled "... (follow-up)" (doctor's stuck-file fix) as recoveries;
+#   3. .writ/stale_rewrite_notices.json (open notices) and saved finish output
+#      (WRIT_FINISH_LOGS, a glob) for notices and finish refusals;
+#   4. a self-reported ledger (WRIT_HURDLE_LEDGER, JSONL: sprint, agent, spec,
+#      kind in forced|allow_removals|refusal|hand_recovery|notice, seal, note),
+#      for what the store cannot show. Deduplicated by (kind, seal).
+# Sprints are assigned by the seal's spec created_at against WRIT_SPRINTS.
+hurdles_section() {
+    local log_json
+    log_json="$(cd "$REPO" && "$WRIT" log --all --format json 2>/dev/null)" || { echo "scorecard: writ log failed" >&2; return 2; }
+    LOG_JSON="$log_json" REPO_DIR="$REPO" python3 - <<'PY'
+import collections, glob, json, os, re
+from pathlib import Path
+
+repo = Path(os.environ["REPO_DIR"]); writ = repo / ".writ"
+seals = json.loads(os.environ["LOG_JSON"])
+sprints = sorted(
+    (start, name) for name, start in (
+        kv.split("=", 1) for kv in os.environ.get(
+            "WRIT_SPRINTS",
+            "sprint-1=2026-10-04T00:00:00Z,sprint-2=2026-10-05T03:00:00Z,sprint-3=2026-10-05T21:00:00Z",
+        ).split(",") if kv))
+
+def sprint_of(ts):
+    name = "pre"
+    for start, n in sprints:
+        if ts.replace("+00:00", "Z") >= start:
+            name = n
+    return name
+
+specs = {}
+for f in glob.glob(str(writ / "specs" / "*.json")):
+    try:
+        d = json.load(open(f)); specs[d["id"]] = d
+    except (OSError, ValueError, KeyError):
+        continue
+
+# A summary declares the seal's own flag as "(..., --force)", "(--force: why)"
+# or "--force: why" at a sentence start. Quoted text ('...', `...`, "...") is
+# dropped first so a summary that describes the convention is not counted.
+FORCED = re.compile(r"(?:\(|, )--force(?:\)|:)|(?:^|[.;] )--force:|\(forced\)")
+ALLOWED = re.compile(r"(?:\(|, )--allow-removals(?:\)|:)|(?:^|[.;] )--allow-removals:")
+QUOTED = re.compile(r"'[^']*'|`[^`]*`|\"[^\"]*\"")
+events = []          # (sprint, agent, kind, seal, source)
+seal_count = collections.Counter()
+seal_index = {}
+for s in seals:
+    spec = specs.get(s.get("spec_id") or "", {})
+    sp = sprint_of(spec.get("created_at") or s["timestamp"])
+    agent = s["agent"]["id"]; sid = s["id"][:12]
+    seal_count[(sp, agent)] += 1
+    seal_index[sid] = (sp, agent)
+    summ = QUOTED.sub("", s.get("summary") or "")
+    if s.get("forced") or s.get("force") or FORCED.search(summ):
+        events.append((sp, agent, "forced", sid, "record" if s.get("forced") or s.get("force") else "log"))
+    if s.get("allow_removals") or ALLOWED.search(summ):
+        events.append((sp, agent, "allow_removals", sid, "record" if s.get("allow_removals") else "log"))
+for sid_full, spec in specs.items():
+    if (spec.get("title") or "").rstrip().endswith("(follow-up)"):
+        sp = sprint_of(spec.get("created_at") or "")
+        events.append((sp, spec.get("claimed_by") or spec.get("created_by") or "?", "recovery_follow_up", sid_full, "spec"))
+
+ev_path = writ / "security" / "events.jsonl"
+if ev_path.exists():
+    for line in ev_path.read_text().splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if "refus" in (e.get("event_type") or ""):
+            events.append((sprint_of(e.get("timestamp", "")), e.get("agent_id", "?"), "refusal", None, "events"))
+
+notices_path = writ / "stale_rewrite_notices.json"
+open_notices = 0
+if notices_path.exists():
+    try:
+        n = json.load(open(notices_path))
+        open_notices = len(n if isinstance(n, list) else n.get("notices", []))
+    except ValueError:
+        pass
+for f in sorted(glob.glob(os.environ.get("WRIT_FINISH_LOGS", ""))) if os.environ.get("WRIT_FINISH_LOGS") else []:
+    text = Path(f).read_text(errors="replace")
+    ts = re.search(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d", text)
+    sp = sprint_of(ts[0] + "Z") if ts else "?"
+    events += [(sp, "finish", "notice", None, f"finish:{Path(f).name}")
+               for _ in re.findall(r"(?im)^.*stale.rewrite.*$", text)]
+    events += [(sp, "finish", "refusal", None, f"finish:{Path(f).name}")
+               for _ in re.findall(r"(?im)^.*\bfinish refused\b.*$", text)]
+
+ledger = os.environ.get("WRIT_HURDLE_LEDGER")
+seen = {(k, s) for _, _, k, s, _ in events if s}
+ledger_rows = 0
+if ledger and Path(ledger).exists():
+    for line in Path(ledger).read_text().splitlines():
+        if not line.strip():
+            continue
+        e = json.loads(line); ledger_rows += 1
+        key = (e["kind"], (e.get("seal") or "")[:12] or None)
+        if key[1] and key in seen:
+            continue
+        seen.add(key)
+        events.append((e["sprint"], e["agent"], e["kind"], key[1], "ledger"))
+
+KINDS = [("forced", "forced"), ("allow_removals", "allowed"), ("refusal", "refusals"),
+         ("hand_recovery", "hand rec."), ("recovery_follow_up", "follow-up rec."), ("notice", "notices")]
+by = collections.Counter((sp, ag, k) for sp, ag, k, _, _ in events)
+src = collections.Counter(s.split(":")[0] for *_, s in events)
+print("## Hurdle ratio")
+print()
+print("Forced seals, survival allowances, refusals, hand recoveries, stale notices per sprint "
+      "(spec created_at). Target: sprint 3 halves sprint 2 on the same agent (baseline: bri 6/3/1/0).")
+print(f"Sources: {dict(src) or 'none'}; ledger rows {ledger_rows} "
+      f"({ledger or 'unset: WRIT_HURDLE_LEDGER'}); open stale notices in store: {open_notices}.")
+print("writ 0.3.0 records neither forced seals nor refusals; log counts are summary markers only.")
+print()
+print("| sprint | agent | seals | " + " | ".join(h for _, h in KINDS) + " | total | per 10 seals |")
+print("|---|---|---:|" + "---:|" * (len(KINDS) + 2))
+rows = sorted({(sp, ag) for sp, ag, _ in by} | {k for k in seal_count})
+totals = collections.Counter()
+for sp, ag in rows:
+    vals = [by[(sp, ag, k)] for k, _ in KINDS]
+    t = sum(vals); n = seal_count[(sp, ag)]
+    totals[sp] += t
+    if t == 0:
+        continue
+    rate = f"{10 * t / n:.1f}" if n else "n/a"
+    print(f"| {sp} | {ag} | {n} | " + " | ".join(map(str, vals)) + f" | {t} | {rate} |")
+print()
+for sp in sorted({sp for sp, _ in seal_count} | set(totals)):
+    n = sum(v for (s, _), v in seal_count.items() if s == sp)
+    print(f"- {sp}: {totals[sp]} hurdles over {n} seals")
+bri2 = sum(by[("sprint-2", "bri", k)] for k, _ in KINDS)
+bri3 = sum(by[("sprint-3", "bri", k)] for k, _ in KINDS)
+n3 = sum(v for (s, a), v in seal_count.items() if s == "sprint-3" and a == "bri")
+ratio = f"{bri3 / bri2:.2f}x; target <= 0.50x" if bri2 and n3 else "no sprint-3 seals yet"
+print(f"- bri sprint-3 vs sprint-2: {bri3} vs {bri2} ({ratio})")
+print()
+PY
+}
+
+if [[ $HURDLES_ONLY -eq 1 ]]; then
+    hurdles_section
+    exit $?
+fi
 
 analytics="$(cd "$REPO" && "$WRIT" analytics --format json)" || { echo "scorecard: writ analytics failed" >&2; exit 2; }
 gc_audit="$(cd "$REPO" && "$WRIT" gc audit --format json)" || { echo "scorecard: writ gc audit failed" >&2; exit 2; }
@@ -62,6 +219,7 @@ print(f"| specs active / committed | {g['active_specs']} / {g['committed_specs']
 print()
 PY
 
+hurdles_section
 echo "## Store integrity"
 echo
 echo "Referenced-but-missing objects (every seal tree and spec genesis tree walked, every change hash, every workspace index). Must be 0."

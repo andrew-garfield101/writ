@@ -5,6 +5,22 @@ All notable changes to writ will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — Unreleased
+
+### Added
+
+- `writ doctor` runs the fast tier: six checks with stable ids (`store_integrity`, `stale_claim`, `committed_spec_seal`, `unsealed_at_risk`, `version_skew`, `left_out`). Each finding names what is wrong, the paths involved, and the exact command that clears it when pasted. `--format json` for scripts; exit 0 when clean, 1 on any finding. The first line always names the tier that ran and the survival state; on a clean repository it reads `fast checks clean; survival check not available until 0.4.1`.
+- `writ finish` runs doctor first and refuses on a red finding unless `--force`. `writ watch` runs doctor every interval and reports when the findings change. `writ context --format brief` carries one `doctor:` line.
+- Every finish refusal (doctor, build check, survival check, unresolved convergence, `--strict`) is recorded as a `finish_refused` event in `.writ/security/events.jsonl` with the reason, specs and files.
+- `writ repair` also repairs the `.writ` layout: missing directories, `version.toml`, the main HEAD and index (rebuilt from the newest seal), an unparseable `config.toml` (moved aside), and unparseable seal or spec records (moved to `.writ/quarantine/`, never deleted). For objects no source can regenerate it prints `writ doctor --allow-missing <prefix>...`, which records the loss as accepted under `[doctor] allow_missing`.
+- `[doctor]` settings in `.writ/config.toml`: `stale_claim_minutes` (default 120), `unsealed_minutes` (default 30), `allow_missing`.
+- Claims record the claiming session's process and host, so doctor can tell a claim whose holder has exited.
+- Python: `Repository.doctor()` returns the fast-tier report (it returned the 0.3 layout checks).
+
+### Fixed
+
+- `writ finish` no longer lists files identical to git HEAD as left out.
+
 ## [0.3.0] — 2026-10-05
 
 Two agents can now share one directory: each seal takes only its own spec's files, closing a spec never sweeps another agent's work, and `writ finish` commits only what was sealed.

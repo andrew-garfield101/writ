@@ -248,6 +248,20 @@ fn render_watch_event(event: &WatchEvent) {
                 specs.join(", "),
             );
         }
+
+        WatchEventKind::DoctorChanged { headline, findings } => {
+            print!("\r  {}  {} {}\r\n", ts, "doctor:".cyan(), headline);
+            for (check, severity, message, fix) in findings {
+                print!(
+                    "\r  {}          [{}] {}: {}\r\n",
+                    " ".repeat(12),
+                    severity,
+                    check,
+                    message
+                );
+                print!("\r  {}            fix: {}\r\n", " ".repeat(12), fix);
+            }
+        }
     }
     let _ = std::io::stdout().flush();
 }

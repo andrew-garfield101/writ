@@ -458,6 +458,11 @@ enum Commands {
         #[arg(long)]
         no_check: bool,
 
+        /// Finish even when `writ doctor` reports red findings. The refusal
+        /// is skipped, not hidden: the findings are still printed.
+        #[arg(long)]
+        force: bool,
+
         /// Create a proposal instead of committing directly (propose mode).
         #[arg(long)]
         propose: bool,
@@ -738,11 +743,21 @@ enum Commands {
         status: bool,
     },
 
-    /// Check repository health and schema version.
+    /// Name every bad state in this repository and the command that fixes
+    /// it. Runs the fast tier; exits 0 when clean, 1 on any finding.
     Doctor {
-        /// Output as JSON instead of human-readable.
+        /// Output format: "human" (default) or "json".
         #[arg(long)]
+        format: Option<String>,
+
+        /// Same as `--format json` (kept for scripts written against 0.3).
+        #[arg(long, hide = true)]
         json: bool,
+
+        /// Accept the permanent loss of these objects (hash prefixes, 12+
+        /// hex chars): add them to `[doctor] allow_missing`, then run doctor.
+        #[arg(long, num_args = 1.., value_name = "PREFIX")]
+        allow_missing: Vec<String>,
 
         /// Attempt to fix problems (reserved for future use).
         #[arg(long)]
@@ -1440,21 +1455,24 @@ fn main() {
             allow_removals,
         } => {
             let agent = resolve_agent(agent.as_deref(), &cwd);
-            cmd_seal(
+            with_doctor_notice(
                 &cwd,
-                &summary,
-                &agent,
-                spec,
-                &status,
-                paths,
-                tests_passed,
-                tests_failed,
-                linted,
-                allow_empty,
-                expected_head,
-                enforce_scope,
-                force,
-                allow_removals,
+                cmd_seal(
+                    &cwd,
+                    &summary,
+                    &agent,
+                    spec,
+                    &status,
+                    paths,
+                    tests_passed,
+                    tests_failed,
+                    linted,
+                    allow_empty,
+                    expected_head,
+                    enforce_scope,
+                    force,
+                    allow_removals,
+                ),
             )
         }
         Commands::Show {
@@ -1547,17 +1565,18 @@ fn main() {
             archive_unclaimed,
             strict,
             no_check,
+            force,
         } => {
             if proposals {
                 cmd_finish_proposals(&cwd)
             } else if let Some(id) = accept {
-                cmd_finish_accept(&cwd, &id, &strategy, strict, no_check)
+                cmd_finish_accept(&cwd, &id, &strategy, strict, no_check, force)
             } else if let Some(id) = reject {
                 cmd_finish_reject(&cwd, &id)
             } else if propose {
                 cmd_finish_propose(&cwd, full, &strategy)
             } else if auto {
-                cmd_finish_auto(&cwd, &strategy, strict, no_check)
+                cmd_finish_auto(&cwd, &strategy, strict, no_check, force)
             } else {
                 cmd_finish(
                     &cwd,
@@ -1571,6 +1590,7 @@ fn main() {
                         archive_unclaimed,
                         strict,
                         no_check,
+                        force,
                     },
                     &strategy,
                 )
@@ -1650,15 +1670,18 @@ fn main() {
                 no_seal,
                 force,
                 allow_removals,
-            } => cmd_spec_done(
+            } => with_doctor_notice(
                 &cwd,
-                id.as_deref(),
-                summary,
-                agent.as_deref(),
-                paths,
-                no_seal,
-                force,
-                allow_removals,
+                cmd_spec_done(
+                    &cwd,
+                    id.as_deref(),
+                    summary,
+                    agent.as_deref(),
+                    paths,
+                    no_seal,
+                    force,
+                    allow_removals,
+                ),
             ),
             SpecCommands::Complete { id } => cmd_spec_complete(&cwd, &id),
             SpecCommands::Show { id, format } => cmd_spec_show(&cwd, &id, &format),
@@ -1831,7 +1854,19 @@ fn main() {
             stop,
             status,
         } => cmd_watch(&cwd, interval, no_auto_converge, daemon, stop, status),
-        Commands::Doctor { json, fix } => cmd_doctor(&cwd, json, fix),
+        Commands::Doctor {
+            format,
+            json,
+            fix,
+            allow_missing,
+        } => {
+            let format = if json {
+                "json".to_string()
+            } else {
+                format.unwrap_or_else(|| "human".to_string())
+            };
+            cmd_doctor(&cwd, &format, fix, &allow_missing)
+        }
     };
 
     if let Err(e) = result {
@@ -2141,21 +2176,47 @@ fn cmd_init(
     }
 
     // Phase 1+2: Interactive flow collects user preferences via prompts.
-    let plan = init::plan_init(&opts)?;
+    let mut plan = init::plan_init(&opts)?;
+    let writ_dir = cwd.join(".writ");
+    let config_path = writ_dir.join("config.toml");
+    // Finding 82: a rerun keeps the existing config; see init::rerun_config.
+    let rerun_text = if plan.scan.writ_already_initialized {
+        std::fs::read_to_string(&config_path).ok()
+    } else {
+        None
+    };
+    if let Some(existing) = &rerun_text {
+        let planned = [plan.enable_claude, plan.enable_codex, plan.enable_generic];
+        let (_, enables) = init::rerun_config(existing, planned, &plan.project_config, &opts);
+        [plan.enable_claude, plan.enable_codex, plan.enable_generic] = enables;
+    }
 
     // Execute: create .writ/, import baseline.
     // Finding 71: a rerun refreshes generated files and never seals.
     let result = Repository::init_project_with(cwd, false)?;
 
-    // Save GC config from the selected profile.
-    let gc_config = writ_core::gc::GcConfig::from_profile(profile)?;
-    gc_config.save(&cwd.join(".writ"))?;
+    // Save GC config from the selected profile (a rerun keeps an existing one).
+    if rerun_text.is_none() || !writ_dir.join("gc").join("config.json").exists() {
+        let gc_config = writ_core::gc::GcConfig::from_profile(profile)?;
+        gc_config.save(&writ_dir)?;
+    }
 
-    // Save the project config from the interactive flow.
-    plan.project_config.save(&cwd.join(".writ"))?;
-
-    // MS.30: Append commented [watch] section to config.toml for discoverability.
-    append_watch_config_comment(&cwd.join(".writ").join("config.toml"));
+    match &rerun_text {
+        // Rerun: only the keys this command's flags asked to change.
+        Some(existing) => {
+            let planned = [!opts.no_claude, !opts.no_codex, !opts.no_generic];
+            let (text, _) = init::rerun_config(existing, planned, &plan.project_config, &opts);
+            if &text != existing {
+                writ_core::fsutil::atomic_write(&config_path, text.as_bytes())?;
+            }
+        }
+        None => {
+            // Save the project config from the interactive flow.
+            plan.project_config.save(&writ_dir)?;
+            // MS.30: Append commented [watch] section for discoverability.
+            append_watch_config_comment(&config_path);
+        }
+    }
 
     // Finding 39: .writ/ is git-ignored in every mode, --bare included;
     // otherwise `git add -A` would commit the whole store.
@@ -2744,6 +2805,32 @@ fn cmd_task_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
+/// Open, unclaimed specs that `agent_id` created (finding 87), sorted.
+fn unclaimed_specs_created_by(
+    repo: &Repository,
+    agent_id: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    use writ_core::spec::{LifecycleState, SpecStatus};
+    let mut ids: Vec<String> = repo
+        .list_specs()?
+        .into_iter()
+        .filter(|s| {
+            s.claimed_by.is_none()
+                && s.created_by.as_deref() == Some(agent_id)
+                && matches!(s.status, SpecStatus::Pending | SpecStatus::InProgress)
+                && !matches!(
+                    s.lifecycle_state,
+                    LifecycleState::Cancelled
+                        | LifecycleState::Completed
+                        | LifecycleState::Archived
+                )
+        })
+        .map(|s| s.id)
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
 fn cmd_seal(
     cwd: &PathBuf,
     summary: &str,
@@ -2761,16 +2848,6 @@ fn cmd_seal(
     allow_removals: Vec<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let is_agent = detect_agent_from_env().is_some();
-
-    // C.14: Context token check — warn if writ context wasn't run recently.
-    if is_agent && !check_context_token(cwd) {
-        eprintln!(
-            "{} No `writ context` run detected this session.",
-            "warning:".yellow().bold()
-        );
-        eprintln!("  Run `writ context` first to get project state.");
-        eprintln!("  Seal saved, but your work may conflict with other agents.");
-    }
 
     let mut repo = Repository::open_from_dir(cwd)?;
     // The flag can only turn enforcement on; `[security] scope_enforcement`
@@ -2793,10 +2870,54 @@ fn cmd_seal(
         match repo.resolve_spec_for_agent(None, agent_id) {
             Ok(id) => Some(id),
             Err(_) => {
+                // Finding 85: several claims is not "no spec"; name them.
+                let held: Vec<String> = repo
+                    .list_specs()?
+                    .into_iter()
+                    .filter(|s| {
+                        s.claimed_by.as_deref() == Some(agent_id)
+                            && s.status != writ_core::spec::SpecStatus::Complete
+                            && !matches!(
+                                s.lifecycle_state,
+                                writ_core::spec::LifecycleState::Cancelled
+                                    | writ_core::spec::LifecycleState::Completed
+                                    | writ_core::spec::LifecycleState::Archived
+                            )
+                    })
+                    .map(|s| s.id)
+                    .collect();
+                if held.len() > 1 {
+                    eprintln!(
+                        "{} You hold {} claimed specs ({}); pass --spec <id>. Nothing was sealed.",
+                        "ERROR:".red().bold(),
+                        held.len(),
+                        held.join(", ")
+                    );
+                    process::exit(1);
+                }
+                // Finding 87: the agent's own single unclaimed open spec
+                // is claimed by its first seal; several: name them.
+                let created = unclaimed_specs_created_by(&repo, agent_id)?;
+                if created.len() == 1 {
+                    repo.spec_claim(&created[0], agent_id)?;
+                    eprintln!(
+                        "{} claimed spec {} (you created it) for this seal",
+                        "note:".cyan().bold(),
+                        created[0]
+                    );
+                    Some(created[0].clone())
+                } else if created.len() > 1 {
+                    eprintln!(
+                        "{} You created {} unclaimed specs ({}); pass --spec <id>. Nothing was sealed.",
+                        "ERROR:".red().bold(),
+                        created.len(),
+                        created.join(", ")
+                    );
+                    process::exit(1);
                 // C.13: No auto-scope available — enforce spec for agents.
-                if is_agent {
+                } else if is_agent {
                     eprintln!("{} No active spec for this seal.", "ERROR:".red().bold());
-                    eprintln!("  Create one: writ spec add \"brief description of your task\"");
+                    eprintln!("  Create and claim one: writ spec add \"brief description of your task\" --claim");
                     eprintln!("  Then retry your seal.");
                     eprintln!();
                     eprintln!("  Agents must link seals to specs for tracking and coordination.");
@@ -2811,6 +2932,16 @@ fn cmd_seal(
             }
         }
     };
+
+    // C.14: Context token check — warn if writ context wasn't run recently.
+    // After spec resolution, so a refused seal prints one message only.
+    if is_agent && !check_context_token(cwd) {
+        eprintln!(
+            "{} No `writ context` run detected this session.",
+            "warning:".yellow().bold()
+        );
+        eprintln!("  Run `writ context` first to get project state; your work may conflict with other agents.");
+    }
 
     let agent = AgentIdentity {
         id: agent_id.to_string(),
@@ -3539,6 +3670,19 @@ fn cmd_context(
             }
             println!();
 
+            // ── Doctor (finding 86) ─────────────────────────────────────
+            if let Some(ref d) = ctx.doctor {
+                println!("  {} {}", "doctor:".cyan(), d.headline);
+                for f in &d.findings {
+                    let fix = f
+                        .fix_command
+                        .as_deref()
+                        .unwrap_or("none to paste; needs your decision");
+                    println!("    [{}] {}: {}", f.severity.as_str(), f.check, f.message);
+                    println!("      fix: {fix}");
+                }
+            }
+
             // ── Session complete banner ─────────────────────────────────
             if let Some(ref ss) = ctx.session_summary {
                 println!();
@@ -3910,7 +4054,9 @@ fn cmd_status(
     }
 
     let repo = Repository::open_from_dir(cwd)?;
-    let status = repo.status()?;
+    let mut status = repo.status()?;
+    // Finding 90: doctor rides along when it is not clean.
+    status.doctor = writ_core::doctor::notice(&repo);
 
     // Machine-readable output (W.3).
     match format {
@@ -4256,6 +4402,10 @@ fn cmd_status(
 
     println!();
 
+    if let Some(ref d) = status.doctor {
+        print_doctor_section(d);
+    }
+
     Ok(())
 }
 
@@ -4450,6 +4600,7 @@ fn cmd_status_watch(
                     archive_unclaimed: false,
                     strict: false,
                     no_check: false,
+                    force: false,
                 },
                 "single",
             )?;
@@ -4503,6 +4654,7 @@ struct FinishOpts {
     archive_unclaimed: bool,
     strict: bool,
     no_check: bool,
+    force: bool,
 }
 
 fn cmd_finish(
@@ -4522,9 +4674,11 @@ fn cmd_finish(
         archive_unclaimed,
         strict,
         no_check,
+        force,
     } = opts;
 
     let repo = Repository::open_from_dir(cwd)?;
+    finish_doctor_gate(&repo, force, dry_run)?;
 
     // WV.6: Auto-converge outstanding workspaces before finishing.
     let workspaces = repo.list_workspaces()?;
@@ -4563,6 +4717,20 @@ fn cmd_finish(
                 "  Resolve escalations before finishing. Run {} to see details.",
                 "`writ converge-all --dry-run`".bold()
             );
+            if !dry_run {
+                let files: Vec<String> = report
+                    .escalations
+                    .iter()
+                    .map(|e| e.file_path.clone())
+                    .collect();
+                finish::record_refusal(
+                    &repo,
+                    writ_core::doctor::FinishRefusal::ConvergenceConflict,
+                    "workspace convergence has unresolved escalations",
+                    &ws_names,
+                    &files,
+                );
+            }
             return Err("convergence has unresolved escalations".into());
         }
         if report.is_clean {
@@ -4606,7 +4774,11 @@ fn cmd_finish(
                         eprintln!("  {} {}: {}", "·".red(), esc.file_path, esc.reason);
                     }
                     eprintln!();
-                    if print_survival_losses(&repo, &conv_report.escalations) {
+                    let survival = print_survival_losses(&repo, &conv_report.escalations);
+                    if !dry_run {
+                        record_escalation_refusal(&repo, &conv_report.escalations, survival);
+                    }
+                    if survival {
                         return Err("finish refused: the merge would lose sealed lines".into());
                     }
                     eprintln!(
@@ -4664,7 +4836,7 @@ fn cmd_finish(
         // committed. Unsealed changes need --include-unsealed.
         let plan = repo.finish_plan(&[])?;
         println!("Nothing to commit — no completed specs.");
-        print_finish_left_out(&plan, false);
+        print_finish_left_out(repo.root(), &plan, false);
         println!();
         println!(
             "  {} Use `writ spec done <id>` to mark a spec as complete.",
@@ -4759,7 +4931,7 @@ fn cmd_finish(
     // S.1: stage only paths the completed specs sealed, with sealed content.
     let committable_ids: Vec<String> = committable.iter().map(|s| s.id.clone()).collect();
     let plan = repo.finish_plan(&committable_ids)?;
-    print_finish_left_out(&plan, include_unsealed);
+    print_finish_left_out(repo.root(), &plan, include_unsealed);
 
     if dry_run {
         println!();
@@ -5052,8 +5224,10 @@ fn common_directory_prefix(paths: &[String]) -> String {
 
 /// Legacy finish path: no spec awareness, just stage and commit.
 /// Print what `writ finish` leaves out, each list under its own heading.
-fn print_finish_left_out(plan: &writ_core::repo::FinishPlan, include_unsealed: bool) {
+fn print_finish_left_out(root: &Path, plan: &writ_core::repo::FinishPlan, include_unsealed: bool) {
     use colored::Colorize;
+    // Finding 75: a file identical to git HEAD is not left out of anything.
+    let unsealed = writ_core::doctor::differs_from_head(root, &plan.unsealed);
     let section = |title: &str, items: &[String]| {
         if items.is_empty() {
             return;
@@ -5080,7 +5254,7 @@ fn print_finish_left_out(plan: &writ_core::repo::FinishPlan, include_unsealed: b
         );
         section(
             "Left out: not sealed by any completed spec (pass --include-unsealed to commit them)",
-            &plan.unsealed,
+            &unsealed,
         );
     }
     let in_progress: Vec<String> = plan
@@ -5092,6 +5266,97 @@ fn print_finish_left_out(plan: &writ_core::repo::FinishPlan, include_unsealed: b
         "Left out: sealed under specs that are not done yet",
         &in_progress,
     );
+}
+
+/// Run the doctor fast tier before finish. Red findings refuse (recording a
+/// `finish_refused` event) unless `--force`; yellow findings are printed and
+/// finish continues. A dry run prints what finish would do and never records.
+fn finish_doctor_gate(
+    repo: &Repository,
+    force: bool,
+    dry_run: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use colored::Colorize;
+    let report = writ_core::doctor::run(repo)?;
+    if report.clean {
+        println!("  {} doctor: {}", "✓".green(), report.headline);
+        return Ok(());
+    }
+    print_doctor_human(&report);
+    println!();
+    if !report.blocks_finish() {
+        return Ok(());
+    }
+    if force {
+        eprintln!(
+            "{} --force: finishing despite {} red doctor finding(s)",
+            "warning:".yellow().bold(),
+            report.red
+        );
+        return Ok(());
+    }
+    if dry_run {
+        println!("  dry run: finish would refuse on the red finding(s) above (or pass --force)");
+        return Ok(());
+    }
+    let red: Vec<&writ_core::doctor::DoctorFinding> = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == writ_core::doctor::Severity::Red)
+        .collect();
+    let mut checks: Vec<String> = red.iter().map(|f| f.check.clone()).collect();
+    checks.dedup();
+    let mut files: Vec<String> = red.iter().flat_map(|f| f.paths.clone()).collect();
+    files.sort();
+    files.dedup();
+    let specs: Vec<String> = repo
+        .list_specs()?
+        .into_iter()
+        .filter(|s| s.is_committable())
+        .map(|s| s.id)
+        .collect();
+    finish::record_refusal(
+        repo,
+        writ_core::doctor::FinishRefusal::DoctorRed,
+        &format!("doctor red: {}", checks.join(", ")),
+        &specs,
+        &files,
+    );
+    Err(format!(
+        "finish refused: {} red doctor finding(s); run each fix above, or pass --force",
+        report.red
+    )
+    .into())
+}
+
+/// Record a seal-tree convergence refusal: `survival_check` when any
+/// escalation is a merge loss, else `convergence_conflict`.
+fn record_escalation_refusal(
+    repo: &Repository,
+    escalations: &[writ_core::convergence::PipelineEscalation],
+    survival: bool,
+) {
+    let mut specs: Vec<String> = escalations
+        .iter()
+        .flat_map(|e| [e.left_spec.clone(), e.right_spec.clone()])
+        .collect();
+    specs.sort();
+    specs.dedup();
+    let mut files: Vec<String> = escalations.iter().map(|e| e.file_path.clone()).collect();
+    files.sort();
+    files.dedup();
+    let (reason, details) = if survival {
+        (
+            writ_core::doctor::FinishRefusal::SurvivalCheck,
+            "the merge would lose sealed lines",
+        )
+    } else {
+        (
+            writ_core::doctor::FinishRefusal::ConvergenceConflict,
+            "seal-tree convergence has unresolved conflicts",
+        )
+    };
+    finish::record_refusal(repo, reason, details, &specs, &files);
 }
 
 /// Explain merge-survival escalations (a spec's own sealed lines missing
@@ -5337,11 +5602,13 @@ fn cmd_finish_accept(
     strategy: &str,
     strict: bool,
     no_check: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
     use writ_core::git_ops::Git2Ops;
 
     let repo = Repository::open_from_dir(cwd)?;
+    finish_doctor_gate(&repo, force, false)?;
     let proposal = repo.accept_proposal(proposal_id)?;
     // Finding 37: the proposal's own strategy wins; the flag is the fallback.
     let strategy = if proposal.strategy.is_empty() {
@@ -5363,7 +5630,7 @@ fn cmd_finish_accept(
         check: finish::resolve_check(&repo, no_check),
     };
     let plan = repo.finish_plan(&proposal.spec_ids)?;
-    print_finish_left_out(&plan, false);
+    print_finish_left_out(repo.root(), &plan, false);
     let made = finish::commit_specs(&repo, &git, &specs, strategy, &proposal.message, &opts)?;
     if made.is_empty() {
         println!("Nothing to commit — sealed content already matches HEAD.");
@@ -5427,12 +5694,14 @@ fn cmd_finish_auto(
     strategy: &str,
     strict: bool,
     no_check: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
     use writ_core::config::ProjectConfig;
     use writ_core::git_ops::{Git2Ops, GitOps};
 
     let repo = Repository::open_from_dir(cwd)?;
+    finish_doctor_gate(&repo, force, false)?;
 
     // Load auto config
     let project_config = ProjectConfig::load(repo.writ_dir()).unwrap_or_default();
@@ -5539,7 +5808,7 @@ fn cmd_finish_auto(
     for (specs, message) in &runs {
         let ids: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
         let plan = repo.finish_plan(&ids)?;
-        print_finish_left_out(&plan, false);
+        print_finish_left_out(repo.root(), &plan, false);
         let made = finish::commit_specs(&repo, &git, specs, strategy, message, &opts)?;
         for c in &made {
             total_committed += c.spec_ids.len();
@@ -5919,6 +6188,24 @@ fn cmd_spec_add(
     }
     spec.file_scope = file_scope;
     let creator = resolve_agent(agent, cwd);
+    // Finding 84: `--id X --claim` is idempotent for the agent that already
+    // holds X open, so doctor's fixes can each carry their own spec add and
+    // be pasted in any order.
+    if id.is_some() && claim {
+        if let Ok(existing) = repo.load_spec(&spec_id) {
+            let open = existing.status != writ_core::spec::SpecStatus::Complete
+                && !matches!(
+                    existing.lifecycle_state,
+                    writ_core::spec::LifecycleState::Cancelled
+                        | writ_core::spec::LifecycleState::Completed
+                        | writ_core::spec::LifecycleState::Archived
+                );
+            if open && existing.claimed_by.as_deref() == Some(creator.as_str()) {
+                println!("spec {spec_id} already exists, claimed by you ({creator})");
+                return Ok(());
+            }
+        }
+    }
     spec.created_by = Some(creator.clone());
     repo.add_spec(&spec)?;
 
@@ -9811,55 +10098,102 @@ fn cmd_workspace_delete(
 // Doctor
 // ---------------------------------------------------------------------------
 
-fn cmd_doctor(cwd: &PathBuf, json: bool, fix: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let repo = Repository::open_from_dir(cwd)?;
-    let report = writ_core::migrate::DoctorReport::run(repo.writ_dir());
-
+fn cmd_doctor(
+    cwd: &Path,
+    format: &str,
+    fix: bool,
+    allow_missing: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !allow_missing.is_empty() {
+        let repo = Repository::open_from_dir(cwd)?;
+        let all = writ_core::doctor::add_allow_missing(repo.writ_dir(), allow_missing)?;
+        eprintln!(
+            "recorded in .writ/config.toml: {}",
+            writ_core::doctor::allow_missing_config_line(&all)
+        );
+    }
     if fix {
         eprintln!(
-            "{} --fix is reserved for a future release. Showing report only.",
+            "{} --fix is reserved for a future release; each finding prints its fix command.",
             "note:".yellow()
         );
     }
+    let report = match Repository::open_from_dir(cwd) {
+        Ok(repo) => writ_core::doctor::run(&repo)?,
+        Err(e) => match writ_core::doctor::open_refusal_report(&e) {
+            Some(report) => report,
+            None => return Err(e.into()),
+        },
+    };
 
-    if json {
+    if format == "json" {
         println!("{}", serde_json::to_string_pretty(&report)?);
-        return Ok(());
+    } else {
+        print_doctor_human(&report);
     }
 
-    // Human-readable output
-    for check in &report.checks {
-        let icon = match check.status {
-            writ_core::migrate::CheckStatus::Pass => "✓".green().to_string(),
-            writ_core::migrate::CheckStatus::Fail => "✗".red().to_string(),
-            writ_core::migrate::CheckStatus::Warning => "!".yellow().to_string(),
-        };
-        println!("  {} {} — {}", icon, check.name, check.message);
+    if !report.clean {
+        std::io::Write::flush(&mut std::io::stdout())?;
+        process::exit(1);
     }
-
-    println!();
-    let failed_str = report.failed.to_string();
-    let warn_str = report.warnings.to_string();
-    println!(
-        "  {} passed, {} failed, {} warnings",
-        report.passed.to_string().green(),
-        if report.failed > 0 {
-            failed_str.red().to_string()
-        } else {
-            failed_str
-        },
-        if report.warnings > 0 {
-            warn_str.yellow().to_string()
-        } else {
-            warn_str
-        },
-    );
-
-    if !report.is_healthy() {
-        std::process::exit(1);
-    }
-
     Ok(())
+}
+
+/// After a successful seal or spec done, print doctor when it is not clean
+/// (finding 90): agents read context once, so a state that appears mid-run
+/// must reach them through the commands they keep running. Warm fast tier.
+fn with_doctor_notice(
+    cwd: &Path,
+    result: Result<(), Box<dyn std::error::Error>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    result?;
+    if let Ok(repo) = Repository::open_from_dir(cwd) {
+        if let Some(d) = writ_core::doctor::notice(&repo) {
+            print_doctor_section(&d);
+        }
+    }
+    Ok(())
+}
+
+/// The doctor section as human text: headline, then each finding and fix.
+fn print_doctor_section(d: &writ_core::context::ContextDoctor) {
+    println!();
+    println!("{} {}", "doctor:".cyan().bold(), d.headline);
+    for f in &d.findings {
+        println!("  [{}] {}: {}", f.severity.as_str(), f.check, f.message);
+        match &f.fix_command {
+            Some(cmd) => println!("    fix: {cmd}"),
+            None => println!("    fix: none to paste; needs your decision"),
+        }
+    }
+}
+
+/// Human output: headline first (tier and survival state), then one block
+/// per finding with its fix command on its own line, ready to paste.
+fn print_doctor_human(report: &writ_core::doctor::DoctorReport) {
+    println!("{}", report.headline);
+    for f in &report.findings {
+        let tag = match f.severity {
+            writ_core::doctor::Severity::Red => "red".red().to_string(),
+            writ_core::doctor::Severity::Yellow => "yellow".yellow().to_string(),
+        };
+        println!();
+        println!("  [{tag}] {}: {}", f.check, f.message);
+        if !f.paths.is_empty() {
+            let shown: Vec<&str> = f.paths.iter().take(10).map(String::as_str).collect();
+            let more = f.paths.len().saturating_sub(shown.len());
+            let suffix = if more > 0 {
+                format!(" (+{more} more)")
+            } else {
+                String::new()
+            };
+            println!("    paths: {}{suffix}", shown.join(", "));
+        }
+        match &f.fix_command {
+            Some(cmd) => println!("    fix:   {cmd}"),
+            None => println!("    fix:   none to paste; this needs your decision (see above)"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -10025,6 +10359,9 @@ mod tests {
             committed_at: None,
             workspace: None,
             claimed_by: None,
+            claimed_pid: None,
+            claimed_pid_start: None,
+            claimed_host: None,
             genesis_tree: None,
             created_by: None,
         }
@@ -10104,6 +10441,18 @@ fn cmd_repair(cwd: &Path, dry_run: bool, format: &str) -> Result<(), Box<dyn std
 
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&report)?);
+        if !report.is_clean() {
+            std::io::Write::flush(&mut std::io::stdout())?;
+            process::exit(1);
+        }
+        return Ok(());
+    }
+    let verb = if dry_run { "would fix" } else { "fixed" };
+    for action in &report.layout {
+        println!("layout {verb}: {action}");
+    }
+    if report.store_scan_skipped {
+        println!("dry run: store scan skipped until the layout is fixed; run `writ repair`");
     } else if report.missing.is_empty() && report.unreadable_trees.is_empty() {
         println!("store ok: no referenced objects are missing");
     } else {
@@ -10131,9 +10480,39 @@ fn cmd_repair(cwd: &Path, dry_run: bool, format: &str) -> Result<(), Box<dyn std
         if dry_run && !report.recovered.is_empty() {
             println!("dry run: nothing written; run `writ repair` to write recovered objects");
         }
+        let mut lost: Vec<String> = report
+            .unrecoverable
+            .iter()
+            .map(|u| u.hash[..12].to_string())
+            .chain(
+                report
+                    .unreadable_trees
+                    .iter()
+                    .map(|t| t.hash[..12].to_string()),
+            )
+            .collect();
+        lost.sort();
+        lost.dedup();
+        if !lost.is_empty() {
+            println!("no source can regenerate these; to accept the loss, run:");
+            println!("  {}", writ_core::doctor::allow_missing_command(&lost));
+            println!(
+                "  (adds to .writ/config.toml: {})",
+                writ_core::doctor::allow_missing_config_line(&lost)
+            );
+        }
     }
 
-    if !report.is_clean() {
+    // Objects accepted as lost with `writ doctor --allow-missing` do not
+    // fail the run.
+    let accepted = writ_core::doctor::DoctorConfig::load(repo.writ_dir()).unwrap_or_default();
+    let unexcused = report
+        .unrecoverable
+        .iter()
+        .map(|u| u.hash.as_str())
+        .chain(report.unreadable_trees.iter().map(|t| t.hash.as_str()))
+        .any(|h| !accepted.excuses(h));
+    if unexcused {
         std::io::Write::flush(&mut std::io::stdout())?;
         process::exit(1);
     }

@@ -779,3 +779,400 @@ fn three_spec_chain_takes_the_last_descendant() {
     assert!(r.is_clean, "{:?}", r.escalations);
     assert_eq!(merged_file(&f, &r), c);
 }
+
+// ── Sprint 3: finding 69 allowances, finding 74, finding 76 ─────────────
+
+/// `#[ignore]` marker above every fourth of the first twenty lines (Bri's
+/// shape: five standalone attribute lines the spec added).
+fn with_ignore_markers(base: &str) -> String {
+    let mut out = String::new();
+    for (i, l) in base.lines().enumerate() {
+        if i % 4 == 0 && i < 20 {
+            out.push_str("#[ignore = \"not landed (Amis)\"]\n");
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    out
+}
+
+fn refusal_events(f: &Fixture) -> Vec<serde_json::Value> {
+    let path = f.root().join(".writ/security/events.jsonl");
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["event_type"] == "seal_refused")
+        .collect()
+}
+
+/// Allowance (a), finding 69 as Bri hit it (`ac795e106e2b`): sa added five
+/// `#[ignore]` lines; sb's later seal continued sa's version and removed
+/// them (sb's recorded base held them). sa's disk copy is sb's version plus
+/// sa's new test: the removal is already sealed by a newer seal of another
+/// spec, so sa seals without --force.
+#[test]
+fn cross_spec_removal_already_sealed_is_not_refused() {
+    let f = Fixture::new();
+    let base = base_text();
+    f.write(&with_ignore_markers(&base));
+    f.seal("a", "sa").unwrap();
+    let unignored = with_edit(&base, 30, "B");
+    f.write(&unignored);
+    f.seal("b", "sb").unwrap();
+
+    f.write(&format!("{unignored}fn new_test_by_a() {{}}\n"));
+    let seal = f.seal("a", "sa").unwrap();
+    assert!(!seal.forced);
+    assert!(refusal_events(&f).is_empty());
+}
+
+/// Still refused (a): the other spec removed only three of the five
+/// markers. The two it kept are sa's to lose; refused naming exactly them,
+/// and the refusal is on record (finding 76).
+#[test]
+fn cross_spec_removal_excuses_only_the_copies_it_removed() {
+    let f = Fixture::new();
+    let base = base_text();
+    let marked = with_ignore_markers(&base);
+    f.write(&marked);
+    f.seal("a", "sa").unwrap();
+    // sb keeps the first two markers.
+    let mut seen = 0;
+    let partly: String = marked
+        .lines()
+        .filter(|l| {
+            if l.starts_with("#[ignore") {
+                seen += 1;
+                seen <= 2
+            } else {
+                true
+            }
+        })
+        .map(|l| format!("{l}\n"))
+        .collect();
+    f.write(&partly);
+    f.seal("b", "sb").unwrap();
+
+    f.write(&format!("{base}fn new_test_by_a() {{}}\n"));
+    let err = f.seal("a", "sa").unwrap_err();
+    let WritError::OwnLinesRemoved { losses, .. } = &err else {
+        panic!("expected OwnLinesRemoved, got {err:?}");
+    };
+    assert_eq!(losses[0].lines.len(), 2, "{losses:?}");
+
+    let events = refusal_events(&f);
+    assert_eq!(events.len(), 1, "{events:?}");
+    let e = &events[0];
+    assert_eq!(e["reason"], "survival_check");
+    assert_eq!(e["severity"], "warning");
+    assert_eq!(e["agent_id"], "a");
+    assert_eq!(e["specs"][0], "sa");
+    assert_eq!(e["files"][0], FILE);
+    assert!(e["details"].as_str().unwrap().contains("seal refused"));
+}
+
+/// (a) "committed or newer": sb removed the markers, then sa re-added them
+/// (sa's latest seal of the path is newer than sb's removal). sa dropping
+/// them again beside new content is refused while sb is open; once sb is
+/// committed its removal is in git and excuses the drop.
+#[test]
+fn older_cross_spec_removal_excuses_only_when_its_spec_is_committed() {
+    let f = Fixture::new();
+    let base = base_text();
+    let marked = with_ignore_markers(&base);
+    f.write(&marked);
+    f.seal("a", "sa").unwrap();
+    f.write(&base);
+    f.seal("b", "sb").unwrap();
+    f.write(&marked);
+    f.seal("a", "sa").unwrap();
+
+    f.write(&format!("{base}fn new_test_by_a() {{}}\n"));
+    let err = f.seal("a", "sa").unwrap_err();
+    assert!(matches!(err, WritError::OwnLinesRemoved { .. }), "{err:?}");
+
+    f.repo.mark_spec_done("sb", None).unwrap();
+    f.repo
+        .mark_spec_committed("sb", "0123456789abcdef")
+        .unwrap();
+    f.seal("a", "sa").unwrap();
+}
+
+/// Allowance (b) with the capture-shape gate open: the block moves and the
+/// same seal adds a new function (unknown content). Not refused. Dropping
+/// one line of the block in the move is still refused, naming that line.
+#[test]
+fn moved_block_beside_new_lines_is_not_refused_but_a_dropped_line_is() {
+    let f = Fixture::new();
+    let base = base_text();
+    let mut v: Vec<String> = base.lines().map(String::from).collect();
+    v.splice(5..5, ["fn added() {", "    work();", "}"].map(String::from));
+    f.write(&lines_of(&v.iter().map(String::as_str).collect::<Vec<_>>()));
+    f.seal("a", "sa").unwrap();
+
+    let block: Vec<String> = v.drain(5..8).collect();
+    v.splice(30..30, block.clone());
+    v.push("fn brand_new() {}".into());
+    f.write(&lines_of(&v.iter().map(String::as_str).collect::<Vec<_>>()));
+    f.seal("a", "sa").unwrap();
+
+    // Moved again, this time without its middle line.
+    let pos = v.iter().position(|l| l == "fn added() {").unwrap();
+    v.drain(pos..pos + 3);
+    v.splice(10..10, ["fn added() {".to_string(), "}".to_string()]);
+    v.push("fn newer() {}".into());
+    f.write(&lines_of(&v.iter().map(String::as_str).collect::<Vec<_>>()));
+    let err = f.seal("a", "sa").unwrap_err();
+    let WritError::OwnLinesRemoved { losses, .. } = &err else {
+        panic!("expected OwnLinesRemoved, got {err:?}");
+    };
+    assert_eq!(losses[0].lines, vec!["    work();".to_string()]);
+}
+
+/// Allowance (c): the spec's expected-ignored gate entry is dropped and
+/// the same seal adds its un-marked form (the entry moves to another list
+/// without its comment), beside new content. Not refused.
+#[test]
+fn un_ignore_that_adds_the_unmarked_entry_is_not_refused() {
+    let f = Fixture::new();
+    let gate = f.root().join("gate.py");
+    fs::write(&gate, lines_of(&["EXPECTED = {", "}", "TIMING = {", "}"])).unwrap();
+    seal_files(&f, "a", "sa", &["gate.py"]).unwrap();
+    fs::write(
+        &gate,
+        lines_of(&[
+            "EXPECTED = {",
+            "    \"test_x\",  # 17, until S.2 lands",
+            "}",
+            "TIMING = {",
+            "}",
+        ]),
+    )
+    .unwrap();
+    seal_files(&f, "a", "sa", &["gate.py"]).unwrap();
+
+    fs::write(
+        &gate,
+        lines_of(&[
+            "EXPECTED = {",
+            "}",
+            "TIMING = {",
+            "    \"test_x\",",
+            "}",
+            "NEW_FLAG = 1",
+        ]),
+    )
+    .unwrap();
+    seal_files(&f, "a", "sa", &["gate.py"]).unwrap();
+}
+
+/// Still refused (c), the binding negative: the marked lines are gone and
+/// nothing un-marked was added. A standalone `#[ignore]` has no un-marked
+/// form, so its drop beside new content is never excused by this rule.
+#[test]
+fn dropping_marked_lines_without_their_unmarked_form_is_refused() {
+    let f = Fixture::new();
+    let gate = f.root().join("gate.py");
+    // `fn t()` predates the spec (sealed by "base"): its marker is the
+    // spec's only work there, so option B does not excuse the drop.
+    fs::write(
+        &gate,
+        lines_of(&["EXPECTED = {", "}", "#[test]", "fn t() {}"]),
+    )
+    .unwrap();
+    seal_files(&f, "setup", "base", &["gate.py"]).unwrap();
+    fs::write(
+        &gate,
+        lines_of(&[
+            "EXPECTED = {",
+            "    \"test_x\",  # 17, until S.2 lands",
+            "}",
+            "#[test]",
+            "#[ignore = \"until S.2 lands\"]",
+            "fn t() {}",
+        ]),
+    )
+    .unwrap();
+    seal_files(&f, "a", "sa", &["gate.py"]).unwrap();
+
+    fs::write(
+        &gate,
+        lines_of(&["EXPECTED = {", "}", "#[test]", "fn t() {}", "NEW_FLAG = 1"]),
+    )
+    .unwrap();
+    let err = seal_files(&f, "a", "sa", &["gate.py"]).unwrap_err();
+    let WritError::OwnLinesRemoved { losses, .. } = &err else {
+        panic!("expected OwnLinesRemoved, got {err:?}");
+    };
+    assert_eq!(
+        losses[0].lines,
+        vec![
+            "    \"test_x\",  # 17, until S.2 lands".to_string(),
+            "#[ignore = \"until S.2 lands\"]".to_string()
+        ]
+    );
+}
+
+/// Finding 76: a forced seal and a scoped allowance are on the record, and
+/// an ordinary seal carries neither field.
+#[test]
+fn forced_seal_and_allowances_are_recorded_on_the_seal() {
+    let mut f = Fixture::new();
+    let base = base_text();
+    f.write(&with_edit(&base, 2, "A"));
+    let plain = f.seal("a", "sa").unwrap();
+    let json = serde_json::to_string(&plain).unwrap();
+    assert!(
+        !json.contains("\"forced\"") && !json.contains("\"allow_removals\""),
+        "{json}"
+    );
+
+    f.write(&with_edit(&base, 30, "B"));
+    f.repo.set_allow_own_line_removal(true);
+    let forced = f.seal("a", "sa").unwrap();
+    f.repo.set_allow_own_line_removal(false);
+    assert!(forced.forced);
+    assert!(f.repo.load_seal(&forced.id).unwrap().forced);
+
+    f.write(&with_edit(&with_edit(&base, 2, "A"), 31, "more"));
+    f.seal("a", "sa").unwrap();
+    f.write(&with_edit(&base, 35, "C"));
+    f.repo.set_allow_removal_paths([FILE.to_string()]);
+    let allowed = f.seal("a", "sa").unwrap();
+    assert!(!allowed.forced);
+    assert_eq!(allowed.allow_removals, vec![FILE.to_string()]);
+    assert_eq!(
+        f.repo.load_seal(&allowed.id).unwrap().allow_removals,
+        vec![FILE.to_string()]
+    );
+}
+
+/// Finding 74: the file's newest seal is on a spec that was committed while
+/// the file never reached git. It matches the index, so before the fix no
+/// seal saw it ("working directory matches last seal") and finish skipped
+/// it. Now it is listed as stuck and a new spec can seal it; once git HEAD
+/// holds the content it is not stuck.
+#[cfg(feature = "bridge")]
+#[test]
+fn file_whose_newest_seal_is_on_a_committed_spec_can_be_resealed() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let git = git2::Repository::init(root).unwrap();
+    let sig = git2::Signature::now("t", "t@t").unwrap();
+    fs::write(root.join(".gitignore"), ".writ/\n").unwrap();
+    fs::write(root.join(FILE), base_text()).unwrap();
+    let commit = |msg: &str| -> String {
+        let mut idx = git.index().unwrap();
+        idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        idx.write().unwrap();
+        let tree = git.find_tree(idx.write_tree().unwrap()).unwrap();
+        let parent = git.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        git.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap()
+            .to_string()
+    };
+    let head = commit("base");
+    let repo = Repository::init(root).unwrap();
+    for id in ["sa", "sb"] {
+        repo.add_spec(&Spec::new(id.into(), id.into(), String::new()))
+            .unwrap();
+    }
+    let seal = |agent: &str, spec: &str| {
+        repo.seal_paths(
+            AgentIdentity {
+                id: agent.to_string(),
+                agent_type: AgentType::Agent,
+            },
+            format!("{agent} work"),
+            Some(spec.to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            &[FILE.to_string()],
+            false,
+        )
+    };
+    fs::write(root.join(FILE), with_edit(&base_text(), 2, "A")).unwrap();
+    let first = seal("a", "sa").unwrap();
+    assert!(repo.stuck_files().unwrap().is_empty());
+    repo.mark_spec_done("sa", None).unwrap();
+    repo.mark_spec_committed("sa", &head).unwrap();
+
+    let stuck = repo.stuck_files().unwrap();
+    assert_eq!(stuck.len(), 1, "{stuck:?}");
+    assert_eq!(stuck[0].path, FILE);
+    assert_eq!(
+        (stuck[0].spec_id.as_str(), stuck[0].seal_id.as_str()),
+        ("sa", first.id.as_str())
+    );
+
+    let resealed = seal("b", "sb").unwrap();
+    assert_eq!(resealed.changes.len(), 1);
+    assert_eq!(resealed.changes[0].path, FILE);
+    assert_eq!(resealed.changes[0].new_hash, first.changes[0].new_hash);
+    assert!(repo.stuck_files().unwrap().is_empty());
+    assert!(matches!(
+        seal("b", "sb").unwrap_err(),
+        WritError::NothingToSeal
+    ));
+
+    // Committed to git as well: nothing stuck even with sb committed.
+    commit("sb");
+    repo.mark_spec_done("sb", None).unwrap();
+    repo.mark_spec_committed("sb", "feedface").unwrap();
+    assert!(repo.stuck_files().unwrap().is_empty());
+}
+
+/// Option B on (c), Bri's actual un-ignore shape: the spec added a test
+/// with a standalone `#[ignore]` above it; a later seal drops the marker,
+/// keeps the test, and adds a new test. Not refused. A stale rewrite from
+/// before the spec's seal (test and marker both gone) is still refused.
+#[test]
+fn dropping_a_standalone_marker_on_own_test_is_not_refused_but_a_stale_rewrite_is() {
+    let f = Fixture::new();
+    let t = f.root().join("t.rs");
+    fs::write(&t, lines_of(&["mod base {}"])).unwrap();
+    seal_files(&f, "setup", "base", &["t.rs"]).unwrap();
+    fs::write(
+        &t,
+        lines_of(&[
+            "mod base {}",
+            "#[test]",
+            "#[ignore = \"S.1 not landed (Amis)\"]",
+            "fn s1_case() {}",
+        ]),
+    )
+    .unwrap();
+    seal_files(&f, "a", "sa", &["t.rs"]).unwrap();
+
+    // Stale rewrite: another agent's copy from before the spec's seal,
+    // with their own addition in a hunk of its own.
+    fs::write(&t, lines_of(&["fn theirs() {}", "mod base {}"])).unwrap();
+    let err = seal_files(&f, "a", "sa", &["t.rs"]).unwrap_err();
+    let WritError::OwnLinesRemoved { losses, .. } = &err else {
+        panic!("expected OwnLinesRemoved, got {err:?}");
+    };
+    assert!(
+        losses[0]
+            .lines
+            .contains(&"#[ignore = \"S.1 not landed (Amis)\"]".to_string()),
+        "{losses:?}"
+    );
+
+    // The un-ignore: marker dropped, own test kept, new test added.
+    fs::write(
+        &t,
+        lines_of(&[
+            "mod base {}",
+            "#[test]",
+            "fn s1_case() {}",
+            "#[test]",
+            "fn s1_second_case() {}",
+        ]),
+    )
+    .unwrap();
+    seal_files(&f, "a", "sa", &["t.rs"]).unwrap();
+}

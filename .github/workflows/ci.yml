@@ -57,25 +57,46 @@ jobs:
 
       # Wall-clock tests (finding 27, 2026-10-05): these assert time bounds, so
       # they are #[ignore]d out of the default suite and run here alone, one
-      # thread, after the parallel suite. Names mirror TIMING_TESTS in
-      # bench/test-gate.sh; keep the two lists in sync. Linux only.
+      # thread, after the parallel suite. The list has one source: TIMING_TESTS
+      # in bench/test-gate.sh (sprint 3, doctor-ops). This step parses that
+      # array instead of keeping a copy (two steps: the parse blocks, the run
+      # does not). Linux only.
       # TODO(2026-10-05, clippy-clean): non-blocking for now because shared
       # runners are noisy enough to push them over their limits. Make it
       # blocking once a few weeks of runs show it green, or once the bounds
       # are relative to a calibration run.
+      # Blocking: a parse failure is a CI failure even though the run below is
+      # not, so a reshaped array cannot hide behind continue-on-error.
+      - name: Timing test list (from bench/test-gate.sh)
+        id: timing-list
+        if: matrix.os == 'ubuntu-24.04'
+        shell: bash
+        run: |
+          tests=()
+          while IFS= read -r t; do tests+=("$t"); done < <(awk '
+            /^TIMING_TESTS=\(/ { f = 1; next }
+            f && /^\)/         { exit }
+            f { gsub(/^[ \t]+|[ \t]+$/, ""); if ($0 != "" && $0 !~ /^#/) print }
+          ' bench/test-gate.sh)
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "::error::no TIMING_TESTS parsed from bench/test-gate.sh"; exit 1
+          fi
+          for t in "${tests[@]}"; do
+            [[ "$t" =~ ^[A-Za-z0-9_:]+$ ]] || { echo "::error::unexpected TIMING_TESTS entry: $t"; exit 1; }
+          done
+          echo "${#tests[@]} timing tests: ${tests[*]}"
+          echo "tests=${tests[*]}" >> "$GITHUB_OUTPUT"
+
       - name: Timing tests (serial)
         if: matrix.os == 'ubuntu-24.04'
         continue-on-error: true
+        shell: bash
+        env:
+          TIMING_TESTS: ${{ steps.timing-list.outputs.tests }}
         run: |
+          read -ra tests <<< "$TIMING_TESTS"
           cargo test -p writ-core --all-features --lib --no-fail-fast -- \
-            --include-ignored --exact --test-threads=1 \
-            repo::scale_tests::test_scale_100_specs \
-            repo::scale_tests::test_scale_500_seals_linear_chain \
-            repo::scale_tests::test_scale_context_with_many_seals \
-            repo::scale_tests::test_scale_parallel_specs \
-            repo::scale_tests::test_scale_many_files_in_single_seal \
-            repo::chain_tests::test_chain_100_seals_performance \
-            repo::context_edge_case_tests::test_context_500_seals_all_scopes
+            --include-ignored --exact --test-threads=1 "${tests[@]}"
 
       # Store integrity gate (sprint 2, 2026-10-05). Builds the bench/context
       # fixture (7 seals, 3 specs, 2 agents, 1,000 unsealed edits) with the CLI
@@ -95,6 +116,53 @@ jobs:
           python3 bench/store_integrity.py "$fixture"
           python3 bench/verify_check.py "$fixture" --writ "$writ_bin"
 
+      # writ doctor fast tier (sprint 3, doctor-ops). Builds a fresh project in
+      # a temp dir (git init, writ init, one spec, one seal with --paths) with
+      # the debug CLI and asserts `writ doctor --format json` exits 0 with
+      # clean: true. Doctor on the writ repo's own store runs in Bri's release
+      # gate, not here (.writ/ is gitignored, so CI has no store of its own).
+      # A binary without `doctor --format json` (no subcommand, or the 0.3.0
+      # doctor with --json only) fails with a clap usage error (exit 2); that
+      # is skipped with a visible notice. Anything else that is not clean fails.
+      - name: writ doctor (fast tier, fresh project)
+        shell: bash
+        run: |
+          W="$GITHUB_WORKSPACE/target/debug/writ"
+          P="$RUNNER_TEMP/writ-doctor-project"
+          rm -rf "$P"; mkdir -p "$P"; cd "$P"
+          unset WRIT_AGENT_ID
+          git init -q -b main
+          printf 'print("hi")\n' > app.py
+          git add -A && git -c user.name=ci -c user.email=ci@localhost commit -qm base
+          "$W" init -y > init.log 2>&1 || { cat init.log; exit 1; }
+          "$W" spec add --id ci-doctor --title "ci doctor" --agent ci --claim
+          echo 'x = 1' >> app.py
+          "$W" seal -s "ci doctor seal" --agent ci --spec ci-doctor --paths app.py
+          rc=0
+          "$W" doctor --format json > doctor.json 2> doctor.err || rc=$?
+          if [ "$rc" -eq 2 ] && grep -qE "unrecognized subcommand|unexpected argument '--format'" doctor.err; then
+            echo "::notice title=writ doctor skipped::this build has no 'writ doctor --format json'"
+            cat doctor.err; exit 0
+          fi
+          DOCTOR_RC=$rc python3 - <<'EOF'
+          import json, os, sys
+          rc = int(os.environ["DOCTOR_RC"])
+          try:
+              r = json.load(open("doctor.json"))
+          except json.JSONDecodeError as e:
+              print(f"::error title=writ doctor::exit {rc}, output is not JSON ({e})")
+              print(open("doctor.json").read()[:2000], open("doctor.err").read()[:2000]); sys.exit(1)
+          print(r["headline"])
+          print(f"tier={r['tier']} checks={','.join(r['checks_run'])} "
+                f"red={r['red']} yellow={r['yellow']} elapsed_ms={r['elapsed_ms']}")
+          for f in r["findings"]:
+              print(f"::error title=doctor {f['check']} ({f['severity']})::"
+                    f"{f['message']} | fix: {f['fix_command']}")
+          if rc != 0 or not r["clean"] or r["findings"]:
+              print(f"::error title=writ doctor::expected exit 0 and clean on a fresh project, got exit {rc}")
+              sys.exit(1)
+          EOF
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -103,7 +171,19 @@ jobs:
         # TODO(2026-10-05, clippy-clean): remove once the inventory in
         # TEAM_WRIT_DOCS/docs/sprints/clippy-inventory.md is cleared. Fails today
         # with 134 errors in writ-core on stable 1.99, so writ-cli is never linted.
+        # Re-measured 2026-10-05 (doctor-ops, rustc 1.99.0, sprint 3 tree):
+        # `cargo clippy --workspace --all-features` = 237 warnings
+        # (writ-core 131, writ-cli 94, writ-py 12, writ-mcp 0).
         continue-on-error: true
+
+      # PREPARED, NOT ENABLED (sprint 3, doctor-ops). Target state once the
+      # count above is zero: replace the step above with this one. --workspace
+      # adds writ-py and writ-mcp; writ-py's pyo3 build script needs a python3
+      # on PATH, which ubuntu-24.04 and macos-14 both ship. Enable only after
+      # `cargo clippy --workspace --all-features -- -D warnings` exits 0 locally
+      # on the pinned 1.99.0.
+      # - name: Run clippy
+      #   run: cargo clippy --workspace --all-features -- -D warnings
 
   # TODO(bri, B.1 bench-context): uncomment once bench/bench-context.sh lands.
   # Gates context cost: default <= 32 KB, brief <= 2 KB, --budget 8192 <= 8 KB,

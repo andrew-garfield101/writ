@@ -113,6 +113,43 @@ pub struct Repository {
     allow_removal_paths: HashSet<String>,
 }
 
+/// `event_type` of a seal-time refusal record (finding 76).
+pub const EVENT_SEAL_REFUSED: &str = "seal_refused";
+
+/// Which seal-time check refused. Serialized as the `reason` field of
+/// [`SealRefusedEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SealRefusal {
+    /// The own-line survival check (finding 42).
+    SurvivalCheck,
+    /// The spec is held by another agent under strict claim enforcement.
+    ClaimConflict,
+    /// The spec is already committed (finding 65).
+    SpecCommitted,
+    /// A path is outside the agent's scope under strict enforcement.
+    ScopeViolation,
+    /// The agent is revoked or suspended.
+    AgentInactive,
+}
+
+/// A `seal_refused` record in `.writ/security/events.jsonl` (finding 76):
+/// the five `SecurityEvent` fields plus `reason`, `specs` and `files`, the
+/// same shape as `finish_refused`, so the hurdle metric can be read from
+/// the store. Readers that parse `SecurityEvent` ignore the extras.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealRefusedEvent {
+    pub timestamp: DateTime<Utc>,
+    pub severity: crate::security::Severity,
+    pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+    pub details: String,
+    pub reason: SealRefusal,
+    pub specs: Vec<String>,
+    pub files: Vec<String>,
+}
+
 /// Snapshot of git working tree state, used by install().
 #[cfg(feature = "bridge")]
 struct GitStateSnapshot {
@@ -697,15 +734,12 @@ impl Repository {
         allow_empty: bool,
         mode: ScopeMode,
     ) -> WritResult<(Seal, Option<SealScope>)> {
-        self.check_agent_can_seal(&agent.id)?;
-        let mut warnings = Vec::new();
-        if let Some(ref sid) = spec_id {
-            warnings.extend(self.check_seal_claim(sid, &agent.id)?);
-        }
+        let mut warnings = self.seal_prechecks(&agent.id, spec_id.as_deref())?;
         let lock = self.lock()?;
         let index = self.load_index()?;
         let rules = self.ignore_rules();
-        let working_state = state::compute_state(&self.root, &index, &rules);
+        let mut working_state = state::compute_state(&self.root, &index, &rules);
+        self.add_stuck_files(&mut working_state, &index);
 
         let (selected, scope): (Vec<&state::FileState>, Option<SealScope>) = match spec_id {
             Some(ref sid) => {
@@ -1168,14 +1202,22 @@ impl Repository {
         mut seal_warnings: Vec<String>,
     ) -> WritResult<Seal> {
         let changed_paths: Vec<String> = selected.iter().map(|f| f.path.clone()).collect();
-        seal_warnings.extend(self.check_agent_scope(&agent.id, &changed_paths)?);
+        match self.check_agent_scope(&agent.id, &changed_paths) {
+            Ok(w) => seal_warnings.extend(w),
+            Err(e) => {
+                self.note_seal_refusal(spec_id.as_deref(), &agent.id, &changed_paths, &e);
+                return Err(e);
+            }
+        }
         if let (Some(sid), false) = (spec_id.as_deref(), self.allow_own_line_removal) {
             let losses = self.own_line_losses(sid, selected, &index)?;
             if !losses.is_empty() {
-                return Err(WritError::OwnLinesRemoved {
+                let err = WritError::OwnLinesRemoved {
                     spec_id: sid.to_string(),
                     losses,
-                });
+                };
+                self.note_seal_refusal(Some(sid), &agent.id, &changed_paths, &err);
+                return Err(err);
             }
         }
 
@@ -1266,6 +1308,12 @@ impl Repository {
             parent_seal_hash,
         );
         seal.workspace = self.active_workspace.clone();
+        // Finding 76: a forced seal and its allowances are visible in the
+        // record, so the hurdle metric can be read from the store.
+        seal.forced = self.allow_own_line_removal;
+        let mut allowed: Vec<String> = self.allow_removal_paths.iter().cloned().collect();
+        allowed.sort();
+        seal.allow_removals = allowed;
 
         let ks = KeyStore::open(&self.writ_dir);
         let signing_key = ks.load_agent_signing_key(&seal.agent.id).ok();
@@ -1325,6 +1373,9 @@ impl Repository {
         if checked.is_empty() {
             return Ok(Vec::new());
         }
+        // Allowance (a), finding 69: other specs' seals, loaded only when a
+        // loss needs excusing.
+        let mut others: Option<Vec<(bool, Seal)>> = None;
         // What this seal records, every file: a removed line whose content
         // moved to another sealed file survives (finding 53).
         let mut recorded: Vec<(&str, String)> = Vec::new();
@@ -1377,7 +1428,7 @@ impl Repository {
                 }
             }
             let sealed: Vec<&str> = sealed_texts.iter().map(String::as_str).collect();
-            if let Some(l) = convergence::survival::own_line_loss(
+            let Some(first) = convergence::survival::own_line_loss(
                 spec_id,
                 &file_state.path,
                 &base,
@@ -1385,11 +1436,323 @@ impl Repository {
                 &sealed,
                 new,
                 &elsewhere,
-            ) {
+            ) else {
+                continue;
+            };
+            // Allowance (a): lines a seal of another spec already removed on
+            // purpose, newer than this spec's latest seal of the path or on
+            // a committed spec. Excused per copy; the rest is the loss.
+            let since = v.times.last().copied().unwrap_or_default();
+            let others = match others {
+                Some(ref o) => o,
+                None => others.insert(self.other_spec_seals(spec_id)?),
+            };
+            let excused = self.cross_spec_removals(others, &file_state.path, since)?;
+            let l = if excused.is_empty() {
+                Some(first)
+            } else {
+                convergence::survival::own_line_loss_excused(
+                    spec_id,
+                    &file_state.path,
+                    &base,
+                    &last,
+                    &sealed,
+                    new,
+                    &elsewhere,
+                    &excused,
+                )
+            };
+            if let Some(l) = l {
                 losses.push(l);
             }
         }
         Ok(losses)
+    }
+
+    /// Every seal of every spec other than `spec_id`, with whether its spec
+    /// is committed. Seals whose record was pruned are skipped.
+    fn other_spec_seals(&self, spec_id: &str) -> WritResult<Vec<(bool, Seal)>> {
+        let mut out = Vec::new();
+        for spec in self.list_specs()? {
+            if spec.id == spec_id {
+                continue;
+            }
+            let committed = spec.commit_state == crate::spec::CommitState::Committed;
+            for id in &spec.sealed_by {
+                match self.load_seal(id) {
+                    Ok(seal) => out.push((committed, seal)),
+                    Err(WritError::ObjectNotFound(_)) => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Per line content, how many copies seals in `others` removed from
+    /// `path` on purpose (their recorded base held the line), counting only
+    /// seals newer than `since` or on a committed spec.
+    fn cross_spec_removals(
+        &self,
+        others: &[(bool, Seal)],
+        path: &str,
+        since: DateTime<Utc>,
+    ) -> WritResult<HashMap<String, usize>> {
+        let mut excused: HashMap<String, usize> = HashMap::new();
+        for (committed, seal) in others {
+            if !*committed && seal.timestamp <= since {
+                continue;
+            }
+            for change in seal.changes.iter().filter(|c| c.path == path) {
+                let old = match &change.old_hash {
+                    Some(h) => self.objects.retrieve(h)?,
+                    None => continue,
+                };
+                if crate::diff::is_binary(&old) {
+                    continue;
+                }
+                let new = match (&change.change_type, &change.new_hash) {
+                    (ChangeType::Deleted, _) | (_, None) => Vec::new(),
+                    (_, Some(h)) => self.objects.retrieve(h)?,
+                };
+                let (old, new) = (
+                    String::from_utf8_lossy(&old).into_owned(),
+                    String::from_utf8_lossy(&new).into_owned(),
+                );
+                for (line, n) in convergence::survival::informed_removals(&old, &new) {
+                    *excused.entry(line.to_string()).or_insert(0) += n;
+                }
+            }
+        }
+        Ok(excused)
+    }
+
+    /// Seal-time pre-checks shared by every seal entry point: the agent may
+    /// seal, and the spec is open and (under strict enforcement) held by
+    /// this agent. A refusal is recorded (finding 76) before it is returned.
+    fn seal_prechecks(&self, agent_id: &str, spec_id: Option<&str>) -> WritResult<Vec<String>> {
+        if let Err(e) = self.check_agent_can_seal(agent_id) {
+            self.note_seal_refusal(spec_id, agent_id, &[], &e);
+            return Err(e);
+        }
+        let mut warnings = Vec::new();
+        if let Some(sid) = spec_id {
+            match self.check_seal_claim(sid, agent_id) {
+                Ok(w) => warnings.extend(w),
+                Err(e) => {
+                    self.note_seal_refusal(Some(sid), agent_id, &[], &e);
+                    return Err(e);
+                }
+            }
+        }
+        Ok(warnings)
+    }
+
+    /// Finding 76: a seal-time check refused the seal. Recorded as a
+    /// `seal_refused` event in `.writ/security/events.jsonl` with the spec,
+    /// agent, paths and reason, so the hurdle metric can be read from the
+    /// store. "Nothing to seal" is not a refusal. Best-effort.
+    fn note_seal_refusal(
+        &self,
+        spec_id: Option<&str>,
+        agent_id: &str,
+        paths: &[String],
+        err: &WritError,
+    ) {
+        let reason = match err {
+            WritError::OwnLinesRemoved { .. } => SealRefusal::SurvivalCheck,
+            WritError::SealClaimConflict { .. } => SealRefusal::ClaimConflict,
+            WritError::SpecAlreadyCommitted { .. } => SealRefusal::SpecCommitted,
+            WritError::ScopeViolation(_) => SealRefusal::ScopeViolation,
+            WritError::AgentInactive(_) => SealRefusal::AgentInactive,
+            _ => return,
+        };
+        let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+        let _ = logger.emit_record(&SealRefusedEvent {
+            timestamp: Utc::now(),
+            severity: crate::security::Severity::Warning,
+            event_type: EVENT_SEAL_REFUSED.to_string(),
+            agent_id: Some(agent_id.to_string()),
+            details: err.to_string(),
+            reason,
+            specs: spec_id.map(|s| vec![s.to_string()]).unwrap_or_default(),
+            files: paths.to_vec(),
+        });
+    }
+
+    /// Finding 74: tracked files whose newest spec seal is on a committed
+    /// spec while git HEAD does not hold that content.
+    ///
+    /// Finish stages only open specs and the file matches the index, so
+    /// nothing re-seals it and nothing commits it: stuck. The seal entry
+    /// points list these as pending so a new spec can take them (see
+    /// [`Self::add_stuck_files`]); `writ doctor` reports them.
+    ///
+    /// Needs git (the `bridge` feature and a repository): without it no
+    /// file can be shown stuck, and the list is empty.
+    pub fn stuck_files(&self) -> WritResult<Vec<seal_scope::StuckFile>> {
+        let index = self.load_index()?;
+        self.stuck_files_in(&index)
+    }
+
+    fn stuck_files_in(&self, index: &Index) -> WritResult<Vec<seal_scope::StuckFile>> {
+        use crate::spec::CommitState;
+        let specs = self.list_specs()?;
+        // Newest spec seal per path: (time, spec, seal id, content it recorded).
+        let mut newest: HashMap<String, (DateTime<Utc>, &Spec, String, Option<String>)> =
+            HashMap::new();
+        for spec in &specs {
+            for id in &spec.sealed_by {
+                let Ok(seal) = self.load_seal(id) else {
+                    continue;
+                };
+                for change in &seal.changes {
+                    let recorded = match change.change_type {
+                        ChangeType::Deleted => None,
+                        _ => change.new_hash.clone(),
+                    };
+                    let newer = newest
+                        .get(&change.path)
+                        .is_none_or(|(t, ..)| seal.timestamp > *t);
+                    if newer {
+                        newest.insert(
+                            change.path.clone(),
+                            (seal.timestamp, spec, seal.id.clone(), recorded),
+                        );
+                    }
+                }
+            }
+        }
+        let candidates: Vec<(String, &Spec, String, String)> = newest
+            .into_iter()
+            .filter_map(|(path, (_, spec, seal_id, recorded))| {
+                let hash = recorded?;
+                (spec.commit_state == CommitState::Committed
+                    && index.get_hash(&path) == Some(hash.as_str()))
+                .then_some((path, spec, seal_id, hash))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let paths: Vec<String> = candidates.iter().map(|c| c.0.clone()).collect();
+        let head = match self.git_head_blobs(&paths) {
+            Ok(h) => h,
+            // No git to compare against: nothing can be shown stuck.
+            Err(_) => return Ok(Vec::new()),
+        };
+        // Finding 80: a git-ignored path absent from HEAD can never be
+        // committed by finish, so it is not stuck (a force-added one is).
+        let ignored = self.git_ignored(&paths);
+        let mut out: Vec<seal_scope::StuckFile> = candidates
+            .into_iter()
+            .filter(|(path, _, _, _)| !(ignored.contains(path) && !head.contains_key(path)))
+            .filter(|(path, _, _, hash)| {
+                head.get(path)
+                    .is_none_or(|bytes| crate::hash::hash_bytes(bytes) != *hash)
+            })
+            .map(|(path, spec, seal_id, _)| seal_scope::StuckFile {
+                path,
+                spec_id: spec.id.clone(),
+                seal_id,
+            })
+            .collect();
+        out.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(out)
+    }
+
+    /// Finding 74: list stuck files as pending `Modified` entries (content
+    /// unchanged, hash from the index) so the seal paths can take them.
+    /// Best-effort: a store or git error leaves the state as computed.
+    fn add_stuck_files(&self, working: &mut WorkingState, index: &Index) {
+        let Ok(stuck) = self.stuck_files_in(index) else {
+            return;
+        };
+        let pending: HashSet<&str> = working.changes.iter().map(|f| f.path.as_str()).collect();
+        let extra: Vec<state::FileState> = stuck
+            .into_iter()
+            .filter(|s| !pending.contains(s.path.as_str()))
+            .map(|s| state::FileState {
+                hash: index.get_hash(&s.path).map(String::from),
+                path: s.path,
+                status: FileStatus::Modified,
+            })
+            .collect();
+        working.changes.extend(extra);
+    }
+
+    /// Content of `paths` at git HEAD, for the paths HEAD holds.
+    ///
+    /// `Err(NoGitRepo)` without a git repository, or when built without the
+    /// `bridge` feature.
+    #[cfg(feature = "bridge")]
+    pub fn git_head_blobs(&self, paths: &[String]) -> WritResult<HashMap<String, Vec<u8>>> {
+        let git_repo = git2::Repository::discover(&self.root).map_err(|_| WritError::NoGitRepo)?;
+        let mut out = HashMap::new();
+        let Ok(head) = git_repo.head() else {
+            // Unborn branch: HEAD holds nothing.
+            return Ok(out);
+        };
+        let tree = head.peel_to_tree()?;
+        for path in paths {
+            let Ok(entry) = tree.get_path(Path::new(path)) else {
+                continue;
+            };
+            if entry.kind() != Some(git2::ObjectType::Blob) {
+                continue;
+            }
+            let blob = git_repo.find_blob(entry.id())?;
+            out.insert(path.clone(), blob.content().to_vec());
+        }
+        Ok(out)
+    }
+
+    /// The subset of `paths` git ignores (finding 80). Empty without git.
+    #[cfg(feature = "bridge")]
+    pub fn git_ignored(&self, paths: &[String]) -> HashSet<String> {
+        let Ok(git_repo) = git2::Repository::discover(&self.root) else {
+            return HashSet::new();
+        };
+        // Git never re-includes a file inside an excluded directory, but
+        // libgit2 answers per path and honours a nested `!pattern`; check
+        // every ancestor directory first, as git does.
+        let ignored = |p: &str| git_repo.status_should_ignore(Path::new(p)).unwrap_or(false);
+        paths
+            .iter()
+            .filter(|p| {
+                let mut dirs: Vec<String> = Path::new(p.as_str())
+                    .ancestors()
+                    .skip(1)
+                    .filter(|a| !a.as_os_str().is_empty())
+                    .map(|a| format!("{}/", a.display()))
+                    .collect();
+                dirs.reverse();
+                dirs.iter().any(|d| ignored(d)) || ignored(p)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// See the `bridge` build.
+    #[cfg(not(feature = "bridge"))]
+    pub fn git_ignored(&self, _paths: &[String]) -> HashSet<String> {
+        HashSet::new()
+    }
+
+    /// See the `bridge` build; without git support HEAD cannot be read.
+    #[cfg(not(feature = "bridge"))]
+    pub fn git_head_blobs(&self, _paths: &[String]) -> WritResult<HashMap<String, Vec<u8>>> {
+        Err(WritError::NoGitRepo)
+    }
+
+    /// Added-line survival of `spec_ids` against the working tree or git
+    /// HEAD; see [`convergence::survival::audit`].
+    pub fn survival_audit(
+        &self,
+        spec_ids: &[String],
+        against: convergence::survival::Against,
+    ) -> WritResult<convergence::survival::AuditReport> {
+        convergence::survival::audit(self, spec_ids, against)
     }
 
     /// Agent identity checks (Sprint B): inactive warning and scope constraints.
@@ -1458,7 +1821,7 @@ impl Repository {
             spec.updated_at = now;
             spec.last_activity = now;
             if spec.claimed_by.is_none() {
-                spec.claimed_by = Some(seal.agent.id.clone());
+                spec.set_claim(&seal.agent.id);
             }
             let promoted = self.auto_promote_spec_status(&mut spec, &seal.status);
             self.save_spec(&spec)?;
@@ -2261,6 +2624,7 @@ impl Repository {
         }
 
         Ok(StatusOutput {
+            doctor: None,
             project_name,
             timestamp: now,
             agents: AgentSummary {
@@ -2609,7 +2973,7 @@ impl Repository {
                 claimed_by: existing.clone(),
             });
         }
-        spec.claimed_by = Some(agent_id.to_string());
+        spec.set_claim(agent_id);
         spec.updated_at = chrono::Utc::now();
         self.save_spec(&spec)?;
         Ok(())
@@ -2649,7 +3013,7 @@ impl Repository {
                 ),
             })?;
         }
-        spec.claimed_by = None;
+        spec.clear_claim();
         spec.updated_at = chrono::Utc::now();
         self.save_spec(&spec)?;
         Ok(Some(previous))
@@ -3528,6 +3892,7 @@ impl Repository {
         F: Fn(&ContextOutput) -> WritResult<usize>,
     {
         let mut ctx = self.context(scope.clone(), seal_limit, filter)?;
+        crate::doctor::attach_to_context(self, &mut ctx);
         let prio = self.file_priority(&scope, &ctx)?;
         ctx.apply_file_cap(limits.max_files, &prio);
         if let Some(budget) = limits.budget {
@@ -3911,6 +4276,7 @@ impl Repository {
 
                 let mut result = ContextOutput {
                     writ_version: crate::context::WRIT_VERSION.to_string(),
+                    doctor: None,
                     task: task_ctx,
                     workspace: ws_filter.map(|s| s.to_string()),
                     active_spec: None,
@@ -4273,6 +4639,7 @@ impl Repository {
 
                 Ok(ContextOutput {
                     writ_version: crate::context::WRIT_VERSION.to_string(),
+                    doctor: None,
                     task: None,
                     workspace: filter.workspace.clone(),
                     active_spec: Some(spec),
@@ -4566,6 +4933,7 @@ impl Repository {
 
                 Ok(ContextOutput {
                     writ_version: crate::context::WRIT_VERSION.to_string(),
+                    doctor: None,
                     task: None,
                     workspace: filter.workspace.clone(),
                     active_spec: None, // agent may have multiple specs
@@ -7181,15 +7549,12 @@ impl Repository {
         allow_empty: bool,
         select: impl Fn(&str) -> bool,
     ) -> WritResult<Seal> {
-        self.check_agent_can_seal(&agent.id)?;
-        let mut warnings = Vec::new();
-        if let Some(ref sid) = spec_id {
-            warnings.extend(self.check_seal_claim(sid, &agent.id)?);
-        }
+        let warnings = self.seal_prechecks(&agent.id, spec_id.as_deref())?;
         let lock = self.lock()?;
         let index = self.load_index()?;
         let rules = self.ignore_rules();
-        let working_state = state::compute_state(&self.root, &index, &rules);
+        let mut working_state = state::compute_state(&self.root, &index, &rules);
+        self.add_stuck_files(&mut working_state, &index);
 
         let selected: Vec<&state::FileState> = working_state
             .changes
@@ -9752,6 +10117,11 @@ impl Repository {
         // Timestamps: earlier created_at, later updated_at
         let created_at = std::cmp::min(incoming.created_at, existing.created_at);
         let updated_at = std::cmp::max(incoming.updated_at, existing.updated_at);
+        let claim_src = if existing.claimed_by.is_some() {
+            existing
+        } else {
+            incoming
+        };
 
         crate::spec::Spec {
             id: existing.id.clone(),
@@ -9786,6 +10156,10 @@ impl Repository {
             committed_at: existing.committed_at.or(incoming.committed_at),
             workspace: existing.workspace.clone().or(incoming.workspace.clone()),
             claimed_by: existing.claimed_by.clone().or(incoming.claimed_by.clone()),
+            // The claim's process record travels with the claim that won.
+            claimed_pid: claim_src.claimed_pid,
+            claimed_pid_start: claim_src.claimed_pid_start.clone(),
+            claimed_host: claim_src.claimed_host.clone(),
             created_by: existing.created_by.clone().or(incoming.created_by.clone()),
             genesis_tree: existing
                 .genesis_tree
@@ -15285,6 +15659,9 @@ mod verify_all_chains_tests {
             committed_at: None,
             workspace: None,
             claimed_by: None,
+            claimed_pid: None,
+            claimed_pid_start: None,
+            claimed_host: None,
             genesis_tree: None,
             created_by: None,
         };
@@ -15352,6 +15729,9 @@ mod verify_all_chains_tests {
                 committed_at: None,
                 workspace: None,
                 claimed_by: None,
+                claimed_pid: None,
+                claimed_pid_start: None,
+                claimed_host: None,
                 genesis_tree: None,
                 created_by: None,
             };
@@ -17891,6 +18271,9 @@ mod remote_tests {
             committed_at: None,
             workspace: None,
             claimed_by: None,
+            claimed_pid: None,
+            claimed_pid_start: None,
+            claimed_host: None,
             genesis_tree: None,
             created_by: None,
         };

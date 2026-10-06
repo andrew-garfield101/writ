@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 pub struct StatusOutput {
     /// Project name from config.
     pub project_name: String,
+    /// `writ doctor` when it is not clean (finding 90); absent when clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctor: Option<crate::context::ContextDoctor>,
     /// When this status was generated.
     pub timestamp: DateTime<Utc>,
     /// Agent activity summary (counts).
@@ -77,6 +80,7 @@ mod tests {
     #[test]
     fn test_status_output_serializes() {
         let status = StatusOutput {
+            doctor: None,
             project_name: "test-project".into(),
             timestamp: Utc::now(),
             agents: AgentSummary {
@@ -135,6 +139,7 @@ mod tests {
     #[test]
     fn test_status_roundtrip() {
         let status = StatusOutput {
+            doctor: None,
             project_name: "roundtrip-test".into(),
             timestamp: Utc::now(),
             agents: AgentSummary {

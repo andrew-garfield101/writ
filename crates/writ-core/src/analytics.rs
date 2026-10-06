@@ -255,6 +255,8 @@ mod tests {
             signature: None,
             workspace: "main".into(),
             convergence: None,
+            forced: false,
+            allow_removals: Vec::new(),
         }
     }
 

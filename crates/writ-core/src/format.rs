@@ -206,7 +206,17 @@ pub fn format_brief_context(
     context: &ContextOutput,
     project_name: Option<&str>,
 ) -> WritResult<String> {
-    let brief = crate::context::BriefContext::from_context(context);
+    format_brief(
+        &crate::context::BriefContext::from_context(context),
+        project_name,
+    )
+}
+
+/// Format an already-built brief (e.g. with its `doctor` line set).
+pub fn format_brief(
+    brief: &crate::context::BriefContext,
+    project_name: Option<&str>,
+) -> WritResult<String> {
     let formatter = match project_name {
         Some(p) => ToonFormatter::with_project(p),
         None => ToonFormatter::new(),
@@ -773,6 +783,7 @@ mod tests {
 
         ContextOutput {
             writ_version: crate::context::WRIT_VERSION.into(),
+            doctor: None,
             task: None,
             workspace: None,
             active_spec: None, // full context doesn't set active_spec
@@ -1603,6 +1614,7 @@ mod tests {
         // Measure each section independently by formatting partial contexts
         let empty_ctx = ContextOutput {
             writ_version: crate::context::WRIT_VERSION.into(),
+            doctor: None,
             task: None,
             workspace: None,
             active_spec: None,

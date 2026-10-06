@@ -124,6 +124,16 @@ pub struct Seal {
     /// convergence-on-seal is disabled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub convergence: Option<SealConvergenceResult>,
+
+    // -- Hurdle record (finding 76) --
+    /// The seal was made with `--force`: the own-line survival check was
+    /// bypassed for every file. Absent when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub forced: bool,
+    /// Paths named with `--allow-removals`: the own-line check was bypassed
+    /// for these files only. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_removals: Vec<String>,
 }
 
 fn default_workspace() -> String {
@@ -192,6 +202,8 @@ impl Seal {
             signature: None,
             workspace: default_workspace(),
             convergence: None,
+            forced: false,
+            allow_removals: Vec::new(),
         };
 
         // Compute the seal's ID from its content

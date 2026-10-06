@@ -1771,41 +1771,17 @@ impl PyRepository {
     // Upgrade & migration bindings (UPG.12)
     // -----------------------------------------------------------------------
 
-    /// Run health checks on the repository. Returns a dict with:
-    ///   checks: list of {name, status, message}
-    ///   passed: int
-    ///   failed: int
-    ///   warnings: int
-    ///   is_healthy: bool
+    /// Run the `writ doctor` fast tier. Returns the report as a dict:
+    ///   headline: str (names the tier and the survival state; first line)
+    ///   tier: "fast"
+    ///   survival_last_green: None until the survival tier exists (0.4.1)
+    ///   checks_run: list[str]
+    ///   findings: list of {check, severity ("red"|"yellow"), message,
+    ///             fix_command, paths}
+    ///   clean: bool, red: int, yellow: int, elapsed_ms: int
     fn doctor(&self, py: Python) -> PyResult<PyObject> {
-        let writ_dir = self.inner.writ_dir();
-        let report = writ_core::migrate::DoctorReport::run(writ_dir);
-        let dict = pyo3::types::PyDict::new(py);
-        let checks: Vec<_> = report
-            .checks
-            .iter()
-            .map(|c| {
-                let d = pyo3::types::PyDict::new(py);
-                d.set_item("name", &c.name).unwrap();
-                d.set_item(
-                    "status",
-                    match c.status {
-                        writ_core::migrate::CheckStatus::Pass => "pass",
-                        writ_core::migrate::CheckStatus::Fail => "fail",
-                        writ_core::migrate::CheckStatus::Warning => "warning",
-                    },
-                )
-                .unwrap();
-                d.set_item("message", &c.message).unwrap();
-                d.to_object(py)
-            })
-            .collect();
-        dict.set_item("checks", checks)?;
-        dict.set_item("passed", report.passed)?;
-        dict.set_item("failed", report.failed)?;
-        dict.set_item("warnings", report.warnings)?;
-        dict.set_item("is_healthy", report.is_healthy())?;
-        Ok(dict.to_object(py))
+        let report = writ_core::doctor::run(&self.inner).map_err(writ_err)?;
+        to_pydict(py, &report)
     }
 
     /// Return version metadata for this repository. Returns a dict with:

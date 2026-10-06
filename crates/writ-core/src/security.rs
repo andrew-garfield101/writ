@@ -120,6 +120,14 @@ impl SecurityEventLogger {
     /// Emit a security event. Creates the directory and file if needed.
     /// Thread-safe via advisory file locking.
     pub fn emit_event(&self, event: &SecurityEvent) -> WritResult<()> {
+        self.emit_record(event)
+    }
+
+    /// Append any record that serializes as a superset of [`SecurityEvent`]
+    /// (same five fields plus structured extras, e.g. `finish_refused`'s
+    /// `reason`, `specs`, `files`). Readers that parse `SecurityEvent` ignore
+    /// the extras. Same locking as [`Self::emit_event`].
+    pub fn emit_record<T: Serialize>(&self, record: &T) -> WritResult<()> {
         if let Some(parent) = self.events_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -133,7 +141,7 @@ impl SecurityEventLogger {
         file.lock_exclusive().map_err(|e| WritError::Io(e))?;
 
         let mut writer = std::io::BufWriter::new(&file);
-        serde_json::to_writer(&mut writer, event)?;
+        serde_json::to_writer(&mut writer, record)?;
         writeln!(writer)?;
         writer.flush()?;
 

@@ -398,11 +398,32 @@ pub struct UnclaimedSpec {
     pub title: String,
 }
 
+/// The doctor section of context: the headline (tier and survival state)
+/// and every finding with its fix.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextDoctor {
+    /// Always present and never trimmed: it is the honesty line.
+    pub headline: String,
+    /// Red findings first. Counts against `--budget`; trimmed last, yellows
+    /// before reds, with `findings_omitted` saying how many were cut.
+    pub findings: Vec<crate::doctor::DoctorFinding>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub findings_omitted: usize,
+    /// The one-line form for the brief format.
+    #[serde(skip)]
+    pub brief: String,
+}
+
 /// The full context output, optimized for LLM consumption.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextOutput {
     /// Writ version marker for LLM parsing.
     pub writ_version: String,
+
+    /// `writ doctor` fast tier, near the top so every format carries it
+    /// (finding 86). Set by `Repository::context_limited`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctor: Option<ContextDoctor>,
 
     /// Task context — present when running inside a workspace with an assigned spec.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -945,6 +966,17 @@ impl ContextOutput {
                 return Ok(());
             }
         }
+        // Doctor findings last; the list is reds first, so popping from the
+        // end drops yellows before any red. The headline always stays.
+        while self.doctor.as_ref().is_some_and(|d| !d.findings.is_empty()) {
+            if let Some(d) = self.doctor.as_mut() {
+                d.findings.pop();
+                d.findings_omitted += 1;
+            }
+            if measure(self)? <= budget {
+                return Ok(());
+            }
+        }
         self.budget_exceeded = true;
         Ok(())
     }
@@ -1024,6 +1056,10 @@ pub struct BriefContext {
     /// Chain verification result; absent when no seals are secured yet.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chain_ok: Option<bool>,
+    /// One line from the `writ doctor` fast tier (tier and survival state
+    /// first). Set by the caller; [`Self::from_context`] leaves it empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doctor: Option<String>,
 }
 
 impl BriefContext {
@@ -1051,6 +1087,7 @@ impl BriefContext {
             },
             next: ctx.recommended_action.clone(),
             chain_ok: ctx.chain_integrity.as_ref().map(|c| c.valid),
+            doctor: ctx.doctor.as_ref().map(|d| d.brief.clone()),
         }
     }
 }
@@ -1751,6 +1788,52 @@ mod tests {
         assert!(!ctx.file_scope_truncated);
         assert_eq!(ctx.recent_seals.len(), 10);
         assert!(!ctx.budget_exceeded);
+    }
+
+    #[test]
+    fn budget_trims_doctor_findings_yellow_first_and_keeps_headline() {
+        use crate::doctor::{DoctorFinding, Severity};
+        let mut ctx = big_context(0);
+        ctx.recent_seals.clear();
+        let red = DoctorFinding::new(
+            "store_integrity",
+            Severity::Red,
+            "r".repeat(80),
+            "writ repair",
+            vec![],
+        );
+        let yellow = |m: &str| {
+            DoctorFinding::new(
+                "left_out",
+                Severity::Yellow,
+                m.repeat(80),
+                "writ init -y",
+                vec![],
+            )
+        };
+        ctx.doctor = Some(ContextDoctor {
+            headline: "fast checks: 3 finding(s)".into(),
+            findings: vec![red.clone(), yellow("a"), yellow("b")],
+            findings_omitted: 0,
+            brief: String::new(),
+        });
+        let mut expect = ctx.clone();
+        if let Some(d) = expect.doctor.as_mut() {
+            d.findings.truncate(1);
+            d.findings_omitted = 2;
+        }
+        let budget = json_len(&expect).unwrap();
+        assert!(json_len(&ctx).unwrap() > budget);
+        ctx.fit_to_budget(budget, &FilePriority::default(), json_len)
+            .unwrap();
+        let d = ctx.doctor.as_ref().unwrap();
+        assert_eq!(d.headline, "fast checks: 3 finding(s)");
+        assert_eq!(d.findings, vec![red]);
+        assert_eq!(d.findings_omitted, 2);
+        assert!(json_len(&ctx).unwrap() <= budget);
+        assert!(!ctx.budget_exceeded);
+        let v = serde_json::to_value(&ctx).unwrap();
+        assert_eq!(v["doctor"]["findings_omitted"], 2);
     }
 
     #[test]

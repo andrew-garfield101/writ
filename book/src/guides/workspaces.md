@@ -1,5 +1,7 @@
 # Workspaces
 
+> **Known issue in 0.2.1: closing a spec can lose that spec's own edits to a shared file.** `writ spec done` seals every file on disk. If another spec's version of a file you both edited is on disk at that moment, your closing seal records that version and your earlier edit to it is gone from your spec's history, and the other spec's edit is recorded as yours. Convergence and `writ finish` then commit the file without your edit and report no conflict. Fixed in 0.3.0. Until then, run `writ diff` before `writ spec done` and do not close the spec if it shows removals you did not make. For a spec already closed, `writ show <final seal> --diff` shows the removal.
+
 Workspaces provide physical file isolation for agents. Most multi-agent work does not need workspaces. Agents work in the same directory and [spec-scoped sealing](multi-agent-workflow.md) keeps their changes separate. Workspaces exist for Level 2 scenarios where agents make competing rewrites to the same file and need separate copies to work from.
 
 When you run `writ task`, writ creates a workspace automatically, a full copy of your project where an agent works without stepping on anyone else's files. When the work is done, `writ finish` converges everything back together and commits to git. You never interact with workspaces directly. You think in tasks. Writ handles the rest.

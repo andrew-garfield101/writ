@@ -1,5 +1,7 @@
 # Multi Agent Workflow
 
+> **Known issue in 0.2.1: closing a spec can lose that spec's own edits to a shared file.** `writ spec done` seals every file on disk. If another spec's version of a file you both edited is on disk at that moment, your closing seal records that version and your earlier edit to it is gone from your spec's history, and the other spec's edit is recorded as yours. Convergence and `writ finish` then commit the file without your edit and report no conflict. Fixed in 0.3.0. Until then, run `writ diff` before `writ spec done` and do not close the spec if it shows removals you did not make. For a spec already closed, `writ show <final seal> --diff` shows the removal.
+
 Multiple agents work in the same project directory. Each agent seals its own changes with `--spec`, and writ keeps them separate. No workspaces, no branches, no path copying. Agents work. Writ handles the rest.
 
 ## The Flow

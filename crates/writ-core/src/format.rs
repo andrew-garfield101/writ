@@ -221,7 +221,7 @@ pub fn format_brief(
         Some(p) => ToonFormatter::with_project(p),
         None => ToonFormatter::new(),
     };
-    let val = serde_json::to_value(&brief)?;
+    let val = serde_json::to_value(brief)?;
     formatter.encode_with_header(&val, "context-brief")
 }
 

@@ -143,8 +143,12 @@ pub struct SpecReopenParams {
 pub struct SpecReleaseParams {
     /// The spec ID or slug whose claim to release.
     pub id: String,
-    /// Release a claim held by another agent. Recorded in the security
-    /// log; use only when that agent is gone.
+    /// Release another agent's claim only if its holder is provably gone
+    /// (same host, its pid exited or was reused); refuses otherwise and
+    /// names the missing evidence. Never acts as force.
+    pub stale: Option<bool>,
+    /// Release a claim held by another agent: a human's decision, recorded
+    /// as forced. Agents use `stale` instead.
     pub force: Option<bool>,
 }
 
@@ -626,7 +630,7 @@ impl WritMcpServer {
     /// Release a spec's claim so another agent can take it.
     #[tool(
         name = "writ_spec_release",
-        description = "Release your claim on a spec so another agent can pick it up. Releasing a claim held by another agent needs force=true and is recorded in the security log."
+        description = "Release your claim on a spec so another agent can pick it up. To release another agent's claim whose holder has exited, pass stale=true: it releases only with proof the holder is gone and otherwise refuses naming the missing evidence. force=true is a human's decision, recorded as forced; agents use stale."
     )]
     async fn writ_spec_release(
         &self,
@@ -635,6 +639,7 @@ impl WritMcpServer {
         self.run_writ_owned(&spec_release_args(
             &params.id,
             &self.agent_id,
+            params.stale.unwrap_or(false),
             params.force.unwrap_or(false),
         ))
     }
@@ -952,7 +957,7 @@ pub async fn run_mcp_server(
 
 /// CLI arguments for `writ_spec_release`: always passes the server's agent
 /// identity, so the holder check runs against the caller.
-fn spec_release_args(id: &str, agent: &str, force: bool) -> Vec<String> {
+fn spec_release_args(id: &str, agent: &str, stale: bool, force: bool) -> Vec<String> {
     let mut args = vec![
         "spec".to_string(),
         "release".to_string(),
@@ -960,6 +965,9 @@ fn spec_release_args(id: &str, agent: &str, force: bool) -> Vec<String> {
         "--agent".to_string(),
         agent.to_string(),
     ];
+    if stale {
+        args.push("--stale".to_string());
+    }
     if force {
         args.push("--force".to_string());
     }
@@ -1034,14 +1042,20 @@ mod tests {
     #[test]
     fn spec_release_passes_agent_and_force_only_when_asked() {
         assert_eq!(
-            spec_release_args("s1", "amis", false),
+            spec_release_args("s1", "amis", false, false),
             vec!["spec", "release", "s1", "--agent", "amis"]
         );
         assert_eq!(
-            spec_release_args("s1", "amis", true)
+            spec_release_args("s1", "amis", false, true)
                 .last()
                 .map(String::as_str),
             Some("--force")
+        );
+        let stale = spec_release_args("s1", "amis", true, false);
+        assert_eq!(stale.last().map(String::as_str), Some("--stale"));
+        assert!(
+            !stale.iter().any(|a| a == "--force"),
+            "--stale never adds --force"
         );
     }
 

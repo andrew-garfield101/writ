@@ -28,7 +28,12 @@ import pytest
 
 import writ
 
-CLEAN = "fast checks clean; survival check not available until 0.4.1"
+# Fresh repo, survival tier never run (0.4.1): never "safe to finish".
+CLEAN = "fast checks clean; survival not run; run `writ doctor --survival`"
+# Any clean fast tier; after a finish the suffix is green / red / changed-since.
+CLEAN_PREFIX = "fast checks clean; survival "
+GREEN_PREFIX = "fast checks clean; survival green as of "
+SAFE = "safe to finish"
 REPORT_KEYS = {
     "headline", "tier", "survival_last_green", "checks_run", "findings",
     "clean", "red", "yellow", "elapsed_ms",
@@ -161,14 +166,17 @@ class Project:
     def assert_clean(self, when: str) -> None:
         r = self.doctor()
         assert r["clean"] is True and r["findings"] == [], f"{when}: {r}"
-        assert r["headline"] == CLEAN, when
+        assert r["headline"].startswith(CLEAN_PREFIX), f"{when}: {r['headline']!r}"
+        if SAFE in r["headline"].lower():
+            assert r["headline"].startswith(GREEN_PREFIX), f"{when}: {r['headline']!r}"
 
     def assert_names(self, check: str) -> dict:
         first = None
         for run in (1, 2):
             r = self.doctor()
             assert r["clean"] is False, f"run {run}: clean while {check} exists: {r}"
-            assert r["headline"] != CLEAN
+            assert not r["headline"].startswith("fast checks clean")
+            assert SAFE not in r["headline"].lower()
             hits = [f for f in r["findings"] if f["check"] == check]
             assert hits, f"run {run}: no {check} finding: {r['findings']}"
             assert hits[0]["fix_command"].strip()
@@ -229,6 +237,9 @@ def test_store_integrity_missing_blob(project: Project):
 
 
 def test_stale_claim_idle_holder(project: Project):
+    """Finding 91: no evidence the holder is gone (another host), so doctor
+    prints no fix_command, sets needs_human, names the host and the human's
+    --force option, and leaves the claim alone."""
     project.spec("sa", "ghost")
     project.write("g.txt", "ghost\n")
     project.seal("ghost", "sa", ["g.txt"])
@@ -236,13 +247,18 @@ def test_stale_claim_idle_holder(project: Project):
     _age_spec(project, "sa", 3 * 3600)
     spec_path = project.root / ".writ" / "specs" / "sa.json"
     doc = json.loads(spec_path.read_text())
-    doc["claimed_host"] = "other-host.invalid"  # holder not checkable: idle rule
+    doc["claimed_host"] = "other-host.invalid"
     spec_path.write_text(json.dumps(doc, indent=2))
 
-    f = project.full_cycle("other", "stale_claim")
+    r = project.doctor()
+    hits = [f for f in r["findings"] if f["check"] == "stale_claim"]
 
-    assert "spec release" in f["fix_command"] and "sa" in f["fix_command"]
-    assert project.repo.get_spec("sa").get("claimed_by") is None
+    assert hits, r
+    assert hits[0]["fix_command"] is None
+    assert hits[0].get("needs_human") is True
+    assert "other-host.invalid" in hits[0]["message"]
+    assert "--force" in hits[0]["message"]
+    assert project.repo.get_spec("sa").get("claimed_by") == "ghost"
 
 
 def test_stale_claim_holder_session_exited(project: Project):
@@ -349,8 +365,10 @@ def test_healthy_two_active_agents_with_pending_work_has_zero_findings(project: 
     project.write("README.md", (project.root / "README.md").read_text())
 
     project.assert_clean("healthy")
+    assert project.doctor()["headline"] == CLEAN  # fresh repo: survival never run
     cli = project.cli("human", "doctor", "--format", "json")
     assert json.loads(cli.stdout)["findings"] == []
+    assert json.loads(cli.stdout)["headline"] == CLEAN
 
 
 def test_harness_fix_commands_resolve_this_build(project: Project):
@@ -360,3 +378,59 @@ def test_harness_fix_commands_resolve_this_build(project: Project):
     )
     assert out.stdout.strip() == str(project.bin / "writ")
     assert project.git("status", "--porcelain").strip() == ""
+
+
+# --- sprint 4: finding 91 parity (assertions before code, retro rule 1) -----
+
+
+def _claim_by_exited_session(p: Project) -> None:
+    (p.bin / "claude").symlink_to("/bin/sh")
+    out = subprocess.run(
+        [str(p.bin / "claude"), "-c", "writ spec claim ghost --agent ghost-session && :"],
+        cwd=p.root, env=p.env("ghost-session"), capture_output=True, text=True,
+    )
+    assert out.returncode == 0, out.stderr
+
+
+def _force_events(p: Project) -> list[dict]:
+    path = p.root / ".writ" / "security" / "events.jsonl"
+    if not path.exists():
+        return []
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return [e for e in rows if e.get("event_type") == "claim_force_released"]
+
+
+def test_stale_claim_session_exited_fix_is_stale_not_force(project: Project):
+    project.repo.add_spec(id="ghost", title="ghost")
+    _claim_by_exited_session(project)
+
+    f = project.full_cycle("other", "stale_claim")
+
+    assert "--stale" in f["fix_command"] and "--force" not in f["fix_command"]
+
+
+def test_spec_release_stale_frees_dead_pid_claim_without_force(project: Project):
+    project.repo.add_spec(id="ghost", title="ghost")
+    _claim_by_exited_session(project)
+
+    previous = project.repo.spec_release("ghost", agent_id="other", stale=True)
+
+    assert previous == "ghost-session"
+    assert project.repo.get_spec("ghost").get("claimed_by") is None
+    assert _force_events(project) == []
+
+
+def test_spec_release_stale_refuses_foreign_host_naming_it(project: Project):
+    project.repo.add_spec(id="ghost", title="ghost")
+    _claim_by_exited_session(project)
+    spec_path = project.root / ".writ" / "specs" / "ghost.json"
+    doc = json.loads(spec_path.read_text())
+    doc["claimed_host"] = "other-host.invalid"
+    spec_path.write_text(json.dumps(doc, indent=2))
+
+    with pytest.raises(writ.WritError) as err:
+        project.repo.spec_release("ghost", agent_id="other", stale=True)
+
+    assert "other-host.invalid" in str(err.value) and "--force" in str(err.value)
+    assert project.repo.get_spec("ghost").get("claimed_by") == "ghost-session"
+    assert _force_events(project) == []

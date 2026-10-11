@@ -283,11 +283,12 @@ fn run_cycle(
     Ok(())
 }
 
-/// Run the doctor fast tier and send `DoctorChanged` when its findings
-/// differ from last cycle's. A doctor error is reported as an event, never
-/// stops the watch.
+/// Run the doctor fast tier and the survival tier (re-audited only when
+/// the store or an audited file changed since its last run, else read from
+/// its cache) and send `DoctorChanged` when the findings differ from last
+/// cycle's. A doctor error is reported as an event, never stops the watch.
 fn doctor_cycle(repo: &Repository, state: &mut WatchState, event_tx: &Sender<WatchEvent>) {
-    let (findings, headline) = match crate::doctor::run(repo) {
+    let (findings, headline) = match crate::doctor::run_survival(repo) {
         Ok(r) => (r.findings, r.headline),
         Err(e) => (
             Vec::new(),

@@ -280,7 +280,7 @@ fn spec_references_file(
     let file_name = file_path.rsplit('/').next().unwrap_or(file_path);
 
     // Also try the stem (e.g., "models" from "models.py") for broader matching.
-    let file_stem = file_name.rsplit('.').last().unwrap_or(file_name);
+    let file_stem = file_name.rsplit('.').next_back().unwrap_or(file_name);
 
     let texts: Vec<&str> = acceptance_criteria
         .iter()

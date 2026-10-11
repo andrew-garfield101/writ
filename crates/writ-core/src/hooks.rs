@@ -245,7 +245,7 @@ fn ensure_claude_instructions(root: &Path) -> WritResult<Option<String>> {
     let current = serde_json::Value::String(writ_instruction());
     let is_writ = |v: &serde_json::Value| {
         v.as_str()
-            .map_or(false, |s| s.contains(WRIT_INSTRUCTION_MARKER))
+            .is_some_and(|s| s.contains(WRIT_INSTRUCTION_MARKER))
     };
     match arr.iter().position(is_writ) {
         Some(i) => {
@@ -296,7 +296,7 @@ fn remove_claude_instructions(root: &Path) -> WritResult<Option<String>> {
     let before = arr.len();
     arr.retain(|v| {
         v.as_str()
-            .map_or(true, |s| !s.contains(WRIT_INSTRUCTION_MARKER))
+            .is_none_or(|s| !s.contains(WRIT_INSTRUCTION_MARKER))
     });
     let removed = arr.len() < before;
     // Init creates the key when absent; if writ's entry was all it held,
@@ -364,13 +364,30 @@ fn settings_hook_stale(settings: &serde_json::Value) -> bool {
     if LEGACY_HOOK_EVENTS.iter().any(|e| !commands(e).is_empty()) {
         return true;
     }
-    commands(WRIT_HOOK_EVENT)
-        .iter()
-        .any(|cmd| session_start_command(&hook_writ_path(cmd)) != *cmd)
+    commands(WRIT_HOOK_EVENT).iter().any(|cmd| {
+        let fallback = hook_writ_path(cmd);
+        session_start_command(&fallback) != *cmd || fallback_is_gone(&fallback)
+    })
 }
 
-/// The writ path a generated hook command runs (`<path> context --format brief`).
+/// Finding 89: an absolute fallback that no longer exists (its install was
+/// removed) leaves the hook silent whenever PATH has no `writ`; doctor
+/// reports it as version_skew so `writ init -y` records a live one.
+fn fallback_is_gone(fallback: &str) -> bool {
+    let p = Path::new(fallback);
+    p.is_absolute() && !p.exists()
+}
+
+/// The writ path a generated hook command records: the fallback in today's
+/// form (`F='<path>'; W=$(command -v writ ...`), or the pinned path in the
+/// form 0.4.0 and earlier wrote (`&& <path> context --format brief ...`).
 fn hook_writ_path(cmd: &str) -> String {
+    if let Some(start) = cmd.rfind(HOOK_FALLBACK_PREFIX) {
+        let rest = &cmd[start + HOOK_FALLBACK_PREFIX.len()..];
+        if let Some(end) = rest.find(HOOK_FALLBACK_SUFFIX) {
+            return rest[..end].replace(r"'\''", "'");
+        }
+    }
     const TAIL: &str = " context --format brief 2>/dev/null || true";
     cmd.strip_suffix(TAIL)
         .and_then(|head| head.rsplit("&& ").next())
@@ -378,23 +395,51 @@ fn hook_writ_path(cmd: &str) -> String {
         .to_string()
 }
 
-/// Build the hook command with an absolute path to the writ binary.
-/// Falls back to bare `writ` if the binary can't be located.
+/// Build the hook command, recording the writ that ran init as the fallback.
 fn writ_hook_command() -> String {
-    let writ_path = std::process::Command::new("which")
-        .arg("writ")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "writ".to_string());
-    session_start_command(&writ_path)
+    session_start_command(&init_writ_path())
 }
+
+/// The writ running init, spelled the way PATH spells it when PATH's first
+/// `writ` is the same file (so a Homebrew symlink survives `brew upgrade`).
+/// When the running binary is not a `writ` (the Python binding runs inside
+/// the interpreter, tests inside the test harness), PATH's first `writ`; with
+/// neither, bare `writ`.
+fn init_writ_path() -> String {
+    let on_path = crate::doctor::writs_on_path(std::env::var_os("PATH").as_deref())
+        .into_iter()
+        .next();
+    let exe = std::env::current_exe()
+        .ok()
+        .filter(|p| p.file_stem().is_some_and(|s| s == "writ"));
+    let same_file = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => false,
+    };
+    let chosen = match (exe, on_path) {
+        (Some(exe), Some(p)) if same_file(&exe, &p) => p,
+        (Some(exe), _) => exe,
+        (None, Some(p)) => p,
+        (None, None) => return "writ".to_string(),
+    };
+    chosen.to_string_lossy().into_owned()
+}
+
+/// Shell text between which the hook records the init-time writ.
+const HOOK_FALLBACK_PREFIX: &str = "F='";
+const HOOK_FALLBACK_SUFFIX: &str = "'; W=$(command -v writ";
 
 /// The SessionStart hook: the same workflow steps and claim note as the
 /// CLAUDE.md block (finding 67), then the brief context.
-fn session_start_command(writ: &str) -> String {
+///
+/// Finding 89: the hook runs the `writ` that PATH resolves when the session
+/// starts, the same one the agent's own `writ` commands run, so an upgrade
+/// through any channel (brew, pip, cargo) reaches the hook without a re-init,
+/// and removing an older install (doctor's multiple-writs fix) never leaves
+/// the hook pointing at a deleted binary. `fallback`, the writ that ran init,
+/// runs only when PATH has no `writ` (an app launched outside a login shell).
+/// When the two differ the hook prints one line naming both.
+fn session_start_command(fallback: &str) -> String {
     let mut lines = vec![
         WRIT_HOOK_BANNER.to_string(),
         "This project uses writ for version control. Follow these steps:".to_string(),
@@ -406,8 +451,12 @@ fn session_start_command(writ: &str) -> String {
         .iter()
         .map(|l| format!("echo '{}'", l.replace('\'', "'\\''")))
         .collect();
+    let quoted = fallback.replace('\'', "'\\''");
     format!(
-        "{} && {writ} context --format brief 2>/dev/null || true",
+        "{} && {HOOK_FALLBACK_PREFIX}{quoted}{HOOK_FALLBACK_SUFFIX} 2>/dev/null) || W=\"$F\"; \
+         [ \"$W\" = \"$F\" ] || echo \"Note: this session runs $W; writ init ran $F. \
+         writ doctor lists every writ on PATH; writ init -y records the one you keep.\"; \
+         \"$W\" context --format brief 2>/dev/null || true",
         echoes.join(" && ")
     )
 }
@@ -438,11 +487,11 @@ fn remove_writ_hook_entries(arr: &mut Vec<serde_json::Value>) -> bool {
         !entry
             .get("hooks")
             .and_then(|h| h.as_array())
-            .map_or(false, |inner| {
+            .is_some_and(|inner| {
                 inner.iter().any(|hook| {
                     hook.get("command")
                         .and_then(|c| c.as_str())
-                        .map_or(false, is_writ_hook_command)
+                        .is_some_and(is_writ_hook_command)
                 })
             })
     });
@@ -1145,13 +1194,6 @@ fn remove_writ_section(content: &str) -> String {
     } else {
         trimmed + "\n"
     }
-}
-
-/// Check if a directory is empty.
-fn is_dir_empty(path: &Path) -> bool {
-    fs::read_dir(path)
-        .map(|mut entries| entries.next().is_none())
-        .unwrap_or(false)
 }
 
 /// Fill a template's placeholders from [`crate::template`] (finding 67).
@@ -2412,7 +2454,7 @@ mod tests {
             .iter()
             .filter(|v| {
                 v.as_str()
-                    .map_or(false, |s| s.contains(WRIT_INSTRUCTION_MARKER))
+                    .is_some_and(|s| s.contains(WRIT_INSTRUCTION_MARKER))
             })
             .count();
         assert_eq!(count, 1, "instruction should not be duplicated");
@@ -3138,5 +3180,119 @@ mod claim_parity_tests {
             }
         }
         assert!(checked >= 5, "only {checked} spec add commands found");
+    }
+}
+
+#[cfg(test)]
+mod hook_path_resolution_tests {
+    //! Finding 89: the SessionStart hook runs PATH's writ, falls back to the
+    //! writ that ran init, and says so when the two differ.
+    use super::*;
+
+    /// A fake `writ` that prints its own name for `context`.
+    #[cfg(unix)]
+    fn fake_writ(dir: &Path, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(dir).unwrap();
+        let p = dir.join("writ");
+        fs::write(
+            &p,
+            format!("#!/bin/sh\necho \"context-brief from {name}\"\n"),
+        )
+        .unwrap();
+        fs::set_permissions(&p, fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[cfg(unix)]
+    fn run_hook(cmd: &str, path: &str) -> String {
+        let out = std::process::Command::new("/bin/sh")
+            .args(["-c", cmd])
+            .env("PATH", path)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_prefers_path_writ_and_falls_back_to_init_writ() {
+        let dir = tempfile::tempdir().unwrap();
+        let init = fake_writ(&dir.path().join("init bin"), "init");
+        let newer = fake_writ(&dir.path().join("newer"), "newer");
+        let cmd = session_start_command(init.to_str().unwrap());
+        let sys = "/usr/bin:/bin";
+
+        // PATH has a different writ: it runs, with one note naming both.
+        let out = run_hook(
+            &cmd,
+            &format!("{}:{sys}", newer.parent().unwrap().display()),
+        );
+        assert!(out.contains("context-brief from newer"), "{out}");
+        assert!(!out.contains("from init"), "{out}");
+        let note: Vec<&str> = out.lines().filter(|l| l.starts_with("Note:")).collect();
+        assert_eq!(note.len(), 1, "{out}");
+        assert!(
+            note[0].contains(newer.to_str().unwrap()) && note[0].contains(init.to_str().unwrap())
+        );
+
+        // PATH's writ is the init writ: no note.
+        let out = run_hook(&cmd, &format!("{}:{sys}", init.parent().unwrap().display()));
+        assert!(
+            out.contains("context-brief from init") && !out.contains("Note:"),
+            "{out}"
+        );
+
+        // No writ on PATH: the init writ runs, no note.
+        let out = run_hook(&cmd, sys);
+        assert!(
+            out.contains("context-brief from init") && !out.contains("Note:"),
+            "{out}"
+        );
+
+        // Neither exists: the hook still exits 0 and prints the steps.
+        let out = run_hook(&session_start_command("/nonexistent/writ"), sys);
+        assert!(out.contains(WRIT_HOOK_BANNER), "{out}");
+    }
+
+    #[test]
+    fn recorded_fallback_round_trips() {
+        for p in [
+            "writ",
+            "/opt/homebrew/bin/writ",
+            "/tmp/with space/writ",
+            "/tmp/it's/writ",
+        ] {
+            assert_eq!(hook_writ_path(&session_start_command(p)), p);
+        }
+    }
+
+    fn settings_with(cmd: &str) -> serde_json::Value {
+        serde_json::json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": cmd}]}]}})
+    }
+
+    #[test]
+    fn pinned_hook_from_040_is_stale_and_current_hook_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("writ");
+        fs::write(&live, "").unwrap();
+        let live = live.to_str().unwrap();
+        // The 0.4.0 form: the steps, then `<path> context --format brief`.
+        let current = session_start_command(live);
+        let head = &current[..current.find(HOOK_FALLBACK_PREFIX).unwrap()];
+        let pinned = format!("{head}{live} context --format brief 2>/dev/null || true");
+        assert_eq!(hook_writ_path(&pinned), live);
+        assert!(settings_hook_stale(&settings_with(&pinned)));
+        assert!(!settings_hook_stale(&settings_with(&current)));
+    }
+
+    #[test]
+    fn hook_whose_fallback_was_removed_is_stale() {
+        let gone = session_start_command("/nonexistent/finding-89/writ");
+        assert!(settings_hook_stale(&settings_with(&gone)));
+        assert!(!settings_hook_stale(&settings_with(
+            &session_start_command("writ")
+        )));
     }
 }

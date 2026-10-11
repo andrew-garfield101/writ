@@ -23,6 +23,7 @@ type CliResult<T> = Result<T, Box<dyn std::error::Error>>;
 pub const DEFAULT_CARGO_CHECK: &str = "cargo check --workspace --quiet";
 
 /// Options shared by every finish path.
+#[derive(Debug, Clone, Default)]
 pub struct CommitOptions {
     /// Stage drifted and unsealed working-tree content too (last commit).
     pub include_unsealed: bool,
@@ -32,6 +33,9 @@ pub struct CommitOptions {
     pub strict: bool,
     /// Command run on each staged tree before committing; None skips.
     pub check: Option<String>,
+    /// `--force`: commit even when the survival check finds lost lines
+    /// (they are printed, with the seals that added them).
+    pub force: bool,
 }
 
 /// One commit: the specs it closes, its message, and what it stages.
@@ -86,6 +90,7 @@ pub fn commit_specs(
     opts: &CommitOptions,
 ) -> CliResult<Vec<Committed>> {
     let units = plan_units(repo, specs, strategy, single_message)?;
+    survival_gate(repo, specs, opts.force)?;
     if opts.strict {
         if let Err(e) = refuse_stale(repo, specs) {
             let ids: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
@@ -162,6 +167,125 @@ pub fn commit_specs(
         });
     }
     Ok(made)
+}
+
+/// The survival tier before finish (0.4.1): every line the committing
+/// specs sealed must be in the tree this finish commits (their staged
+/// sealed content, HEAD elsewhere), or a later seal must have replaced it.
+/// Lost lines refuse the finish before anything is staged, naming each
+/// line and the seal that added it, and record a `finish_refused` event
+/// (`survival_check`), unless `force`.
+pub fn survival_gate(repo: &Repository, specs: &[Spec], force: bool) -> CliResult<()> {
+    use writ_core::convergence::survival::{audit_finish, describe_lost};
+    let ids: Vec<String> = specs
+        .iter()
+        .filter(|s| !s.sealed_by.is_empty())
+        .map(|s| s.id.clone())
+        .collect();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    print_override_context(repo, specs);
+    let plan = repo.finish_plan(&ids)?;
+    let mut staged = std::collections::HashMap::new();
+    for (path, hash) in &plan.stage {
+        let content = match hash {
+            Some(h) => Some(repo.object_content(h)?),
+            None => None,
+        };
+        staged.insert(path.clone(), content);
+    }
+    let started = Instant::now();
+    let report = audit_finish(repo, &ids, &staged)?;
+    let undone: Vec<String> = report
+        .deleted_but_present()
+        .map(|(spec, f)| format!("{} (deletion sealed by {spec})", f.path))
+        .collect();
+    if report.lost == 0 && undone.is_empty() {
+        println!(
+            "  {} survival: {} sealed line(s) of {} spec(s) checked, none lost ({} ms)",
+            "✓".green(),
+            report.checked,
+            ids.len(),
+            started.elapsed().as_millis()
+        );
+        return Ok(());
+    }
+    let mut lines: Vec<String> = report
+        .lost_lines()
+        .map(|(spec, path, l)| format!("{spec}: {}", describe_lost(path, l)))
+        .collect();
+    lines.extend(undone);
+    println!(
+        "{}",
+        format!(
+            "Survival check: this finish would lose {} sealed line(s):",
+            lines.len()
+        )
+        .red()
+        .bold()
+    );
+    for l in &lines {
+        println!("  {} {l}", "·".red());
+    }
+    if force {
+        eprintln!(
+            "{} --force: finishing without {} sealed line(s) listed above",
+            "warning:".yellow().bold(),
+            lines.len()
+        );
+        return Ok(());
+    }
+    let mut files: Vec<String> = report
+        .lost_lines()
+        .map(|(_, p, _)| p.to_string())
+        .chain(report.deleted_but_present().map(|(_, f)| f.path.clone()))
+        .collect();
+    files.sort();
+    files.dedup();
+    record_refusal(
+        repo,
+        writ_core::doctor::FinishRefusal::SurvivalCheck,
+        &format!("survival_check: {}", lines.join("; ")),
+        &ids,
+        &files,
+    );
+    Err(format!(
+        "finish refused: {} sealed line(s) would be lost, nothing staged:\n  {}\nrestore them and seal (`writ show <seal> --diff` shows each), or pass --force to finish without them",
+        lines.len(),
+        lines.join("\n  ")
+    )
+    .into())
+}
+
+/// Finding 102: each removal a committing spec confirmed after the
+/// seal-time refusal, as the record states it.
+fn print_override_context(repo: &Repository, specs: &[Spec]) {
+    for spec in specs {
+        for id in &spec.sealed_by {
+            let Ok(seal) = repo.load_seal(id) else {
+                continue;
+            };
+            for o in &seal.override_context {
+                let short = &seal.id[..12.min(seal.id.len())];
+                let line = match o.other_agents.as_slice() {
+                    [] => format!(
+                        "{} removed {} own line(s) from {} on purpose after being told (seal {short})",
+                        seal.agent.id,
+                        o.lines.len(),
+                        o.path
+                    ),
+                    others => format!(
+                        "{} accepted {}'s version of {} after being told (seal {short})",
+                        seal.agent.id,
+                        others.join(", "),
+                        o.path
+                    ),
+                };
+                println!("  {} {line}", "note:".cyan());
+            }
+        }
+    }
 }
 
 /// Record a `finish_refused` event (finding 76). Every finish refusal goes
@@ -277,7 +401,7 @@ fn mark_without_new_commit(
     let hash = already
         .iter()
         .filter_map(|(p, _)| carried.get(p).map(|(h, _)| h.clone()))
-        .last()
+        .next_back()
         .or(git.head_hash()?);
     let Some(hash) = hash else {
         return Ok(());

@@ -463,6 +463,11 @@ enum Commands {
         #[arg(long)]
         force: bool,
 
+        /// Accept the removals a seal captured from another spec's version
+        /// (the survival tier names the seal). Repeatable; never blocks.
+        #[arg(long = "accept-removals", value_name = "SEAL")]
+        accept_removals: Vec<String>,
+
         /// Create a proposal instead of committing directly (propose mode).
         #[arg(long)]
         propose: bool,
@@ -762,6 +767,11 @@ enum Commands {
         /// Attempt to fix problems (reserved for future use).
         #[arg(long)]
         fix: bool,
+
+        /// Also run the survival tier: every line the specs sealed is still
+        /// there or a later seal replaced it (cached until the store changes).
+        #[arg(long)]
+        survival: bool,
     },
 }
 
@@ -1047,7 +1057,8 @@ enum SpecCommands {
         agent: Option<String>,
     },
 
-    /// Release a claim on a spec. Only the holder can release, unless --force.
+    /// Release a claim on a spec. Only the holder can release, unless
+    /// --stale (holder provably gone) or --force (a human's decision).
     Release {
         /// Spec ID to release.
         id: String,
@@ -1056,7 +1067,14 @@ enum SpecCommands {
         #[arg(long)]
         agent: Option<String>,
 
-        /// Release a claim held by another agent (recorded in the security log).
+        /// Release another agent's claim only if its holder is provably gone
+        /// (same host, its pid exited or was reused). Refuses otherwise and
+        /// names the missing evidence; never acts as --force.
+        #[arg(long, conflicts_with = "force")]
+        stale: bool,
+
+        /// Release a claim held by another agent, a human's decision
+        /// (recorded as forced on the spec and in the security log).
         #[arg(long)]
         force: bool,
     },
@@ -1454,6 +1472,8 @@ fn main() {
             force,
             allow_removals,
         } => {
+            // Finding 98: an explicit --agent is enforced like a detected agent.
+            let explicit_agent = agent.is_some();
             let agent = resolve_agent(agent.as_deref(), &cwd);
             with_doctor_notice(
                 &cwd,
@@ -1461,6 +1481,7 @@ fn main() {
                     &cwd,
                     &summary,
                     &agent,
+                    explicit_agent,
                     spec,
                     &status,
                     paths,
@@ -1566,7 +1587,12 @@ fn main() {
             strict,
             no_check,
             force,
+            accept_removals,
         } => {
+            if let Err(e) = accept_captured_removals(&cwd, &accept_removals) {
+                eprintln!("{} {e}", "error:".red().bold());
+                process::exit(1);
+            }
             if proposals {
                 cmd_finish_proposals(&cwd)
             } else if let Some(id) = accept {
@@ -1707,9 +1733,12 @@ fn main() {
             ),
             SpecCommands::Reopen { id } => cmd_spec_reopen(&cwd, &id),
             SpecCommands::Claim { id, agent } => cmd_spec_claim(&cwd, &id, agent.as_deref()),
-            SpecCommands::Release { id, agent, force } => {
-                cmd_spec_release(&cwd, &id, agent.as_deref(), force)
-            }
+            SpecCommands::Release {
+                id,
+                agent,
+                stale,
+                force,
+            } => cmd_spec_release(&cwd, &id, agent.as_deref(), stale, force),
             SpecCommands::Assign { id, workspace } => cmd_spec_assign(&cwd, &id, &workspace),
             SpecCommands::Unassign { id } => cmd_spec_unassign(&cwd, &id),
         },
@@ -1859,18 +1888,32 @@ fn main() {
             json,
             fix,
             allow_missing,
+            survival,
         } => {
             let format = if json {
                 "json".to_string()
             } else {
                 format.unwrap_or_else(|| "human".to_string())
             };
-            cmd_doctor(&cwd, &format, fix, &allow_missing)
+            cmd_doctor(&cwd, &format, fix, &allow_missing, survival)
         }
     };
 
     if let Err(e) = result {
-        eprintln!("{} {e}", "error:".red().bold());
+        // Finding 102: the own-line refusal carries the exact override command.
+        let own_lines = e
+            .downcast_ref::<writ_core::error::WritError>()
+            .and_then(|w| {
+                let paths = w.own_lines_paths().join(",");
+                w.own_lines_message(&format!(
+                    "{} --allow-removals {paths}",
+                    current_command_line()
+                ))
+            });
+        match own_lines {
+            Some(msg) => eprintln!("{} {msg}", "error:".red().bold()),
+            None => eprintln!("{} {e}", "error:".red().bold()),
+        }
         if let Some(hint) = error_hint(e.as_ref()) {
             eprintln!("  {} {hint}", "hint:".yellow());
         }
@@ -2012,18 +2055,33 @@ fn resolve_strategy(explicit: Option<&str>, cwd: &PathBuf) -> String {
         .unwrap_or_else(|| "escalate".to_string())
 }
 
+/// `writ finish --accept-removals <seal>...`: record each seal's captured
+/// removals as accepted (survival tier) before the finish runs.
+fn accept_captured_removals(
+    cwd: &PathBuf,
+    seals: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if seals.is_empty() {
+        return Ok(());
+    }
+    let repo = Repository::open_from_dir(cwd)?;
+    for seal in seals {
+        let id = writ_core::convergence::survival::accept_removals(&repo, seal)?;
+        println!(
+            "accepted the captured removals of seal {}",
+            &id[..id.len().min(12)]
+        );
+    }
+    Ok(())
+}
+
 /// Return an actionable hint for a given error, or None if no hint is needed.
 fn error_hint(err: &(dyn std::error::Error + 'static)) -> Option<String> {
-    if let Some(writ_core::error::WritError::OwnLinesRemoved { losses, .. }) =
+    // Finding 102: the own-line refusal already names both choices.
+    if let Some(writ_core::error::WritError::OwnLinesRemoved { .. }) =
         err.downcast_ref::<writ_core::error::WritError>()
     {
-        let mut paths: Vec<&str> = losses.iter().map(|l| l.path.as_str()).collect();
-        paths.dedup();
-        return Some(format!(
-            "another agent's version of the file may be on disk. Restore your lines, or exclude the file with --paths. If the removal is yours, allow it for these files only:\n    {} --allow-removals {}",
-            current_command_line(),
-            paths.join(",")
-        ));
+        return None;
     }
     let msg = err.to_string();
 
@@ -2835,6 +2893,7 @@ fn cmd_seal(
     cwd: &PathBuf,
     summary: &str,
     agent_id: &str,
+    explicit_agent: bool,
     spec_id: Option<String>,
     status: &str,
     paths: Option<Vec<String>>,
@@ -2914,20 +2973,34 @@ fn cmd_seal(
                         created.join(", ")
                     );
                     process::exit(1);
-                // C.13: No auto-scope available — enforce spec for agents.
-                } else if is_agent {
-                    eprintln!("{} No active spec for this seal.", "ERROR:".red().bold());
-                    eprintln!("  Create and claim one: writ spec add \"brief description of your task\" --claim");
-                    eprintln!("  Then retry your seal.");
-                    eprintln!();
-                    eprintln!("  Agents must link seals to specs for tracking and coordination.");
-                    process::exit(1);
+                // C.13 (findings 98 to 100): no auto-scope available.
                 } else {
-                    eprintln!(
-                        "{} This seal has no spec. Run `writ spec add` for tracking.",
-                        "warning:".yellow().bold()
-                    );
-                    None
+                    use writ_core::repo::{no_spec_seal_policy, NoSpecSeal, NO_SPEC_FIX};
+                    let strict = repo.claims_strict();
+                    match no_spec_seal_policy(is_agent, explicit_agent, strict) {
+                        NoSpecSeal::Refuse => {
+                            eprintln!(
+                                "{} No active spec for this seal. Nothing was sealed.",
+                                "ERROR:".red().bold()
+                            );
+                            eprintln!("  Create and claim one: {NO_SPEC_FIX}");
+                            eprintln!("  Then retry your seal.");
+                            eprintln!();
+                            if strict && !is_agent && !explicit_agent {
+                                eprintln!("  [security] claim_enforcement = \"strict\" requires every seal to have a spec.");
+                            } else {
+                                eprintln!("  Agents must link seals to specs for tracking and coordination.");
+                            }
+                            process::exit(1);
+                        }
+                        NoSpecSeal::Warn => {
+                            eprintln!(
+                                "{} This seal has no spec. For tracking, create and claim one: {NO_SPEC_FIX}",
+                                "warning:".yellow().bold()
+                            );
+                            None
+                        }
+                    }
                 }
             }
         }
@@ -3041,6 +3114,14 @@ fn cmd_seal(
         &seal.id[..12].cyan(),
         spec_slug_display
     );
+    // Finding 102: an override is stated, with who else worked on the file.
+    for ctx in &seal.override_context {
+        println!(
+            "  {} {}",
+            "override:".yellow(),
+            ctx.describe(&seal.agent.id, &seal.id)
+        );
+    }
 
     if let Some(ref w) = conflict_warning {
         if w.is_clean {
@@ -4754,7 +4835,9 @@ fn cmd_finish(
         Ok(conv_report) => {
             // Finding 62: lines another spec added that a spec's version
             // did not carry were kept; tell the user how to remove them.
-            for n in &conv_report.notices {
+            // Finding 104: only when the merged result finish commits
+            // holds them; a notice never claims a line it lacks.
+            for n in writ_core::convergence::survival::notices_that_hold(&repo, &conv_report) {
                 eprintln!("  {} {}", "notice:".yellow().bold(), n.message);
             }
             if !conv_report.merged_files.is_empty() {
@@ -4970,6 +5053,7 @@ fn cmd_finish(
         include_unsealed,
         strict,
         check: finish::resolve_check(&repo, no_check),
+        force,
     };
     let committable_specs: Vec<Spec> = committable.iter().map(|s| (*s).clone()).collect();
     let made = finish::commit_specs(
@@ -5279,7 +5363,15 @@ fn finish_doctor_gate(
     use colored::Colorize;
     let report = writ_core::doctor::run(repo)?;
     if report.clean {
-        println!("  {} doctor: {}", "✓".green(), report.headline);
+        // Finding 112: a check mark only when both tiers are green; the
+        // refusal marker beside a red or not-yet-green survival state.
+        use writ_core::convergence::survival::SurvivalState;
+        let marker = match SurvivalState::current(repo) {
+            s if s.is_safe() => "✓".green(),
+            SurvivalState::Red { .. } => "✗".red().bold(),
+            _ => "✗".yellow().bold(),
+        };
+        println!("  {marker} doctor: {}", report.headline);
         return Ok(());
     }
     print_doctor_human(&report);
@@ -5397,10 +5489,24 @@ fn print_survival_losses(
             esc.file_path.bold()
         );
         eprintln!("      {}", esc.reason);
-        if let Some(lines) = esc.right_content.as_deref() {
-            for line in lines.lines().take(10) {
-                eprintln!("      | {line}");
-            }
+        // Finding 109: each line with the seal that added it; the merge is
+        // the remover.
+        for line in writ_core::convergence::survival::escalation_lines(esc)
+            .iter()
+            .take(10)
+        {
+            let by =
+                writ_core::convergence::survival::adding_seal(repo, spec, &esc.file_path, line)
+                    .ok()
+                    .flatten()
+                    .map(|s| {
+                        format!(
+                            "added by seal {} of spec '{spec}'",
+                            &s.id[..12.min(s.id.len())]
+                        )
+                    })
+                    .unwrap_or_else(|| format!("sealed by spec '{spec}'"));
+            eprintln!("      | {line}   ({by}; removed by the merge)");
         }
         match seal {
             Some(seal) => eprintln!("      inspect: writ show {seal} --diff"),
@@ -5628,6 +5734,7 @@ fn cmd_finish_accept(
         include_unsealed: false,
         strict,
         check: finish::resolve_check(&repo, no_check),
+        force,
     };
     let plan = repo.finish_plan(&proposal.spec_ids)?;
     print_finish_left_out(repo.root(), &plan, false);
@@ -5779,6 +5886,7 @@ fn cmd_finish_auto(
         include_unsealed: false,
         strict,
         check: finish::resolve_check(&repo, no_check),
+        force,
     };
     let mut total_committed = 0;
 
@@ -6563,15 +6671,24 @@ fn cmd_spec_release(
     cwd: &PathBuf,
     id: &str,
     agent: Option<&str>,
+    stale: bool,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let resolved_id = repo.resolve_spec(id)?.id;
     let agent_id = resolve_agent(agent, cwd);
-    match repo.spec_release(&resolved_id, &agent_id, force)? {
+    let released = if stale {
+        repo.spec_release_stale(&resolved_id, &agent_id)?
+    } else {
+        repo.spec_release(&resolved_id, &agent_id, force)?
+    };
+    match released {
         Some(previous) if previous == agent_id => {
             println!("Released spec '{resolved_id}' (was claimed by '{previous}').")
         }
+        Some(previous) if stale => println!(
+            "Released spec '{resolved_id}' from '{previous}': its holder is gone (--stale by '{agent_id}')."
+        ),
         Some(previous) => {
             println!("Released spec '{resolved_id}' from '{previous}' (--force by '{agent_id}').")
         }
@@ -10103,6 +10220,7 @@ fn cmd_doctor(
     format: &str,
     fix: bool,
     allow_missing: &[String],
+    survival: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if !allow_missing.is_empty() {
         let repo = Repository::open_from_dir(cwd)?;
@@ -10119,6 +10237,7 @@ fn cmd_doctor(
         );
     }
     let report = match Repository::open_from_dir(cwd) {
+        Ok(repo) if survival => writ_core::doctor::run_survival(&repo)?,
         Ok(repo) => writ_core::doctor::run(&repo)?,
         Err(e) => match writ_core::doctor::open_refusal_report(&e) {
             Some(report) => report,
@@ -10193,6 +10312,10 @@ fn print_doctor_human(report: &writ_core::doctor::DoctorReport) {
             Some(cmd) => println!("    fix:   {cmd}"),
             None => println!("    fix:   none to paste; this needs your decision (see above)"),
         }
+    }
+    for note in &report.survival_info {
+        println!();
+        println!("  [{}] survival: {note}", "info".cyan());
     }
 }
 
@@ -10362,6 +10485,7 @@ mod tests {
             claimed_pid: None,
             claimed_pid_start: None,
             claimed_host: None,
+            release_forced: false,
             genesis_tree: None,
             created_by: None,
         }

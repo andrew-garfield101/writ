@@ -30,8 +30,18 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime};
 
-/// Clean headline (honesty condition, 0.4.0).
-const CLEAN: &str = "fast checks clean; survival check not available until 0.4.1";
+/// Clean headline on a repo where the survival tier never ran (0.4.1,
+/// honesty condition): the fresh-repo form, never "safe to finish".
+const CLEAN: &str = "fast checks clean; survival not run; run `writ doctor --survival`";
+/// Every clean fast-tier headline starts with this. After a finish (which
+/// runs the survival tier) the suffix is one of: "survival green as of
+/// <seal12>; safe to finish", "survival red: N sealed line(s) lost as of
+/// <seal12>; run ...", "survival last green as of <seal12>, store changed
+/// since; run ...".
+const CLEAN_PREFIX: &str = "fast checks clean; survival ";
+/// Aubs's honesty condition: only when both tiers are green on the current
+/// state.
+const SAFE: &str = "safe to finish";
 
 const CHECK_STORE_INTEGRITY: &str = "store_integrity";
 const CHECK_STALE_CLAIM: &str = "stale_claim";
@@ -254,7 +264,17 @@ impl Project {
             v["findings"].as_array().is_some_and(|f| f.is_empty()),
             "{when}: findings on a clean repo:\n{v:#}"
         );
-        assert_eq!(v["headline"], CLEAN, "{when}");
+        let headline = v["headline"].as_str().unwrap_or("");
+        assert!(
+            headline.starts_with(CLEAN_PREFIX),
+            "{when}: clean report with headline {headline:?}"
+        );
+        // "safe to finish" only in the green form.
+        assert!(
+            !headline.to_lowercase().contains(SAFE)
+                || headline.starts_with("fast checks clean; survival green as of "),
+            "{when}: 'safe to finish' outside the green form: {headline:?}"
+        );
     }
 
     /// Assertions 1 and 2: named under `check`, never clean (twice), brief
@@ -272,7 +292,12 @@ impl Project {
                 v["clean"], false,
                 "run {run}: reported clean while the state exists:\n{v:#}"
             );
-            assert_ne!(v["headline"], CLEAN, "run {run}");
+            let headline = v["headline"].as_str().unwrap_or("");
+            assert!(
+                !headline.starts_with("fast checks clean")
+                    && !headline.to_lowercase().contains(SAFE),
+                "run {run}: clean headline while the state exists: {headline:?}"
+            );
             let hit = v["findings"]
                 .as_array()
                 .unwrap()
@@ -292,7 +317,7 @@ impl Project {
             .brief_doctor_line(agent)
             .unwrap_or_else(|| panic!("no doctor: line in the brief while `{check}` exists"));
         assert!(
-            !line.contains(CLEAN),
+            !line.contains("fast checks clean") && !line.to_lowercase().contains(SAFE),
             "context brief says clean while `{check}` exists: {line}"
         );
         assert!(
@@ -491,6 +516,12 @@ fn doctor_state_store_integrity_missing_blob() {
 /// Check 2. A claim idle past `stale_claim_minutes` (default 120) whose
 /// holder doctor cannot check: it was made on another host (a shared
 /// directory), sealed once three hours ago, and never came back.
+///
+/// Finding 91 (sprint 4): there is no evidence the holder is gone, so no
+/// command an agent may paste clears it (`--stale` refuses another host,
+/// `--force` is never printed). Doctor names it, prints no fix_command,
+/// sets needs_human, and the message names the host and says a human may
+/// release it with `--force`.
 #[test]
 fn doctor_state_stale_claim_idle_holder() {
     let p = Project::new("stale");
@@ -506,15 +537,26 @@ fn doctor_state_stale_claim_idle_holder() {
         serde_json::json!("other-host.invalid"),
     );
 
-    let f = p.full_cycle("other", CHECK_STALE_CLAIM);
-    let fix = f["fix_command"].as_str().unwrap();
-    assert!(fix.contains("spec release") && fix.contains("sa"), "{fix}");
+    let (code, v) = p.doctor("other");
+    assert_eq!(code, Some(1), "{v:#}");
+    let f = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["check"] == CHECK_STALE_CLAIM)
+        .cloned()
+        .unwrap_or_else(|| panic!("foreign-host idle claim not named:\n{v:#}"));
+    assert!(
+        f["fix_command"].is_null(),
+        "printed a fix no agent may run: {f:#}"
+    );
+    assert_eq!(f["needs_human"], true, "{f:#}");
+    let msg = f["message"].as_str().unwrap();
+    assert!(msg.contains("other-host.invalid"), "host not named: {msg}");
+    assert!(msg.contains("--force"), "human option not named: {msg}");
     let show = p.ok("other", &["spec", "show", "sa", "--format", "json"]);
     let spec: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
-    assert!(
-        spec["claimed_by"].is_null(),
-        "claim still held after fix: {spec:#}"
-    );
+    assert_eq!(spec["claimed_by"], "ghost", "doctor changed the claim");
 }
 
 /// Check 2, session form (the live-run injection): a third session claims a
@@ -814,9 +856,12 @@ fn doctor_healthy_two_active_agents_with_pending_work_has_zero_findings() {
 
     for agent in ["a", "b", "human"] {
         p.assert_clean(agent, &format!("healthy, as {agent}"));
+        let (_, v) = p.doctor(agent);
+        assert_eq!(v["headline"], CLEAN, "fresh repo, survival never run");
     }
     if let Some(line) = p.brief_doctor_line("a") {
         assert!(line.contains(CLEAN), "{line}");
+        assert!(!line.to_lowercase().contains(SAFE), "{line}");
     }
 }
 
@@ -838,10 +883,11 @@ fn context_brief_carries_doctor_line_under_2kb() {
     let line = p.brief_doctor_line("a").expect("no doctor: line in brief");
     assert!(line.contains("fast"), "tier missing from {line}");
     assert!(
-        line.contains("survival check not available until 0.4.1"),
-        "{line}"
+        line.contains("survival not run"),
+        "fresh repo must say survival not run: {line}"
     );
-    assert!(!text.to_lowercase().contains("safe to finish"), "{text}");
+    // The survival tier has never run on this repo: never "safe to finish".
+    assert!(!text.to_lowercase().contains(SAFE), "{text}");
 }
 
 // ---------------------------------------------------------------------------
@@ -927,12 +973,965 @@ fn finish_on_green_runs_the_clean_gate_and_commits() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        all.contains(CLEAN),
+        all.contains(CLEAN_PREFIX),
         "finish did not print the doctor headline:\n{all}"
     );
-    assert!(!all.to_lowercase().contains("safe to finish"), "{all}");
     assert_ne!(p.head(), before);
     assert_eq!(p.git_ok(&["show", "HEAD:a.txt"]), "a1\n");
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 4 (0.4.1): findings 91, 96, 97 and the survival tier. Written before
+// the code (retro rule 1); each is ignored on EXPECTED_IGNORED until it lands.
+// ---------------------------------------------------------------------------
+
+/// Survival tier finding id (Haris; rename here if the code differs).
+const CHECK_SURVIVAL: &str = "survival";
+
+/// Finding 91, session form: the third session exited (same host, dead
+/// pid). The printed fix is `writ spec release ghost --stale`, never
+/// `--force`, and pasted verbatim it clears the state.
+#[test]
+fn doctor_state_stale_claim_session_exited_fix_is_stale_not_force() {
+    let p = Project::new("stale-fix-91");
+    p.ok(
+        "human",
+        &["spec", "add", "--id", "ghost", "--title", "ghost"],
+    );
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/bin/sh", p.bin.join("claude")).unwrap();
+    let session = p
+        .cmd(p.bin.join("claude").to_str().unwrap(), "ghost-session")
+        .args(["-c", "writ spec claim ghost --agent ghost-session && :"])
+        .output()
+        .unwrap();
+    assert!(session.status.success());
+    let f = p.full_cycle("other", CHECK_STALE_CLAIM);
+    let fix = f["fix_command"].as_str().unwrap();
+    assert!(
+        fix.contains("spec release") && fix.contains("ghost") && fix.contains("--stale"),
+        "{fix}"
+    );
+    assert!(!fix.contains("--force"), "{fix}");
+}
+
+/// Finding 91: no fix_command doctor prints contains `--force`, with every
+/// bad state the harness knows present at once (missing blob, exited-session
+/// claim, foreign-host idle claim, committed-spec stuck file, old pending
+/// work while another agent is active, stale managed block, left-out file).
+#[test]
+fn doctor_no_fix_command_contains_force_in_any_state() {
+    let p = Project::new("noforce");
+    // committed-spec stuck file
+    p.spec("sc", "c");
+    p.write("s.txt", "v1\n");
+    p.seal("c", "sc", "s.txt");
+    p.ok("c", &["spec", "done", "sc", "--agent", "c", "--no-seal"]);
+    p.ok("human", &["finish", "-y", "--no-check"]);
+    p.write("s.txt", "v2\n");
+    p.git_ok(&["commit", "-q", "--no-verify", "-am", "outside writ"]);
+    // foreign-host idle claim
+    p.spec("sf", "far");
+    p.write("far.txt", "far\n");
+    p.seal("far", "sf", "far.txt");
+    p.age_spec("sf", Duration::from_secs(3 * 3600));
+    p.set_spec_field(
+        "sf",
+        "claimed_host",
+        serde_json::json!("other-host.invalid"),
+    );
+    // exited-session claim
+    p.ok(
+        "human",
+        &["spec", "add", "--id", "ghost", "--title", "ghost"],
+    );
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/bin/sh", p.bin.join("claude")).unwrap();
+    p.cmd(p.bin.join("claude").to_str().unwrap(), "ghost-session")
+        .args(["-c", "writ spec claim ghost --agent ghost-session && :"])
+        .output()
+        .unwrap();
+    // old pending work while another agent is active
+    p.spec("sa", "a");
+    p.spec("sb", "b");
+    p.write("a.txt", "a1\n");
+    p.seal("a", "sa", "a.txt");
+    p.write("a.txt", "a1\na2\n");
+    p.set_mtime("a.txt", Duration::from_secs(45 * 60));
+    p.write("b.txt", "b1\n");
+    p.seal("b", "sb", "b.txt");
+    // missing blob
+    let log = p.ok("b", &["log", "--format", "json", "--limit", "1"]);
+    let seals: serde_json::Value = serde_json::from_slice(&log.stdout).unwrap();
+    let hash = seals[0]["changes"][0]["new_hash"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    fs::remove_file(p.path(&format!(".writ/objects/{}/{}", &hash[..2], &hash[2..]))).unwrap();
+    // stale managed block
+    let claude = p.read("CLAUDE.md");
+    let begin = claude.find("<!-- BEGIN WRIT").unwrap();
+    let header_end = begin + claude[begin..].find('\n').unwrap() + 1;
+    let end = claude.find("<!-- END WRIT CONFIGURATION -->").unwrap();
+    p.write(
+        "CLAUDE.md",
+        &format!("{}old text\n{}", &claude[..header_end], &claude[end..]),
+    );
+    // left-out file
+    p.write("stray.txt", "nobody sealed me\n");
+
+    for agent in ["a", "other", "human"] {
+        let (_, v) = p.doctor(agent);
+        let findings = v["findings"].as_array().unwrap();
+        let checks: std::collections::BTreeSet<&str> = findings
+            .iter()
+            .filter_map(|f| f["check"].as_str())
+            .collect();
+        assert!(
+            checks.len() >= 5 && checks.contains(CHECK_STALE_CLAIM),
+            "fixture did not produce the states: {checks:?}"
+        );
+        for f in findings {
+            let fix = f["fix_command"].as_str().unwrap_or("");
+            assert!(
+                !fix.contains("--force"),
+                "`{}` prints --force: {fix}",
+                f["check"]
+            );
+        }
+        let human = p.writ(agent, &["doctor"]);
+        let text = String::from_utf8_lossy(&human.stdout);
+        for line in text.lines().filter(|l| l.contains("writ ")) {
+            assert!(
+                !line.contains("--force") || line.to_lowercase().contains("human"),
+                "human doctor output offers --force as a fix: {line}"
+            );
+        }
+    }
+}
+
+/// Finding 96: one writ listed twice on PATH (the same directory twice) is
+/// one writ, not version_skew.
+///
+/// Live from the start: 0.4.0's `writs_on_path` already canonicalizes, as
+/// finding 96 suspected; this pins it.
+#[test]
+fn doctor_version_skew_same_dir_twice_on_path_is_not_skew() {
+    let p = Project::new("path-dup");
+    let out = p
+        .cmd(p.bin.join("writ").to_str().unwrap(), "a")
+        .env("PATH", format!("{}:{}", p.bin.display(), p.env_path()))
+        .args(["doctor", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{v:#}");
+    assert_eq!(v["clean"], true, "{v:#}");
+}
+
+/// Finding 96: a second PATH directory holding a symlink to the same binary
+/// resolves to the same file: one writ, not version_skew. (A real copy is
+/// still two writs: `doctor_state_version_skew_two_writs_on_path_is_named`.)
+#[test]
+fn doctor_version_skew_symlink_to_same_binary_is_not_skew() {
+    let p = Project::new("path-link");
+    let second = p.home.join("linkbin");
+    fs::create_dir_all(&second).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_writ"), second.join("writ")).unwrap();
+    let out = p
+        .cmd(p.bin.join("writ").to_str().unwrap(), "a")
+        .env("PATH", format!("{}:{}", p.env_path(), second.display()))
+        .args(["doctor", "--format", "json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(out.status.code(), Some(0), "{v:#}");
+    assert!(
+        !v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["check"] == CHECK_VERSION_SKEW),
+        "{v:#}"
+    );
+}
+
+/// `n` specs by `n` agents, each sealing its own file twice in interleaved
+/// rounds (seal isolation forks every spec chain off HEAD), then spec done.
+fn forked_specs(p: &Project, n: usize) {
+    for i in 0..n {
+        p.spec(&format!("s{i}"), &format!("ag{i}"));
+    }
+    for round in 0..2 {
+        for i in 0..n {
+            let file = format!("f{i}.txt");
+            p.write(&file, &format!("{i}\n{round}\n"));
+            p.seal(&format!("ag{i}"), &format!("s{i}"), &file);
+        }
+    }
+    for i in 0..n {
+        let (a, s) = (format!("ag{i}"), format!("s{i}"));
+        p.ok(&a, &["spec", "done", &s, "--agent", &a, "--no-seal"]);
+    }
+}
+
+/// (format, for-agent) views an agent sees: plain `writ context` (toon), the
+/// SessionStart brief and json, unscoped and scoped to a fresh agent.
+fn context_views(p: &Project) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for fmt in ["brief", "toon", "json"] {
+        for scoped in [false, true] {
+            let mut args = vec!["context", "--format", fmt];
+            if scoped {
+                args.extend(["--for-agent", "fresh"]);
+            }
+            let o = p.ok("fresh", &args);
+            out.push((
+                format!("{fmt}{}", if scoped { " --for-agent fresh" } else { "" }),
+                String::from_utf8_lossy(&o.stdout).into_owned(),
+            ));
+        }
+    }
+    out
+}
+
+/// Guard for finding 97 (live now): live divergence (forked specs not yet
+/// committed) is still reported. A fix that stops reporting divergence
+/// altogether fails here.
+#[test]
+fn context_uncommitted_forked_specs_still_report_divergence() {
+    let p = Project::new("f97-live");
+    forked_specs(&p, 3);
+    let o = p.ok("fresh", &["context", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(
+        v["diverged_branches"]
+            .as_array()
+            .is_some_and(|d| !d.is_empty()),
+        "uncommitted forked specs no longer reported: {}",
+        v["diverged_branches"]
+    );
+}
+
+/// Finding 97: a clean repo whose 26 committed specs each left a forked seal
+/// chain (this repo's shape) reports risk low and no converge (or any
+/// high-priority) next action, in brief, toon and json, scoped and not.
+/// Doctor is clean, nothing is committable, so there is no next action.
+#[test]
+fn context_clean_repo_with_26_committed_chains_is_risk_low_no_converge() {
+    let p = Project::new("f97");
+    forked_specs(&p, 26);
+    p.ok("human", &["finish", "-y", "--no-check"]);
+    p.assert_clean("fresh", "after finish of 26 specs");
+    for (view, text) in context_views(&p) {
+        let lower = text.to_lowercase();
+        assert!(
+            !lower.contains("converge-all"),
+            "{view}: converge suggested:\n{text}"
+        );
+        assert!(
+            !lower.contains("diverged branch"),
+            "{view}: divergence reported:\n{text}"
+        );
+        if view.starts_with("json") {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if let Some(r) = v.get("integration_risk") {
+                assert_eq!(r["level"], "low", "{view}: {r}");
+            }
+            assert!(
+                v["recommended_action"].is_null(),
+                "{view}: next action on a clean repo: {}",
+                v["recommended_action"]
+            );
+            if let Some(d) = v.get("diverged_branches") {
+                assert!(d.as_array().map_or(true, |a| a.is_empty()), "{view}: {d}");
+            }
+        } else {
+            for l in text.lines().map(str::trim) {
+                assert!(
+                    !(l.starts_with("level:") && !l.ends_with("low")),
+                    "{view}: risk not low: {l}\n{text}"
+                );
+                assert!(
+                    !l.starts_with("action:") && !l.starts_with("priority: high"),
+                    "{view}: next action on a clean repo: {l}\n{text}"
+                );
+            }
+        }
+    }
+}
+
+/// Every surface an agent or human reads the doctor state from.
+fn safe_surfaces(p: &Project, agent: &str) -> Vec<(String, String)> {
+    let mut out = context_views(p);
+    for args in [
+        &["doctor"][..],
+        &["doctor", "--format", "json"][..],
+        &["status"][..],
+    ] {
+        let o = p.writ(agent, args);
+        out.push((
+            format!("writ {}", args.join(" ")),
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&o.stdout),
+                String::from_utf8_lossy(&o.stderr)
+            ),
+        ));
+    }
+    out
+}
+
+fn assert_never_safe(p: &Project, agent: &str, when: &str) {
+    for (surface, text) in safe_surfaces(p, agent) {
+        assert!(
+            !text.to_lowercase().contains(SAFE),
+            "{when}: '{SAFE}' on `{surface}`:\n{text}"
+        );
+    }
+}
+
+fn newest_seal(p: &Project) -> String {
+    let log = p.ok(
+        "human",
+        &["log", "--all", "--format", "json", "--limit", "1"],
+    );
+    let v: serde_json::Value = serde_json::from_slice(&log.stdout).unwrap();
+    v[0]["id"].as_str().unwrap().to_string()
+}
+
+fn doctor_survival(p: &Project, agent: &str) -> (Option<i32>, serde_json::Value, String) {
+    let j = p.writ(agent, &["doctor", "--survival", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&j.stdout).unwrap_or_else(|e| {
+        panic!(
+            "doctor --survival --format json: {e}\n{}{}",
+            String::from_utf8_lossy(&j.stdout),
+            String::from_utf8_lossy(&j.stderr)
+        )
+    });
+    assert_no_destructive_fixes(&v);
+    let h = p.writ(agent, &["doctor", "--survival"]);
+    let human = format!(
+        "{}{}",
+        String::from_utf8_lossy(&h.stdout),
+        String::from_utf8_lossy(&h.stderr)
+    );
+    (j.status.code(), v, human)
+}
+
+// -- Variant B under the override rule (CC, sprint 4) and finding 102 ------
+//
+// Rule: an own-line removal under the spec's own override (`--allow-removals`
+// or `--force`) is intentional and clean, unless the override's replacement
+// content is or becomes another spec's sealed content: then survival reports a
+// yellow "override captured another spec's version" naming both specs, with
+// needs_human and the fix `writ finish --accept-removals <seal>`, not blocking
+// on its own. Without an override and without an informed base, a loss is red
+// and finish refuses (the tier's primary catch).
+
+const AGENT_A: &str = "agent-alpha";
+const AGENT_B: &str = "agent-bravo";
+
+/// 40 numbered lines with `suffix` appended to the given line numbers.
+fn numbered(edits: &[(usize, &str)]) -> String {
+    (0..40)
+        .map(|i| match edits.iter().find(|(n, _)| *n == i) {
+            Some((_, sfx)) => format!("line {i} {sfx}\n"),
+            None => format!("line {i}\n"),
+        })
+        .collect()
+}
+
+fn out_text(o: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    )
+}
+
+/// `shared.txt` (40 numbered lines) sealed by a setup spec and committed by
+/// finish, so writ knows the base exactly as it would after real work.
+fn shared_base(p: &Project) {
+    p.spec("setup", "human");
+    p.write("shared.txt", &numbered(&[]));
+    p.seal("human", "setup", "shared.txt");
+    p.ok(
+        "human",
+        &["spec", "done", "setup", "--agent", "human", "--no-seal"],
+    );
+    p.ok("human", &["finish", "-y", "--no-check"]);
+    assert_eq!(p.git_ok(&["show", "HEAD:shared.txt"]), numbered(&[]));
+}
+
+/// Committed `shared.txt`; spec sa claimed by AGENT_A, sb by AGENT_B (when
+/// `with_b`); sa seals "line 2 A". Returns the project and that seal's id.
+fn shared_with_a_line(tag: &str, with_b: bool) -> (Project, String) {
+    let p = Project::new(tag);
+    shared_base(&p);
+    p.spec("sa", AGENT_A);
+    if with_b {
+        p.spec("sb", AGENT_B);
+    }
+    p.write("shared.txt", &numbered(&[(2, "A")]));
+    p.seal(AGENT_A, "sa", "shared.txt");
+    let added = newest_seal(&p);
+    (p, added)
+}
+
+fn seal_shared(p: &Project, agent: &str, spec: &str, extra: &[&str]) -> Output {
+    let mut args = vec![
+        "seal",
+        "-s",
+        "work",
+        "--agent",
+        agent,
+        "--spec",
+        spec,
+        "--paths",
+        "shared.txt",
+    ];
+    args.extend_from_slice(extra);
+    p.writ(agent, &args)
+}
+
+/// The override context a seal record carries (finding 102): any field whose
+/// name contains "override", serialized.
+fn override_context(p: &Project, seal: &str) -> String {
+    let o = p.ok("human", &["show", seal, "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    v.as_object()
+        .unwrap()
+        .iter()
+        .filter(|(k, _)| k.contains("override"))
+        .map(|(_, x)| x.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The variant B shape where the other spec sealed: a seals "line 2 A"; b
+/// seals its own version of the file (without a's line); a keeps working on
+/// top of b's version and seals. Today that seal passes silently and a's line
+/// never reaches the commit while survival says "safe to finish" (Bri probe,
+/// 2026-10-11). Finding 102: the seal is refused, naming the other agent that
+/// touched the file since a's last seal and both choices.
+fn b_sealed_then_a_seals_on_top(tag: &str) -> (Project, String, Output) {
+    let (p, added) = shared_with_a_line(tag, true);
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    p.write("shared.txt", &numbered(&[(10, "A2"), (30, "B")]));
+    let refused = seal_shared(&p, AGENT_A, "sa", &[]);
+    (p, added, refused)
+}
+
+#[test]
+fn variant_b_seal_refusal_names_other_agent_and_both_choices() {
+    let (p, _added, refused) = b_sealed_then_a_seals_on_top("f102-refusal");
+    let text = out_text(&refused);
+    assert!(
+        !refused.status.success(),
+        "a's seal on top of b's version passed:\n{text}"
+    );
+    assert!(text.contains("line 2 A"), "lost line not named:\n{text}");
+    assert!(text.contains(AGENT_B), "other agent not named:\n{text}");
+    let lower = text.to_lowercase();
+    assert!(
+        lower.contains("keep"),
+        "'keep my lines' choice missing:\n{text}"
+    );
+    assert!(
+        lower.contains("accept"),
+        "'accept {AGENT_B}'s version' choice missing:\n{text}"
+    );
+    assert!(
+        text.contains("--allow-removals shared.txt"),
+        "override command for the path missing:\n{text}"
+    );
+    assert!(!text.contains("--force"), "refusal offers --force:\n{text}");
+    let _ = p;
+}
+
+/// Finding 102: after the refusal, a overrides; the seal record carries the
+/// override context: the path, the other agent and the lines.
+#[test]
+fn variant_b_override_after_refusal_records_context() {
+    let (p, _added, refused) = b_sealed_then_a_seals_on_top("f102-context");
+    assert!(!refused.status.success(), "{}", out_text(&refused));
+    let ov = seal_shared(&p, AGENT_A, "sa", &["--allow-removals", "shared.txt"]);
+    assert!(ov.status.success(), "{}", out_text(&ov));
+    let ctx = override_context(&p, &newest_seal(&p));
+    for want in ["shared.txt", AGENT_B, "line 2 A"] {
+        assert!(
+            ctx.contains(want),
+            "seal override context lacks {want}: {ctx}"
+        );
+    }
+}
+
+/// Finding 102, no other agent: a's own line is gone from disk and the file
+/// holds unsealed text. The refusal says the lines are gone from disk and
+/// names nobody; the override records the path and the lines, no agent.
+#[test]
+fn variant_b_pure_refusal_says_gone_from_disk_and_names_nobody() {
+    let (p, _added) = shared_with_a_line("f102-pure", false);
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    let refused = seal_shared(&p, AGENT_A, "sa", &[]);
+    let text = out_text(&refused);
+    assert!(!refused.status.success(), "{text}");
+    let lower = text.to_lowercase();
+    assert!(
+        lower.contains("disk") && (lower.contains("gone") || lower.contains("no longer")),
+        "refusal does not say the lines are gone from disk:\n{text}"
+    );
+    assert!(!lower.contains("another agent"), "names someone:\n{text}");
+    let ov = seal_shared(&p, AGENT_A, "sa", &["--allow-removals", "shared.txt"]);
+    assert!(ov.status.success(), "{}", out_text(&ov));
+    let ctx = override_context(&p, &newest_seal(&p));
+    assert!(
+        ctx.contains("shared.txt") && ctx.contains("line 2 A"),
+        "override context: {ctx}"
+    );
+}
+
+/// The tier sees what the fast tier cannot (Haris's captured shape): b seals
+/// its version first; a writes its line over it and seals; b's version
+/// returns to disk; a closes with `--allow-removals`, recording b's sealed
+/// content under sa. Fast tier clean; survival yellow "override captured
+/// another spec's version" naming both specs, the seal and the line, with
+/// `writ finish --accept-removals <seal12>` in the message and needs_human;
+/// that command, run verbatim, commits and leaves survival clean.
+#[test]
+fn survival_captured_override_is_yellow_naming_both_and_accept_clears() {
+    let p = Project::new("surv-captured");
+    shared_base(&p);
+    p.spec("sa", AGENT_A);
+    p.spec("sb", AGENT_B);
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    p.write("shared.txt", &numbered(&[(2, "A"), (30, "B")]));
+    p.seal(AGENT_A, "sa", "shared.txt");
+    let added = newest_seal(&p);
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    p.ok(
+        AGENT_A,
+        &[
+            "spec",
+            "done",
+            "sa",
+            "--agent",
+            AGENT_A,
+            "-s",
+            "done",
+            "--paths",
+            "shared.txt",
+            "--allow-removals",
+            "shared.txt",
+        ],
+    );
+    let override_seal = newest_seal(&p);
+    assert_ne!(override_seal, added, "the close recorded no seal");
+    p.ok(
+        AGENT_B,
+        &["spec", "done", "sb", "--agent", AGENT_B, "--no-seal"],
+    );
+    p.assert_clean("human", "fast tier, captured override");
+
+    let (code, v, human) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(1), "a yellow is a finding:\n{v:#}");
+    let f = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["check"] == CHECK_SURVIVAL)
+        .cloned()
+        .unwrap_or_else(|| panic!("captured override not reported:\n{v:#}"));
+    assert_eq!(f["severity"], "yellow", "{f:#}");
+    let msg = f["message"].as_str().unwrap();
+    assert!(
+        msg.contains("override captured another spec's version"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("'sa'") || msg.contains(" sa"),
+        "sa not named: {msg}"
+    );
+    assert!(
+        msg.contains("'sb'") || msg.contains(" sb"),
+        "sb not named: {msg}"
+    );
+    assert!(msg.contains("line 2 A"), "line not named: {msg}");
+    let accept = format!("writ finish --accept-removals {}", &override_seal[..12]);
+    assert!(msg.contains(&accept), "message lacks `{accept}`: {msg}");
+    assert_eq!(f["needs_human"], true, "{f:#}");
+    assert!(!msg.contains("--force"), "{msg}");
+    assert!(!human.to_lowercase().contains(SAFE), "{human}");
+    assert_never_safe(&p, "human", "captured override (yellow)");
+
+    let head = p.head();
+    let out = p.cmd("sh", "human").args(["-c", &accept]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "`{accept}` failed:\n{}",
+        out_text(&out)
+    );
+    assert_ne!(p.head(), head, "accept did not commit");
+    let (code, v, _) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(0), "after `{accept}`:\n{v:#}");
+}
+
+/// The designed residual: pure variant B. b claims and leaves its version on
+/// disk unsealed; a's seal is refused, a overrides with `--allow-removals`;
+/// b never seals. Intentional and clean: survival green with the exact
+/// headline, "safe to finish", and finish commits a's recorded version.
+#[test]
+fn variant_b_pure_override_is_clean_and_safe_to_finish() {
+    let (p, _added) = shared_with_a_line("surv-pure", true);
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    let refused = seal_shared(&p, AGENT_A, "sa", &[]);
+    assert!(!refused.status.success(), "{}", out_text(&refused));
+    let ov = seal_shared(&p, AGENT_A, "sa", &["--allow-removals", "shared.txt"]);
+    assert!(ov.status.success(), "{}", out_text(&ov));
+    let newest = newest_seal(&p);
+    p.ok(
+        AGENT_A,
+        &["spec", "done", "sa", "--agent", AGENT_A, "--no-seal"],
+    );
+    p.ok(AGENT_B, &["spec", "release", "sb", "--agent", AGENT_B]);
+
+    let (code, v, human) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(0), "{v:#}");
+    assert!(v["findings"].as_array().unwrap().is_empty(), "{v:#}");
+    let want = format!(
+        "fast checks clean; survival green as of {}; safe to finish",
+        &newest[..12]
+    );
+    assert_eq!(v["headline"], want.as_str(), "{v:#}");
+    assert!(human.contains(&want), "{human}");
+    let head = p.head();
+    p.ok("human", &["finish", "-y", "--no-check"]);
+    assert_ne!(p.head(), head);
+    assert_eq!(
+        p.git_ok(&["show", "HEAD:shared.txt"]),
+        numbered(&[(30, "B")])
+    );
+}
+
+/// The tier's primary catch: a loss with no record. No override, no sealed
+/// removal: the convergence output finish would commit drops a sealed line
+/// (the merge refuses it). b seals, a seals
+/// on b's tip, b seals again from a stale buffer (its recorded base is its own
+/// first seal, which never held a's line). Today `doctor --survival` says
+/// "survival green; safe to finish" and finish is then refused by the merge
+/// survival check (Bri probe, 2026-10-11): the two must agree. Survival red
+/// names a lost line and the seal that added it, "safe to finish" is absent
+/// everywhere, finish refuses naming the same line, stages nothing, and
+/// records finish_refused/survival_check.
+#[test]
+fn survival_red_without_override_matches_finish_refusal() {
+    let p = Project::new("surv-nooverride");
+    shared_base(&p);
+    p.spec("sa", AGENT_A);
+    p.spec("sb", AGENT_B);
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    p.write("shared.txt", &numbered(&[(5, "alpha-from-a"), (30, "B")]));
+    p.seal(AGENT_A, "sa", "shared.txt");
+    p.write("shared.txt", &numbered(&[(30, "B2")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    for (a, s) in [(AGENT_A, "sa"), (AGENT_B, "sb")] {
+        p.ok(a, &["spec", "done", s, "--agent", a, "--no-seal"]);
+    }
+
+    let (code, v, human) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(1), "{v:#}");
+    let f = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["check"] == CHECK_SURVIVAL && f["severity"] == "red")
+        .cloned()
+        .unwrap_or_else(|| panic!("no red survival finding:\n{v:#}\n{human}"));
+    let msg = f["message"].as_str().unwrap().to_string();
+    assert_never_safe(&p, "human", "survival red, no override");
+
+    let head = p.head();
+    let out = p.writ("human", &["finish", "-y", "--no-check"]);
+    let all = out_text(&out);
+    assert!(!out.status.success(), "finish committed:\n{all}");
+    assert_eq!(p.head(), head);
+    assert!(p
+        .git_ok(&["diff", "--cached", "--name-only"])
+        .trim()
+        .is_empty());
+    let named = ["line 5 alpha-from-a", "line 30 B2"]
+        .into_iter()
+        .filter(|l| msg.contains(l))
+        .collect::<Vec<_>>();
+    assert!(!named.is_empty(), "survival names no lost line: {msg}");
+    for l in &named {
+        assert!(
+            all.contains(l),
+            "finish refusal and survival disagree on {l}:\n{all}"
+        );
+    }
+    assert!(!all.to_lowercase().contains(SAFE), "{all}");
+    let events = fs::read_to_string(p.path(".writ/security/events.jsonl")).unwrap_or_default();
+    assert!(
+        events
+            .lines()
+            .any(|l| l.contains("\"finish_refused\"") && l.contains("survival_check")),
+        "{events}"
+    );
+}
+
+/// Finding 105, positive half (Haris, 20b18b922000): a seals "line 2 A"; b
+/// seals its own version without it; a edits on top of b's version and is
+/// refused (finding 102), closing with no override. Seal-tree convergence
+/// keeps a's line: it reaches HEAD, and the tier and finish both say green.
+#[test]
+fn survival_green_when_convergence_keeps_the_line_finish_commits_it() {
+    let (p, _added) = shared_with_a_line("f105-green", true);
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    p.write("shared.txt", &numbered(&[(10, "A2"), (30, "B")]));
+    let refused = seal_shared(&p, AGENT_A, "sa", &[]);
+    assert!(
+        !refused.status.success(),
+        "finding 102 refusal did not fire:\n{}",
+        out_text(&refused)
+    );
+    p.ok(
+        AGENT_A,
+        &["spec", "done", "sa", "--agent", AGENT_A, "--no-seal"],
+    );
+    p.ok(
+        AGENT_B,
+        &["spec", "done", "sb", "--agent", AGENT_B, "--no-seal"],
+    );
+    for s in log_all(&p) {
+        assert!(
+            s.get("forced").is_none() && s.get("allow_removals").is_none(),
+            "override used: {s}"
+        );
+    }
+    // a's refused edit is still on disk, unsealed; restore the sealed tree.
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+
+    let (code, v, human) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(0), "{v:#}\n{human}");
+    assert!(
+        v["headline"]
+            .as_str()
+            .unwrap()
+            .contains("survival green as of"),
+        "{v:#}"
+    );
+    let out = p.ok("human", &["finish", "-y", "--no-check"]);
+    let all = out_text(&out);
+    let head = p.git_ok(&["show", "HEAD:shared.txt"]);
+    assert!(
+        head.lines().any(|l| l == "line 2 A"),
+        "a's line not committed:\n{head}\n{all}"
+    );
+    assert!(
+        head.lines().any(|l| l == "line 30 B"),
+        "b's line not committed:\n{head}"
+    );
+}
+
+/// Finding 105, red half: a loss with no record. b seals, a seals on b's tip,
+/// b seals again from a stale buffer (its base, b's first seal, never held
+/// a's line). No override, no informed removal of b's own "line 30 B2" in
+/// the merge: the convergence output finish would commit drops it. The tier
+/// is red and counts it (headline never "0 ... lost" next to a lost line),
+/// naming the line and the seal that added it; finish refuses naming both,
+/// stages nothing, and records finish_refused/survival_check.
+#[test]
+fn survival_red_when_the_merge_drops_a_sealed_line_names_line_and_seal() {
+    let p = Project::new("f105-red");
+    shared_base(&p);
+    p.spec("sa", AGENT_A);
+    p.spec("sb", AGENT_B);
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    p.write("shared.txt", &numbered(&[(5, "alpha-from-a"), (30, "B")]));
+    p.seal(AGENT_A, "sa", "shared.txt");
+    p.write("shared.txt", &numbered(&[(30, "B2")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    let b2 = newest_seal(&p);
+    for (a, s) in [(AGENT_A, "sa"), (AGENT_B, "sb")] {
+        p.ok(a, &["spec", "done", s, "--agent", a, "--no-seal"]);
+    }
+    for s in log_all(&p) {
+        assert!(
+            s.get("forced").is_none() && s.get("allow_removals").is_none(),
+            "override used: {s}"
+        );
+    }
+
+    let (code, v, human) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(1), "{v:#}\n{human}");
+    let headline = v["headline"].as_str().unwrap();
+    assert!(headline.contains("survival red"), "{headline}");
+    assert!(
+        !headline.contains("survival red: 0 "),
+        "red headline counts no loss: {headline}"
+    );
+    let f = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["check"] == CHECK_SURVIVAL && f["severity"] == "red")
+        .cloned()
+        .unwrap_or_else(|| panic!("no red survival finding:\n{v:#}"));
+    let msg = f["message"].as_str().unwrap();
+    assert!(msg.contains("line 30 B2"), "{msg}");
+    assert!(msg.contains(&b2[..12]), "adding seal {b2} not named: {msg}");
+    assert!(
+        finding_paths(&f).contains(&"shared.txt".to_string()),
+        "{f:#}"
+    );
+    assert_never_safe(&p, "human", "finding 105 red");
+
+    let head = p.head();
+    let out = p.writ("human", &["finish", "-y", "--no-check"]);
+    let all = out_text(&out);
+    assert!(!out.status.success(), "finish committed the loss:\n{all}");
+    assert_eq!(p.head(), head, "finish moved HEAD");
+    assert!(
+        p.git_ok(&["diff", "--cached", "--name-only"])
+            .trim()
+            .is_empty(),
+        "staged on refusal"
+    );
+    assert!(all.contains("line 30 B2"), "{all}");
+    assert!(
+        all.contains(&b2[..12]),
+        "refusal does not name adding seal {b2}:\n{all}"
+    );
+    assert!(!all.to_lowercase().contains(SAFE), "{all}");
+    let events = fs::read_to_string(p.path(".writ/security/events.jsonl")).unwrap_or_default();
+    assert!(
+        events
+            .lines()
+            .any(|l| l.contains("\"finish_refused\"") && l.contains("survival_check")),
+        "{events}"
+    );
+}
+
+fn log_all(p: &Project) -> Vec<serde_json::Value> {
+    let o = p.ok("human", &["log", "--all", "--format", "json"]);
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    v.as_array().cloned().unwrap_or_default()
+}
+
+/// Finish's merge notice must never claim a line "was kept" that the commit
+/// lacks (Bri probe, 2026-10-11): a seals "line 5 alpha-from-a", b seals the
+/// same line as "line 5 bravo-from-b" on top of it. Whatever finish commits,
+/// a line the output says was kept is in HEAD.
+#[test]
+fn finish_notice_never_claims_a_dropped_line_was_kept() {
+    let p = Project::new("notice-kept");
+    shared_base(&p);
+    p.spec("sa", AGENT_A);
+    p.spec("sb", AGENT_B);
+    p.write("shared.txt", &numbered(&[(5, "alpha-from-a")]));
+    p.seal(AGENT_A, "sa", "shared.txt");
+    p.write("shared.txt", &numbered(&[(5, "bravo-from-b")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    for (a, s) in [(AGENT_A, "sa"), (AGENT_B, "sb")] {
+        p.ok(a, &["spec", "done", s, "--agent", a, "--no-seal"]);
+    }
+    let out = p.writ("human", &["finish", "-y", "--no-check"]);
+    let all = out_text(&out);
+    if !out.status.success() {
+        return; // a refusal makes no claim about the commit
+    }
+    let committed = p.git_ok(&["show", "HEAD:shared.txt"]);
+    for line in all
+        .lines()
+        .filter(|l| l.contains("were kept") || l.contains("was kept"))
+    {
+        for quoted in line.split('"').skip(1).step_by(2) {
+            assert!(
+                committed.lines().any(|c| c == quoted),
+                "notice says {quoted:?} was kept; HEAD lacks it:\n{line}\n--- HEAD ---\n{committed}"
+            );
+        }
+    }
+}
+
+/// Green: two specs on separate files, both done. `writ doctor --survival`
+/// is clean, `survival_last_green` is the newest seal, the headline reads
+/// "fast checks clean; survival green as of <seal>", and only then does
+/// "safe to finish" appear. finish commits both.
+#[test]
+fn survival_tier_green_passes_and_is_the_only_safe_to_finish() {
+    let p = Project::new("surv-green");
+    p.spec("sa", "a");
+    p.spec("sb", "b");
+    p.write("a.txt", "a1\n");
+    p.write("b.txt", "b1\n");
+    p.seal("a", "sa", "a.txt");
+    p.seal("b", "sb", "b.txt");
+    for (a, s) in [("a", "sa"), ("b", "sb")] {
+        p.ok(a, &["spec", "done", s, "--agent", a, "--no-seal"]);
+    }
+    let newest = newest_seal(&p);
+    let (code, v, human) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(0), "{v:#}");
+    assert_eq!(v["clean"], true, "{v:#}");
+    let green = v["survival_last_green"].as_str().unwrap_or("");
+    assert!(
+        !green.is_empty() && (newest.starts_with(green) || green.starts_with(&newest[..12])),
+        "survival_last_green {green:?} is not the newest seal {newest}"
+    );
+    let headline = v["headline"].as_str().unwrap();
+    assert!(
+        headline.starts_with("fast checks clean; survival green as of ")
+            && headline.contains(&newest[..12]),
+        "{headline}"
+    );
+    assert!(
+        human.to_lowercase().contains(SAFE),
+        "positive case missing:\n{human}"
+    );
+    let head = p.head();
+    p.ok("human", &["finish", "-y", "--no-check"]);
+    assert_ne!(p.head(), head);
+    assert_eq!(p.git_ok(&["show", "HEAD:a.txt"]), "a1\n");
+    assert_eq!(p.git_ok(&["show", "HEAD:b.txt"]), "b1\n");
+}
+
+/// "safe to finish" is absent when survival is unavailable (never run),
+/// stale (a seal after the last green), or red, on every surface: doctor
+/// human and json, context brief, toon and json (scoped and not), status.
+#[test]
+fn safe_to_finish_absent_when_survival_unavailable_or_stale() {
+    let p = Project::new("surv-honesty");
+    p.spec("sa", "a");
+    p.write("a.txt", "a1\n");
+    p.seal("a", "sa", "a.txt");
+    p.ok("a", &["spec", "done", "sa", "--agent", "a", "--no-seal"]);
+    // unavailable: the survival tier has never run here
+    let (_, v) = p.doctor("human");
+    assert!(v["survival_last_green"].is_null(), "{v:#}");
+    assert_never_safe(&p, "human", "survival never run");
+    // green, then stale: a new seal after the green result
+    let (code, v, _) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(0), "{v:#}");
+    p.spec("sb", "b");
+    p.write("b.txt", "b1\n");
+    p.seal("b", "sb", "b.txt");
+    let (_, v) = p.doctor("human");
+    let green = v["survival_last_green"].as_str().unwrap_or("");
+    let newest = newest_seal(&p);
+    assert!(
+        !newest.starts_with(green) || green.is_empty(),
+        "survival_last_green claims the newest seal {newest} without a run"
+    );
+    assert_never_safe(&p, "human", "survival stale (seal after last green)");
 }
 
 // ---------------------------------------------------------------------------

@@ -103,7 +103,10 @@ fn seal_capturing_another_agents_version_is_refused() {
 
     let err = f.seal("a", "sa").unwrap_err();
 
-    let WritError::OwnLinesRemoved { spec_id, losses } = &err else {
+    let WritError::OwnLinesRemoved {
+        spec_id, losses, ..
+    } = &err
+    else {
         panic!("expected OwnLinesRemoved, got {err:?}");
     };
     assert_eq!(spec_id, "sa");
@@ -807,15 +810,31 @@ fn refusal_events(f: &Fixture) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// The file as it stands when sa starts in the finding 69 tests: genesis
+/// plus a line spec sc sealed since ("line 35 C"). A live file always
+/// carries recent lines; they are the evidence (finding 105, third
+/// clause). With every other line genesis-old, no content rule can tell a
+/// targeted removal of sa's inserted lines from a stale copy, and the
+/// recorded base (the shared index) is not evidence.
+fn recent_base(f: &Fixture) -> String {
+    f.repo
+        .add_spec(&Spec::new("sc".into(), "sc".into(), String::new()))
+        .unwrap();
+    let text = with_edit(&base_text(), 35, "C");
+    f.write(&text);
+    f.seal("c", "sc").unwrap();
+    text
+}
+
 /// Allowance (a), finding 69 as Bri hit it (`ac795e106e2b`): sa added five
 /// `#[ignore]` lines; sb's later seal continued sa's version and removed
-/// them (sb's recorded base held them). sa's disk copy is sb's version plus
+/// them, keeping sc's line (it saw sa's seal). sa's disk copy is sb's version plus
 /// sa's new test: the removal is already sealed by a newer seal of another
 /// spec, so sa seals without --force.
 #[test]
 fn cross_spec_removal_already_sealed_is_not_refused() {
     let f = Fixture::new();
-    let base = base_text();
+    let base = recent_base(&f);
     f.write(&with_ignore_markers(&base));
     f.seal("a", "sa").unwrap();
     let unignored = with_edit(&base, 30, "B");
@@ -834,7 +853,7 @@ fn cross_spec_removal_already_sealed_is_not_refused() {
 #[test]
 fn cross_spec_removal_excuses_only_the_copies_it_removed() {
     let f = Fixture::new();
-    let base = base_text();
+    let base = recent_base(&f);
     let marked = with_ignore_markers(&base);
     f.write(&marked);
     f.seal("a", "sa").unwrap();
@@ -880,7 +899,7 @@ fn cross_spec_removal_excuses_only_the_copies_it_removed() {
 #[test]
 fn older_cross_spec_removal_excuses_only_when_its_spec_is_committed() {
     let f = Fixture::new();
-    let base = base_text();
+    let base = recent_base(&f);
     let marked = with_ignore_markers(&base);
     f.write(&marked);
     f.seal("a", "sa").unwrap();

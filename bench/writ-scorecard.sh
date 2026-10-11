@@ -4,11 +4,15 @@
 # Usage: bench/writ-scorecard.sh [--hurdles] [REPO_DIR] [WRIT_BIN]
 #   REPO_DIR defaults to the repo containing this script; WRIT_BIN defaults to `writ`.
 #   --hurdles prints only the hurdle ratio section (fast; no analytics or bench).
+#   --hurdles-records prints the records-only hurdle ratio per spec set (sprint 4):
+#     seal record fields and refusal events only, no log markers, no ledger.
 #   Bench section uses bench/context/results/latest.md, else the newest baseline-*.md.
 set -euo pipefail
 
 HURDLES_ONLY=0
+RECORDS_ONLY=0
 if [[ "${1:-}" == "--hurdles" ]]; then HURDLES_ONLY=1; shift; fi
+if [[ "${1:-}" == "--hurdles-records" ]]; then RECORDS_ONLY=1; shift; fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="${1:-$ROOT}"
 WRIT="${2:-writ}"
@@ -43,7 +47,7 @@ sprints = sorted(
     (start, name) for name, start in (
         kv.split("=", 1) for kv in os.environ.get(
             "WRIT_SPRINTS",
-            "sprint-1=2026-10-04T00:00:00Z,sprint-2=2026-10-05T03:00:00Z,sprint-3=2026-10-05T21:00:00Z",
+            "sprint-1=2026-10-04T00:00:00Z,sprint-2=2026-10-05T03:00:00Z,sprint-3=2026-10-05T21:00:00Z,sprint-4=2026-10-11T04:00:00Z",
         ).split(",") if kv))
 
 def sprint_of(ts):
@@ -163,6 +167,92 @@ print()
 PY
 }
 
+# --- Records-only hurdle ratio (sprint 4, harness-0-4-1) ----------------------
+# Trusts only what writ itself wrote: `forced` and `allow_removals` on seal
+# records (`writ log --all --format json`) and `seal_refused` / `finish_refused`
+# events in .writ/security/events.jsonl, attributed by their `specs` field.
+# No summary markers, no ledger. Spec sets come from WRIT_HURDLE_SPECS:
+#   "sprint-3=a,b,c;sprint-4=d,e" (default: sprint 3 and sprint 4's four specs).
+# An event naming no spec of any set is reported as unattributed.
+hurdles_records_section() {
+    local log_json
+    log_json="$(cd "$REPO" && "$WRIT" log --all --format json 2>/dev/null)" || { echo "scorecard: writ log failed" >&2; return 2; }
+    LOG_JSON="$log_json" REPO_DIR="$REPO" python3 - <<'PY'
+import collections, json, os
+from pathlib import Path
+
+repo = Path(os.environ["REPO_DIR"])
+sets = {}
+for part in os.environ.get(
+        "WRIT_HURDLE_SPECS",
+        "sprint-3=doctor-core,doctor-harness,doctor-ops,survival-allowances;"
+        "sprint-4=stale-release,survival-tier,ci-and-hooks,harness-0-4-1").split(";"):
+    if "=" in part:
+        name, specs = part.split("=", 1)
+        sets[name.strip()] = [s.strip() for s in specs.split(",") if s.strip()]
+spec_set = {s: name for name, specs in sets.items() for s in specs}
+seals = json.loads(os.environ["LOG_JSON"])
+KINDS = ("seals", "forced", "allow_removals", "seal_refused", "finish_refused")
+by = collections.defaultdict(collections.Counter)
+unattributed = collections.Counter()
+for s in seals:
+    sp = s.get("spec_id")
+    if sp not in spec_set:
+        continue
+    c = by[sp]
+    c["seals"] += 1
+    c["forced"] += bool(s.get("forced"))
+    c["allow_removals"] += bool(s.get("allow_removals"))
+ev = repo / ".writ" / "security" / "events.jsonl"
+if ev.exists():
+    for line in ev.read_text(errors="replace").splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        kind = e.get("event_type")
+        if kind not in ("seal_refused", "finish_refused"):
+            continue
+        hit = [sp for sp in e.get("specs") or [] if sp in spec_set]
+        if not hit:
+            unattributed[kind] += 1
+        for sp in hit:
+            by[sp][kind] += 1
+print("## Hurdle ratio (records only)")
+print()
+print("Sources: seal record fields `forced`, `allow_removals`; `seal_refused`/`finish_refused` "
+      "events by `specs`. No log markers, no ledger.")
+print()
+print("| set | spec | " + " | ".join(KINDS) + " | hurdles | per 10 seals |")
+print("|---|---|" + "---:|" * (len(KINDS) + 2))
+totals = {}
+for name, specs in sets.items():
+    tot = collections.Counter()
+    for sp in specs:
+        c = by[sp]; tot.update(c)
+        h = sum(c[k] for k in KINDS[1:])
+        rate = f"{10 * h / c['seals']:.1f}" if c["seals"] else "n/a"
+        print(f"| {name} | {sp} | " + " | ".join(str(c[k]) for k in KINDS) + f" | {h} | {rate} |")
+    h = sum(tot[k] for k in KINDS[1:])
+    totals[name] = (h, tot["seals"])
+for name, (h, n) in totals.items():
+    print(f"- {name}: {h} hurdles over {n} seals" + (f" ({10 * h / n:.1f} per 10)" if n else ""))
+print(f"- unattributed refusal events: {dict(unattributed) or 0}")
+names = list(totals)
+if len(names) >= 2:
+    (h0, n0), (h1, n1) = totals[names[-2]], totals[names[-1]]
+    if n0 and n1 and h0:
+        print(f"- {names[-1]} vs {names[-2]} per 10 seals: {(h1 / n1) / (h0 / n0):.2f}x")
+    else:
+        print(f"- {names[-1]} vs {names[-2]}: ratio undefined ({names[-2]} {h0}/{n0}, {names[-1]} {h1}/{n1})")
+print()
+PY
+}
+
+if [[ $RECORDS_ONLY -eq 1 ]]; then
+    hurdles_records_section
+    exit $?
+fi
 if [[ $HURDLES_ONLY -eq 1 ]]; then
     hurdles_section
     exit $?

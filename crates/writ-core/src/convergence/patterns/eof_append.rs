@@ -41,12 +41,12 @@ impl Pattern for EofAppend {
                 .region
                 .left_units
                 .get(i)
-                .map_or(false, |u| u.content.trim() == base_unit.content.trim());
+                .is_some_and(|u| u.content.trim() == base_unit.content.trim());
             let right_match = conflict
                 .region
                 .right_units
                 .get(i)
-                .map_or(false, |u| u.content.trim() == base_unit.content.trim());
+                .is_some_and(|u| u.content.trim() == base_unit.content.trim());
 
             if !left_match || !right_match {
                 return None;

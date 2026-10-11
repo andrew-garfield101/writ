@@ -257,6 +257,7 @@ mod tests {
             convergence: None,
             forced: false,
             allow_removals: Vec::new(),
+            override_context: Vec::new(),
         }
     }
 

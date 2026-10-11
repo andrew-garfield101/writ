@@ -456,6 +456,12 @@ impl Repository {
     /// When enabled, sealing to a spec claimed by a different agent returns
     /// `WritError::SealClaimConflict`. When disabled (default), the seal
     /// succeeds with a `CLAIM:` warning naming the owner.
+    /// True under `[security] claim_enforcement = "strict"` (or after
+    /// [`Repository::set_enforce_claims`]).
+    pub fn claims_strict(&self) -> bool {
+        self.enforce_claims
+    }
+
     pub fn set_enforce_claims(&mut self, enforce: bool) {
         self.enforce_claims = enforce;
     }
@@ -811,6 +817,7 @@ impl Repository {
             status,
             verification,
             allow_empty,
+            &[],
             |_| true,
         )
     }
@@ -1209,15 +1216,44 @@ impl Repository {
                 return Err(e);
             }
         }
+        // Finding 102: losses on paths named with --allow-removals are
+        // recorded on the seal as override context; any other loss refuses,
+        // naming who else worked on the file.
+        let mut override_context = Vec::new();
         if let (Some(sid), false) = (spec_id.as_deref(), self.allow_own_line_removal) {
-            let losses = self.own_line_losses(sid, selected, &index)?;
-            if !losses.is_empty() {
+            let (allowed, refused): (Vec<_>, Vec<_>) = self
+                .own_line_losses(sid, selected, &index)?
+                .into_iter()
+                .partition(|l| self.allow_removal_paths.contains(&l.path));
+            if !refused.is_empty() {
+                let mut other_agents = BTreeSet::new();
+                let mut added_by = Vec::new();
+                for l in &refused {
+                    let (others, by) = self.loss_context(sid, &agent.id, l)?;
+                    other_agents.extend(others);
+                    for id in by {
+                        if !added_by.contains(&id) {
+                            added_by.push(id);
+                        }
+                    }
+                }
                 let err = WritError::OwnLinesRemoved {
                     spec_id: sid.to_string(),
-                    losses,
+                    losses: refused,
+                    other_agents: other_agents.into_iter().collect(),
+                    added_by,
                 };
                 self.note_seal_refusal(Some(sid), &agent.id, &changed_paths, &err);
                 return Err(err);
+            }
+            for l in allowed {
+                let (other_agents, added_by) = self.loss_context(sid, &agent.id, &l)?;
+                override_context.push(crate::seal::OverrideContext {
+                    path: l.path,
+                    other_agents,
+                    lines: l.lines,
+                    added_by,
+                });
             }
         }
 
@@ -1314,6 +1350,7 @@ impl Repository {
         let mut allowed: Vec<String> = self.allow_removal_paths.iter().cloned().collect();
         allowed.sort();
         seal.allow_removals = allowed;
+        seal.override_context = override_context;
 
         let ks = KeyStore::open(&self.writ_dir);
         let signing_key = ks.load_agent_signing_key(&seal.agent.id).ok();
@@ -1362,12 +1399,13 @@ impl Repository {
             }
         };
         // Deleting a whole file is an explicit act, not the sweep shape
-        // (another agent's content captured from disk); allowed.
+        // (another agent's content captured from disk); allowed. Paths named
+        // with --allow-removals are checked too: the caller records their
+        // losses as override context instead of refusing (finding 102).
         let checked: Vec<&state::FileState> = selected
             .iter()
             .copied()
             .filter(|f| !matches!(f.status, FileStatus::Deleted))
-            .filter(|f| !self.allow_removal_paths.contains(&f.path))
             .filter(|f| own.get(&f.path).is_some_and(|v| v.last_new.is_some()))
             .collect();
         if checked.is_empty() {
@@ -1401,7 +1439,17 @@ impl Repository {
             else {
                 continue;
             };
-            let (Some(base), Some(last)) = (text(&v.first_old)?, text(&v.last_new)?) else {
+            // Finding 106: a first seal that recorded the file as new to
+            // writ may still have a base outside writ (git, the genesis
+            // snapshot); own additions are measured against it.
+            let first_old = match &v.first_old {
+                Some(h) => text(&Some(h.clone()))?,
+                None => Some(
+                    self.baseline_text(&spec, &file_state.path, v.times.first().copied())?
+                        .unwrap_or_default(),
+                ),
+            };
+            let (Some(base), Some(last)) = (first_old, text(&v.last_new)?) else {
                 continue;
             };
             let elsewhere: Vec<&str> = recorded
@@ -1447,7 +1495,44 @@ impl Repository {
                 Some(ref o) => o,
                 None => others.insert(self.other_spec_seals(spec_id)?),
             };
-            let excused = self.cross_spec_removals(others, &file_state.path, since)?;
+            // Finding 105: the spec's own steps of the path, (previous own
+            // version, what it sealed), oldest first, for saw_addition.
+            let mut step_texts: Vec<(String, String)> = Vec::with_capacity(v.changes.len());
+            let mut prev = base.clone();
+            for (_, new_hash) in &v.changes {
+                let sealed_text = text(new_hash)?.unwrap_or_default();
+                step_texts.push((prev, sealed_text.clone()));
+                prev = sealed_text;
+            }
+            let steps: Vec<(&str, &str)> = step_texts
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
+            let in_base: HashSet<&str> = base.lines().collect();
+            // The path's earliest known version across every spec's seals:
+            // the oldest change's old blob, else its new blob.
+            let earliest = others
+                .iter()
+                .map(|(_, s)| s)
+                .chain(seals.iter())
+                .flat_map(|s| {
+                    s.changes
+                        .iter()
+                        .filter(|c| c.path == file_state.path)
+                        .map(move |c| (s.timestamp, c))
+                })
+                .min_by_key(|(t, _)| *t)
+                .and_then(|(_, c)| c.old_hash.clone().or_else(|| c.new_hash.clone()));
+            let genesis_text = text(&earliest)?.unwrap_or_default();
+            let genesis: HashSet<&str> = genesis_text.lines().collect();
+            let excused = self.cross_spec_removals(
+                others,
+                &file_state.path,
+                since,
+                &steps,
+                &in_base,
+                &genesis,
+            )?;
             let l = if excused.is_empty() {
                 Some(first)
             } else {
@@ -1467,6 +1552,91 @@ impl Repository {
             }
         }
         Ok(losses)
+    }
+
+    /// The version of `path` a spec started from when its first seal of the
+    /// path recorded no earlier writ version (finding 106): the spec's
+    /// genesis snapshot if it holds the path, else the blob in the newest
+    /// git commit on HEAD's first-parent line made at or before `first_seal`
+    /// (files that predate `writ init` or arrived by a plain git commit).
+    /// None when neither has the path (a file the spec created) or the
+    /// content is binary.
+    pub fn baseline_text(
+        &self,
+        spec: &Spec,
+        path: &str,
+        first_seal: Option<DateTime<Utc>>,
+    ) -> WritResult<Option<String>> {
+        let bytes = match self.baseline_source(Some(spec), path, first_seal)? {
+            Some(Baseline::Stored(hash)) => self.objects.retrieve(&hash)?,
+            Some(Baseline::Git(bytes)) => bytes,
+            None => return Ok(None),
+        };
+        Ok((!crate::diff::is_binary(&bytes)).then(|| String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    /// Lookup for [`Self::baseline_text`] (also the survival audit's base when
+    /// no writ seal precedes a path). Read-only: never writes to the store.
+    /// In order: the spec's genesis snapshot, the last bridge import's tree,
+    /// git (the newest HEAD first-parent commit at or before `at`).
+    fn baseline_source(
+        &self,
+        spec: Option<&Spec>,
+        path: &str,
+        at: Option<DateTime<Utc>>,
+    ) -> WritResult<Option<Baseline>> {
+        let genesis = spec.and_then(|s| s.genesis_tree.clone());
+        let bridge = self.bridge_epoch_and_tree().1;
+        for tree in genesis.iter().chain(bridge.iter()) {
+            if let Ok(index) = self.load_tree_index(tree) {
+                if let Some(entry) = index.entries.get(path) {
+                    return Ok(Some(Baseline::Stored(entry.hash.clone())));
+                }
+            }
+        }
+        Ok(git_blob_at_or_before(&self.root, path, at).map(Baseline::Git))
+    }
+
+    /// For a loss of `spec_id`'s lines in one path (finding 102): the other
+    /// agents who worked on the path since the spec's last seal of it
+    /// ([`crate::doctor::other_touchers`]) and the spec's seals that added
+    /// the lost lines (full ids, oldest first).
+    fn loss_context(
+        &self,
+        spec_id: &str,
+        agent: &str,
+        loss: &convergence::survival::SurvivalLoss,
+    ) -> WritResult<(Vec<String>, Vec<String>)> {
+        let mut since: Option<DateTime<Utc>> = None;
+        let mut added_by: Vec<String> = Vec::new();
+        let mut unattributed: Vec<&str> = loss.lines.iter().map(String::as_str).collect();
+        let text = |hash: &Option<String>| -> WritResult<String> {
+            match hash {
+                None => Ok(String::new()),
+                Some(h) => Ok(String::from_utf8_lossy(&self.objects.retrieve(h)?).into_owned()),
+            }
+        };
+        let mut seals = self.spec_seals(spec_id)?;
+        seals.sort_by_key(|s| s.timestamp);
+        for seal in seals {
+            for c in seal.changes.iter().filter(|c| c.path == loss.path) {
+                since = Some(since.map_or(seal.timestamp, |t| t.max(seal.timestamp)));
+                if unattributed.is_empty() {
+                    continue;
+                }
+                let old = text(&c.old_hash)?;
+                let new = text(&c.new_hash)?;
+                let before: HashSet<&str> = old.lines().collect();
+                let after: HashSet<&str> = new.lines().collect();
+                let n = unattributed.len();
+                unattributed.retain(|l| !(after.contains(l) && !before.contains(l)));
+                if unattributed.len() < n && !added_by.contains(&seal.id) {
+                    added_by.push(seal.id.clone());
+                }
+            }
+        }
+        let others = crate::doctor::other_touchers(self, &loss.path, spec_id, agent, since)?;
+        Ok((others, added_by))
     }
 
     /// Every seal of every spec other than `spec_id`, with whether its spec
@@ -1497,6 +1667,9 @@ impl Repository {
         others: &[(bool, Seal)],
         path: &str,
         since: DateTime<Utc>,
+        steps: &[(&str, &str)],
+        in_base: &HashSet<&str>,
+        genesis: &HashSet<&str>,
     ) -> WritResult<HashMap<String, usize>> {
         let mut excused: HashMap<String, usize> = HashMap::new();
         for (committed, seal) in others {
@@ -1520,6 +1693,15 @@ impl Repository {
                     String::from_utf8_lossy(&new).into_owned(),
                 );
                 for (line, n) in convergence::survival::informed_removals(&old, &new) {
+                    // Finding 105: the recorded base is the shared index, so
+                    // "its base held the line" can be true in the record and
+                    // false in fact; excuse only if this seal saw the own
+                    // seal that added the line.
+                    if !convergence::survival::remover_saw(
+                        &old, &new, line, steps, in_base, genesis,
+                    ) {
+                        continue;
+                    }
                     *excused.entry(line.to_string()).or_insert(0) += n;
                 }
             }
@@ -2277,6 +2459,34 @@ impl Repository {
         })
     }
 
+    /// Ids of specs committed (or pushed) to git. Their seals are history:
+    /// they are not diverged branches and do not feed `integration_risk`
+    /// (finding 97).
+    pub fn committed_spec_ids(&self) -> WritResult<HashSet<String>> {
+        Ok(Self::committed_ids_of(&self.list_specs()?))
+    }
+
+    fn committed_ids_of(specs: &[Spec]) -> HashSet<String> {
+        use crate::spec::CommitState;
+        specs
+            .iter()
+            .filter(|s| matches!(s.commit_state, CommitState::Committed | CommitState::Pushed))
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
+    /// Seals that are live work: not part of a committed spec (finding 97).
+    fn live_seals<'a>(
+        seals: &'a [Seal],
+        committed: &'a HashSet<String>,
+    ) -> impl Iterator<Item = &'a Seal> + 'a {
+        seals.iter().filter(move |s| {
+            s.spec_id
+                .as_ref()
+                .map_or(true, |id| !committed.contains(id))
+        })
+    }
+
     /// Detect spec branches whose tip seals are not reachable from global HEAD.
     ///
     /// Returns a list of `(spec_id, branch_tip, seal_count)` for each
@@ -2300,10 +2510,16 @@ impl Repository {
             return Ok(Vec::new());
         }
 
+        // Finding 97: a committed spec's chain is history already in git,
+        // not live divergence; it never asks for converge-all.
+        let committed = self.committed_spec_ids()?;
         let mut diverged = Vec::new();
         for entry in fs::read_dir(&heads_dir)? {
             let entry = entry?;
             let spec_id = entry.file_name().to_string_lossy().to_string();
+            if committed.contains(&spec_id) {
+                continue;
+            }
             if let Some(tip) = self.read_spec_head(&spec_id)? {
                 if !head_chain.contains(&tip) {
                     let branch_seals = self.spec_log(&spec_id)?;
@@ -3012,7 +3228,53 @@ impl Repository {
                     spec.id
                 ),
             })?;
+            spec.release_forced = true;
         }
+        spec.clear_claim();
+        spec.updated_at = chrono::Utc::now();
+        self.save_spec(&spec)?;
+        Ok(Some(previous))
+    }
+
+    /// `writ spec release --stale` (finding 91): release another agent's
+    /// claim only with proof its holder is gone (same host, recorded pid
+    /// exited or reused; see [`crate::doctor::stale_verdict`]). Without
+    /// proof it refuses with [`WritError::StaleReleaseRefused`] naming the
+    /// missing evidence; it never falls back to `force`, never marks the
+    /// spec `release_forced` and never writes a force event.
+    ///
+    /// Returns the previous holder, or None when the spec was unclaimed.
+    pub fn spec_release_stale(&self, spec_id: &str, agent_id: &str) -> WritResult<Option<String>> {
+        let mut spec = self.resolve_spec(spec_id)?;
+        let previous = match spec.claimed_by.clone() {
+            None => return Ok(None),
+            Some(holder) if holder == agent_id => {
+                return self.spec_release(spec_id, agent_id, false)
+            }
+            Some(holder) => holder,
+        };
+        let proof = match crate::doctor::stale_verdict_here(&spec) {
+            crate::doctor::StaleVerdict::Gone(proof) => proof,
+            crate::doctor::StaleVerdict::Alive(reason)
+            | crate::doctor::StaleVerdict::Unproven(reason) => {
+                return Err(WritError::StaleReleaseRefused {
+                    spec_id: spec.id.clone(),
+                    holder: previous,
+                    reason,
+                })
+            }
+        };
+        let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
+        logger.emit_event(&crate::security::SecurityEvent {
+            timestamp: chrono::Utc::now(),
+            severity: crate::security::Severity::Info,
+            event_type: "claim_stale_released".to_string(),
+            agent_id: Some(agent_id.to_string()),
+            details: format!(
+                "Agent '{agent_id}' released stale spec '{}' claimed by '{previous}': {proof}",
+                spec.id
+            ),
+        })?;
         spec.clear_claim();
         spec.updated_at = chrono::Utc::now();
         self.save_spec(&spec)?;
@@ -3728,7 +3990,7 @@ impl Repository {
     /// Build file contention map: files touched by 2+ agents.
     ///
     /// Excludes bridge seals. Sorted by agent count descending, capped at 10.
-    fn build_file_contention(seals: &[Seal]) -> Vec<FileContention> {
+    fn build_file_contention<'a>(seals: impl IntoIterator<Item = &'a Seal>) -> Vec<FileContention> {
         use std::collections::HashMap;
 
         // Map: file path → (set of agent IDs, total seal count).
@@ -4141,6 +4403,10 @@ impl Repository {
                 // Walk ALL heads (global + spec branches) for agent activity,
                 // so agents on diverged branches aren't invisible.
                 let all_seals = self.log_all()?;
+                let committed = Self::committed_ids_of(&specs);
+                // Finding 97: `finish` is a next action only when some spec
+                // is complete and not yet committed.
+                let any_committable = specs.iter().any(Spec::is_committable);
                 let agent_activity = Self::build_agent_activity(&all_seals, None);
 
                 // Detect diverged branches and build warnings.
@@ -4166,26 +4432,27 @@ impl Repository {
 
                 let convergence_recommended = !diverged_branches.is_empty();
 
-                let file_scope_violations: Vec<FileScopeViolation> = all_seals
-                    .iter()
-                    .take(seal_limit)
-                    .filter_map(|seal| {
-                        let spec_id = seal.spec_id.as_ref()?;
-                        let changed: Vec<String> =
-                            seal.changes.iter().map(|c| c.path.clone()).collect();
-                        let warning = self.check_file_scope(spec_id, &changed)?;
-                        Some(FileScopeViolation {
-                            seal_id: seal.id[..12].to_string(),
-                            agent_id: seal.agent.id.clone(),
-                            spec_id: spec_id.clone(),
-                            out_of_scope_files: warning.out_of_scope_files,
-                            declared_scope: warning.declared_scope,
+                let file_scope_violations: Vec<FileScopeViolation> =
+                    Self::live_seals(&all_seals, &committed)
+                        .take(seal_limit)
+                        .filter_map(|seal| {
+                            let spec_id = seal.spec_id.as_ref()?;
+                            let changed: Vec<String> =
+                                seal.changes.iter().map(|c| c.path.clone()).collect();
+                            let warning = self.check_file_scope(spec_id, &changed)?;
+                            Some(FileScopeViolation {
+                                seal_id: seal.id[..12].to_string(),
+                                agent_id: seal.agent.id.clone(),
+                                spec_id: spec_id.clone(),
+                                out_of_scope_files: warning.out_of_scope_files,
+                                declared_scope: warning.declared_scope,
+                            })
                         })
-                    })
-                    .collect();
+                        .collect();
 
                 // Build file contention map: files touched by 2+ agents.
-                let file_contention = Self::build_file_contention(&all_seals);
+                let file_contention =
+                    Self::build_file_contention(Self::live_seals(&all_seals, &committed));
 
                 let max_file_agents = file_contention
                     .iter()
@@ -4359,7 +4626,7 @@ impl Repository {
                     result.diverged_branches.len(),
                     &result.integration_risk,
                     &result.seal_nudge,
-                    result.session_complete,
+                    result.session_complete && any_committable,
                 );
 
                 Ok(result)
@@ -4538,6 +4805,7 @@ impl Repository {
                 // Walk ALL heads for agent activity so diverged agents are visible,
                 // filtered to spec-relevant files so agents only see relevant ownership.
                 let all_seals = self.log_all()?;
+                let committed = self.committed_spec_ids()?;
                 let agent_activity = if has_scope_filter {
                     let scope_ref = &file_scope;
                     let scope_fn = |path: &str| -> bool {
@@ -4578,7 +4846,8 @@ impl Repository {
                 let convergence_recommended = !diverged_branches.is_empty();
 
                 // File contention: filter to files in this spec's scope.
-                let all_contention = Self::build_file_contention(&all_seals);
+                let all_contention =
+                    Self::build_file_contention(Self::live_seals(&all_seals, &committed));
                 let file_contention: Vec<FileContention> = if has_scope_filter {
                     let scope_ref = &file_scope;
                     all_contention
@@ -4596,23 +4865,23 @@ impl Repository {
                 };
 
                 // Scope violations: only for this spec's seals.
-                let file_scope_violations: Vec<FileScopeViolation> = all_seals
-                    .iter()
-                    .filter(|s| s.spec_id.as_deref() == Some(spec_id.as_str()))
-                    .take(seal_limit)
-                    .filter_map(|seal| {
-                        let changed: Vec<String> =
-                            seal.changes.iter().map(|c| c.path.clone()).collect();
-                        let warning = self.check_file_scope(&spec_id, &changed)?;
-                        Some(FileScopeViolation {
-                            seal_id: seal.id[..12].to_string(),
-                            agent_id: seal.agent.id.clone(),
-                            spec_id: spec_id.clone(),
-                            out_of_scope_files: warning.out_of_scope_files,
-                            declared_scope: warning.declared_scope,
+                let file_scope_violations: Vec<FileScopeViolation> =
+                    Self::live_seals(&all_seals, &committed)
+                        .filter(|s| s.spec_id.as_deref() == Some(spec_id.as_str()))
+                        .take(seal_limit)
+                        .filter_map(|seal| {
+                            let changed: Vec<String> =
+                                seal.changes.iter().map(|c| c.path.clone()).collect();
+                            let warning = self.check_file_scope(&spec_id, &changed)?;
+                            Some(FileScopeViolation {
+                                seal_id: seal.id[..12].to_string(),
+                                agent_id: seal.agent.id.clone(),
+                                spec_id: spec_id.clone(),
+                                out_of_scope_files: warning.out_of_scope_files,
+                                declared_scope: warning.declared_scope,
+                            })
                         })
-                    })
-                    .collect();
+                        .collect();
 
                 // Integration risk: computed from filtered signals.
                 let max_file_agents = file_contention
@@ -4675,6 +4944,7 @@ impl Repository {
             ContextScope::Agent(agent_id) => {
                 // Agent-scoped context: derive the agent's world from their seals.
                 let all_seals = self.log_all()?;
+                let committed = self.committed_spec_ids()?;
 
                 // 1. Find all specs this agent has worked on.
                 let agent_spec_ids: Vec<String> = {
@@ -4853,7 +5123,8 @@ impl Repository {
                 let convergence_recommended = !diverged_branches.is_empty();
 
                 // 7. File contention: filtered to agent's file scope.
-                let all_contention = Self::build_file_contention(&all_seals);
+                let all_contention =
+                    Self::build_file_contention(Self::live_seals(&all_seals, &committed));
                 let file_contention: Vec<FileContention> = if has_scope_filter {
                     let scope_ref = &file_scope;
                     all_contention
@@ -4871,24 +5142,24 @@ impl Repository {
                 };
 
                 // 8. Scope violations: only for agent's seals.
-                let file_scope_violations: Vec<FileScopeViolation> = all_seals
-                    .iter()
-                    .filter(|s| s.agent.id == agent_id)
-                    .take(seal_limit)
-                    .filter_map(|seal| {
-                        let spec_id = seal.spec_id.as_ref()?;
-                        let changed: Vec<String> =
-                            seal.changes.iter().map(|c| c.path.clone()).collect();
-                        let warning = self.check_file_scope(spec_id, &changed)?;
-                        Some(FileScopeViolation {
-                            seal_id: seal.id[..12].to_string(),
-                            agent_id: seal.agent.id.clone(),
-                            spec_id: spec_id.clone(),
-                            out_of_scope_files: warning.out_of_scope_files,
-                            declared_scope: warning.declared_scope,
+                let file_scope_violations: Vec<FileScopeViolation> =
+                    Self::live_seals(&all_seals, &committed)
+                        .filter(|s| s.agent.id == agent_id)
+                        .take(seal_limit)
+                        .filter_map(|seal| {
+                            let spec_id = seal.spec_id.as_ref()?;
+                            let changed: Vec<String> =
+                                seal.changes.iter().map(|c| c.path.clone()).collect();
+                            let warning = self.check_file_scope(spec_id, &changed)?;
+                            Some(FileScopeViolation {
+                                seal_id: seal.id[..12].to_string(),
+                                agent_id: seal.agent.id.clone(),
+                                spec_id: spec_id.clone(),
+                                out_of_scope_files: warning.out_of_scope_files,
+                                declared_scope: warning.declared_scope,
+                            })
                         })
-                    })
-                    .collect();
+                        .collect();
 
                 // 9. Dependency status: union of all agent specs' dependencies.
                 let all_dep_ids: HashSet<String> = agent_specs
@@ -7206,7 +7477,8 @@ impl Repository {
 
         // Add high-contention file warnings.
         let all_seals = self.log_all().unwrap_or_default();
-        let contention = Self::build_file_contention(&all_seals);
+        let committed = self.committed_spec_ids().unwrap_or_default();
+        let contention = Self::build_file_contention(Self::live_seals(&all_seals, &committed));
         for fc in &contention {
             if fc.agents.len() >= 3 {
                 warnings.push(format!(
@@ -7529,6 +7801,7 @@ impl Repository {
             status,
             verification,
             allow_empty,
+            paths,
             |path| {
                 paths
                     .iter()
@@ -7547,6 +7820,7 @@ impl Repository {
         status: TaskStatus,
         verification: Verification,
         allow_empty: bool,
+        named: &[String],
         select: impl Fn(&str) -> bool,
     ) -> WritResult<Seal> {
         let warnings = self.seal_prechecks(&agent.id, spec_id.as_deref())?;
@@ -7555,6 +7829,24 @@ impl Repository {
         let rules = self.ignore_rules();
         let mut working_state = state::compute_state(&self.root, &index, &rules);
         self.add_stuck_files(&mut working_state, &index);
+        // Finding 111: a path named with --paths that an earlier seal holds
+        // and that is gone from disk is a deletion to record, even when the
+        // ignore rules now hide it from the scan (else nothing could ever
+        // update or retire that seal).
+        for p in named {
+            let listed = working_state.changes.iter().any(|f| &f.path == p);
+            if !listed
+                && index.get_hash(p).is_some()
+                && rules.is_path_ignored(p)
+                && !self.root.join(p).exists()
+            {
+                working_state.changes.push(state::FileState {
+                    path: p.clone(),
+                    status: FileStatus::Deleted,
+                    hash: None,
+                });
+            }
+        }
 
         let selected: Vec<&state::FileState> = working_state
             .changes
@@ -7715,6 +8007,19 @@ impl Repository {
         &self,
         spec_ids: &[String],
         strategy: ConvergeStrategy,
+    ) -> WritResult<SealTreeConvergenceReport> {
+        self.converge_from_seal_trees_into(spec_ids, strategy, None)
+    }
+
+    /// [`Self::converge_from_seal_trees`]; with `dry` set (finding 110) the
+    /// merged contents go into `dry` keyed by their object hash instead of
+    /// the store, and neither the notices file nor the pending convergence
+    /// file is written.
+    fn converge_from_seal_trees_into(
+        &self,
+        spec_ids: &[String],
+        strategy: ConvergeStrategy,
+        mut dry: Option<&mut HashMap<String, Vec<u8>>>,
     ) -> WritResult<SealTreeConvergenceReport> {
         if spec_ids.len() < 2 {
             return Ok(SealTreeConvergenceReport {
@@ -8017,13 +8322,22 @@ impl Repository {
                 specs_converged: spec_trees.iter().map(|(id, _)| id.clone()).collect(),
                 shadow_results: Vec::new(),
                 notices: {
-                    self.record_stale_notices(&notices)?;
+                    if dry.is_none() {
+                        self.record_stale_notices(&notices)?;
+                    }
                     notices
                 },
             });
         }
         for (path, content) in to_store {
-            let hash = self.objects.store(content.as_bytes())?;
+            let hash = match dry.as_deref_mut() {
+                Some(mem) => {
+                    let hash = crate::hash::hash_bytes(content.as_bytes());
+                    mem.insert(hash.clone(), content.into_bytes());
+                    hash
+                }
+                None => self.objects.store(content.as_bytes())?,
+            };
             shadow_results.push((path, hash));
         }
 
@@ -8032,7 +8346,7 @@ impl Repository {
         // object because nothing reads one back (finding 32). The merged
         // objects it lists are gc roots while it exists (finding 41).
         // Attaching this report to the convergence seal is phase 4.
-        if !merged_files.is_empty() {
+        if !merged_files.is_empty() && dry.is_none() {
             let record = serde_json::json!({
                 "type": "convergence_v3",
                 "specs": spec_ids,
@@ -8055,7 +8369,9 @@ impl Repository {
             specs_converged: spec_trees.iter().map(|(id, _)| id.clone()).collect(),
             shadow_results,
             notices: {
-                self.record_stale_notices(&notices)?;
+                if dry.is_none() {
+                    self.record_stale_notices(&notices)?;
+                }
                 notices
             },
         })
@@ -8502,6 +8818,39 @@ impl Repository {
         }
 
         self.converge_from_seal_trees(&completed_ids, ConvergeStrategy::Escalate)
+    }
+
+    /// [`Self::finalize_convergence`] for diagnostics (finding 110): the same
+    /// merge computed in memory. Stores no object and writes neither
+    /// `stale_rewrite_notices.json` nor the pending convergence file; the
+    /// would-be notices are on the report and the merged contents in
+    /// [`DryConvergence::contents`].
+    pub fn finalize_convergence_dry_run(&self) -> WritResult<DryConvergence> {
+        let (epoch, bridge_tree) = self.bridge_epoch_and_tree();
+        let specs = self.list_specs()?;
+        let completed_ids: Vec<String> = specs
+            .iter()
+            .filter(|s| self.spec_eligible_for_convergence(s, epoch, bridge_tree.as_deref(), true))
+            .map(|s| s.id.clone())
+            .collect();
+        let mut contents = HashMap::new();
+        let report = if completed_ids.len() < 2 {
+            SealTreeConvergenceReport {
+                merged_files: Vec::new(),
+                escalations: Vec::new(),
+                is_clean: true,
+                specs_converged: completed_ids,
+                shadow_results: Vec::new(),
+                notices: Vec::new(),
+            }
+        } else {
+            self.converge_from_seal_trees_into(
+                &completed_ids,
+                ConvergeStrategy::Escalate,
+                Some(&mut contents),
+            )?
+        };
+        Ok(DryConvergence { report, contents })
     }
 
     /// Write converged file content from object store to working directory.
@@ -10160,6 +10509,7 @@ impl Repository {
             claimed_pid: claim_src.claimed_pid,
             claimed_pid_start: claim_src.claimed_pid_start.clone(),
             claimed_host: claim_src.claimed_host.clone(),
+            release_forced: existing.release_forced || incoming.release_forced,
             created_by: existing.created_by.clone().or(incoming.created_by.clone()),
             genesis_tree: existing
                 .genesis_tree
@@ -10863,6 +11213,26 @@ pub struct SealTreeConvergenceReport {
     /// context under `stale_rewrite_notices`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notices: Vec<convergence::survival::ConvergenceNotice>,
+}
+
+/// A convergence computed without writing (finding 110).
+#[derive(Debug, Clone)]
+pub struct DryConvergence {
+    /// The report `finalize_convergence` would return; its `shadow_results`
+    /// hashes are keys of `contents`, not stored objects.
+    pub report: SealTreeConvergenceReport,
+    /// Merged content by object hash.
+    pub contents: HashMap<String, Vec<u8>>,
+}
+
+impl DryConvergence {
+    /// Content for a hash in `report.shadow_results`, else from the store.
+    pub fn content(&self, repo: &Repository, hash: &str) -> WritResult<Vec<u8>> {
+        match self.contents.get(hash) {
+            Some(bytes) => Ok(bytes.clone()),
+            None => repo.object_content(hash),
+        }
+    }
 }
 
 /// File under `.writ/` holding convergence notices (finding 62).
@@ -15662,6 +16032,7 @@ mod verify_all_chains_tests {
             claimed_pid: None,
             claimed_pid_start: None,
             claimed_host: None,
+            release_forced: false,
             genesis_tree: None,
             created_by: None,
         };
@@ -15732,6 +16103,7 @@ mod verify_all_chains_tests {
                 claimed_pid: None,
                 claimed_pid_start: None,
                 claimed_host: None,
+                release_forced: false,
                 genesis_tree: None,
                 created_by: None,
             };
@@ -18274,6 +18646,7 @@ mod remote_tests {
             claimed_pid: None,
             claimed_pid_start: None,
             claimed_host: None,
+            release_forced: false,
             genesis_tree: None,
             created_by: None,
         };
@@ -36638,5 +37011,549 @@ mod finding_65_tests {
             repo.load_spec("done").unwrap().lifecycle_state,
             LifecycleState::Archived
         );
+    }
+}
+
+/// Where a path's pre-writ baseline came from (finding 106).
+enum Baseline {
+    /// An object already in the writ store.
+    Stored(String),
+    /// Blob bytes read from git.
+    Git(Vec<u8>),
+}
+
+/// The bytes of `path` (relative to `root`) in the newest commit on HEAD's
+/// first-parent line whose commit time is at or before `at` (HEAD itself
+/// when `at` is None). None without a git repository, a commit that old, or
+/// the path in it. Without the `bridge` feature writ cannot read git: None.
+#[cfg(not(feature = "bridge"))]
+fn git_blob_at_or_before(_root: &Path, _path: &str, _at: Option<DateTime<Utc>>) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(feature = "bridge")]
+fn git_blob_at_or_before(root: &Path, path: &str, at: Option<DateTime<Utc>>) -> Option<Vec<u8>> {
+    let repo = git2::Repository::discover(root).ok()?;
+    let workdir = repo.workdir()?.canonicalize().ok()?;
+    let prefix = root
+        .canonicalize()
+        .ok()?
+        .strip_prefix(&workdir)
+        .ok()?
+        .to_path_buf();
+    let mut commit = repo.head().ok()?.peel_to_commit().ok()?;
+    if let Some(at) = at {
+        while commit.time().seconds() > at.timestamp() {
+            commit = commit.parent(0).ok()?;
+        }
+    }
+    let entry = commit.tree().ok()?.get_path(&prefix.join(path)).ok()?;
+    let blob = repo.find_blob(entry.id()).ok()?;
+    Some(blob.content().to_vec())
+}
+
+/// What `writ seal` does when no spec resolves (C.13, findings 98 to 100).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoSpecSeal {
+    /// Refuse, record nothing, print [`NO_SPEC_FIX`].
+    Refuse,
+    /// Seal without a spec and warn with [`NO_SPEC_FIX`].
+    Warn,
+}
+
+/// The pasteable fix for a seal with no spec, in every message that names it.
+pub const NO_SPEC_FIX: &str = "writ spec add \"brief description of your task\" --claim";
+
+/// C.13: a seal with no spec is refused for an agent, whether detected from
+/// the environment or named with an explicit `--agent` (an explicit flag is
+/// the stronger statement, finding 98), and for anyone under
+/// `[security] claim_enforcement = "strict"` (finding 100). Otherwise a
+/// human's seal is recorded with a warning.
+pub fn no_spec_seal_policy(
+    agent_from_env: bool,
+    explicit_agent_flag: bool,
+    claims_strict: bool,
+) -> NoSpecSeal {
+    if agent_from_env || explicit_agent_flag || claims_strict {
+        NoSpecSeal::Refuse
+    } else {
+        NoSpecSeal::Warn
+    }
+}
+
+#[cfg(test)]
+mod no_spec_seal_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_agent_flag_alone_refuses_like_a_detected_agent() {
+        // Finding 98.
+        assert_eq!(no_spec_seal_policy(false, true, false), NoSpecSeal::Refuse);
+        assert_eq!(no_spec_seal_policy(true, false, false), NoSpecSeal::Refuse);
+    }
+
+    #[test]
+    fn human_default_warns_and_the_fix_names_claim() {
+        // Finding 99.
+        assert_eq!(no_spec_seal_policy(false, false, false), NoSpecSeal::Warn);
+        assert!(NO_SPEC_FIX.starts_with("writ spec add \"") && NO_SPEC_FIX.ends_with(" --claim"));
+    }
+
+    #[test]
+    fn strict_claim_enforcement_refuses_a_human_no_spec_seal() {
+        // Finding 100.
+        assert_eq!(no_spec_seal_policy(false, false, true), NoSpecSeal::Refuse);
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = Repository::init(dir.path()).unwrap();
+        assert!(!repo.claims_strict());
+        repo.set_enforce_claims(true);
+        assert!(repo.claims_strict());
+    }
+}
+
+/// Finding 97: committed specs' chains are history, not divergence, and do
+/// not feed `integration_risk`; `next` defers to doctor.
+#[cfg(test)]
+mod committed_chain_tests {
+    use super::*;
+    use crate::context::{ContextFilter, ContextLimits, ContextScope};
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use crate::spec::Spec;
+    use tempfile::tempdir;
+
+    const SPECS: usize = 6;
+
+    fn agent(name: &str) -> AgentIdentity {
+        AgentIdentity {
+            id: name.to_string(),
+            agent_type: AgentType::Agent,
+        }
+    }
+
+    fn seal(repo: &Repository, root: &Path, i: usize, round: usize) {
+        fs::write(root.join(format!("own{i}.txt")), format!("{i}.{round}\n")).unwrap();
+        fs::write(root.join("shared.txt"), format!("{i}.{round}\n")).unwrap();
+        for k in 0..SPECS {
+            fs::write(root.join(format!("c{k}.txt")), format!("{i}.{round}\n")).unwrap();
+        }
+        repo.seal_all_pending(
+            agent(&format!("dev-{i}")),
+            format!("s{i} round {round}"),
+            Some(format!("s{i}")),
+            TaskStatus::InProgress,
+            Verification::default(),
+            false,
+        )
+        .unwrap();
+    }
+
+    /// Six specs by six agents on shared files, each forked off HEAD.
+    fn diverged_store() -> (tempfile::TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        for i in 0..SPECS {
+            repo.add_spec(&Spec::new(format!("s{i}"), format!("S{i}"), String::new()))
+                .unwrap();
+        }
+        for round in 0..2 {
+            for i in 0..SPECS {
+                seal(&repo, dir.path(), i, round);
+            }
+        }
+        (dir, repo)
+    }
+
+    fn commit_all(repo: &Repository) {
+        for i in 0..SPECS {
+            let mut spec = repo.load_spec(&format!("s{i}")).unwrap();
+            spec.status = SpecStatus::Complete;
+            spec.mark_committed(format!("{i:040}"));
+            repo.save_spec(&spec).unwrap();
+        }
+    }
+
+    fn json_len(c: &ContextOutput) -> WritResult<usize> {
+        Ok(serde_json::to_string(c)?.len())
+    }
+
+    fn limited(repo: &Repository, scope: ContextScope) -> ContextOutput {
+        repo.context_limited(
+            scope,
+            10,
+            &ContextFilter::default(),
+            &ContextLimits::default(),
+            json_len,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn live_divergence_still_reports_risk_and_converge() {
+        let (_dir, repo) = diverged_store();
+        assert!(!repo.diverged_branches().unwrap().is_empty());
+        let ctx = repo
+            .context(ContextScope::Full, 10, &ContextFilter::default())
+            .unwrap();
+        assert_eq!(ctx.integration_risk.level, "high");
+        assert_eq!(ctx.recommended_action.unwrap().action, "converge");
+    }
+
+    #[test]
+    fn committed_chains_are_not_diverged_and_risk_is_low() {
+        let (_dir, repo) = diverged_store();
+        commit_all(&repo);
+        assert!(repo.diverged_branches().unwrap().is_empty());
+        for scope in [
+            ContextScope::Full,
+            ContextScope::Spec("s0".into()),
+            ContextScope::Agent("dev-0".into()),
+        ] {
+            let ctx = limited(&repo, scope.clone());
+            assert!(ctx.diverged_branches.is_empty(), "{scope:?}");
+            assert!(!ctx.convergence_recommended, "{scope:?}");
+            assert!(ctx.file_contention.is_empty(), "{scope:?}");
+            assert!(ctx.file_scope_violations.is_empty(), "{scope:?}");
+            assert_eq!(ctx.integration_risk.level, "low", "{scope:?}");
+            assert_eq!(ctx.integration_risk.score, 0, "{scope:?}");
+            if let Some(next) = &ctx.recommended_action {
+                assert_ne!(next.action, "converge", "{scope:?}");
+                assert_ne!(next.action, "review_risk", "{scope:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn clean_doctor_never_sits_under_a_high_next_action() {
+        // Live divergence ranks converge high; doctor has no red finding,
+        // so the attached context shows it at medium.
+        let (_dir, repo) = diverged_store();
+        let ctx = limited(&repo, ContextScope::Full);
+        let doctor = ctx.doctor.as_ref().unwrap();
+        assert!(doctor
+            .findings
+            .iter()
+            .all(|f| f.severity != crate::doctor::Severity::Red));
+        let next = ctx.recommended_action.unwrap();
+        assert_eq!(next.action, "converge");
+        assert_ne!(next.priority, "high");
+    }
+}
+
+/// Finding 102: a seal-time own-line refusal names who else worked on the
+/// file, or nobody; a seal that overrides with `--allow-removals` records
+/// what the agent was told.
+#[cfg(test)]
+mod own_line_override_tests {
+    use super::*;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    const FILE: &str = "shared.txt";
+
+    fn numbered(edits: &[(usize, &str)]) -> String {
+        (0..40)
+            .map(|i| match edits.iter().find(|(n, _)| *n == i) {
+                Some((_, sfx)) => format!("line {i} {sfx}\n"),
+                None => format!("line {i}\n"),
+            })
+            .collect()
+    }
+
+    /// Base sealed with no spec (nobody's open work), specs `sa` and `sb`.
+    fn fixture() -> (tempfile::TempDir, Repository) {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join(FILE), numbered(&[])).unwrap();
+        seal(&repo, "setup", None).unwrap();
+        for id in ["sa", "sb"] {
+            repo.add_spec(&Spec::new(id.into(), id.into(), String::new()))
+                .unwrap();
+        }
+        (dir, repo)
+    }
+
+    fn seal(repo: &Repository, agent: &str, spec: Option<&str>) -> WritResult<Seal> {
+        repo.seal_paths(
+            AgentIdentity {
+                id: agent.to_string(),
+                agent_type: AgentType::Agent,
+            },
+            format!("{agent} work"),
+            spec.map(str::to_string),
+            TaskStatus::InProgress,
+            Verification::default(),
+            &[FILE.to_string()],
+            false,
+        )
+    }
+
+    fn write(dir: &tempfile::TempDir, text: &str) {
+        fs::write(dir.path().join(FILE), text).unwrap();
+    }
+
+    #[test]
+    fn refusal_names_the_other_agent_and_both_choices() {
+        let (dir, repo) = fixture();
+        write(&dir, &numbered(&[(2, "A")]));
+        let added = seal(&repo, "a", Some("sa")).unwrap();
+        write(&dir, &numbered(&[(30, "B")]));
+        seal(&repo, "b", Some("sb")).unwrap();
+        write(&dir, &numbered(&[(10, "A2"), (30, "B")]));
+
+        let err = seal(&repo, "a", Some("sa")).unwrap_err();
+        let WritError::OwnLinesRemoved {
+            other_agents,
+            added_by,
+            ..
+        } = &err
+        else {
+            panic!("expected OwnLinesRemoved, got {err:?}");
+        };
+        assert_eq!(other_agents, &["b".to_string()]);
+        assert_eq!(added_by, &[added.id.clone()]);
+        let msg = err
+            .own_lines_message("writ seal --spec sa --allow-removals shared.txt")
+            .unwrap();
+        assert!(
+            msg.contains("agent 'b' worked on shared.txt since your last seal"),
+            "{msg}"
+        );
+        assert!(msg.contains("    - line 2 A"), "{msg}");
+        assert!(
+            msg.contains(&format!("`writ show {} --diff`", &added.id[..12])),
+            "{msg}"
+        );
+        assert!(
+            msg.contains(
+                "accept b's version of shared.txt: writ seal --spec sa --allow-removals shared.txt"
+            ),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("--force") && !msg.contains("unsealed work?"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn refusal_with_no_other_agent_names_nobody() {
+        let (dir, repo) = fixture();
+        write(&dir, &numbered(&[(2, "A")]));
+        seal(&repo, "a", Some("sa")).unwrap();
+        write(&dir, &numbered(&[(30, "B")]));
+
+        let err = seal(&repo, "a", Some("sa")).unwrap_err();
+        let WritError::OwnLinesRemoved { other_agents, .. } = &err else {
+            panic!("expected OwnLinesRemoved, got {err:?}");
+        };
+        assert!(other_agents.is_empty(), "{other_agents:?}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("are no longer in shared.txt on disk. No other agent"),
+            "{msg}"
+        );
+        assert!(msg.contains("remove them on purpose: "), "{msg}");
+        assert!(!msg.contains("agent '"), "{msg}");
+    }
+
+    #[cfg(feature = "bridge")]
+    /// Finding 106 (Djo's check 10 shape): the file's base came from a plain
+    /// git commit after `writ init`, never through a writ seal. The spec's
+    /// first seal records the file as new to writ; its own line is still
+    /// protected, measured against the git base.
+    #[test]
+    fn git_only_base_still_protects_own_lines() {
+        let dir = tempdir().unwrap();
+        let git = git2::Repository::init(dir.path()).unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        write(&dir, &numbered(&[]));
+        let mut gi = git.index().unwrap();
+        gi.add_path(Path::new(FILE)).unwrap();
+        gi.write().unwrap();
+        let tree = git.find_tree(gi.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("t", "t@localhost").unwrap();
+        git.commit(Some("HEAD"), &sig, &sig, "shared", &tree, &[])
+            .unwrap();
+        repo.add_spec(&Spec::new("sa".into(), "sa".into(), String::new()))
+            .unwrap();
+        write(&dir, &numbered(&[(2, "A")]));
+        let first = seal(&repo, "a", Some("sa")).unwrap();
+        assert!(
+            first.changes[0].old_hash.is_none(),
+            "fixture: base not via writ"
+        );
+
+        write(&dir, &numbered(&[(30, "B")]));
+        let err = seal(&repo, "a", Some("sa")).unwrap_err();
+        let WritError::OwnLinesRemoved { losses, .. } = &err else {
+            panic!("expected OwnLinesRemoved, got {err:?}");
+        };
+        assert_eq!(losses[0].lines, vec!["line 2 A".to_string()]);
+        let spec = repo.load_spec("sa").unwrap();
+        assert_eq!(
+            repo.baseline_text(&spec, FILE, Some(first.timestamp))
+                .unwrap(),
+            Some(numbered(&[]))
+        );
+        // A file the spec created (in no base) has no baseline.
+        assert_eq!(repo.baseline_text(&spec, "new.txt", None).unwrap(), None);
+    }
+
+    #[test]
+    fn override_records_context_on_the_seal() {
+        let (dir, mut repo) = fixture();
+        write(&dir, &numbered(&[(2, "A")]));
+        let added = seal(&repo, "a", Some("sa")).unwrap();
+        write(&dir, &numbered(&[(30, "B")]));
+        seal(&repo, "b", Some("sb")).unwrap();
+        write(&dir, &numbered(&[(10, "A2"), (30, "B")]));
+        repo.set_allow_removal_paths([FILE.to_string()]);
+
+        let s = seal(&repo, "a", Some("sa")).unwrap();
+        let expect = crate::seal::OverrideContext {
+            path: FILE.to_string(),
+            other_agents: vec!["b".to_string()],
+            lines: vec!["line 2 A".to_string()],
+            added_by: vec![added.id.clone()],
+        };
+        assert_eq!(s.override_context, vec![expect.clone()]);
+        assert_eq!(
+            repo.load_seal(&s.id).unwrap().override_context,
+            vec![expect.clone()]
+        );
+        assert_eq!(
+            expect.describe("a", &s.id),
+            format!(
+                "a accepted b's version of shared.txt after being told (seal {})",
+                &s.id[..12]
+            )
+        );
+        // A seal that used no override records none.
+        repo.set_allow_removal_paths(Vec::<String>::new());
+        write(&dir, &numbered(&[(10, "A3"), (30, "B")]));
+        assert!(seal(&repo, "a", Some("sa"))
+            .unwrap()
+            .override_context
+            .is_empty());
+    }
+}
+
+/// Finding 110: the dry-run convergence diagnostics use writes nothing.
+#[cfg(test)]
+mod dry_convergence_tests {
+    use super::*;
+    use crate::seal::{AgentType, TaskStatus, Verification};
+    use tempfile::tempdir;
+
+    const FILE: &str = "shared.txt";
+
+    fn numbered(edits: &[(usize, &str)]) -> String {
+        (0..40)
+            .map(|i| match edits.iter().find(|(n, _)| *n == i) {
+                Some((_, sfx)) => format!("line {i} {sfx}\n"),
+                None => format!("line {i}\n"),
+            })
+            .collect()
+    }
+
+    fn seal(repo: &Repository, agent: &str, spec: &str) {
+        repo.seal_paths(
+            AgentIdentity {
+                id: agent.to_string(),
+                agent_type: AgentType::Agent,
+            },
+            format!("{agent} work"),
+            Some(spec.to_string()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            &[FILE.to_string()],
+            false,
+        )
+        .unwrap();
+    }
+
+    /// Every file under `.writ/` with its bytes, except what a diagnostic
+    /// may touch: security events and doctor's own caches.
+    fn store_snapshot(writ_dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        let mut stack = vec![writ_dir.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                let rel = path.strip_prefix(writ_dir).unwrap().to_path_buf();
+                if rel.starts_with("security")
+                    || rel.ends_with("doctor_cache.json")
+                    || rel.ends_with("survival_cache.json")
+                {
+                    continue;
+                }
+                if path.is_dir() {
+                    stack.push(path);
+                } else {
+                    out.insert(rel, fs::read(&path).unwrap());
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn dry_run_merges_in_memory_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join(FILE), numbered(&[])).unwrap();
+        repo.add_spec(&Spec::new("base".into(), "base".into(), String::new()))
+            .unwrap();
+        seal(&repo, "setup", "base");
+        let mut base = repo.load_spec("base").unwrap();
+        base.status = SpecStatus::Complete;
+        base.mark_committed("0".repeat(40));
+        repo.save_spec(&base).unwrap();
+        for id in ["sa", "sb"] {
+            repo.add_spec(&Spec::new(id.into(), id.into(), String::new()))
+                .unwrap();
+        }
+        // Two specs edit different lines of one file from the same base:
+        // the merge differs from both inputs.
+        fs::write(dir.path().join(FILE), numbered(&[(5, "A")])).unwrap();
+        seal(&repo, "a", "sa");
+        fs::write(dir.path().join(FILE), numbered(&[(30, "B")])).unwrap();
+        seal(&repo, "b", "sb");
+        for id in ["sa", "sb"] {
+            let mut spec = repo.load_spec(id).unwrap();
+            spec.status = SpecStatus::Complete;
+            repo.save_spec(&spec).unwrap();
+        }
+
+        let before = store_snapshot(repo.writ_dir());
+        let dry = repo.finalize_convergence_dry_run().unwrap();
+        let after = store_snapshot(repo.writ_dir());
+        assert!(before == after, "dry run changed the store: {:?}", {
+            let changed: Vec<_> = after
+                .keys()
+                .chain(before.keys())
+                .filter(|k| before.get(*k) != after.get(*k))
+                .collect();
+            changed
+        });
+
+        let (path, hash) = dry
+            .report
+            .shadow_results
+            .iter()
+            .find(|(p, _)| p == FILE)
+            .expect("the merge path ran");
+        assert_eq!(path, FILE);
+        let merged = dry.content(&repo, hash).unwrap();
+        assert_eq!(merged, numbered(&[(5, "A"), (30, "B")]).into_bytes());
+        assert!(
+            repo.object_content(hash).is_err(),
+            "dry run stored the merge"
+        );
+
+        // The real path still stores the same merge.
+        let real = repo.finalize_convergence().unwrap();
+        assert_eq!(real.shadow_results, dry.report.shadow_results);
+        assert_eq!(repo.object_content(hash).unwrap(), merged);
     }
 }

@@ -129,7 +129,7 @@ impl PatternRegistry {
             if let Some(proposal) = pattern.resolve(conflict) {
                 let dominated = best
                     .as_ref()
-                    .map_or(false, |b| b.confidence >= proposal.confidence);
+                    .is_some_and(|b| b.confidence >= proposal.confidence);
                 if !dominated {
                     best = Some(proposal);
                 }

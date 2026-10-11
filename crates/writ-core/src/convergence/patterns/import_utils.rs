@@ -174,11 +174,9 @@ fn parse_module_from_content(content: &str, lang: &ImportLang) -> Option<String>
     let trimmed = content.trim();
     match lang {
         ImportLang::Python => {
-            if trimmed.starts_with("from ") {
-                let rest = &trimmed[5..];
+            if let Some(rest) = trimmed.strip_prefix("from ") {
                 rest.split_whitespace().next().map(|s| s.to_string())
-            } else if trimmed.starts_with("import ") {
-                let rest = &trimmed[7..];
+            } else if let Some(rest) = trimmed.strip_prefix("import ") {
                 rest.split(|c: char| c == ',' || c.is_whitespace())
                     .next()
                     .map(|s| s.to_string())
@@ -200,12 +198,7 @@ fn parse_module_from_content(content: &str, lang: &ImportLang) -> Option<String>
                 if let Some(brace_start) = rest.find('{') {
                     Some(rest[..brace_start].trim_end_matches("::").to_string())
                 } else {
-                    Some(
-                        rest.split(|c: char| c == ' ' || c == ';')
-                            .next()
-                            .unwrap_or("")
-                            .to_string(),
-                    )
+                    Some(rest.split([' ', ';']).next().unwrap_or("").to_string())
                 }
             } else {
                 None

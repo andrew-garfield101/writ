@@ -318,7 +318,7 @@ pub(crate) fn parse_ts_def_header(trimmed: &str, is_typescript: bool) -> (String
         return ("function".into(), name);
     }
     if after_prefix.starts_with("function*") {
-        let rest = after_prefix[9..].trim_start_matches(|c: char| c == '(' || c == ' ');
+        let rest = after_prefix[9..].trim_start_matches(['(', ' ']);
         let name = extract_js_ident(rest);
         return ("function".into(), name);
     }
@@ -532,10 +532,10 @@ pub(crate) fn ts_semantic_equivalent(a: &str, b: &str) -> bool {
                 result.push(normalized);
             }
         }
-        while result.first().map_or(false, |l| l.is_empty()) {
+        while result.first().is_some_and(|l| l.is_empty()) {
             result.remove(0);
         }
-        while result.last().map_or(false, |l| l.is_empty()) {
+        while result.last().is_some_and(|l| l.is_empty()) {
             result.pop();
         }
         result.join("\n")

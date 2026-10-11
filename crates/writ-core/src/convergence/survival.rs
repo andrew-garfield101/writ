@@ -551,6 +551,166 @@ pub fn anchor_seal(base: &str, first_old: &str, versions: &[&str], later: &str) 
     anchor
 }
 
+/// One own seal of a file, precomputed for [`saw_addition`]: the
+/// distinctive lines it added, the lines it removed (non-blank), and the
+/// line counts of what it sealed.
+#[derive(Debug, Clone)]
+pub struct SealStep<'a> {
+    pub adds: HashSet<&'a str>,
+    pub removed: Vec<&'a str>,
+    pub kept: HashMap<&'a str, usize>,
+    /// Every other distinctive line of the sealed version (not blank, not
+    /// in the path's genesis, not added by this step): what else had
+    /// entered the file by then.
+    pub others: Vec<&'a str>,
+}
+
+impl<'a> SealStep<'a> {
+    /// `steps`: the spec's own seals of the file as `(its previous own
+    /// version, what it sealed)`, oldest first. `genesis`: the path's
+    /// earliest known version, for [`Self::others`] (`None`: `in_base`).
+    pub fn all(
+        steps: &[(&'a str, &'a str)],
+        in_base: &HashSet<&str>,
+        genesis: Option<&HashSet<&str>>,
+    ) -> Vec<Self> {
+        let genesis = genesis.unwrap_or(in_base);
+        steps
+            .iter()
+            .map(|(prev, new)| {
+                let before = counts(prev.lines());
+                let adds: HashSet<&'a str> = additions(prev, new)
+                    .into_iter()
+                    .map(|(_, l)| l)
+                    .filter(|l| {
+                        !l.trim().is_empty() && !before.contains_key(l) && !in_base.contains(l)
+                    })
+                    .collect();
+                let mut others: Vec<&'a str> = new
+                    .lines()
+                    .filter(|l| !l.trim().is_empty() && !genesis.contains(l) && !adds.contains(l))
+                    .collect();
+                others.sort_unstable();
+                others.dedup();
+                Self {
+                    adds,
+                    others,
+                    removed: informed_removals(prev, new)
+                        .into_keys()
+                        .filter(|l| !l.trim().is_empty())
+                        .collect(),
+                    kept: counts(new.lines()),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Finding 105: did `version` (another spec's sealed version) see the own
+/// seal that added `line`? The anchor rule per seal: `steps` are the
+/// spec's own seals of the file as `(its previous own version, what it
+/// sealed)`, oldest first. A step that added `line` was seen when
+/// `version` keeps another distinctive line that step added, or lacks
+/// every line that step removed (it replaced them, and they are gone).
+/// Third (CC, finding 69 shape): `version` keeps every other distinctive
+/// line of that step's sealed version; a stale copy from before the seal
+/// would lack whatever else had entered the file, a targeted removal keeps
+/// it. A step that only inserted lines into a file with no other
+/// distinctive line, none kept, is undecidable: not seen, which keeps its
+/// work. `true` when no step added `line` (not ours).
+pub fn saw_addition(
+    version: &str,
+    line: &str,
+    steps: &[(&str, &str)],
+    in_base: &HashSet<&str>,
+) -> bool {
+    saw_addition_in(
+        &counts(version.lines()),
+        line,
+        &SealStep::all(steps, in_base, None),
+    )
+}
+
+/// [`saw_addition`] with the path's earliest known version (`genesis`) for
+/// the third clause, so lines that entered the file after genesis but
+/// before the spec's first seal count as evidence.
+pub fn saw_addition_since(
+    version: &str,
+    line: &str,
+    steps: &[(&str, &str)],
+    in_base: &HashSet<&str>,
+    genesis: &HashSet<&str>,
+) -> bool {
+    saw_addition_in(
+        &counts(version.lines()),
+        line,
+        &SealStep::all(steps, in_base, Some(genesis)),
+    )
+}
+
+/// [`saw_addition`] over precomputed steps and the version's line counts.
+pub fn saw_addition_in(have: &HashMap<&str, usize>, line: &str, steps: &[SealStep<'_>]) -> bool {
+    let mut ours = false;
+    for step in steps.iter().filter(|s| s.adds.contains(line)) {
+        ours = true;
+        if step.adds.iter().any(|l| *l != line && have.contains_key(l)) {
+            return true;
+        }
+        if !step.removed.is_empty()
+            && step.removed.iter().all(|l| {
+                have.get(l).copied().unwrap_or(0) <= step.kept.get(l).copied().unwrap_or(0)
+            })
+        {
+            return true;
+        }
+        if !step.others.is_empty() && step.others.iter().all(|l| have.contains_key(l)) {
+            return true;
+        }
+    }
+    !ours
+}
+
+/// Lines of `old` that `new` replaced in place with new text: each hunk
+/// of the edit that deletes lines and inserts at least one line for which
+/// `is_new_text` holds (never seen in the file before). A remover that
+/// rewrote a line in place saw it; a stale copy puts old text, or
+/// nothing, where the line was (finding 105).
+pub fn replaced_in_place<'a>(
+    old: &'a str,
+    new: &str,
+    is_new_text: impl Fn(&str) -> bool,
+) -> HashSet<&'a str> {
+    let (o, n) = (split_lines(old), split_lines(new));
+    let mut out = HashSet::new();
+    for h in hunks(&o, &n) {
+        if !h.deleted.is_empty() && h.inserted.iter().any(|&j| is_new_text(n[j])) {
+            out.extend(h.deleted.iter().map(|&i| o[i]));
+        }
+    }
+    out
+}
+
+/// Did a seal of another spec that recorded `old -> new` see the own seal
+/// that added `line`? The seal-time allowance's single entry point (finding
+/// 105): [`saw_addition_since`] (all three clauses, with `genesis` the
+/// path's earliest known version), or it replaced the line in place with
+/// text new to the file (not in `old`, not in `in_base`).
+pub fn remover_saw(
+    old: &str,
+    new: &str,
+    line: &str,
+    steps: &[(&str, &str)],
+    in_base: &HashSet<&str>,
+    genesis: &HashSet<&str>,
+) -> bool {
+    let old_lines: HashSet<&str> = old.lines().collect();
+    saw_addition_since(new, line, steps, in_base, genesis)
+        || replaced_in_place(old, new, |l| {
+            !l.trim().is_empty() && !old_lines.contains(l) && !in_base.contains(l)
+        })
+        .contains(line)
+}
+
 /// A non-blocking convergence notice for the spec whose version did not
 /// carry another spec's lines (finding 62). The merge kept them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -979,7 +1139,7 @@ pub fn own_versions<'a>(seals: impl IntoIterator<Item = &'a Seal>) -> HashMap<St
     out
 }
 
-// ── Survival audit (0.4.1 survival tier groundwork) ────────────────────
+// ── Survival audit (the survival tier of `writ doctor`) ───────────────
 
 /// What the sealed additions are checked against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -988,41 +1148,103 @@ pub enum Against {
     /// The files on disk.
     WorkingTree,
     /// The files at git HEAD (needs the `bridge` feature and a repository).
+    /// Specs not yet committed are listed in `not_committed`, not audited.
     Head,
+    /// Per spec: committed specs against HEAD, the rest against the
+    /// working tree (the survival tier on demand and on watch).
+    Auto,
+    /// The tree `writ finish` will commit: the staged sealed content where
+    /// it stages a path, HEAD elsewhere ([`audit_finish`]).
+    FinishTree,
 }
 
-/// A sealed addition the target lacks and no later seal removed on purpose.
+/// A sealed addition the target lacks with no evidence it was meant to go.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LostLine {
-    /// 1-based line in the spec's last sealed version of the file.
+    /// 1-based line in the version of the file that held it: the spec's
+    /// last sealed version, or for a line its own overridden seal removed,
+    /// the version before that seal.
     pub line: usize,
     pub text: String,
+    /// The spec's seal that added the line.
+    pub added_by: String,
+    /// The spec's own seal that removed the line under `--allow-removals`
+    /// or `--force` (finding 42 variant B), if that is how it went.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub removed_by: Option<String>,
 }
 
-/// A sealed addition the target lacks because a later seal removed it
-/// while its recorded base held it (an informed removal; not a loss).
+/// Why a missing addition is not a loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SupersededBy {
+    /// A later seal removed it while its recorded base held it
+    /// ([`informed_removals`]).
+    InformedRemoval,
+    /// A later seal of a spec since committed to git recorded the file
+    /// without it (finding 77: a finish accepted that version).
+    CommittedSpec,
+    /// The spec's own seal removed it under `--allow-removals` naming the
+    /// path, or `--force`: refused first, then overridden on the record
+    /// (CC decision C, sprint 4).
+    OwnOverride,
+}
+
+/// A spec's own line its own overridden seal removed, where that seal
+/// recorded another spec's sealed content in its place: the override
+/// captured another spec's version under this spec's name (the finding 42
+/// variant B signature). A yellow finding, never a block.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedLine {
+    pub line: usize,
+    pub text: String,
+    /// The spec's seal that added the line.
+    pub added_by: String,
+    /// The spec's own overridden seal that removed it.
+    pub removed_by: String,
+    /// The other spec, and its seal, whose sealed content the override
+    /// recorded.
+    pub other_spec: String,
+    pub other_seal: String,
+}
+
+/// A sealed addition the target lacks because a later seal replaced it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SupersededLine {
     pub line: usize,
     pub text: String,
     pub by_seal: String,
     pub by_spec: Option<String>,
+    pub reason: SupersededBy,
 }
 
 /// Why a file's additions were not line-checked.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileAuditStatus {
-    /// Every addition was checked.
+    /// Every distinctive addition was checked.
     Checked,
     /// The spec's last seal deleted the file, and the target lacks it too.
     DeletedAsSealed,
-    /// The spec's last seal deleted the file, but the target still has it.
+    /// The spec's last seal deleted the file, but the target still has it
+    /// and no later seal wrote it again.
     DeletedButPresent,
+    /// The spec's last seal deleted the file and a later seal wrote it
+    /// again: superseded.
+    RecreatedLater,
     /// The sealed content is binary.
     Binary,
     /// The sealed blob is missing from the store.
     Unreadable,
+    /// Against HEAD: the target lacks the file because git ignores its
+    /// path, so no finish can commit it. Reported, not a merge loss.
+    IgnoredByGit,
+    /// Like [`Self::IgnoredByGit`], and writ's own ignore rules cover the
+    /// path too (finding 111): an info note, never a finding.
+    IgnoredByGitAndWrit,
+    /// A later seal (any spec) deleted the whole file and the target lacks
+    /// it: an explicit act, superseding the spec's additions.
+    DeletedLater,
 }
 
 /// Survival of one spec's additions to one file.
@@ -1032,10 +1254,17 @@ pub struct FileSurvival {
     /// The spec's last seal of the path.
     pub seal_id: String,
     pub status: FileAuditStatus,
-    /// Added lines checked.
+    /// Distinctive added lines checked.
     pub checked: usize,
+    /// Added lines skipped as non-distinctive (blank, or text the file
+    /// already had before the spec): they say nothing about survival.
+    #[serde(default)]
+    pub skipped: usize,
     pub lost: Vec<LostLine>,
     pub superseded: Vec<SupersededLine>,
+    /// Own lines an own override replaced with another spec's content.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captured: Vec<CapturedLine>,
 }
 
 /// Survival of one spec's sealed additions.
@@ -1056,59 +1285,203 @@ pub struct AuditReport {
     pub checked: usize,
     pub lost: usize,
     pub superseded: usize,
+    #[serde(default)]
+    pub skipped: usize,
+    /// Against HEAD: specs not audited because they are not committed
+    /// (their work is not meant to be in HEAD yet).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_committed: Vec<String>,
     pub elapsed_ms: u64,
 }
 
 impl AuditReport {
-    /// No sealed addition is missing without a later informed removal.
+    /// No sealed addition is missing without evidence it was replaced.
     pub fn is_green(&self) -> bool {
-        self.lost == 0
-            && self
-                .specs
+        self.lost == 0 && self.deleted_but_present().next().is_none()
+    }
+
+    /// `(spec, file)` pairs whose sealed deletion did not hold.
+    pub fn deleted_but_present(&self) -> impl Iterator<Item = (&str, &FileSurvival)> {
+        self.specs.iter().flat_map(|s| {
+            s.files
                 .iter()
-                .flat_map(|s| &s.files)
-                .all(|f| f.status != FileAuditStatus::DeletedButPresent)
+                .filter(|f| f.status == FileAuditStatus::DeletedButPresent)
+                .map(move |f| (s.spec_id.as_str(), f))
+        })
+    }
+
+    /// Every lost line: `(spec, file, line)`.
+    pub fn lost_lines(&self) -> impl Iterator<Item = (&str, &str, &LostLine)> {
+        self.specs.iter().flat_map(|s| {
+            s.files.iter().flat_map(move |f| {
+                f.lost
+                    .iter()
+                    .map(move |l| (s.spec_id.as_str(), f.path.as_str(), l))
+            })
+        })
     }
 }
 
-/// Added-line survival of `spec_ids` (the core of `bench/finish_audit.py`).
+/// One seal's change to one path, texts loaded.
+struct PathEvent<'a> {
+    seal: &'a Seal,
+    old: Option<std::rc::Rc<str>>,
+    /// Empty for a deletion.
+    new: std::rc::Rc<str>,
+    deleted: bool,
+}
+
+/// Blob text by hash, loaded once per audit. `None`: binary.
+struct Texts<'r> {
+    repo: &'r crate::Repository,
+    cache: HashMap<String, Option<std::rc::Rc<str>>>,
+}
+
+impl Texts<'_> {
+    fn get(&mut self, hash: &str) -> crate::error::WritResult<Option<std::rc::Rc<str>>> {
+        if let Some(t) = self.cache.get(hash) {
+            return Ok(t.clone());
+        }
+        let bytes = self.repo.object_content(hash)?;
+        let t = (!crate::diff::is_binary(&bytes))
+            .then(|| std::rc::Rc::from(String::from_utf8_lossy(&bytes).as_ref()));
+        self.cache.insert(hash.to_string(), t.clone());
+        Ok(t)
+    }
+
+    /// Like [`Self::get`], with a missing blob read as `None`.
+    fn get_lenient(&mut self, hash: &str) -> crate::error::WritResult<Option<std::rc::Rc<str>>> {
+        match self.get(hash) {
+            Err(crate::error::WritError::ObjectNotFound(_)) => Ok(None),
+            r => r,
+        }
+    }
+}
+
+/// Specs to audit since `since` (the last green result): those with a seal
+/// after it or committed after it. `None`: every spec.
+pub fn specs_since(
+    repo: &crate::Repository,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> crate::error::WritResult<Vec<String>> {
+    let mut ids = Vec::new();
+    for spec in repo.list_specs()? {
+        let Some(since) = since else {
+            ids.push(spec.id);
+            continue;
+        };
+        let committed_after = spec.committed_at.is_some_and(|t| t > since);
+        let sealed_after = spec.sealed_by.iter().rev().any(|id| {
+            repo.load_seal(id)
+                .map(|s| s.timestamp > since)
+                .unwrap_or(false)
+        });
+        if committed_after || sealed_after {
+            ids.push(spec.id);
+        }
+    }
+    ids.sort();
+    Ok(ids)
+}
+
+/// Added-line survival of `spec_ids` (finding 77 semantics).
 ///
-/// For each spec and each path its seals captured: the lines the spec's
-/// last sealed version of the file added relative to the file before the
-/// spec's first seal of it must be in the target, by content and per copy
-/// (a moved block survives, finding 53). A missing line is *superseded*
-/// when a later seal, of any spec, removed it while its recorded base held
-/// it ([`informed_removals`]); otherwise it is *lost*. A file the spec's
-/// last seal deleted counts as lost when the target still has it.
+/// For each spec and each path its seals recorded, the candidates are the
+/// spec's **distinctive** additions (the [`anchor_seal`] rule: not blank,
+/// and not text the file had before the spec's first seal of it):
 ///
-/// Not wired to `writ doctor` yet (0.4.1 survival tier).
+/// 1. the lines its last sealed version added relative to that base, and
+/// 2. lines one of its seals added and a later seal of its own removed
+///    under `--allow-removals` or `--force` (finding 42 variant B: the
+///    override is the only record that the removal was unchecked).
+///
+/// A candidate the target lacks (by content, per copy; a moved block
+/// survives, finding 53) is **superseded** when a later seal removed it
+/// while its recorded base held it (not counting the spec's own seals that
+/// overrode the own-line check for the path, `--allow-removals`/`--force`)
+/// ([`informed_removals`]), or when a later seal of
+/// a spec since committed to git recorded the file without it. Otherwise
+/// it is **lost**, named with the seal that added it. A file the spec's
+/// last seal deleted is lost when the target still has it and no later
+/// seal wrote it again.
 pub fn audit(
     repo: &crate::Repository,
     spec_ids: &[String],
     against: Against,
 ) -> crate::error::WritResult<AuditReport> {
+    audit_with(repo, spec_ids, against, None)
+}
+
+/// [`audit`] against the tree `writ finish` will commit: `staged` maps each
+/// path finish stages to its sealed content (`None`: a staged deletion);
+/// every other path is read at HEAD.
+pub fn audit_finish(
+    repo: &crate::Repository,
+    spec_ids: &[String],
+    staged: &HashMap<String, Option<Vec<u8>>>,
+) -> crate::error::WritResult<AuditReport> {
+    audit_with(repo, spec_ids, Against::FinishTree, Some(staged))
+}
+
+fn audit_with(
+    repo: &crate::Repository,
+    spec_ids: &[String],
+    against: Against,
+    staged: Option<&HashMap<String, Option<Vec<u8>>>>,
+) -> crate::error::WritResult<AuditReport> {
     use std::time::Instant;
     let started = Instant::now();
 
-    // Every seal in the workspace, oldest first, for the superseded check.
-    let mut all_seals = repo.log()?;
-    all_seals.reverse();
-
-    let text = |hash: &str| -> crate::error::WritResult<Option<String>> {
-        let bytes = repo.object_content(hash)?;
-        Ok((!crate::diff::is_binary(&bytes)).then(|| String::from_utf8_lossy(&bytes).into_owned()))
+    // Every seal in the store (global chain and every spec chain), oldest
+    // first: under seal isolation most seals are only on spec chains.
+    let mut all_seals = repo.log_all()?;
+    all_seals.sort_by_key(|s| s.timestamp);
+    let mut by_path: HashMap<&str, Vec<(usize, usize)>> = HashMap::new();
+    for (si, seal) in all_seals.iter().enumerate() {
+        for (ci, change) in seal.changes.iter().enumerate() {
+            by_path
+                .entry(change.path.as_str())
+                .or_default()
+                .push((si, ci));
+        }
+    }
+    let committed: HashSet<String> = repo
+        .list_specs()?
+        .into_iter()
+        .filter(|s| s.commit_state != crate::spec::CommitState::Uncommitted)
+        .map(|s| s.id)
+        .collect();
+    let mut not_committed = Vec::new();
+    let writ_ignore = crate::ignore::IgnoreRules::load(repo.root());
+    let mut texts = Texts {
+        repo,
+        cache: HashMap::new(),
     };
 
+    let mut histories: HashMap<String, HashMap<String, chrono::DateTime<chrono::Utc>>> =
+        HashMap::new();
     let mut specs = Vec::with_capacity(spec_ids.len());
     for spec_id in spec_ids {
+        let spec_rec = repo.resolve_spec(spec_id)?;
+        let resolved = spec_rec.id.clone();
+        if against == Against::Head && !committed.contains(&resolved) {
+            not_committed.push(spec_id.clone());
+            continue;
+        }
         let mut seals = repo.spec_seals(spec_id)?;
         seals.reverse();
         let own = own_versions(&seals);
         let mut paths: Vec<&String> = own.keys().collect();
         paths.sort();
 
-        let targets: HashMap<String, Vec<u8>> = match against {
-            Against::WorkingTree => paths
+        let mut git_ignored = HashSet::new();
+        let at_head = match against {
+            Against::Head | Against::FinishTree => true,
+            Against::Auto => committed.contains(&resolved),
+            Against::WorkingTree => false,
+        };
+        let targets: HashMap<String, Vec<u8>> = match at_head {
+            false => paths
                 .iter()
                 .filter_map(|p| {
                     std::fs::read(repo.root().join(p.as_str()))
@@ -1116,132 +1489,103 @@ pub fn audit(
                         .map(|c| ((*p).clone(), c))
                 })
                 .collect(),
-            Against::Head => {
-                let owned: Vec<String> = paths.iter().map(|p| (*p).clone()).collect();
-                repo.git_head_blobs(&owned)?
+            true => {
+                let owned: Vec<String> = paths
+                    .iter()
+                    .map(|p| (*p).clone())
+                    .filter(|p| !staged.is_some_and(|m| m.contains_key(p)))
+                    .collect();
+                let mut blobs = repo.git_head_blobs(&owned)?;
+                let absent: Vec<String> = owned
+                    .into_iter()
+                    .filter(|p| !blobs.contains_key(p))
+                    .collect();
+                git_ignored = repo.git_ignored(&absent);
+                for (p, content) in staged.into_iter().flatten() {
+                    if let Some(c) = content {
+                        if own.contains_key(p) {
+                            blobs.insert(p.clone(), c.clone());
+                        }
+                    }
+                }
+                blobs
             }
         };
 
         let mut files = Vec::with_capacity(paths.len());
         for path in paths {
-            let v = &own[path];
-            let seal_id = seals
-                .iter()
-                .rev()
-                .find(|s| s.changes.iter().any(|c| &c.path == path))
-                .map(|s| s.id.clone())
-                .unwrap_or_default();
-            let last_time = v.times.last().copied().unwrap_or_default();
-            let mut file = FileSurvival {
-                path: path.clone(),
-                seal_id,
-                status: FileAuditStatus::Checked,
-                checked: 0,
-                lost: Vec::new(),
-                superseded: Vec::new(),
-            };
-            let Some(last_hash) = v.last_new.as_deref() else {
-                file.status = if targets.contains_key(path) {
-                    FileAuditStatus::DeletedButPresent
-                } else {
-                    FileAuditStatus::DeletedAsSealed
+            let mut events = Vec::new();
+            for &(si, ci) in by_path.get(path.as_str()).map(Vec::as_slice).unwrap_or(&[]) {
+                let seal = &all_seals[si];
+                let change = &seal.changes[ci];
+                let deleted =
+                    change.change_type == ChangeType::Deleted || change.new_hash.is_none();
+                let new = match change.new_hash.as_deref() {
+                    Some(h) if !deleted => match texts.get_lenient(h)? {
+                        Some(t) => t,
+                        None => continue,
+                    },
+                    _ => std::rc::Rc::from(""),
                 };
-                files.push(file);
-                continue;
-            };
-            let version = match text(last_hash) {
-                Ok(Some(t)) => t,
-                Ok(None) => {
-                    file.status = FileAuditStatus::Binary;
-                    files.push(file);
-                    continue;
-                }
-                Err(crate::error::WritError::ObjectNotFound(_)) => {
-                    file.status = FileAuditStatus::Unreadable;
-                    files.push(file);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            };
-            let base = match v.first_old.as_deref() {
-                Some(h) => match text(h) {
-                    Ok(Some(t)) => t,
-                    Ok(None) => String::new(),
-                    Err(crate::error::WritError::ObjectNotFound(_)) => String::new(),
-                    Err(e) => return Err(e),
-                },
-                None => String::new(),
-            };
+                let old = match change.old_hash.as_deref() {
+                    Some(h) => texts.get_lenient(h)?,
+                    None => None,
+                };
+                events.push(PathEvent {
+                    seal,
+                    old,
+                    new,
+                    deleted,
+                });
+            }
             let target = targets
                 .get(path)
-                .map(|b| String::from_utf8_lossy(b).into_owned())
-                .unwrap_or_default();
-
-            let version_lines = split_lines(&version);
-            let added: Vec<usize> = additions(&base, &version)
-                .into_iter()
-                .map(|(i, _)| i)
-                .collect();
-            file.checked = added.len();
-            let missing = content_gone(added, &version_lines, &counts(target.lines()));
-            if missing.is_empty() {
-                files.push(file);
+                .map(|b| String::from_utf8_lossy(b).into_owned());
+            let own_last = own[path].times.last().copied().unwrap_or_default();
+            let deleted_later = target.is_none()
+                && events
+                    .last()
+                    .is_some_and(|e| e.deleted && e.seal.timestamp > own_last);
+            if deleted_later || (target.is_none() && git_ignored.contains(path.as_str())) {
+                let status = if deleted_later {
+                    FileAuditStatus::DeletedLater
+                } else if writ_ignore.is_path_ignored(path) {
+                    FileAuditStatus::IgnoredByGitAndWrit
+                } else {
+                    FileAuditStatus::IgnoredByGit
+                };
+                files.push(FileSurvival {
+                    path: path.clone(),
+                    seal_id: seals
+                        .iter()
+                        .rev()
+                        .find(|s| s.changes.iter().any(|c| &c.path == path))
+                        .map(|s| s.id.clone())
+                        .unwrap_or_default(),
+                    status,
+                    checked: 0,
+                    skipped: 0,
+                    lost: Vec::new(),
+                    superseded: Vec::new(),
+                    captured: Vec::new(),
+                });
                 continue;
             }
-
-            // Later seals on this path, by any spec: an informed removal
-            // (base held the line, result lacks it) supersedes the addition.
-            let mut removers: Vec<(&Seal, HashMap<String, usize>)> = Vec::new();
-            for seal in all_seals.iter().filter(|s| s.timestamp > last_time) {
-                for change in seal.changes.iter().filter(|c| &c.path == path) {
-                    let Some(old) = change.old_hash.as_deref() else {
-                        continue;
-                    };
-                    let Ok(Some(old)) = text(old) else {
-                        continue;
-                    };
-                    let new = match (&change.change_type, change.new_hash.as_deref()) {
-                        (ChangeType::Deleted, _) | (_, None) => String::new(),
-                        (_, Some(h)) => match text(h) {
-                            Ok(Some(t)) => t,
-                            _ => continue,
-                        },
-                    };
-                    let removed: HashMap<String, usize> = informed_removals(&old, &new)
-                        .into_iter()
-                        .map(|(l, n)| (l.to_string(), n))
-                        .collect();
-                    if !removed.is_empty() {
-                        removers.push((seal, removed));
-                    }
-                }
-            }
-            for i in missing {
-                let line = version_lines[i];
-                let by =
-                    removers
-                        .iter_mut()
-                        .find_map(|(seal, removed)| match removed.get_mut(line) {
-                            Some(n) if *n > 0 => {
-                                *n -= 1;
-                                Some(*seal)
-                            }
-                            _ => None,
-                        });
-                match by {
-                    Some(seal) => file.superseded.push(SupersededLine {
-                        line: i + 1,
-                        text: line.to_string(),
-                        by_seal: seal.id.clone(),
-                        by_spec: seal.spec_id.clone(),
-                    }),
-                    None => file.lost.push(LostLine {
-                        line: i + 1,
-                        text: line.to_string(),
-                    }),
-                }
-            }
-            files.push(file);
+            let history = histories
+                .entry(path.clone())
+                .or_insert_with(|| line_history(&events));
+            files.push(audit_file(
+                &spec_rec,
+                spec_id,
+                path,
+                &seals,
+                &own[path],
+                &events,
+                history,
+                target.as_deref(),
+                &committed,
+                &mut texts,
+            )?);
         }
 
         let (checked, lost, superseded) = files.iter().fold((0, 0, 0), |(c, l, s), f| {
@@ -1256,17 +1600,1149 @@ pub fn audit(
         });
     }
 
-    let (checked, lost, superseded) = specs.iter().fold((0, 0, 0), |(c, l, s), sp| {
-        (c + sp.checked, l + sp.lost, s + sp.superseded)
-    });
+    let (checked, lost, superseded, skipped) =
+        specs.iter().fold((0, 0, 0, 0), |(c, l, s, k), sp| {
+            let sk: usize = sp.files.iter().map(|f| f.skipped).sum();
+            (c + sp.checked, l + sp.lost, s + sp.superseded, k + sk)
+        });
     Ok(AuditReport {
         against,
         specs,
         checked,
         lost,
         superseded,
+        skipped,
+        not_committed,
         elapsed_ms: started.elapsed().as_millis() as u64,
     })
+}
+
+/// When each line first appeared in any sealed version of a path (in a
+/// seal's recorded base or its result), from all its events. Built once
+/// per path per audit.
+fn line_history(events: &[PathEvent<'_>]) -> HashMap<String, chrono::DateTime<chrono::Utc>> {
+    let mut out: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+    let mut seen_texts: HashSet<*const u8> = HashSet::new();
+    for e in events {
+        let t = e.seal.timestamp;
+        for text in [e.old.as_deref(), Some(&*e.new)].into_iter().flatten() {
+            // Consecutive events share blobs; read each text once.
+            if !seen_texts.insert(text.as_ptr()) {
+                continue;
+            }
+            for l in text.lines() {
+                match out.get_mut(l) {
+                    Some(first) if *first <= t => {}
+                    Some(first) => *first = t,
+                    None => {
+                        out.insert(l.to_string(), t);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A candidate addition: where it was, what it says, who added it, and
+/// after when a removal of it counts.
+struct Candidate {
+    line: usize,
+    text: String,
+    added_by: String,
+    removed_by: Option<String>,
+    after: chrono::DateTime<chrono::Utc>,
+}
+
+/// Is `seal` an override of the own-line check for `path`?
+fn overridden(seal: &Seal, path: &str) -> bool {
+    seal.forced || seal.allow_removals.iter().any(|p| p == path)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn audit_file(
+    spec_rec: &crate::spec::Spec,
+    spec_id: &str,
+    path: &str,
+    own_seals: &[Seal],
+    v: &OwnVersion,
+    events: &[PathEvent<'_>],
+    history: &HashMap<String, chrono::DateTime<chrono::Utc>>,
+    target: Option<&str>,
+    committed: &HashSet<String>,
+    texts: &mut Texts<'_>,
+) -> crate::error::WritResult<FileSurvival> {
+    let own_events: Vec<&PathEvent<'_>> = events
+        .iter()
+        .filter(|e| e.seal.spec_id.as_deref() == Some(spec_id))
+        .collect();
+    let last_seal = own_seals
+        .iter()
+        .rev()
+        .find(|s| s.changes.iter().any(|c| c.path == path));
+    let last_time = v.times.last().copied().unwrap_or_default();
+    let mut file = FileSurvival {
+        path: path.to_string(),
+        seal_id: last_seal.map(|s| s.id.clone()).unwrap_or_default(),
+        status: FileAuditStatus::Checked,
+        checked: 0,
+        skipped: 0,
+        lost: Vec::new(),
+        superseded: Vec::new(),
+        captured: Vec::new(),
+    };
+
+    let Some(last_hash) = v.last_new.as_deref() else {
+        let recreated = events
+            .iter()
+            .any(|e| e.seal.timestamp > last_time && !e.deleted);
+        file.status = match (target.is_some(), recreated) {
+            (false, _) => FileAuditStatus::DeletedAsSealed,
+            (true, true) => FileAuditStatus::RecreatedLater,
+            (true, false) => FileAuditStatus::DeletedButPresent,
+        };
+        return Ok(file);
+    };
+    let version = match texts.get(last_hash) {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            file.status = FileAuditStatus::Binary;
+            return Ok(file);
+        }
+        Err(crate::error::WritError::ObjectNotFound(_)) => {
+            file.status = FileAuditStatus::Unreadable;
+            return Ok(file);
+        }
+        Err(e) => return Err(e),
+    };
+    // Finding 106: a path whose history starts in git (no writ version
+    // before the spec's first seal) takes its base from the spec's genesis
+    // snapshot or git, not the empty file.
+    let git_base = match v.first_old {
+        Some(_) => None,
+        None => texts
+            .repo
+            .baseline_text(spec_rec, path, v.times.first().copied())?
+            .map(|t| std::rc::Rc::<str>::from(t.as_str())),
+    };
+    let base = match v.first_old.as_deref() {
+        Some(h) => texts
+            .get_lenient(h)?
+            .unwrap_or_else(|| std::rc::Rc::from("")),
+        None => git_base.clone().unwrap_or_else(|| std::rc::Rc::from("")),
+    };
+    // Non-distinctive: blank, or text the file held before the spec first
+    // sealed it, in its base or in any earlier sealed version (the anchor
+    // rule: a stale rewrite that restores old text says nothing).
+    // Only the spec's own lines are ever asked about, so only those are
+    // looked up in the path's history (first time each line appeared).
+    let first_own = own_events.first().map(|e| e.seal.timestamp);
+    let mut in_base: HashSet<&str> = base.lines().collect();
+    if let Some(t) = first_own {
+        for e in &own_events {
+            in_base.extend(
+                e.new
+                    .lines()
+                    .filter(|l| history.get(*l).is_some_and(|first| *first < t)),
+            );
+        }
+    }
+    let distinctive = |l: &str| !l.trim().is_empty() && !in_base.contains(l);
+
+    // The spec's own seals of the file as (previous own version, sealed).
+    let steps: Vec<(&str, &str)> = own_events
+        .iter()
+        .enumerate()
+        .map(|(k, e)| {
+            let prev: &str = if k == 0 {
+                &base
+            } else {
+                &own_events[k - 1].new
+            };
+            (prev, &*e.new)
+        })
+        .collect();
+    // Finding 105: a foreign seal that recorded removing `l` but never saw
+    // the own seal that added it (its version is a stale copy).
+    // The path's earliest known version: the first event's recorded base,
+    // or what it sealed when the file was new to writ.
+    let genesis: HashSet<&str> = match events.first() {
+        Some(e) => match (e.old.as_deref(), git_base.as_deref()) {
+            (Some(old), _) => old.lines().collect(),
+            (None, Some(g)) if own_events.first().is_some_and(|o| std::ptr::eq(*o, e)) => {
+                g.lines().collect()
+            }
+            (None, _) => e.new.lines().collect(),
+        },
+        None => HashSet::new(),
+    };
+    let steps = SealStep::all(&steps, &in_base, Some(&genesis));
+    // Which own seal added each distinctive text (the latest that did).
+    let mut adder: HashMap<&str, &str> = HashMap::new();
+    for (step, e) in steps.iter().zip(&own_events) {
+        for l in &step.adds {
+            adder.insert(l, e.seal.id.as_str());
+        }
+    }
+    let last_id = file.seal_id.clone();
+
+    let target_text = target.unwrap_or("");
+    let have = counts(target_text.lines());
+    let version_lines = split_lines(&version);
+    let mut candidates: Vec<Candidate> = Vec::new();
+
+    // 1. Additions in the last sealed version.
+    let added: Vec<usize> = additions(&base, &version)
+        .into_iter()
+        .map(|(i, _)| i)
+        .collect();
+    let (kept, skipped): (Vec<usize>, Vec<usize>) = added
+        .into_iter()
+        .partition(|&i| distinctive(version_lines[i]));
+    file.skipped += skipped.len();
+    file.checked += kept.len();
+    for i in content_gone(kept, &version_lines, &have) {
+        let text = version_lines[i];
+        candidates.push(Candidate {
+            line: i + 1,
+            text: text.to_string(),
+            added_by: adder.get(text).map_or(last_id.clone(), |s| s.to_string()),
+            removed_by: None,
+            after: last_time,
+        });
+    }
+
+    // 2. Own additions that an own overridden seal removed (CC decision
+    // C): intentional, the agent was refused and overrode on the record,
+    // unless the override recorded another spec's sealed content in their
+    // place (captured: yellow).
+    // Line counts of each event's sealed version, computed once, on use.
+    let event_counts_cell = std::cell::OnceCell::new();
+    let event_counts = || -> &Vec<HashMap<&str, usize>> {
+        event_counts_cell.get_or_init(|| events.iter().map(|e| counts(e.new.lines())).collect())
+    };
+    // Per event, the lines it replaced in place with text new to the file
+    // (finding 105), computed on first use.
+    let in_place: Vec<std::cell::OnceCell<HashSet<&str>>> =
+        events.iter().map(|_| std::cell::OnceCell::new()).collect();
+    let rewrote = |i: usize, l: &str| -> bool {
+        let e = &events[i];
+        let Some(old) = e.old.as_deref() else {
+            return false;
+        };
+        in_place[i]
+            .get_or_init(|| {
+                let old_lines: HashSet<&str> = old.lines().collect();
+                replaced_in_place(old, &e.new, |x| {
+                    !x.trim().is_empty()
+                        && !old_lines.contains(x)
+                        && !in_base.contains(x)
+                        && !genesis.contains(x)
+                        && history
+                            .get(x)
+                            .is_none_or(|first| *first >= e.seal.timestamp)
+                })
+            })
+            .contains(l)
+    };
+    let unseen_removal =
+        |l: &str, after: chrono::DateTime<chrono::Utc>, until: chrono::DateTime<chrono::Utc>| {
+            events
+                .iter()
+                .zip(event_counts())
+                .enumerate()
+                .filter(|(_, (o, _))| o.seal.spec_id.as_deref() != Some(spec_id))
+                .filter(|(_, (o, _))| o.seal.timestamp > after && o.seal.timestamp <= until)
+                .find(|(i, (o, have))| {
+                    !have.contains_key(l)
+                        && o.old
+                            .as_deref()
+                            .is_some_and(|old| old.lines().any(|x| x == l))
+                        && !saw_addition_in(have, l, &steps)
+                        && !rewrote(*i, l)
+                })
+                .map(|(_, (o, _))| o.seal)
+        };
+    // Another spec's sealed additions to the file, built on first use.
+    let mut foreign: Option<HashMap<&str, &Seal>> = None;
+    let mut earlier: HashSet<&str> = HashSet::new();
+    for (k, e) in own_events.iter().enumerate() {
+        let is_override = overridden(e.seal, path);
+        // Against the spec's own previous version of the file (the recorded
+        // base is the shared index, which may be another spec's version).
+        let old: &str = match k {
+            0 => &base,
+            _ => &own_events[k - 1].new,
+        };
+        // Own lines added by an earlier own seal that this seal removed.
+        let mut gone: Vec<&str> = steps[k]
+            .removed
+            .iter()
+            .copied()
+            .filter(|l| earlier.contains(l))
+            .collect();
+        earlier.extend(steps[k].adds.iter().copied());
+        if gone.is_empty() {
+            continue;
+        }
+        gone.sort_unstable();
+        // The capture signature (overrides only): the file this seal
+        // recorded is another spec's sealed version, or its new lines are
+        // another spec's sealed additions.
+        let captured_from = if !is_override {
+            None
+        } else {
+            let foreign = foreign.get_or_insert_with(|| {
+                events
+                    .iter()
+                    .filter(|e| e.seal.spec_id.as_deref().is_some_and(|s| s != spec_id))
+                    .flat_map(|e| {
+                        additions(e.old.as_deref().unwrap_or(""), &e.new)
+                            .into_iter()
+                            .map(move |(_, l)| (l, e.seal))
+                    })
+                    .filter(|(l, _)| distinctive(l))
+                    .collect()
+            });
+            events
+                .iter()
+                .find(|o| {
+                    o.seal.spec_id.as_deref().is_some_and(|s| s != spec_id)
+                        && !o.deleted
+                        && *o.new == *e.new
+                })
+                .map(|o| o.seal)
+                .or_else(|| steps[k].adds.iter().find_map(|l| foreign.get(l).copied()))
+        };
+        let old_lines: Vec<&str> = old.lines().collect();
+        for l in gone {
+            if have.contains_key(l) || version_lines.contains(&l) {
+                if is_override {
+                    file.checked += 1;
+                }
+                continue;
+            }
+            let line = old_lines.iter().position(|x| *x == l).map_or(0, |i| i + 1);
+            if !is_override {
+                // Own iteration, unless the removal carried over a foreign
+                // seal's stale copy (finding 105: the backstop, whatever
+                // the seal-time check did).
+                let added_at = own_events[..k]
+                    .iter()
+                    .rev()
+                    .find(|p| p.new.lines().any(|x| x == l))
+                    .map(|p| p.seal.timestamp)
+                    .unwrap_or_default();
+                if unseen_removal(l, added_at, e.seal.timestamp).is_some() {
+                    file.checked += 1;
+                    file.lost.push(LostLine {
+                        line,
+                        text: l.to_string(),
+                        added_by: adder.get(l).map_or(String::new(), |s| s.to_string()),
+                        removed_by: None,
+                    });
+                }
+                continue;
+            }
+            file.checked += 1;
+            match captured_from {
+                Some(other) => file.captured.push(CapturedLine {
+                    line,
+                    text: l.to_string(),
+                    added_by: adder.get(l).map_or(String::new(), |s| s.to_string()),
+                    removed_by: e.seal.id.clone(),
+                    other_spec: other.spec_id.clone().unwrap_or_default(),
+                    other_seal: other.id.clone(),
+                }),
+                None => file.superseded.push(SupersededLine {
+                    line,
+                    text: l.to_string(),
+                    by_seal: e.seal.id.clone(),
+                    by_spec: e.seal.spec_id.clone(),
+                    reason: SupersededBy::OwnOverride,
+                }),
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(file);
+    }
+
+    // Later removals by any seal: informed (base held the line), per copy.
+    // (event index, seal, its line counts, lines it removed per copy)
+    type Remover<'s, 'l> = (
+        usize,
+        &'s Seal,
+        &'l HashMap<&'l str, usize>,
+        HashMap<&'l str, usize>,
+    );
+    let mut removers: Vec<Remover> = events
+        .iter()
+        .zip(event_counts())
+        .enumerate()
+        .filter_map(|(i, (e, have))| {
+            let old = e.old.as_deref()?;
+            let r = informed_removals(old, &e.new);
+            (!r.is_empty()).then_some((i, e.seal, have, r))
+        })
+        .collect();
+    for c in candidates {
+        let informed = removers.iter_mut().find_map(|(i, seal, new, removed)| {
+            if seal.timestamp <= c.after {
+                return None;
+            }
+            // Finding 105: another spec's removal is informed only if its
+            // version saw the seal that added the line, or it rewrote the
+            // line in place.
+            if seal.spec_id.as_deref() != Some(spec_id)
+                && !saw_addition_in(new, &c.text, &steps)
+                && !rewrote(*i, &c.text)
+            {
+                return None;
+            }
+            match removed.get_mut(c.text.as_str()) {
+                Some(n) if *n > 0 => {
+                    *n -= 1;
+                    Some(*seal)
+                }
+                _ => None,
+            }
+        });
+        let by = informed
+            .map(|s| (s, SupersededBy::InformedRemoval))
+            .or_else(|| {
+                events
+                    .iter()
+                    .filter(|e| e.seal.timestamp > c.after)
+                    .filter(|e| {
+                        e.seal
+                            .spec_id
+                            .as_deref()
+                            .is_some_and(|s| s != spec_id && committed.contains(s))
+                    })
+                    .find(|e| !e.new.lines().any(|x| x == c.text))
+                    .map(|e| (e.seal, SupersededBy::CommittedSpec))
+            });
+        match by {
+            Some((seal, reason)) => file.superseded.push(SupersededLine {
+                line: c.line,
+                text: c.text,
+                by_seal: seal.id.clone(),
+                by_spec: seal.spec_id.clone(),
+                reason,
+            }),
+            None => file.lost.push(LostLine {
+                line: c.line,
+                text: c.text,
+                added_by: c.added_by,
+                removed_by: c.removed_by,
+            }),
+        }
+    }
+    Ok(file)
+}
+
+// ── Survival tier (`writ doctor --survival`, before finish, on watch) ──
+
+/// Cache of the last survival tier run, `.writ/survival_cache.json`.
+pub const SURVIVAL_CACHE_FILE: &str = "survival_cache.json";
+
+/// Doctor check id of the survival tier.
+pub const CHECK_SURVIVAL: &str = "survival";
+
+/// The last survival tier run and the last green one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SurvivalCache {
+    /// writ version that wrote it; another version's cache is ignored.
+    pub version: String,
+    /// The state the run saw: seal set, spec records, audited files' stat.
+    pub key: String,
+    /// Paths the run audited (their stat is part of `key`).
+    pub paths: Vec<String>,
+    /// Newest seal when the run happened.
+    pub newest_seal: Option<String>,
+    /// No lost line and no sealed deletion undone.
+    pub green: bool,
+    /// The run's findings (red: lost lines; yellow: files git ignores).
+    pub findings: Vec<crate::doctor::DoctorFinding>,
+    /// Lost lines in the run.
+    pub lost: usize,
+    /// Info notes (finding 111): sealed paths both git and writ ignore.
+    /// Never findings; never affect green or "safe to finish".
+    #[serde(default)]
+    pub info: Vec<String>,
+    /// Newest seal at the last green run, and that seal's time (the bound
+    /// of the next run).
+    pub last_green: Option<String>,
+    pub last_green_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Wall time of the run and how many specs it audited.
+    pub elapsed_ms: u64,
+    pub specs_audited: usize,
+}
+
+impl SurvivalCache {
+    fn path(repo: &crate::Repository) -> std::path::PathBuf {
+        repo.writ_dir().join(SURVIVAL_CACHE_FILE)
+    }
+
+    /// The cache on disk, if this writ version wrote it.
+    pub fn load(repo: &crate::Repository) -> Option<Self> {
+        let bytes = std::fs::read(Self::path(repo)).ok()?;
+        let c: Self = serde_json::from_slice(&bytes).ok()?;
+        (c.version == env!("CARGO_PKG_VERSION")).then_some(c)
+    }
+
+    fn save(&self, repo: &crate::Repository) {
+        if let Ok(bytes) = serde_json::to_vec(self) {
+            let _ = crate::fsutil::atomic_write(&Self::path(repo), &bytes);
+        }
+    }
+
+    /// True when the state the run saw is the current state.
+    pub fn is_current(&self, repo: &crate::Repository) -> bool {
+        state_key(repo, &self.paths).is_some_and(|k| k == self.key)
+    }
+}
+
+/// What the fast tier says about survival, from the cache alone (no audit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurvivalState {
+    /// The tier never ran here (or this writ version never ran it).
+    NotRun,
+    /// The last run is green and nothing changed since. `notes`: yellow
+    /// findings (sealed files git ignores).
+    Green { seal: String, notes: usize },
+    /// The last run found losses and nothing changed since.
+    Red { lost: usize, seal: Option<String> },
+    /// Something changed since the last run.
+    Stale { last_green: Option<String> },
+}
+
+impl SurvivalState {
+    /// From the cache, re-checking its key against the current state.
+    pub fn current(repo: &crate::Repository) -> Self {
+        let Some(c) = SurvivalCache::load(repo) else {
+            return Self::NotRun;
+        };
+        if !c.is_current(repo) {
+            return Self::Stale {
+                last_green: c.last_green,
+            };
+        }
+        let notes = c.findings.len();
+        match (c.green, c.newest_seal) {
+            (true, Some(seal)) => Self::Green { seal, notes },
+            (true, None) => Self::NotRun,
+            (false, seal) => Self::Red { lost: c.lost, seal },
+        }
+    }
+
+    /// The headline suffix after the fast-tier part.
+    pub fn note(&self) -> String {
+        const RUN: &str = "run `writ doctor --survival`";
+        match self {
+            Self::NotRun => format!("survival not run; {RUN}"),
+            Self::Green { seal, notes: 0 } => format!("survival green as of {}", short(seal)),
+            Self::Green { seal, notes } => format!(
+                "survival green as of {} with {notes} note(s); run `writ doctor --survival`",
+                short(seal)
+            ),
+            Self::Red { lost: 0, seal } => format!(
+                "survival red: the merge finish would commit has an unresolved conflict{}; {RUN}",
+                seal.as_deref()
+                    .map(|s| format!(" as of {}", short(s)))
+                    .unwrap_or_default()
+            ),
+            Self::Red { lost, seal } => format!(
+                "survival red: {lost} sealed line(s) lost{}; {RUN}",
+                seal.as_deref()
+                    .map(|s| format!(" as of {}", short(s)))
+                    .unwrap_or_default()
+            ),
+            Self::Stale {
+                last_green: Some(s),
+            } => format!(
+                "survival last green as of {}, store changed since; {RUN}",
+                short(s)
+            ),
+            Self::Stale { last_green: None } => {
+                format!("survival not green since the store changed; {RUN}")
+            }
+        }
+    }
+
+    /// `survival_last_green` for the report: the seal of the last green
+    /// run, whatever happened since.
+    pub fn last_green(repo: &crate::Repository) -> Option<String> {
+        SurvivalCache::load(repo).and_then(|c| c.last_green)
+    }
+
+    pub fn is_green(&self) -> bool {
+        matches!(self, Self::Green { .. })
+    }
+
+    /// Green with no finding at all: the survival half of "safe to finish".
+    pub fn is_safe(&self) -> bool {
+        matches!(self, Self::Green { notes: 0, .. })
+    }
+}
+
+fn short(id: &str) -> &str {
+    &id[..12.min(id.len())]
+}
+
+/// The state a survival result depends on: the seal set, the spec records
+/// and the audited files (stat only). `None` when the store cannot be read.
+pub fn state_key(repo: &crate::Repository, paths: &[String]) -> Option<String> {
+    let mut h = blake3::Hasher::new();
+    let mut seal_ids: Vec<String> = std::fs::read_dir(repo.writ_dir().join("seals"))
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    seal_ids.sort();
+    for id in &seal_ids {
+        h.update(id.as_bytes());
+        h.update(b"\n");
+    }
+    let mut specs: Vec<(String, u64, i128)> = std::fs::read_dir(repo.writ_dir().join("specs"))
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            Some((
+                e.file_name().to_string_lossy().into_owned(),
+                m.len(),
+                mtime(&m),
+            ))
+        })
+        .collect();
+    specs.sort();
+    for (name, len, t) in &specs {
+        h.update(format!("s {name} {len} {t}\n").as_bytes());
+    }
+    for a in accepted_removals(repo) {
+        h.update(format!("a {a}\n").as_bytes());
+    }
+    for p in paths {
+        match std::fs::metadata(repo.root().join(p)) {
+            Ok(m) => h.update(format!("f {p} {} {}\n", m.len(), mtime(&m)).as_bytes()),
+            Err(_) => h.update(format!("f {p} absent\n").as_bytes()),
+        };
+    }
+    Some(h.finalize().to_hex().to_string())
+}
+
+fn mtime(m: &std::fs::Metadata) -> i128 {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_nanos() as i128)
+}
+
+/// Result of one survival tier run.
+#[derive(Debug, Clone)]
+pub struct TierRun {
+    pub cache: SurvivalCache,
+    /// Served from the cache (nothing changed since the last run).
+    pub cached: bool,
+    pub report: Option<AuditReport>,
+}
+
+/// Run the survival tier: every spec not yet committed (against the
+/// working tree) and every spec sealed or committed since the last green
+/// result (committed ones against HEAD). Served from the cache when the
+/// state it saw has not changed.
+pub fn run_tier(repo: &crate::Repository) -> crate::error::WritResult<TierRun> {
+    let prev = SurvivalCache::load(repo);
+    if let Some(c) = prev.as_ref().filter(|c| c.is_current(repo)) {
+        return Ok(TierRun {
+            cache: c.clone(),
+            cached: true,
+            report: None,
+        });
+    }
+    let started = std::time::Instant::now();
+    let since = prev.as_ref().and_then(|c| c.last_green_at);
+    let specs = repo.list_specs()?;
+    let mut ids: Vec<String> = specs
+        .iter()
+        .filter(|s| s.commit_state == crate::spec::CommitState::Uncommitted)
+        .filter(|s| !s.sealed_by.is_empty())
+        .map(|s| s.id.clone())
+        .collect();
+    for id in specs_since(repo, since)? {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids.sort();
+    let against = if cfg!(feature = "bridge") && repo.git_head_blobs(&[]).is_ok() {
+        Against::Auto
+    } else {
+        Against::WorkingTree
+    };
+    // Committable specs are judged on the tree finish would commit, so the
+    // tier and finish never disagree (finding 103); the rest per `against`.
+    let committable: Vec<String> = specs
+        .iter()
+        .filter(|s| s.is_committable() && !s.sealed_by.is_empty() && ids.contains(&s.id))
+        .map(|s| s.id.clone())
+        .collect();
+    let rest: Vec<String> = ids
+        .iter()
+        .filter(|id| !committable.contains(id))
+        .cloned()
+        .collect();
+    let mut report = audit(repo, &rest, against)?;
+    let mut escalations = Vec::new();
+    if !committable.is_empty() {
+        let (tree, conv) = finish_tree(repo, &committable)?;
+        let mut fin = audit_finish(repo, &committable, &tree)?;
+        // A file the merge escalates has no result finish would commit
+        // (finish refuses at the merge): the escalation is the verdict.
+        let escalated: HashSet<&str> = conv
+            .escalations
+            .iter()
+            .map(|e| e.file_path.as_str())
+            .collect();
+        for spec in &mut fin.specs {
+            spec.files.retain(|f| !escalated.contains(f.path.as_str()));
+            spec.checked = spec.files.iter().map(|f| f.checked).sum();
+            spec.lost = spec.files.iter().map(|f| f.lost.len()).sum();
+            spec.superseded = spec.files.iter().map(|f| f.superseded.len()).sum();
+        }
+        report.checked += fin.specs.iter().map(|s| s.checked).sum::<usize>();
+        report.lost += fin.specs.iter().map(|s| s.lost).sum::<usize>();
+        report.superseded += fin.specs.iter().map(|s| s.superseded).sum::<usize>();
+        report.skipped += fin.skipped;
+        report.specs.extend(fin.specs);
+        report.specs.sort_by(|a, b| a.spec_id.cmp(&b.spec_id));
+        escalations = conv.escalations;
+    }
+    let newest = repo.log_all()?.into_iter().max_by_key(|s| s.timestamp);
+    let mut paths: Vec<String> = report
+        .specs
+        .iter()
+        .flat_map(|s| s.files.iter().map(|f| f.path.clone()))
+        .collect();
+    paths.sort();
+    paths.dedup();
+    // Escalations first: finish refuses on them before any line check.
+    let mut findings = escalation_findings(repo, &escalations);
+    findings.extend(self::findings(repo, &report));
+    let green = report.is_green() && escalations.is_empty();
+    let (last_green, last_green_at) = if green {
+        (
+            newest.as_ref().map(|s| s.id.clone()),
+            newest.as_ref().map(|s| s.timestamp),
+        )
+    } else {
+        (
+            prev.as_ref().and_then(|c| c.last_green.clone()),
+            prev.as_ref().and_then(|c| c.last_green_at),
+        )
+    };
+    let info = info_notes(&report);
+    let cache = SurvivalCache {
+        info,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        key: state_key(repo, &paths).unwrap_or_default(),
+        paths,
+        newest_seal: newest.map(|s| s.id),
+        green,
+        findings,
+        // Finding 108: the count the headline shows is the lines the red
+        // findings name: the audit's plus each merge loss's.
+        lost: report.lost
+            + escalations
+                .iter()
+                .filter(|e| e.conflict_class == MERGE_LOSS_CLASS)
+                .map(|e| escalation_lines(e).len().max(1))
+                .sum::<usize>(),
+        last_green,
+        last_green_at,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        specs_audited: ids.len(),
+    };
+    cache.save(repo);
+    Ok(TierRun {
+        cache,
+        cached: false,
+        report: Some(report),
+    })
+}
+
+/// Finding 111: one info line per sealed path that git and writ both
+/// ignore (deduplicated across specs), naming the two exits.
+pub fn info_notes(report: &AuditReport) -> Vec<String> {
+    let mut by_path: std::collections::BTreeMap<&str, Vec<(&str, &str)>> = Default::default();
+    for spec in &report.specs {
+        for f in spec
+            .files
+            .iter()
+            .filter(|f| f.status == FileAuditStatus::IgnoredByGitAndWrit)
+        {
+            by_path
+                .entry(f.path.as_str())
+                .or_default()
+                .push((spec.spec_id.as_str(), f.seal_id.as_str()));
+        }
+    }
+    by_path
+        .into_iter()
+        .map(|(path, sealed)| {
+            let by: Vec<String> = sealed
+                .iter()
+                .map(|(spec, seal)| format!("spec '{spec}' seal {}", short(seal)))
+                .collect();
+            format!(
+                "{path} was sealed ({}) but git and writ both ignore it now, so no finish can commit it. Either remove the ignore rule and seal the file (or its deletion), or leave it: the seal stays as history. To retire it without editing the ignore rules, delete the file and run `writ seal --paths {path}`",
+                by.join(", ")
+            )
+        })
+        .collect()
+}
+
+/// Path -> content finish would commit (`None`: a staged deletion).
+pub type FinishTree = HashMap<String, Option<Vec<u8>>>;
+
+/// The tree `writ finish` would commit for `spec_ids` (findings 103, 104):
+/// each staged path's sealed content from the finish plan, overlaid with
+/// the seal-tree convergence result finish materializes, as
+/// `path -> content` (`None`: a staged deletion). Also the convergence
+/// report: finish refuses on any escalation. Writes nothing (dry run).
+pub fn finish_tree(
+    repo: &crate::Repository,
+    spec_ids: &[String],
+) -> crate::error::WritResult<(FinishTree, crate::repo::SealTreeConvergenceReport)> {
+    // Finding 110: a diagnostic never writes to the store; the dry run
+    // merges the same way and stores nothing.
+    let dry = repo.finalize_convergence_dry_run()?;
+    let plan = repo.finish_plan(spec_ids)?;
+    let mut tree = HashMap::new();
+    for (path, hash) in &plan.stage {
+        let content = match hash {
+            Some(h) => Some(repo.object_content(h)?),
+            None => None,
+        };
+        tree.insert(path.clone(), content);
+    }
+    for (path, hash) in &dry.report.shadow_results {
+        if tree.contains_key(path) {
+            tree.insert(path.clone(), Some(dry.content(repo, hash)?));
+        }
+    }
+    Ok((tree, dry.report))
+}
+
+/// Finding 104: the convergence notices whose lines the merged result
+/// actually holds. A notice says the lines "were kept"; when the content
+/// finish commits lacks them (no merge result, or one without them), the
+/// claim is false and the notice is dropped.
+pub fn notices_that_hold<'r>(
+    repo: &crate::Repository,
+    report: &'r crate::repo::SealTreeConvergenceReport,
+) -> Vec<&'r ConvergenceNotice> {
+    report
+        .notices
+        .iter()
+        .filter(|n| {
+            let Some((_, hash)) = report.shadow_results.iter().find(|(p, _)| *p == n.path) else {
+                return false;
+            };
+            let Ok(bytes) = repo.object_content(hash) else {
+                return false;
+            };
+            let merged = String::from_utf8_lossy(&bytes);
+            let have = counts(merged.lines());
+            n.lines.iter().all(|l| have.contains_key(l.as_str()))
+        })
+        .collect()
+}
+
+/// Up to this many lost lines are quoted per finding.
+pub const MAX_LINES_SHOWN: usize = 5;
+
+/// One line naming a lost line and the seal that added it.
+pub fn describe_lost(path: &str, l: &LostLine) -> String {
+    let mut s = format!(
+        "{path}:{} {:?} (added by seal {}",
+        l.line,
+        l.text,
+        short(&l.added_by)
+    );
+    if let Some(r) = &l.removed_by {
+        s.push_str(&format!(
+            ", removed by its own seal {}, which overrode the removal check",
+            short(r)
+        ));
+    }
+    s.push(')');
+    s
+}
+
+/// Doctor findings for an audit: one red per (spec, file) with lost lines
+/// or an undone sealed deletion; one yellow per sealed file git ignores.
+pub fn findings(
+    repo: &crate::Repository,
+    report: &AuditReport,
+) -> Vec<crate::doctor::DoctorFinding> {
+    use crate::doctor::{DoctorFinding, Severity};
+    let accepted = accepted_removals(repo);
+    let mut out = Vec::new();
+    for spec in &report.specs {
+        for f in &spec.files {
+            if !f.lost.is_empty() {
+                let mut shown: Vec<String> = f
+                    .lost
+                    .iter()
+                    .take(MAX_LINES_SHOWN)
+                    .map(|l| describe_lost(&f.path, l))
+                    .collect();
+                if f.lost.len() > MAX_LINES_SHOWN {
+                    shown.push(format!("and {} more", f.lost.len() - MAX_LINES_SHOWN));
+                }
+                out.push(DoctorFinding::new(
+                    CHECK_SURVIVAL,
+                    Severity::Red,
+                    format!(
+                        "{} sealed line(s) of spec '{}' are missing and no seal removed them: {}. Restore them (`writ show <seal> --diff` shows the original) and seal, or decide they go",
+                        f.lost.len(),
+                        spec.spec_id,
+                        shown.join("; ")
+                    ),
+                    String::new(),
+                    vec![f.path.clone()],
+                ));
+            }
+            let mut captured: Vec<&CapturedLine> = f
+                .captured
+                .iter()
+                .filter(|c| {
+                    !accepted
+                        .iter()
+                        .any(|a| c.removed_by.starts_with(a.as_str()))
+                })
+                .collect();
+            captured.sort_by(|a, b| a.removed_by.cmp(&b.removed_by));
+            let mut i = 0;
+            while i < captured.len() {
+                let seal = captured[i].removed_by.clone();
+                let group: Vec<&CapturedLine> = captured[i..]
+                    .iter()
+                    .take_while(|c| c.removed_by == seal)
+                    .copied()
+                    .collect();
+                i += group.len();
+                let c0 = group[0];
+                let shown: Vec<String> = group
+                    .iter()
+                    .take(MAX_LINES_SHOWN)
+                    .map(|c| {
+                        format!(
+                            "{}:{} {:?} (added by seal {})",
+                            f.path,
+                            c.line,
+                            c.text,
+                            short(&c.added_by)
+                        )
+                    })
+                    .collect();
+                out.push(DoctorFinding::new(
+                    CHECK_SURVIVAL,
+                    Severity::Yellow,
+                    format!(
+                        "override captured another spec's version: spec '{}' seal {} overrode the removal check on {} and recorded spec '{}''s content (seal {}) in place of {} of its own line(s): {}{}. If that was meant, confirm it with `writ finish --accept-removals {}`; else restore the lines and seal",
+                        spec.spec_id,
+                        short(&seal),
+                        f.path,
+                        c0.other_spec,
+                        short(&c0.other_seal),
+                        group.len(),
+                        shown.join("; "),
+                        if group.len() > MAX_LINES_SHOWN { format!("; and {} more", group.len() - MAX_LINES_SHOWN) } else { String::new() },
+                        short(&seal),
+                    ),
+                    String::new(),
+                    vec![f.path.clone()],
+                ));
+            }
+            match f.status {
+                FileAuditStatus::DeletedButPresent => out.push(DoctorFinding::new(
+                    CHECK_SURVIVAL,
+                    Severity::Red,
+                    format!(
+                        "spec '{}' sealed the deletion of {} (seal {}) but the file is back and no seal wrote it again",
+                        spec.spec_id,
+                        f.path,
+                        short(&f.seal_id)
+                    ),
+                    String::new(),
+                    vec![f.path.clone()],
+                )),
+                FileAuditStatus::IgnoredByGit => out.push(DoctorFinding::new(
+                    CHECK_SURVIVAL,
+                    Severity::Yellow,
+                    format!(
+                        "spec '{}' sealed {} (seal {}) but git ignores it ({}), so no finish can commit it: remove that ignore rule, or stop sealing the path",
+                        spec.spec_id,
+                        f.path,
+                        short(&f.seal_id),
+                        ignore_source(repo, &f.path)
+                    ),
+                    String::new(),
+                    vec![f.path.clone()],
+                )),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
+/// The seal of `spec_id` that added `line` to `path`: the latest of the
+/// spec's own seals of the path whose step (from its previous own
+/// version) added it (finding 109). `None` when no own seal added it.
+pub fn adding_seal(
+    repo: &crate::Repository,
+    spec_id: &str,
+    path: &str,
+    line: &str,
+) -> crate::error::WritResult<Option<Seal>> {
+    let mut seals = repo.spec_seals(spec_id)?;
+    seals.reverse();
+    let text = |h: &str| -> Option<String> {
+        let b = repo.object_content(h).ok()?;
+        (!crate::diff::is_binary(&b)).then(|| String::from_utf8_lossy(&b).into_owned())
+    };
+    let mut prev: Option<String> = None;
+    let mut found = None;
+    for seal in seals {
+        let Some(change) = seal.changes.iter().find(|c| c.path == path) else {
+            continue;
+        };
+        let old = prev
+            .clone()
+            .or_else(|| change.old_hash.as_deref().and_then(text))
+            .unwrap_or_default();
+        let new = change
+            .new_hash
+            .as_deref()
+            .and_then(text)
+            .unwrap_or_default();
+        if additions(&old, &new).iter().any(|(_, l)| *l == line) {
+            found = Some(seal.clone());
+        }
+        prev = Some(new);
+    }
+    Ok(found)
+}
+
+/// The lines a merge-loss escalation says would be lost.
+pub fn escalation_lines(e: &super::PipelineEscalation) -> Vec<String> {
+    e.right_content
+        .as_deref()
+        .map(|c| c.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// Red findings for the seal-tree convergence escalations finish would
+/// refuse on: a merge loss names each line, the seal that added it and its
+/// spec, with the merge as the remover (finding 109); a conflict names the
+/// file and specs.
+fn escalation_findings(
+    repo: &crate::Repository,
+    escalations: &[super::PipelineEscalation],
+) -> Vec<crate::doctor::DoctorFinding> {
+    escalations
+        .iter()
+        .map(|e| {
+            let message = if e.conflict_class == MERGE_LOSS_CLASS {
+                let spec = &e.right_spec;
+                let lines: Vec<String> = escalation_lines(e)
+                    .iter()
+                    .take(MAX_LINES_SHOWN)
+                    .map(|l| {
+                        let by = adding_seal(repo, spec, &e.file_path, l)
+                            .ok()
+                            .flatten()
+                            .map(|s| format!("added by seal {} of spec '{spec}'", short(&s.id)))
+                            .unwrap_or_else(|| format!("sealed by spec '{spec}'"));
+                        format!("{}: {l:?} ({by})", e.file_path)
+                    })
+                    .collect();
+                format!(
+                    "{} sealed line(s) of spec '{spec}' would be lost by the merge finish would commit: {}. Restore them (`writ show <seal> --diff` shows the original) and seal, or resolve the merge (`writ converge-all --dry-run`)",
+                    escalation_lines(e).len().max(1),
+                    lines.join("; ")
+                )
+            } else {
+                format!(
+                    "the merge finish would commit has an unresolved conflict in {} (specs '{}' and '{}'): {}. Resolve it (`writ converge-all --dry-run` shows it) and seal",
+                    e.file_path, e.left_spec, e.right_spec, e.reason
+                )
+            };
+            crate::doctor::DoctorFinding::new(
+                CHECK_SURVIVAL,
+                crate::doctor::Severity::Red,
+                message,
+                String::new(),
+                vec![e.file_path.clone()],
+            )
+        })
+        .collect()
+}
+
+/// Seals whose captured removals a human confirmed with
+/// `writ finish --accept-removals <seal>` (prefixes), in
+/// `.writ/survival_accepted.json`.
+pub const ACCEPTED_FILE: &str = "survival_accepted.json";
+
+pub fn accepted_removals(repo: &crate::Repository) -> Vec<String> {
+    std::fs::read(repo.writ_dir().join(ACCEPTED_FILE))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Record a human's confirmation of an override's captured removals
+/// (`writ finish --accept-removals <seal>`). The seal must exist; the
+/// stored id is the full one. Returns it.
+pub fn accept_removals(repo: &crate::Repository, seal: &str) -> crate::error::WritResult<String> {
+    let id = repo.resolve_seal_id(seal)?;
+    let mut all = accepted_removals(repo);
+    if !all.contains(&id) {
+        all.push(id.clone());
+        all.sort();
+        crate::fsutil::atomic_write(
+            &repo.writ_dir().join(ACCEPTED_FILE),
+            &serde_json::to_vec_pretty(&all)?,
+        )?;
+    }
+    Ok(id)
+}
+
+/// The rule that makes git ignore `path` (`.gitignore:54: bench/x/`),
+/// from `git check-ignore -v`; a generic phrase when git cannot say.
+fn ignore_source(repo: &crate::Repository, path: &str) -> String {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.root())
+        .args(["check-ignore", "-v", "--no-index", "--"])
+        .arg(path)
+        .output();
+    out.ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let line = String::from_utf8_lossy(&o.stdout).into_owned();
+            let rule = line.split('\t').next()?.trim().to_string();
+            // "source:line:pattern" -> "source:line: pattern"
+            let mut parts = rule.splitn(3, ':');
+            let (src, n, pat) = (parts.next()?, parts.next()?, parts.next()?);
+            Some(format!("{src}:{n}: {pat}"))
+        })
+        .unwrap_or_else(|| "a .gitignore rule".to_string())
 }
 
 #[cfg(test)]

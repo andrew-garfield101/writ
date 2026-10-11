@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 import writ
 
-CLEAN = "fast checks clean; survival check not available until 0.4.1"
+CLEAN = "fast checks clean; survival not run; run `writ doctor --survival`"
 CHECK_IDS = {
     "store_integrity",
     "stale_claim",
@@ -88,7 +88,8 @@ class TestStoreIntegrity:
         assert finding["severity"] == "red"
         assert finding["fix_command"] == "writ repair"
         assert finding["paths"] == ["kept.txt"]
-        assert "survival check not available until 0.4.1" in report["headline"]
+        assert "survival not run" in report["headline"]
+        assert "safe to finish" not in report["headline"].lower()
 
     def test_fix_command_clears_the_finding(self, tmp_repo):
         repo, path = tmp_repo

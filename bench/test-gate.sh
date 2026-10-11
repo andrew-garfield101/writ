@@ -84,6 +84,23 @@ verify_json="$(python3 "$ROOT/bench/verify_check.py" "$ROOT" --writ "$WRIT_BIN" 
 # the tests asserting its absence do not count). The brief must stay under
 # 2 KB and carry a `doctor:` line.
 DOCTOR_BIN="$ROOT/target/release/writ"
+# Survival tier (sprint 4, Aubs negative 4), run FIRST: `writ doctor
+# --survival` on this repo, release build, budget 10 s. The fast doctor below
+# then reads the cached result, so on a green store its headline must be the
+# green form "fast checks clean; survival green as of <newest seal12>; safe to
+# finish" (negative 3, positive case). Once the tier exists the binary may
+# carry the phrase; the binary grep is dropped and the headline rule replaces it.
+survival_json="$(dirname "$OUT")/test-gate-survival.json"
+survival_ms=""
+survival_rc=""
+newest_seal=""
+if "$DOCTOR_BIN" doctor --help 2>/dev/null | grep -q -- "--survival"; then
+    survival_t0="$(python3 -c 'import time; print(time.perf_counter())')"
+    survival_rc=0
+    "$DOCTOR_BIN" doctor --survival --format json >"$survival_json" 2>&1 || survival_rc=$?
+    survival_ms="$(python3 -c "import time; print(round((time.perf_counter() - $survival_t0) * 1000))")"
+    newest_seal="$("$DOCTOR_BIN" log --all --format json --limit 1 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])' 2>/dev/null || true)"
+fi
 doctor_json="$(dirname "$OUT")/test-gate-doctor.json"
 doctor_rc=0
 "$DOCTOR_BIN" doctor --format json >"$doctor_json" 2>&1 || doctor_rc=$?
@@ -98,8 +115,11 @@ for _ in range(5):
 print(f"{statistics.median(runs):.0f}")
 TIMING
 )"
-safe_hits="$(LC_ALL=C grep -l -i "safe to finish" "$DOCTOR_BIN" 2>/dev/null || true)
+safe_hits=""
+if [[ -z "$survival_rc" ]]; then  # 0.4.0-style binary without the tier: phrase must not ship
+    safe_hits="$(LC_ALL=C grep -l -i "safe to finish" "$DOCTOR_BIN" 2>/dev/null || true)
 $(grep -rli "safe to finish" crates/writ-py/python 2>/dev/null || true)"
+fi
 brief_out="$(dirname "$OUT")/test-gate-brief.txt"
 "$DOCTOR_BIN" context --format brief >"$brief_out" 2>/dev/null || true
 
@@ -110,6 +130,7 @@ BUILD_RC=$build_rc BUILD_LOG="$build_log" \
 TIMING_LOG="$timing_log" TIMING_RC=$timing_rc TIMING_LOAD="$timing_load" TIMING_TESTS="${TIMING_TESTS[*]}" \
 RUST_LOG="$rust_log" PY_LOG="$py_log" RUST_RC=$rust_rc PY_RC=$py_rc \
 VERIFY_JSON="$verify_json" VERIFY_RC=$verify_rc \
+SURVIVAL_JSON="$survival_json" SURVIVAL_MS="$survival_ms" SURVIVAL_RC="$survival_rc" NEWEST_SEAL="$newest_seal" \
 DOCTOR_JSON="$doctor_json" DOCTOR_RC=$doctor_rc DOCTOR_MS="$doctor_ms" SAFE_HITS="$safe_hits" BRIEF_OUT="$brief_out" \
 BARE="$bare_ignores" OUT="$OUT" python3 - <<'PY'
 import json, os, re, datetime as dt
@@ -199,8 +220,47 @@ if doctor.get("error") or (doctor["rc"] != 0 and (doctor["release_mode"] or reds
     problems.append(f"doctor: exit {doctor['rc']} on this repo: {doctor.get('findings') or doctor.get('error')}")
 if doctor["wall_ms_median5"] is None or doctor["wall_ms_median5"] > DOCTOR_BUDGET_MS:
     problems.append(f"doctor: {doctor['wall_ms_median5']} ms median wall time, budget {DOCTOR_BUDGET_MS} ms")
-if doctor.get("tier") != "fast" or "survival check not available until 0.4.1" not in (doctor.get("headline") or ""):
-    problems.append(f"doctor: honesty headline missing tier or survival note: {doctor.get('headline')!r}")
+SURVIVAL_BUDGET_MS = 10_000
+survival = {"budget_ms": SURVIVAL_BUDGET_MS}
+if os.environ.get("SURVIVAL_RC", "") == "":
+    survival["available"] = False
+    if doctor.get("tier") != "fast" or "survival check not available until 0.4.1" not in (doctor.get("headline") or ""):
+        problems.append(f"doctor: honesty headline missing tier or survival note: {doctor.get('headline')!r}")
+else:
+    survival["available"] = True
+    survival["rc"] = int(os.environ["SURVIVAL_RC"])
+    survival["wall_ms"] = int(os.environ["SURVIVAL_MS"]) if os.environ["SURVIVAL_MS"].isdigit() else None
+    try:
+        sv = json.load(open(os.environ["SURVIVAL_JSON"]))
+        survival.update(headline=sv.get("headline"), clean=sv.get("clean"),
+                        survival_last_green=sv.get("survival_last_green"),
+                        findings=[f"{f['check']}/{f['severity']}: {f['message'][:160]}" for f in sv.get("findings", [])])
+    except (ValueError, OSError):
+        survival["error"] = open(os.environ["SURVIVAL_JSON"]).read().strip()[:300]
+    newest = os.environ.get("NEWEST_SEAL", "")
+    green = survival.get("survival_last_green") or ""
+    head = (survival.get("headline") or "").lower()
+    if survival.get("error"):
+        problems.append(f"survival: could not run: {survival['error']}")
+    elif survival["rc"] != 0 and (doctor["release_mode"] or any("/red:" in f for f in survival.get("findings", []))):
+        problems.append(f"survival: exit {survival['rc']} on this repo: {survival.get('findings')}")
+    if survival["wall_ms"] is None or survival["wall_ms"] > SURVIVAL_BUDGET_MS:
+        problems.append(f"survival: {survival['wall_ms']} ms on this repo, budget {SURVIVAL_BUDGET_MS} ms")
+    fast_head = doctor.get("headline") or ""
+    survival["fast_headline_after"] = fast_head
+    green_now = bool(survival.get("clean") and green and newest[:12] and newest.startswith(green[:12]))
+    if green_now and doctor.get("clean"):
+        want = f"fast checks clean; survival green as of {newest[:12]}; safe to finish"
+        if fast_head != want:
+            problems.append(f"survival: green on {newest[:12]} but fast headline is {fast_head!r}, want {want!r}")
+    elif "safe to finish" in fast_head.lower() or "safe to finish" in head:
+        problems.append(f"honesty: 'safe to finish' without both tiers green on the newest seal "
+                        f"({green!r} vs {newest[:12]!r}): {fast_head!r}")
+    if doctor["release_mode"] and not green_now:
+        problems.append(f"survival: not green on the newest seal in release mode: {survival.get('headline')!r}")
+    if "survival_tier" in PENDING_GATE_CHECKS:
+        problems.append("gate: survival tier exists now, remove survival_tier from PENDING_GATE_CHECKS")
+doctor["survival"] = survival
 safe_hits = [h for h in os.environ["SAFE_HITS"].splitlines() if h.strip()]
 if safe_hits:
     problems.append(f"honesty: 'safe to finish' present in shipped artifacts: {safe_hits}")
@@ -212,6 +272,11 @@ doctor["brief_line"] = brief_line
 if len(brief) >= BRIEF_BUDGET_BYTES:
     problems.append(f"brief: {len(brief)} bytes, budget {BRIEF_BUDGET_BYTES}")
 pending = []
+if not survival["available"]:
+    if "survival_tier" in PENDING_GATE_CHECKS:
+        pending.append("survival_tier")
+    else:
+        problems.append("survival: `writ doctor --survival` not available in the release build")
 if brief_line is None:
     if "brief_doctor_line" in PENDING_GATE_CHECKS:
         pending.append("brief_doctor_line")

@@ -379,21 +379,17 @@ fn short_hash(input: &str) -> String {
 /// receive during convergence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum TrustLevel {
     /// No confidence cap (1.0). Typically human operators.
     Full,
     /// Slight confidence reduction (0.90). Default for agents.
+    #[default]
     Standard,
     /// Significant confidence reduction (0.60).
     Restricted,
     /// Always escalate to human review (0.0).
     Untrusted,
-}
-
-impl Default for TrustLevel {
-    fn default() -> Self {
-        TrustLevel::Standard
-    }
 }
 
 impl TrustLevel {
@@ -416,19 +412,15 @@ impl TrustLevel {
 /// Agent lifecycle status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum AgentStatus {
     /// Agent is active and can create seals.
+    #[default]
     Active,
     /// Agent is temporarily suspended (seals produce warnings).
     Suspended,
     /// Agent is permanently revoked (seals produce warnings).
     Revoked,
-}
-
-impl Default for AgentStatus {
-    fn default() -> Self {
-        AgentStatus::Active
-    }
 }
 
 // ---------------------------------------------------------------------------

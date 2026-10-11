@@ -30,6 +30,11 @@ pub enum WritError {
     OwnLinesRemoved {
         spec_id: String,
         losses: Vec<crate::convergence::survival::SurvivalLoss>,
+        /// Agents other than the sealer who worked on the paths since the
+        /// spec's last seal of them (finding 102); empty means nobody.
+        other_agents: Vec<String>,
+        /// Full ids of the spec's seals that added the lost lines.
+        added_by: Vec<String>,
     },
     /// Seal rejected under strict claim enforcement: the spec is claimed by
     /// a different agent.
@@ -59,6 +64,13 @@ pub enum WritError {
     },
     /// A spec is already claimed by another agent.
     SpecAlreadyClaimed { spec_id: String, claimed_by: String },
+    /// `writ spec release --stale` found no proof the holder is gone
+    /// (finding 91). `reason` names the missing or contradicting evidence.
+    StaleReleaseRefused {
+        spec_id: String,
+        holder: String,
+        reason: String,
+    },
     /// A seal with this ID already exists (immutable store).
     SealAlreadyExists(String),
     /// Spec has no seals — cannot converge.
@@ -110,6 +122,91 @@ pub enum WritError {
     Other(String),
 }
 
+/// Lost lines shown per path in a refusal before "and N more".
+const LOST_LINES_SHOWN: usize = 5;
+
+impl WritError {
+    /// Paths of an [`WritError::OwnLinesRemoved`] refusal, in order, deduped.
+    pub fn own_lines_paths(&self) -> Vec<String> {
+        let WritError::OwnLinesRemoved { losses, .. } = self else {
+            return Vec::new();
+        };
+        let mut paths: Vec<String> = Vec::new();
+        for l in losses {
+            if !paths.contains(&l.path) {
+                paths.push(l.path.clone());
+            }
+        }
+        paths
+    }
+
+    /// The finding 102 refusal for [`WritError::OwnLinesRemoved`], with
+    /// `override_cmd` (the caller's exact command plus `--allow-removals`)
+    /// as the second choice. None for any other error.
+    pub fn own_lines_message(&self, override_cmd: &str) -> Option<String> {
+        let WritError::OwnLinesRemoved {
+            spec_id,
+            losses,
+            other_agents,
+            added_by,
+        } = self
+        else {
+            return None;
+        };
+        let n: usize = losses.iter().map(|l| l.line_count()).sum();
+        let paths = self.own_lines_paths().join(", ");
+        let mut out = format!(
+            "seal refused: {n} line(s) that spec '{spec_id}' sealed are no longer in {paths} on disk"
+        );
+        let quoted: Vec<String> = other_agents.iter().map(|a| format!("'{a}'")).collect();
+        match crate::seal::join_names(&quoted) {
+            Some(who) => out.push_str(&format!(
+                ", and that part of the file was not written in this session: agent {who} worked on {paths} since your last seal of it. Nothing was sealed."
+            )),
+            None => out.push_str(&format!(
+                ". No other agent has worked on {paths} since your last seal of it. Nothing was sealed."
+            )),
+        }
+        for l in losses {
+            out.push_str(&format!("\n  {}: line(s) {}", l.path, l.ranges_label()));
+            for line in l.lines.iter().take(LOST_LINES_SHOWN) {
+                out.push_str(&format!("\n    - {line}"));
+            }
+            if l.lines.len() > LOST_LINES_SHOWN {
+                out.push_str(&format!(
+                    "\n    and {} more",
+                    l.lines.len() - LOST_LINES_SHOWN
+                ));
+            }
+            if !l.foreign.is_empty() {
+                out.push_str("\n    in their place, lines no seal recorded:");
+                for line in &l.foreign {
+                    out.push_str(&format!("\n    + {line}"));
+                }
+            }
+        }
+        let shows: Vec<String> = added_by
+            .iter()
+            .map(|id| format!("`writ show {} --diff`", &id[..id.len().min(12)]))
+            .collect();
+        let shows = if shows.is_empty() {
+            String::new()
+        } else {
+            format!(" ({} shows them)", shows.join(", "))
+        };
+        out.push_str(&format!(
+            "\nChoose one:\n  keep your lines: put them back in {paths} and seal again{shows}"
+        ));
+        match crate::seal::join_names(other_agents) {
+            Some(who) => out.push_str(&format!(
+                "\n  accept {who}'s version of {paths}: {override_cmd}"
+            )),
+            None => out.push_str(&format!("\n  remove them on purpose: {override_cmd}")),
+        }
+        Some(out)
+    }
+}
+
 impl fmt::Display for WritError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -153,28 +250,10 @@ impl fmt::Display for WritError {
                 "nothing to seal for spec '{spec_id}' — pending changes are outside its default scope ({}). Pass --paths to seal specific files",
                 scope.left_out_summary()
             ),
-            WritError::OwnLinesRemoved { spec_id, losses } => {
-                let n: usize = losses.iter().map(|l| l.line_count()).sum();
-                write!(
-                    f,
-                    "seal refused: it would remove {n} line(s) that earlier seals of spec '{spec_id}' added; nothing was sealed"
-                )?;
-                for l in losses {
-                    write!(f, "\n  {}: line(s) {}", l.path, l.ranges_label())?;
-                    for line in &l.lines {
-                        write!(f, "\n    - {line}")?;
-                    }
-                    if !l.foreign.is_empty() {
-                        write!(
-                            f,
-                            "\n    refused because the file also holds lines no seal recorded (another agent's unsealed work?):"
-                        )?;
-                        for line in &l.foreign {
-                            write!(f, "\n    + {line}")?;
-                        }
-                    }
-                }
-                Ok(())
+            WritError::OwnLinesRemoved { .. } => {
+                let paths = self.own_lines_paths().join(",");
+                let cmd = format!("writ seal <same arguments> --allow-removals {paths}");
+                f.write_str(&self.own_lines_message(&cmd).unwrap_or_default())
             }
             WritError::SpecAlreadyCommitted {
                 spec_id,
@@ -208,6 +287,17 @@ impl fmt::Display for WritError {
                     "spec '{spec_id}' is already claimed by agent '{claimed_by}'. Use `writ context` to find unclaimed specs."
                 )
             }
+            WritError::StaleReleaseRefused {
+                spec_id,
+                holder,
+                reason,
+            } => write!(
+                f,
+                "refusing to release spec '{spec_id}' from '{holder}' as stale: {reason}. \
+                 --stale releases only when the holder is provably gone (same host, its pid \
+                 exited or now belongs to a newer process). If you know '{holder}' is gone, \
+                 a human may run `writ spec release {spec_id} --force` (recorded as forced)."
+            ),
             WritError::SealAlreadyExists(id) => {
                 write!(f, "seal '{id}' already exists (immutable)")
             }

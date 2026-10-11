@@ -6,7 +6,11 @@ license.workspace = true
 description = "MCP server for writ — native agent tool integration"
 
 [dependencies]
-writ-core = { path = "../writ-core" }
+# bridge (finding 107): the git-base lookup behind the seal-time survival
+# check (finding 106) needs it. The shipped MCP server runs inside the CLI
+# (`writ mcp-serve`) and seals by running the CLI, which already has it; this
+# makes a standalone writ-mcp build (tests, embedders) match.
+writ-core = { path = "../writ-core", features = ["bridge"] }
 rmcp = { version = "0.16", features = ["server", "transport-io", "schemars"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

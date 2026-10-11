@@ -134,6 +134,59 @@ pub struct Seal {
     /// for these files only. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_removals: Vec<String>,
+    /// Finding 102: for each path where `--allow-removals` let this seal
+    /// remove lines its spec sealed, what the agent was told when it chose
+    /// to: the other agents who worked on the path and the lines removed.
+    /// Absent when empty (no override was used).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub override_context: Vec<OverrideContext>,
+}
+
+/// One path's override record on a seal (finding 102).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverrideContext {
+    pub path: String,
+    /// Agents other than the sealer who worked on the path since its spec's
+    /// last seal of it; empty when nobody did.
+    pub other_agents: Vec<String>,
+    /// The removed lines.
+    pub lines: Vec<String>,
+    /// Full ids of this spec's seals that added the removed lines.
+    pub added_by: Vec<String>,
+}
+
+impl OverrideContext {
+    /// The finish and handoff line: who accepted whose version, or who
+    /// removed their own lines, after being told (seal `seal_id`).
+    pub fn describe(&self, agent: &str, seal_id: &str) -> String {
+        let id12 = &seal_id[..seal_id.len().min(12)];
+        match self.other_agents.first() {
+            Some(other) => format!(
+                "{agent} accepted {}'s version of {} after being told (seal {id12})",
+                join_names(&self.other_agents).unwrap_or_else(|| other.clone()),
+                self.path
+            ),
+            None => format!(
+                "{agent} removed {} own line(s) from {} on purpose after being told (seal {id12})",
+                self.lines.len(),
+                self.path
+            ),
+        }
+    }
+}
+
+/// "a", "a, and b", "a, b, and c"; None when empty.
+pub fn join_names(names: &[String]) -> Option<String> {
+    match names {
+        [] => None,
+        [one] => Some(one.clone()),
+        [first, rest @ ..] => Some(format!(
+            "{first}{}",
+            rest.iter()
+                .map(|n| format!(", and {n}"))
+                .collect::<String>()
+        )),
+    }
 }
 
 fn default_workspace() -> String {
@@ -204,6 +257,7 @@ impl Seal {
             convergence: None,
             forced: false,
             allow_removals: Vec::new(),
+            override_context: Vec::new(),
         };
 
         // Compute the seal's ID from its content

@@ -161,6 +161,11 @@ pub struct Spec {
     /// Host the claiming process ran on; liveness is only judged on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_host: Option<String>,
+    /// True once a claim on this spec was released with `--force` by
+    /// someone other than its holder (finding 91). Distinct from a seal's
+    /// `forced`; read by the hurdle ratio. `--stale` never sets it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub release_forced: bool,
     /// Agent that created the spec (`writ spec add`). Not a claim: it only
     /// lets the default seal scope (S.1) know another agent is working on an
     /// open, unclaimed spec. None for specs created before 0.3.0.
@@ -238,6 +243,7 @@ impl Spec {
             claimed_pid: None,
             claimed_pid_start: None,
             claimed_host: None,
+            release_forced: false,
             genesis_tree: None,
             created_by: None,
         }

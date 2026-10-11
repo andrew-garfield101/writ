@@ -135,6 +135,7 @@ pub enum FileMergeResult {
 /// the fallback for genuinely irreconcilable conflicts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[derive(Default)]
 pub enum ConvergeStrategy {
     /// Leave irreconcilable conflicts unresolved for manual review.
     Manual,
@@ -151,13 +152,8 @@ pub enum ConvergeStrategy {
     /// Escalate unresolvable conflicts with full context (Phase 4/5/6 path).
     /// This is the recommended strategy — it never silently loses work.
     /// Unresolved conflicts are recorded as `EscalationRecord`s in the report.
+    #[default]
     Escalate,
-}
-
-impl Default for ConvergeStrategy {
-    fn default() -> Self {
-        ConvergeStrategy::Escalate
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2040,7 +2036,7 @@ pub fn post_merge_cleanup(content: &str, path: &str) -> String {
     };
 
     // Quick check: does this content have any imports?
-    let has_imports = content.lines().any(|l| is_import_line(l));
+    let has_imports = content.lines().any(is_import_line);
     if !has_imports {
         // Even without imports, Python files still benefit from formatting.
         if ext_lang == Some(ImportLanguage::Python) {

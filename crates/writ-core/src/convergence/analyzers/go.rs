@@ -248,8 +248,7 @@ fn is_go_def_start(trimmed: &str) -> bool {
 
 /// Parse a Go definition header.
 fn parse_go_def_header(trimmed: &str) -> (String, String) {
-    if trimmed.starts_with("func ") {
-        let rest = &trimmed[5..];
+    if let Some(rest) = trimmed.strip_prefix("func ") {
         // Method receiver: `func (r *Receiver) Name(...)`
         let after_receiver = if rest.starts_with('(') {
             if let Some(close) = rest.find(") ") {
@@ -263,8 +262,7 @@ fn parse_go_def_header(trimmed: &str) -> (String, String) {
         let name = extract_go_ident(after_receiver);
         return ("function".into(), name);
     }
-    if trimmed.starts_with("type ") {
-        let rest = &trimmed[5..];
+    if let Some(rest) = trimmed.strip_prefix("type ") {
         let name = extract_go_ident(rest);
         // Determine if it's struct, interface, or type alias.
         let kind = if rest.contains("struct") {
@@ -276,13 +274,11 @@ fn parse_go_def_header(trimmed: &str) -> (String, String) {
         };
         return (kind.into(), name);
     }
-    if trimmed.starts_with("var ") {
-        let rest = &trimmed[4..];
+    if let Some(rest) = trimmed.strip_prefix("var ") {
         let name = extract_go_ident(rest);
         return ("variable".into(), name);
     }
-    if trimmed.starts_with("const ") {
-        let rest = &trimmed[6..];
+    if let Some(rest) = trimmed.strip_prefix("const ") {
         let name = extract_go_ident(rest);
         return ("const".into(), name);
     }

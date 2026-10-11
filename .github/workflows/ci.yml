@@ -163,6 +163,23 @@ jobs:
               sys.exit(1)
           EOF
 
+      # Finding 107 (sprint 4): every crate that seals must link writ-core with
+      # the bridge feature, or the seal-time check on files whose base came
+      # from git (finding 106) silently does not run. Asserted on each crate's
+      # own feature graph, so a standalone build cannot drift. Linux only;
+      # cargo tree reads metadata, no build.
+      - name: writ-core bridge feature in cli, py and mcp
+        if: matrix.os == 'ubuntu-24.04'
+        shell: bash
+        run: |
+          for c in writ-cli writ-py writ-mcp; do
+            if cargo tree -p "$c" -e features -i writ-core | grep -q 'writ-core feature "bridge"'; then
+              echo "$c: writ-core bridge on"
+            else
+              echo "::error title=finding 107::$c links writ-core without the bridge feature"; exit 1
+            fi
+          done
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -174,6 +191,12 @@ jobs:
         # Re-measured 2026-10-05 (doctor-ops, rustc 1.99.0, sprint 3 tree):
         # `cargo clippy --workspace --all-features` = 237 warnings
         # (writ-core 131, writ-cli 94, writ-py 12, writ-mcp 0).
+        # Sprint 4 (ci-and-hooks): 182 on the working tree (writ-core 82,
+        # writ-cli 94, writ-py 6, writ-mcp 0) after machine fixes in the files
+        # nobody else was editing (seal 2fd5ec1100bd) and in writ-py. Left:
+        # judgment items (too_many_arguments, deprecated pyo3 to_object, an
+        # unused agent_id in py seal), main.rs and repo.rs, and the convergence
+        # analyzers' by-hand manual_strip rewrites.
         continue-on-error: true
 
       # PREPARED, NOT ENABLED (sprint 3, doctor-ops). Target state once the
@@ -249,7 +272,10 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-py${{ matrix.python-version }}-cargo-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          # "-cli-" (finding 95): actions/cache never rewrites an exact-hit key,
+          # so the old key would keep a target/ without the CLI and every run
+          # would rebuild it. The restore prefix still matches the old entries.
+          key: ${{ runner.os }}-py${{ matrix.python-version }}-cargo-cli-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: ${{ runner.os }}-py${{ matrix.python-version }}-cargo-
 
       - name: Create virtualenv and install dependencies
@@ -263,6 +289,23 @@ jobs:
         run: |
           source ${{ github.workspace }}/.venv/bin/activate
           maturin develop --release
+
+      # Finding 95 (sprint 4): the CLI tests (init, hooks, finish, doctor,
+      # install e2e) look for target/release/writ, then target/debug, then
+      # PATH, and skip when none exists. Without this step CI ran 674 and
+      # skipped 302 (0.4.0); on a clean clone with the CLI built, 939 pass and
+      # 16 skip. Release profile, like the local release gate. It does not
+      # reuse maturin's artifacts (different flags; every crate recompiles):
+      # 78 s cold on an M-series Mac, cached under the "-cli-" key after the
+      # first run. The test step itself grows to several minutes. Build time
+      # goes to the step summary.
+      - name: Build writ CLI for the CLI tests
+        shell: bash
+        run: |
+          start=$SECONDS
+          cargo build --release -p writ-cli
+          "$GITHUB_WORKSPACE/target/release/writ" --version
+          echo "writ CLI build: $((SECONDS - start)) s" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Configure git for tests
         run: |

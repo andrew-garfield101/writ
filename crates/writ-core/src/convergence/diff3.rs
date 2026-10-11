@@ -32,7 +32,7 @@ pub(super) fn build_action_table(
         match op {
             EditOp::Equal(oi, _ni) => {
                 if !pending_inserts.is_empty() {
-                    inserts_before[*oi].extend(pending_inserts.drain(..));
+                    inserts_before[*oi].append(&mut pending_inserts);
                 }
             }
             EditOp::Insert(ni) => {
@@ -40,7 +40,7 @@ pub(super) fn build_action_table(
             }
             EditOp::Delete(oi) => {
                 if !pending_inserts.is_empty() {
-                    inserts_before[*oi].extend(pending_inserts.drain(..));
+                    inserts_before[*oi].append(&mut pending_inserts);
                 }
                 actions[*oi] = LineAction::Delete;
             }
@@ -59,7 +59,7 @@ pub(super) fn build_action_table(
             let mut replacement = Vec::new();
             for j in run_start..=i.min(base_len) {
                 if j < inserts_before.len() {
-                    replacement.extend(inserts_before[j].drain(..));
+                    replacement.append(&mut inserts_before[j]);
                 }
             }
             if !replacement.is_empty() {

@@ -6,6 +6,7 @@ C.14: writ context writes .context_token; writ seal warns if stale/missing + age
 These are CLI-level tests exercising the enforcement gates in main.rs.
 """
 
+import json
 import os
 import subprocess
 import time
@@ -43,7 +44,36 @@ HUMAN_ENV_KEYS = [
     "CODEX_SESSION",
     "CODEX_SESSION_ID",
     "WRIT_AGENT_ID",
+    # Finding 95: Claude Code sets CLAUDECODE=1 and writ treats it as an agent
+    # (agent.rs). Left in, every "human" test run from a Claude Code shell
+    # was really an agent test, and two tests passed only there.
+    "CLAUDECODE",
 ]
+
+# Sprint 4: findings 98 (explicit --agent enforces like a detected agent), 99
+# (the human warning names `writ spec add "..." --claim`) and 100 (strict
+# claim_enforcement refuses a no-spec seal) are fixed; their xfails are lifted.
+
+
+def _seal_summaries(path: Path) -> list:
+    """Summaries of every seal in the repo, newest first."""
+    out = run_writ(["log", "--all", "--format", "json"], str(path), env=clean_env())
+    assert out.returncode == 0, out.stderr
+    data = json.loads(out.stdout)
+    seals = data if isinstance(data, list) else data.get("seals", [])
+    return [s.get("summary") for s in seals]
+
+
+def _set_security(path: Path, key: str, value: str) -> None:
+    """Set `key = value` in the [security] table of .writ/config.toml."""
+    cfg = path / ".writ" / "config.toml"
+    text = cfg.read_text() if cfg.exists() else ""
+    lines = [l for l in text.splitlines() if not l.strip().startswith(f"{key} ")]
+    if "[security]" in lines:
+        lines.insert(lines.index("[security]") + 1, f"{key} = {value}")
+    else:
+        lines += ["", "[security]", f"{key} = {value}"]
+    cfg.write_text("\n".join(lines) + "\n")
 
 
 def clean_env() -> dict:
@@ -136,19 +166,50 @@ class TestSealEnforcementC13:
         )
         assert result.returncode == 0
 
-    def test_human_no_spec_rejected(self, writ_repo):
-        """No agent env + no --spec = error (C.13 enforces spec for all seals)."""
+    def test_human_no_spec_warns_and_succeeds(self, writ_repo):
+        """No agent env + no --spec, default claim_enforcement: the seal is
+        recorded and a warning names `writ spec add` (designed default)."""
         path = writ_repo
         (path / "app.py").write_text("print('hello')\n")
 
-        result = run_writ(
-            ["seal", "-s", "human work"],
-            str(path),
-            env=clean_env(),
-        )
-        assert result.returncode != 0
+        result = run_writ(["seal", "-s", "human work"], str(path), env=clean_env())
+
         combined = result.stdout + result.stderr
-        assert "spec" in combined.lower()
+        assert result.returncode == 0, combined
+        assert "warning" in combined.lower() and "no spec" in combined.lower(), combined
+        assert "writ spec add" in combined, combined
+        assert "human work" in _seal_summaries(path)
+
+    def test_human_no_spec_warning_names_spec_add_claim(self, writ_repo):
+        """The warning gives the pasteable form: `writ spec add ... --claim`."""
+        path = writ_repo
+        (path / "app.py").write_text("print('hello')\n")
+
+        result = run_writ(["seal", "-s", "human work"], str(path), env=clean_env())
+
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        warning = next(
+            (l for l in combined.splitlines() if "no spec" in l.lower()), ""
+        )
+        follow = combined[combined.find(warning):]
+        assert "writ spec add" in follow and "--claim" in follow, combined
+
+    def test_human_no_spec_refused_under_strict_claim_enforcement(self, writ_repo):
+        """Strict counterpart: with [security] claim_enforcement = "strict" the
+        same seal is refused, nothing is recorded, and the message names
+        `writ spec add ... --claim`."""
+        path = writ_repo
+        _set_security(path, "claim_enforcement", '"strict"')
+        (path / "app.py").write_text("print('hello')\n")
+        before = _seal_summaries(path)
+
+        result = run_writ(["seal", "-s", "human work"], str(path), env=clean_env())
+
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, combined
+        assert "spec add" in combined and "--claim" in combined, combined
+        assert _seal_summaries(path) == before, "a refused seal was recorded"
 
     def test_human_with_spec_no_warning(self, writ_repo):
         """No agent env + spec provided = no warning, seal succeeds."""
@@ -307,3 +368,4 @@ class TestContextTokenC14:
         )
         # Seal succeeds but now warns everyone (not just agents) about missing context
         assert result.returncode == 0
+

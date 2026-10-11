@@ -138,7 +138,7 @@ impl SecurityEventLogger {
             .open(&self.events_path)?;
 
         // Exclusive lock — blocks until available, released on File drop.
-        file.lock_exclusive().map_err(|e| WritError::Io(e))?;
+        file.lock_exclusive().map_err(WritError::Io)?;
 
         let mut writer = std::io::BufWriter::new(&file);
         serde_json::to_writer(&mut writer, record)?;
@@ -158,7 +158,7 @@ impl SecurityEventLogger {
             return Ok(Vec::new());
         }
         let file = File::open(&self.events_path)?;
-        file.lock_shared().map_err(|e| WritError::Io(e))?;
+        file.lock_shared().map_err(WritError::Io)?;
         let reader = BufReader::new(file);
         let mut events = Vec::new();
         for line in reader.lines() {

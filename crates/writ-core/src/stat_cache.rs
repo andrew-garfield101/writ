@@ -52,8 +52,8 @@ impl StatKey {
             use std::os::unix::fs::MetadataExt;
             Self {
                 size: meta.len(),
-                mtime_ns: meta.mtime() as i64 * 1_000_000_000 + meta.mtime_nsec() as i64,
-                ctime_ns: meta.ctime() as i64 * 1_000_000_000 + meta.ctime_nsec() as i64,
+                mtime_ns: meta.mtime() * 1_000_000_000 + meta.mtime_nsec(),
+                ctime_ns: meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
                 ino: meta.ino(),
             }
         }

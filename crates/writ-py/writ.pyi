@@ -497,9 +497,16 @@ class Repository:
         ...
 
     def spec_release(
-        self, spec_id: str, agent_id: Optional[str] = None, force: bool = False
+        self,
+        spec_id: str,
+        agent_id: Optional[str] = None,
+        force: bool = False,
+        stale: bool = False,
     ) -> Optional[str]:
-        """Release a spec's claim. The holder may release; others need force=True.
+        """Release a spec's claim. The holder may release. Others need
+        stale=True (only with proof the holder is gone; raises WritError naming
+        the missing evidence otherwise) or force=True (a human's decision,
+        recorded as forced). stale and force are exclusive.
 
         Returns the previous holder, or None if the spec was unclaimed.
         """

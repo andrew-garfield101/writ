@@ -2181,6 +2181,7 @@ mod tests {
             claimed_pid: None,
             claimed_pid_start: None,
             claimed_host: None,
+            release_forced: false,
             genesis_tree: None,
             created_by: None,
         }
@@ -2905,6 +2906,7 @@ mod tests {
             convergence: None,
             forced: false,
             allow_removals: Vec::new(),
+            override_context: Vec::new(),
         }
     }
 
@@ -3695,6 +3697,7 @@ mod tests {
             claimed_pid: None,
             claimed_pid_start: None,
             claimed_host: None,
+            release_forced: false,
             genesis_tree: None,
             created_by: None,
         }

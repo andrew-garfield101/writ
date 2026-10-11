@@ -98,7 +98,7 @@ fn parse_task_status(s: &str) -> PyResult<TaskStatus> {
 
 fn parse_spec_status(s: &str) -> PyResult<writ_core::spec::SpecStatus> {
     s.parse::<writ_core::spec::SpecStatus>()
-        .map_err(|e| WritError::new_err(e))
+        .map_err(WritError::new_err)
 }
 
 // ---------------------------------------------------------------------------
@@ -852,12 +852,13 @@ impl PyRepository {
         resolutions: Option<PyObject>,
     ) -> PyResult<()> {
         let report: writ_core::convergence::ConvergenceReport =
-            pythonize::depythonize(&report.bind(py))
+            pythonize::depythonize(report.bind(py))
                 .map_err(|e| WritError::new_err(e.to_string()))?;
 
         let resolutions: Vec<writ_core::convergence::FileResolution> = match resolutions {
-            Some(r) => pythonize::depythonize(&r.bind(py))
-                .map_err(|e| WritError::new_err(e.to_string()))?,
+            Some(r) => {
+                pythonize::depythonize(r.bind(py)).map_err(|e| WritError::new_err(e.to_string()))?
+            }
             None => Vec::new(),
         };
 
@@ -1486,7 +1487,7 @@ impl PyRepository {
                         .stage
                         .iter()
                         .filter_map(|(p, _)| carried.get(p).cloned())
-                        .last();
+                        .next_back();
                     plan.stage.retain(|(p, _)| !carried.contains_key(p));
                     let outcome = self
                         .inner
@@ -1695,21 +1696,32 @@ impl PyRepository {
         Ok(())
     }
 
-    /// Release a spec's claim (S.3). The holder may release; anyone else
-    /// needs `force=True`, which is recorded in the security log.
+    /// Release a spec's claim (S.3). The holder may release. Anyone else
+    /// needs `stale=True` (released only with proof the holder is gone,
+    /// else WritError naming the missing evidence; finding 91) or
+    /// `force=True` (a human's decision, recorded as forced).
     ///
     /// Returns the previous holder, or None when the spec was unclaimed.
-    #[pyo3(signature = (spec_id, agent_id=None, force=false))]
+    #[pyo3(signature = (spec_id, agent_id=None, force=false, stale=false))]
     fn spec_release(
         &self,
         spec_id: &str,
         agent_id: Option<&str>,
         force: bool,
+        stale: bool,
     ) -> PyResult<Option<String>> {
+        if stale && force {
+            return Err(WritError::new_err(
+                "spec_release: stale and force are exclusive; stale never acts as force",
+            ));
+        }
         let agent = resolve_py_agent(&self.inner, agent_id, None)?;
-        self.inner
-            .spec_release(spec_id, &agent.id, force)
-            .map_err(writ_err)
+        let released = if stale {
+            self.inner.spec_release_stale(spec_id, &agent.id)
+        } else {
+            self.inner.spec_release(spec_id, &agent.id, force)
+        };
+        released.map_err(writ_err)
     }
 
     // -- Propose mode (W.31) --

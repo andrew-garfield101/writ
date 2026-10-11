@@ -989,10 +989,8 @@ pub fn remove_skills(root: &Path) -> WritResult<Vec<String>> {
     }
 
     // Clean up empty skills directory.
-    if skills_dir.exists() {
-        if fs::read_dir(&skills_dir)?.next().is_none() {
-            let _ = fs::remove_dir(&skills_dir);
-        }
+    if skills_dir.exists() && fs::read_dir(&skills_dir)?.next().is_none() {
+        let _ = fs::remove_dir(&skills_dir);
     }
 
     Ok(removed)

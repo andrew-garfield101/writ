@@ -51,11 +51,18 @@ pub const CHECK_IDS: [&str; 6] = [
     CHECK_LEFT_OUT,
 ];
 
-/// The headline on a repository with no fast-tier findings, in 0.4.0.
-pub const CLEAN_HEADLINE: &str = "fast checks clean; survival check not available until 0.4.1";
+/// The fast-tier part of the headline on a repository with no findings.
+/// The survival part follows after "; " (see [`headline_with`]).
+pub const CLEAN_HEADLINE: &str = "fast checks clean";
 
-/// What the survival tier reports in this release.
-const SURVIVAL_NOTE: &str = "survival check not available until 0.4.1";
+/// Survival tier (0.4.1): lost sealed lines (red) and sealed files git
+/// ignores (yellow). Runs on `writ doctor --survival`, before finish and on
+/// watch; the fast tier reads only its cached result.
+pub const CHECK_SURVIVAL: &str = crate::convergence::survival::CHECK_SURVIVAL;
+
+/// Said only when the fast tier is clean and the survival tier is green on
+/// the current state (Aubs's honesty condition).
+pub const SAFE_TO_FINISH: &str = "safe to finish";
 
 /// Default minutes before an idle claim counts as stale.
 pub const DEFAULT_STALE_CLAIM_MINUTES: u64 = 120;
@@ -174,7 +181,13 @@ impl DoctorFinding {
             !is_destructive(&fix_command),
             "{check}: destructive fix_command {fix_command:?}"
         );
-        let fix_command = Some(fix_command).filter(|c| !c.is_empty() && !is_destructive(c));
+        // Finding 91: `--force` is a human's decision, never a printed fix.
+        debug_assert!(
+            !fix_command.contains("--force"),
+            "{check}: fix_command uses --force {fix_command:?}"
+        );
+        let fix_command = Some(fix_command)
+            .filter(|c| !c.is_empty() && !is_destructive(c) && !c.contains("--force"));
         Self {
             check: check.to_string(),
             severity,
@@ -193,9 +206,16 @@ pub struct DoctorReport {
     pub headline: String,
     /// Which tier ran: `"fast"` in 0.4.0.
     pub tier: String,
-    /// When the survival tier was last green on this repository. `None`
-    /// until the survival tier exists (0.4.1).
+    /// The newest seal when the survival tier was last green here. `None`
+    /// when it never was.
     pub survival_last_green: Option<String>,
+    /// The survival part of the headline (also in the brief line).
+    #[serde(default)]
+    pub survival: String,
+    /// Survival tier info notes (finding 111): not findings, never affect
+    /// `clean` or "safe to finish".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub survival_info: Vec<String>,
     /// Check ids that ran, in order.
     pub checks_run: Vec<String>,
     pub findings: Vec<DoctorFinding>,
@@ -227,6 +247,8 @@ impl DoctorReport {
             headline: headline(red, yellow),
             tier: TIER_FAST.to_string(),
             survival_last_green: None,
+            survival: crate::convergence::survival::SurvivalState::NotRun.note(),
+            survival_info: Vec::new(),
             checks_run,
             clean: findings.is_empty(),
             findings,
@@ -245,7 +267,7 @@ impl DoctorReport {
     /// The single `doctor:` line for `writ context --format brief`.
     pub fn brief_line(&self) -> String {
         if self.clean {
-            return CLEAN_HEADLINE.to_string();
+            return self.headline.clone();
         }
         let mut ids: Vec<&str> = Vec::new();
         for f in &self.findings {
@@ -258,7 +280,7 @@ impl DoctorReport {
             self.red,
             self.yellow,
             ids.join(", "),
-            SURVIVAL_NOTE
+            self.survival
         )
     }
 }
@@ -307,6 +329,8 @@ pub fn attach_to_context(repo: &Repository, ctx: &mut crate::context::ContextOut
                     message: format!("doctor {}: {}; {todo}", first.check, first.message),
                     priority: "high".to_string(),
                 });
+            } else {
+                defer_to_clean_doctor(&mut ctx.recommended_action);
             }
             let mut findings = report.findings.clone();
             // Reds first (stable), so a budget trim drops yellows first.
@@ -331,6 +355,18 @@ pub fn attach_to_context(repo: &Repository, ctx: &mut crate::context::ContextOut
     ctx.doctor = Some(section);
 }
 
+/// Finding 97: `next` defers to doctor. A clean doctor never sits under a
+/// high-priority claim about repository health (converge, review_risk):
+/// with no red finding those are shown at medium. A blocking dependency is
+/// a fact about the spec's own ordering, not a health claim, and stays high.
+fn defer_to_clean_doctor(action: &mut Option<crate::context::RecommendedAction>) {
+    if let Some(a) = action.as_mut() {
+        if a.priority == "high" && a.action != "wait_for_dependency" {
+            a.priority = "medium".to_string();
+        }
+    }
+}
+
 /// The `doctor` line for `writ context --format brief`: the brief line of
 /// a fresh run, or the error that stopped doctor (never silently absent).
 pub fn brief_line_for(repo: &Repository) -> String {
@@ -340,16 +376,75 @@ pub fn brief_line_for(repo: &Repository) -> String {
     }
 }
 
-/// The headline for a fast-tier run with these counts.
+/// The headline for a fast-tier run with these counts, survival never run.
 pub fn headline(red: usize, yellow: usize) -> String {
+    let note = crate::convergence::survival::SurvivalState::NotRun.note();
+    headline_with(red, yellow, &note, false)
+}
+
+/// The headline: the fast-tier counts, then the survival `note`, then
+/// "safe to finish" only when `safe` (both tiers green on the current
+/// state) and there is no finding at all.
+pub fn headline_with(red: usize, yellow: usize, note: &str, safe: bool) -> String {
     if red == 0 && yellow == 0 {
-        return CLEAN_HEADLINE.to_string();
+        if safe {
+            return format!("{CLEAN_HEADLINE}; {note}; {SAFE_TO_FINISH}");
+        }
+        return format!("{CLEAN_HEADLINE}; {note}");
     }
     format!(
-        "fast checks: {} finding(s), {red} red, {yellow} yellow; {SURVIVAL_NOTE}",
+        "fast checks: {} finding(s), {red} red, {yellow} yellow; {note}",
         red + yellow
     )
 }
+
+// ── Survival tier section (Haris) ──────────────────────────────────────
+
+/// Put the survival state into a fast-tier report from the cache alone:
+/// `survival_last_green`, the survival note and the headline.
+fn apply_survival_state(repo: &Repository, report: &mut DoctorReport) {
+    use crate::convergence::survival::SurvivalState;
+    let state = SurvivalState::current(repo);
+    report.survival_last_green = SurvivalState::last_green(repo);
+    report.survival = state.note();
+    report.survival_info = crate::convergence::survival::SurvivalCache::load(repo)
+        .map(|c| c.info)
+        .unwrap_or_default();
+    report.headline = headline_with(report.red, report.yellow, &report.survival, state.is_safe());
+}
+
+/// `writ doctor --survival`: the fast tier, then the survival tier (served
+/// from its cache when nothing changed), its findings added to the report.
+pub fn run_survival(repo: &Repository) -> WritResult<DoctorReport> {
+    use crate::convergence::survival::{run_tier, SurvivalState};
+    let mut report = run(repo)?;
+    let lap = Instant::now();
+    let tier = run_tier(repo)?;
+    report
+        .check_ms
+        .insert(CHECK_SURVIVAL.to_string(), lap.elapsed().as_millis() as u64);
+    report.checks_run.push(CHECK_SURVIVAL.to_string());
+    report.tier = format!("{TIER_FAST}+{CHECK_SURVIVAL}");
+    let (fast_red, fast_yellow) = (report.red, report.yellow);
+    report.findings.extend(tier.cache.findings.iter().cloned());
+    report.survival_info = tier.cache.info.clone();
+    report.red = report
+        .findings
+        .iter()
+        .filter(|f| f.severity == Severity::Red)
+        .count();
+    report.yellow = report.findings.len() - report.red;
+    report.clean = report.findings.is_empty();
+    let state = SurvivalState::current(repo);
+    report.survival_last_green = tier.cache.last_green.clone();
+    report.survival = state.note();
+    // The headline counts the fast tier; the survival note says the rest.
+    report.headline = headline_with(fast_red, fast_yellow, &report.survival, state.is_safe());
+    report.elapsed_ms += report.check_ms[CHECK_SURVIVAL];
+    Ok(report)
+}
+
+// ── End of survival tier section ───────────────────────────────────────
 
 /// Run the fast tier against an open repository.
 pub fn run(repo: &Repository) -> WritResult<DoctorReport> {
@@ -412,6 +507,7 @@ pub fn run(repo: &Repository) -> WritResult<DoctorReport> {
 
     let mut report = DoctorReport::from_findings(findings, checks_run, started);
     report.check_ms = check_ms;
+    apply_survival_state(repo, &mut report);
     Ok(report)
 }
 
@@ -605,43 +701,86 @@ fn spec_is_open(spec: &crate::spec::Spec) -> bool {
         )
 }
 
-/// Whether the process that took a claim is still running.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClaimHolder {
-    /// Same host, process found with the recorded start time.
-    Alive,
-    /// Same host, no such process (or the pid was reused).
-    Gone,
-    /// No record, another host, or no process table: judge by idle time.
-    Unknown,
+/// Whether a claim's holder is provably gone (finding 91). Shared by
+/// doctor's `stale_claim` check and `writ spec release --stale`, so the
+/// `--stale` fix doctor prints always succeeds when pasted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StaleVerdict {
+    /// Proof the holder is gone; the string names it.
+    Gone(String),
+    /// The holder's process is running; the string names pid and start.
+    Alive(String),
+    /// No proof either way; the string names the missing evidence.
+    Unproven(String),
 }
 
-/// Judge a claim's holder against a process table (`None`: unreadable).
-pub fn claim_holder(
+/// Judge a claim for `--stale`: proof needs the recorded pid, its start
+/// time and host, this machine's host name matching it, and a readable
+/// process table. Idle time is never evidence.
+pub fn stale_verdict(
     spec: &crate::spec::Spec,
     host: Option<&str>,
     table: Option<&[crate::agent::session::ProcInfo]>,
-) -> ClaimHolder {
-    let (Some(pid), Some(claim_host), Some(host), Some(table)) =
-        (spec.claimed_pid, spec.claimed_host.as_deref(), host, table)
-    else {
-        return ClaimHolder::Unknown;
+) -> StaleVerdict {
+    let missing: Vec<&str> = [
+        ("pid", spec.claimed_pid.is_none()),
+        ("pid start time", spec.claimed_pid_start.is_none()),
+        ("host", spec.claimed_host.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(name, absent)| absent.then_some(name))
+    .collect();
+    let (Some(pid), Some(start), Some(claim_host)) = (
+        spec.claimed_pid,
+        spec.claimed_pid_start.as_deref(),
+        spec.claimed_host.as_deref(),
+    ) else {
+        return StaleVerdict::Unproven(format!(
+            "the claim records no {} (taken by an older writ or a session writ could not identify)",
+            missing.join(", no ")
+        ));
+    };
+    let Some(host) = host else {
+        return StaleVerdict::Unproven(format!(
+            "the claim was taken on host '{claim_host}' and this machine's host name cannot be read"
+        ));
     };
     if claim_host != host {
-        return ClaimHolder::Unknown;
+        return StaleVerdict::Unproven(format!(
+            "the claim was taken on host '{claim_host}', this is host '{host}'; writ cannot see another host's processes"
+        ));
     }
-    let alive = table.iter().any(|p| {
-        p.pid == pid
-            && spec
-                .claimed_pid_start
-                .as_deref()
-                .map_or(true, |start| start == p.start)
-    });
-    if alive {
-        ClaimHolder::Alive
+    let Some(table) = table else {
+        return StaleVerdict::Unproven(format!(
+            "the process table cannot be read on host '{host}', so pid {pid} cannot be checked"
+        ));
+    };
+    match table.iter().find(|p| p.pid == pid) {
+        Some(p) if p.start == start => StaleVerdict::Alive(format!(
+            "the holder is alive: pid {pid} (started {start}) is running on host '{host}'"
+        )),
+        Some(p) => StaleVerdict::Gone(format!(
+            "pid {pid} on host '{host}' now belongs to a process started {}, not the holder started {start}",
+            p.start
+        )),
+        None => StaleVerdict::Gone(format!("pid {pid} on host '{host}' has exited")),
+    }
+}
+
+/// The verdict for `spec` on this machine, reading the process table only
+/// when the claim can be judged by process.
+pub fn stale_verdict_here(spec: &crate::spec::Spec) -> StaleVerdict {
+    let host = crate::agent::session::host_name();
+    let judgeable = spec.claimed_pid.is_some()
+        && spec.claimed_pid_start.is_some()
+        && spec.claimed_host.is_some()
+        && spec.claimed_host == host;
+    let table = if judgeable {
+        crate::agent::session::process_table()
     } else {
-        ClaimHolder::Gone
-    }
+        None
+    };
+    stale_verdict(spec, host.as_deref(), table.as_deref())
 }
 
 fn check_stale_claims(
@@ -660,7 +799,7 @@ fn check_stale_claims(
     // One `ps` only when some claim can be judged by process.
     let table = if claimed
         .iter()
-        .any(|s| s.claimed_pid.is_some() && s.claimed_host.is_some() && s.claimed_host == host)
+        .any(|s| s.claimed_pid.is_some() && s.claimed_pid_start.is_some() && s.claimed_host == host)
     {
         crate::agent::session::process_table()
     } else {
@@ -671,26 +810,35 @@ fn check_stale_claims(
     for spec in claimed {
         let holder = spec.claimed_by.as_deref().unwrap_or_default();
         let idle = now - std::cmp::max(spec.last_activity, spec.updated_at);
-        let reason = match claim_holder(spec, host.as_deref(), table.as_deref()) {
-            ClaimHolder::Alive => continue,
-            ClaimHolder::Gone => format!(
-                "the process that claimed it (pid {}) has exited",
-                spec.claimed_pid.unwrap_or_default()
+        // Finding 91: the printed fix is `--stale` and only with proof the
+        // holder is gone; without proof a human decides. Never `--force`.
+        let finding = match stale_verdict(spec, host.as_deref(), table.as_deref()) {
+            StaleVerdict::Alive(_) => continue,
+            StaleVerdict::Gone(proof) => DoctorFinding::new(
+                CHECK_STALE_CLAIM,
+                Severity::Yellow,
+                format!("spec '{}' is claimed by '{holder}', but {proof}", spec.id),
+                format!("writ spec release {} --stale", shell_quote(&spec.id)),
+                Vec::new(),
             ),
-            ClaimHolder::Unknown if idle > limit => format!(
-                "idle {} min (limit {} min, [doctor] stale_claim_minutes)",
-                idle.num_minutes(),
-                config.stale_claim_minutes
+            StaleVerdict::Unproven(why) if idle > limit => DoctorFinding::new(
+                CHECK_STALE_CLAIM,
+                Severity::Yellow,
+                format!(
+                    "spec '{}' is claimed by '{holder}', idle {} min (limit {} min, [doctor] stale_claim_minutes), \
+                     and writ cannot prove the holder is gone: {why}. Ask '{holder}'; if it is gone, \
+                     a human may run `writ spec release {} --force`",
+                    spec.id,
+                    idle.num_minutes(),
+                    config.stale_claim_minutes,
+                    shell_quote(&spec.id)
+                ),
+                "",
+                Vec::new(),
             ),
-            ClaimHolder::Unknown => continue,
+            StaleVerdict::Unproven(_) => continue,
         };
-        out.push(DoctorFinding::new(
-            CHECK_STALE_CLAIM,
-            Severity::Yellow,
-            format!("spec '{}' is claimed by '{holder}', but {reason}", spec.id),
-            format!("writ spec release {} --force", spec.id),
-            Vec::new(),
-        ));
+        out.push(finding);
     }
     out
 }
@@ -754,6 +902,9 @@ struct PendingContext {
         std::collections::BTreeMap<String, (std::collections::BTreeSet<String>, Option<String>)>,
     /// Agents with a seal or claim activity inside the unsealed window.
     active: std::collections::BTreeSet<String>,
+    /// Pending path -> every seal of it on an open spec: (agent, spec, when).
+    touches:
+        std::collections::BTreeMap<String, Vec<(String, String, chrono::DateTime<chrono::Utc>)>>,
 }
 
 impl PendingContext {
@@ -782,6 +933,10 @@ impl PendingContext {
         let mut newest: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
             Default::default();
         let mut active = std::collections::BTreeSet::new();
+        let mut touches: std::collections::BTreeMap<
+            String,
+            Vec<(String, String, chrono::DateTime<chrono::Utc>)>,
+        > = Default::default();
         for spec in specs.iter().filter(|s| spec_is_open(s)) {
             if let Some(holder) = &spec.claimed_by {
                 if now - spec.last_activity <= window {
@@ -800,6 +955,11 @@ impl PendingContext {
                     .iter()
                     .filter(|c| wanted.contains(c.path.as_str()))
                 {
+                    touches.entry(c.path.clone()).or_default().push((
+                        seal.agent.id.clone(),
+                        spec.id.clone(),
+                        seal.timestamp,
+                    ));
                     let entry = sealers.entry(c.path.clone()).or_default();
                     entry.0.insert(seal.agent.id.clone());
                     let at = newest.entry(c.path.clone()).or_insert(seal.timestamp);
@@ -814,8 +974,54 @@ impl PendingContext {
             pending: pending_paths,
             sealers,
             active,
+            touches,
         })
     }
+}
+
+/// Agents other than `agent` who worked on `path` (finding 102), from the
+/// same per-path data `unsealed_at_risk` uses: agents that sealed `path` on
+/// an open spec after `since` (the caller's spec's last seal of the path),
+/// plus active agents whose open spec sealed `path` or has it in its file
+/// scope. Sorted and deduped; empty means nobody.
+pub fn other_touchers(
+    repo: &Repository,
+    path: &str,
+    spec_id: &str,
+    agent: &str,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+) -> WritResult<Vec<String>> {
+    let specs = repo.list_specs()?;
+    let config = DoctorConfig::load(repo.writ_dir())?;
+    let now = chrono::Utc::now();
+    let pending = [crate::state::FileState {
+        path: path.to_string(),
+        status: crate::state::FileStatus::Modified,
+        hash: None,
+    }];
+    let ctx = PendingContext::build(repo, &specs, &pending, &config, now, &Default::default())?;
+    let mut out = std::collections::BTreeSet::new();
+    for (who, _spec, at) in ctx.touches.get(path).into_iter().flatten() {
+        let after = since.map_or(true, |t| *at > t);
+        if after || ctx.active.contains(who) {
+            out.insert(who.clone());
+        }
+    }
+    let in_scope = |s: &crate::spec::Spec| {
+        s.file_scope
+            .iter()
+            .any(|e| e == path || (e.ends_with('/') && path.starts_with(e.as_str())))
+    };
+    for spec in specs
+        .iter()
+        .filter(|s| spec_is_open(s) && s.id != spec_id && in_scope(s))
+    {
+        if let Some(holder) = spec.claimed_by.as_ref().filter(|h| ctx.active.contains(*h)) {
+            out.insert(holder.clone());
+        }
+    }
+    out.remove(agent);
+    Ok(out.into_iter().collect())
 }
 
 /// Minutes since `root/path` was last written; None when it is gone.
@@ -1500,21 +1706,184 @@ fn set_doctor_key(text: &str, key: &str, line: &str) -> String {
 mod tests {
     use super::*;
 
+    fn proc(pid: u32, start: &str) -> crate::agent::session::ProcInfo {
+        crate::agent::session::ProcInfo {
+            pid,
+            ppid: 1,
+            start: start.to_string(),
+            comm: "claude".to_string(),
+        }
+    }
+
+    fn claimed(pid: Option<u32>, start: Option<&str>, host: Option<&str>) -> crate::spec::Spec {
+        let mut spec = crate::spec::Spec::new("g".into(), "g".into(), String::new());
+        spec.claimed_by = Some("ghost".into());
+        spec.claimed_pid = pid;
+        spec.claimed_pid_start = start.map(str::to_string);
+        spec.claimed_host = host.map(str::to_string);
+        spec
+    }
+
+    const START: &str = "Sun Oct 11 00:00:00 2026";
+
+    #[test]
+    fn stale_verdict_gone_when_pid_exited_or_reused_on_this_host() {
+        let spec = claimed(Some(42), Some(START), Some("h"));
+        let table = [proc(7, START)];
+        assert!(matches!(
+            stale_verdict(&spec, Some("h"), Some(&table)),
+            StaleVerdict::Gone(p) if p.contains("pid 42") && p.contains("exited")
+        ));
+        let reused = [proc(42, "Mon Oct 12 00:00:00 2026")];
+        assert!(matches!(
+            stale_verdict(&spec, Some("h"), Some(&reused)),
+            StaleVerdict::Gone(p) if p.contains("now belongs to")
+        ));
+    }
+
+    #[test]
+    fn stale_verdict_alive_when_pid_and_start_match() {
+        let spec = claimed(Some(42), Some(START), Some("h"));
+        let table = [proc(42, START)];
+        assert!(matches!(
+            stale_verdict(&spec, Some("h"), Some(&table)),
+            StaleVerdict::Alive(p) if p.contains("pid 42") && p.contains("alive")
+        ));
+    }
+
+    #[test]
+    fn stale_verdict_unproven_names_the_missing_evidence() {
+        let table = [proc(7, START)];
+        let foreign = claimed(Some(42), Some(START), Some("far.invalid"));
+        assert!(matches!(
+            stale_verdict(&foreign, Some("h"), Some(&table)),
+            StaleVerdict::Unproven(w) if w.contains("far.invalid") && w.contains("'h'")
+        ));
+        let bare = claimed(None, None, None);
+        assert!(matches!(
+            stale_verdict(&bare, Some("h"), Some(&table)),
+            StaleVerdict::Unproven(w) if w.contains("no pid, no pid start time, no host")
+        ));
+        // A pid with no start time is not proof: the pid may have been reused.
+        let no_start = claimed(Some(42), None, Some("h"));
+        assert!(matches!(
+            stale_verdict(&no_start, Some("h"), Some(&table)),
+            StaleVerdict::Unproven(w) if w.contains("no pid start time")
+        ));
+        let here = claimed(Some(42), Some(START), Some("h"));
+        assert!(matches!(
+            stale_verdict(&here, None, Some(&table)),
+            StaleVerdict::Unproven(w) if w.contains("host name cannot be read")
+        ));
+        assert!(matches!(
+            stale_verdict(&here, Some("h"), None),
+            StaleVerdict::Unproven(w) if w.contains("process table")
+        ));
+    }
+
+    /// Finding 91: every stale_claim shape doctor can report (holder gone,
+    /// another host, no evidence) prints `--stale` or nothing, never `--force`.
+    #[test]
+    fn stale_claim_findings_never_print_force() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::hours(3);
+        let mut gone = claimed(Some(u32::MAX - 1), Some(START), None);
+        gone.claimed_host = crate::agent::session::host_name();
+        let mut foreign = claimed(Some(42), Some(START), Some("far.invalid"));
+        foreign.id = "f".into();
+        let mut bare = claimed(None, None, None);
+        bare.id = "b".into();
+        let mut specs = vec![gone, foreign, bare];
+        for s in &mut specs {
+            s.last_activity = old;
+            s.updated_at = old;
+        }
+        let found = check_stale_claims(&specs, &DoctorConfig::default(), now);
+        assert_eq!(found.len(), 3, "{found:#?}");
+        for f in &found {
+            let fix = f.fix_command.as_deref().unwrap_or("");
+            assert!(!fix.contains("--force"), "{f:?}");
+            assert_eq!(f.needs_human, f.fix_command.is_none());
+        }
+        if crate::agent::session::host_name().is_some() && cfg!(unix) {
+            assert_eq!(
+                found[0].fix_command.as_deref(),
+                Some("writ spec release g --stale")
+            );
+        }
+        assert!(found[1].message.contains("far.invalid") && found[1].message.contains("--force"));
+        assert!(found[2].message.contains("no pid"));
+    }
+
+    /// Finding 91: the constructor never lets `--force` through as a fix,
+    /// whichever check builds it (release builds drop it to needs_human).
+    #[test]
+    #[cfg(not(debug_assertions))]
+    fn constructor_drops_a_force_fix() {
+        let f = DoctorFinding::new(
+            "x",
+            Severity::Yellow,
+            "m",
+            "writ spec release g --force",
+            vec![],
+        );
+        assert!(f.fix_command.is_none() && f.needs_human);
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "uses --force")]
+    fn constructor_refuses_a_force_fix_in_debug() {
+        let _ = DoctorFinding::new(
+            "x",
+            Severity::Yellow,
+            "m",
+            "writ spec release g --force",
+            vec![],
+        );
+    }
+
+    #[test]
+    fn clean_doctor_demotes_a_high_next_action_and_keeps_the_rest() {
+        let mk_action = |action: &str, p: &str| {
+            Some(crate::context::RecommendedAction {
+                action: action.to_string(),
+                message: "m".to_string(),
+                priority: p.to_string(),
+            })
+        };
+        let mk = |p: &str| mk_action("converge", p);
+        let mut blocked = mk_action("wait_for_dependency", "high");
+        defer_to_clean_doctor(&mut blocked);
+        assert_eq!(blocked.unwrap().priority, "high");
+        let mut high = mk("high");
+        defer_to_clean_doctor(&mut high);
+        assert_eq!(high.unwrap().priority, "medium");
+        let mut low = mk("low");
+        defer_to_clean_doctor(&mut low);
+        assert_eq!(low.unwrap().priority, "low");
+        let mut none = None;
+        defer_to_clean_doctor(&mut none);
+        assert!(none.is_none());
+    }
+
     #[test]
     fn clean_headline_is_exact() {
         assert_eq!(
             headline(0, 0),
-            "fast checks clean; survival check not available until 0.4.1"
+            "fast checks clean; survival not run; run `writ doctor --survival`"
         );
     }
 
+    /// Without a green survival result on the current state the headline
+    /// never says "safe to finish" (Aubs's honesty condition).
     #[test]
     fn headlines_never_claim_safety() {
         for (r, y) in [(0, 0), (1, 0), (0, 3), (2, 2)] {
             let h = headline(r, y);
             assert!(h.starts_with("fast checks"), "{h}");
-            assert!(h.contains("survival check not available until 0.4.1"));
-            assert!(!h.contains("safe to finish"));
+            assert!(h.contains("survival not run"));
+            assert!(!h.contains(SAFE_TO_FINISH));
         }
     }
 
@@ -1701,7 +2070,7 @@ mod tests {
             CHECK_STALE_CLAIM,
             Severity::Red,
             "m",
-            "writ spec release x --force",
+            "writ spec release x --stale",
             vec!["a".into()],
         );
         let v = serde_json::to_value(&f).unwrap();

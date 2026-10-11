@@ -257,7 +257,7 @@ impl KeyStore {
 
 /// Decode a hex string to bytes.
 fn hex_decode_bytes(hex: &str) -> WritResult<Vec<u8>> {
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         return Err(WritError::InvalidInput("odd-length hex string".into()));
     }
     (0..hex.len())

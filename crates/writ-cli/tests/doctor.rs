@@ -9,7 +9,7 @@ use writ_core::seal::{AgentIdentity, AgentType, TaskStatus, Verification};
 use writ_core::spec::Spec;
 use writ_core::Repository;
 
-const CLEAN: &str = "fast checks clean; survival check not available until 0.4.1";
+const CLEAN: &str = "fast checks clean; survival not run; run `writ doctor --survival`";
 
 struct Scratch(PathBuf);
 
@@ -135,10 +135,12 @@ fn store_integrity_missing_blob_is_red_with_repair_fix() {
     assert_eq!(f["severity"], "red");
     assert_eq!(f["fix_command"], "writ repair");
     assert_eq!(f["paths"][0], "kept.txt");
-    assert!(v["headline"]
-        .as_str()
-        .unwrap()
-        .contains("survival check not available until 0.4.1"));
+    let headline = v["headline"].as_str().unwrap();
+    assert!(headline.contains("survival not run"), "{headline}");
+    assert!(
+        !headline.to_lowercase().contains("safe to finish"),
+        "{headline}"
+    );
     run_fix_then_clean(&s.0, f["fix_command"].as_str().unwrap());
 }
 
@@ -628,7 +630,7 @@ fn version_skew_two_writs_on_path() {
 }
 
 /// stale_claim (session gone): the claim names a pid on this host that has
-/// exited. Fix: force release.
+/// exited. Fix: `--stale` release, never `--force` (finding 91).
 #[test]
 fn stale_claim_exited_holder_is_reported_and_released() {
     let s = Scratch::new("stale-gone");
@@ -651,8 +653,8 @@ fn stale_claim_exited_holder_is_reported_and_released() {
     let found = findings_for(&s.0, "amis-test", "stale_claim");
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0]["message"].as_str().unwrap().contains("has exited"));
-    assert_eq!(found[0]["fix_command"], "writ spec release g --force");
-    run_fix_then_clean(&s.0, "writ spec release g --force");
+    assert_eq!(found[0]["fix_command"], "writ spec release g --stale");
+    run_fix_then_clean(&s.0, "writ spec release g --stale");
 }
 
 /// stale_claim (idle): no process record and idle past the threshold.
@@ -675,7 +677,26 @@ fn stale_claim_idle_past_threshold() {
     fs::write(&path, serde_json::to_string_pretty(&spec).unwrap()).unwrap();
     let found = findings_for(&s.0, "amis-test", "stale_claim");
     assert_eq!(found.len(), 1, "{found:?}");
-    assert!(found[0]["message"].as_str().unwrap().contains("idle"));
+    let msg = found[0]["message"].as_str().unwrap();
+    assert!(msg.contains("idle"), "{msg}");
+    // Finding 91: no proof the holder is gone, so a human decides; the
+    // message names the missing evidence and the human's --force.
+    assert!(found[0]["fix_command"].is_null(), "{found:?}");
+    assert_eq!(found[0]["needs_human"], true);
+    assert!(msg.contains("no pid") && msg.contains("host"), "{msg}");
+    assert!(
+        msg.contains("a human may run `writ spec release g --force`"),
+        "{msg}"
+    );
+    // --stale refuses the same claim and leaves it held.
+    let out = writ_as(
+        &s.0,
+        "other",
+        &["spec", "release", "g", "--stale", "--agent", "other"],
+    );
+    assert!(!out.status.success());
+    let held: Spec = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    assert_eq!(held.claimed_by.as_deref(), Some("ghost"));
 }
 
 /// A live holder (this test process's session) is never stale.
@@ -1019,7 +1040,7 @@ fn repo_with_ghost_claim(root: &Path) {
 fn assert_notice(out: &str) {
     assert!(out.contains("doctor: fast checks: 1 finding(s)"), "{out}");
     assert!(out.contains("[yellow] stale_claim"), "{out}");
-    assert!(out.contains("fix: writ spec release g --force"), "{out}");
+    assert!(out.contains("fix: writ spec release g --stale"), "{out}");
 }
 
 /// Finding 90: seal prints doctor after its output when not clean, and
@@ -1089,6 +1110,6 @@ fn status_carries_doctor_when_not_clean() {
     assert_eq!(v["doctor"]["findings"][0]["check"], "stale_claim", "{v}");
     assert_eq!(
         v["doctor"]["findings"][0]["fix_command"],
-        "writ spec release g --force"
+        "writ spec release g --stale"
     );
 }

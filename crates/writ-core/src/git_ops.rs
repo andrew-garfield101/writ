@@ -207,11 +207,7 @@ mod git2_impl {
 
             let after = index.len();
             // Return approximate count (may differ from actual staged changes)
-            Ok(if after >= before {
-                after - before
-            } else {
-                before - after
-            })
+            Ok(after.abs_diff(before))
         }
 
         fn commit(&self, message: &str) -> WritResult<String> {

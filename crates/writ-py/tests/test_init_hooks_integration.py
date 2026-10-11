@@ -645,15 +645,11 @@ class TestSessionStartHookEndToEnd:
             f"hook injects {len(result.stdout.encode())} B"
         )
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "finding 24: the hook embeds `which writ` at init time, not the binary "
-            "that ran init; a stale binary earlier on PATH gets pinned, and "
-            "`2>/dev/null || true` hides its errors"
-        ),
-    )
-    def test_hook_uses_the_binary_that_ran_init(self, tmp_path: Path):
+    def test_hook_runs_path_writ_and_names_the_init_writ(self, tmp_path: Path):
+        """Finding 89 (supersedes the finding 24 xfail): init records the binary
+        that ran it, never a stale `writ` earlier on PATH; at session start the
+        hook runs PATH's writ (the one the agent's own commands run) and prints
+        one note naming both when they differ."""
         decoy_dir = tmp_path / "decoy-bin"
         decoy_dir.mkdir()
         decoy = decoy_dir / "writ"
@@ -668,8 +664,13 @@ class TestSessionStartHookEndToEnd:
                        capture_output=True, text=True, check=True)
 
         (command,) = _writ_hook_commands(_settings(repo), "SessionStart")
-        assert str(decoy) not in command
-        assert str(Path(WRIT_BIN).resolve()) in command or " writ context" in command
+        assert f"F='{decoy}'" not in command
+        assert "F='" in command and "command -v writ" in command
+        result = subprocess.run(["sh", "-c", command], cwd=str(repo), env=env,
+                                capture_output=True, text=True, timeout=10)
+        assert "decoy" in result.stdout
+        notes = [l for l in result.stdout.splitlines() if l.startswith("Note:")]
+        assert len(notes) == 1 and str(decoy) in notes[0], result.stdout
 
     def test_init_replaces_pathless_legacy_hooks(self, tmp_path: Path):
         legacy = {"hooks": [{"type": "command", "command": "writ context 2>/dev/null || true"}]}

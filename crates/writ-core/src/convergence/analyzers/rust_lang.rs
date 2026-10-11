@@ -78,10 +78,10 @@ impl LanguageAnalyzer for RustAnalyzer {
                     result.push(normalized);
                 }
             }
-            while result.first().map_or(false, |l| l.is_empty()) {
+            while result.first().is_some_and(|l| l.is_empty()) {
                 result.remove(0);
             }
-            while result.last().map_or(false, |l| l.is_empty()) {
+            while result.last().is_some_and(|l| l.is_empty()) {
                 result.pop();
             }
             result.join("\n")
@@ -502,7 +502,7 @@ fn extract_use_module(trimmed: &str) -> String {
         return String::new();
     };
     // Take until `;`, `{`, or `as`.
-    rest.split(|c: char| c == ';' || c == '{' || c == ' ')
+    rest.split([';', '{', ' '])
         .next()
         .unwrap_or("")
         .trim_end_matches(';')
@@ -530,17 +530,12 @@ fn parse_use_details(line: &str) -> (String, Vec<String>) {
             return (module, names);
         }
         // Simple: `use std::io;` or `use std::io as io2;`
-        let module = rest
-            .split(|c: char| c == ' ' || c == ';')
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let module = rest.split([' ', ';']).next().unwrap_or("").to_string();
         return (module, vec![]);
     }
     if after_vis.starts_with("extern crate ") {
         let module = after_vis[13..]
             .trim_end_matches(';')
-            .trim()
             .split_whitespace()
             .next()
             .unwrap_or("")

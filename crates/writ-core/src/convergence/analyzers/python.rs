@@ -81,10 +81,10 @@ impl LanguageAnalyzer for PythonAnalyzer {
                 }
             }
             // Trim leading/trailing blank lines.
-            while result.first().map_or(false, |l| l.is_empty()) {
+            while result.first().is_some_and(|l| l.is_empty()) {
                 result.remove(0);
             }
-            while result.last().map_or(false, |l| l.is_empty()) {
+            while result.last().is_some_and(|l| l.is_empty()) {
                 result.pop();
             }
             result.join("\n")
@@ -255,24 +255,21 @@ fn is_top_level_def(line: &str) -> bool {
 
 /// Parse a def/class header to extract the kind and name.
 fn parse_def_header(trimmed: &str) -> (String, String) {
-    if trimmed.starts_with("class ") {
-        let rest = &trimmed[6..];
+    if let Some(rest) = trimmed.strip_prefix("class ") {
         let name = rest
             .split(|c: char| c == '(' || c == ':' || c.is_whitespace())
             .next()
             .unwrap_or("")
             .to_string();
         ("class".into(), name)
-    } else if trimmed.starts_with("async def ") {
-        let rest = &trimmed[10..];
+    } else if let Some(rest) = trimmed.strip_prefix("async def ") {
         let name = rest
             .split(|c: char| c == '(' || c == ':' || c.is_whitespace())
             .next()
             .unwrap_or("")
             .to_string();
         ("async_function".into(), name)
-    } else if trimmed.starts_with("def ") {
-        let rest = &trimmed[4..];
+    } else if let Some(rest) = trimmed.strip_prefix("def ") {
         let name = rest
             .split(|c: char| c == '(' || c == ':' || c.is_whitespace())
             .next()
@@ -310,11 +307,9 @@ fn find_block_end(lines: &[&str], start: usize) -> usize {
 
 /// Extract the module name from a Python import line.
 fn extract_import_module(trimmed: &str) -> String {
-    if trimmed.starts_with("from ") {
-        let rest = &trimmed[5..];
+    if let Some(rest) = trimmed.strip_prefix("from ") {
         rest.split_whitespace().next().unwrap_or("").to_string()
-    } else if trimmed.starts_with("import ") {
-        let rest = &trimmed[7..];
+    } else if let Some(rest) = trimmed.strip_prefix("import ") {
         // Handle `import X as Y` and `import X, Y`.
         rest.split(|c: char| c == ',' || c.is_whitespace())
             .next()
@@ -328,8 +323,7 @@ fn extract_import_module(trimmed: &str) -> String {
 /// Parse import details (module and names) from an import line.
 fn parse_import_details(line: &str) -> (String, Vec<String>) {
     let trimmed = line.trim();
-    if trimmed.starts_with("from ") {
-        let rest = &trimmed[5..];
+    if let Some(rest) = trimmed.strip_prefix("from ") {
         if let Some(import_idx) = rest.find(" import ") {
             let module = rest[..import_idx].trim().to_string();
             let names_part = rest[import_idx + 8..].trim();

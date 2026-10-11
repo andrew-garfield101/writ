@@ -45,8 +45,9 @@ class TestDoctorBinding:
 
         assert report["clean"], report["findings"]
         assert report["headline"] == (
-            "fast checks clean; survival check not available until 0.4.1"
+            "fast checks clean; survival not run; run `writ doctor --survival`"
         )
+        assert "safe to finish" not in report["headline"].lower()
 
     def test_doctor_detects_missing_directory(self, tmp_repo):
         """A removed objects directory is a red store_integrity finding."""

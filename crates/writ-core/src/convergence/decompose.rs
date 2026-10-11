@@ -94,11 +94,11 @@ fn partition_units(units: &[StructuralUnit]) -> (Vec<StructuralUnit>, Vec<Struct
             let prev_is_import = (0..i)
                 .rev()
                 .find(|&j| !matches!(units[j].kind, UnitKind::Whitespace | UnitKind::Comment))
-                .map_or(false, |j| is_import[j]);
+                .is_some_and(|j| is_import[j]);
 
             let next_is_import = ((i + 1)..units.len())
                 .find(|&j| !matches!(units[j].kind, UnitKind::Whitespace | UnitKind::Comment))
-                .map_or(false, |j| is_import[j]);
+                .is_some_and(|j| is_import[j]);
 
             // Only associate with imports if BOTH neighbors are imports,
             // or if we're at the start/end of the file adjacent to imports.

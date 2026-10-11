@@ -3,7 +3,8 @@
 # generated files (managed CLAUDE.md and AGENTS.md blocks, SessionStart hook,
 # settings instructions, skills, slash commands, AGENT_INSTRUCTIONS.md), keeps
 # the user's own text and settings, and leaves the store and specs alone.
-# Backs the 0.3.0 release note claim; caught findings 71 and 72.
+# Backs the 0.3.0 release note claim; caught findings 71 and 72. Check 27
+# (finding 89, 0.4.1): the hook resolves writ from PATH with a fallback.
 #
 # Usage: bench/release_checks/init_rerun.sh [WRIT_BIN] [SCRATCH_DIR]
 #   WRIT_BIN     writ binary under test (default: <repo>/target/release/writ)
@@ -136,6 +137,17 @@ chk "config [doctor] section preserved (finding 82)" "[ \"\$(cfg_val .writ/confi
 chk "config [frameworks] codex = false preserved (finding 82)" "[ \"\$(cfg_val .writ/config.toml frameworks codex)\" = false ]"
 chk "config [git] baseline_ref unchanged (finding 82)" "[ -n \"\$(cfg_val config.before.toml git baseline_ref)\" ] && [ \"\$(cfg_val config.before.toml git baseline_ref)\" = \"\$(cfg_val .writ/config.toml git baseline_ref)\" ]"
 chk "config [project] initialized unchanged (finding 82)" "[ -n \"\$(cfg_val config.before.toml project initialized)\" ] && [ \"\$(cfg_val config.before.toml project initialized)\" = \"\$(cfg_val .writ/config.toml project initialized)\" ]"
+# Finding 89 (0.4.1): the SessionStart hook runs the writ PATH resolves at
+# session start (the one the agent's own commands run), falls back to the writ
+# that ran init when PATH has none, and prints one Note line when they differ.
+# A fake newer writ stands in for an install through another channel.
+hook_cmd="$(python3 -c 'import json; d = json.load(open(".claude/settings.json")); print(next(h["command"] for e in d["hooks"]["SessionStart"] for h in e["hooks"] if "Writ VCS Active" in h["command"]))')"
+mkdir -p other-install
+printf '#!/bin/sh\necho "context-brief from OTHER-INSTALL"\n' > other-install/writ; chmod +x other-install/writ
+PATH="$PWD/other-install:/usr/bin:/bin" sh -c "$hook_cmd" > hook.path.out 2>&1 || true
+PATH="/usr/bin:/bin" sh -c "$hook_cmd" > hook.nopath.out 2>&1 || true
+chk "SessionStart hook runs PATH's writ, falls back to the init writ, notes the difference (finding 89)" \
+  "grep -q OTHER-INSTALL hook.path.out && [ \$(grep -c '^Note: this session runs $PWD/other-install/writ; writ init ran ' hook.path.out) -eq 1 ] && grep -q 'writ context-brief' hook.nopath.out && ! grep -q '^Note:' hook.nopath.out"
 echo "--- config.toml diff (before rerun vs after)"; diff config.before.toml .writ/config.toml || true
 echo "--- init2 output"; cat init2.log
 exit $fail

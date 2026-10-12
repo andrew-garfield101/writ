@@ -26,21 +26,16 @@ use crate::spec::LifecycleState;
 // ---------------------------------------------------------------------------
 
 /// GC operating mode.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GcMode {
     /// GC only runs when `writ gc` is explicitly called.
+    #[default]
     Manual,
     /// GC runs on a schedule (not implemented for beta).
     Scheduled,
     /// GC runs continuously as a background process (not implemented for beta).
     Daemon,
-}
-
-impl Default for GcMode {
-    fn default() -> Self {
-        GcMode::Manual
-    }
 }
 
 /// Spec lifecycle GC configuration.
@@ -2183,6 +2178,7 @@ mod tests {
             claimed_host: None,
             release_forced: false,
             genesis_tree: None,
+            post_commit_notes: Vec::new(),
             created_by: None,
         }
     }
@@ -3699,6 +3695,7 @@ mod tests {
             claimed_host: None,
             release_forced: false,
             genesis_tree: None,
+            post_commit_notes: Vec::new(),
             created_by: None,
         }
     }

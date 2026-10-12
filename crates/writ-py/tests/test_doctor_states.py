@@ -295,7 +295,11 @@ def test_committed_spec_seal_stuck_file(project: Project):
     assert (project.root / "s.txt").read_text() == "v2\n"
 
 
-def test_unsealed_at_risk_old_pending_while_other_active(project: Project):
+def test_unsealed_at_risk_old_pending_while_other_active(project: Project, monkeypatch):
+    # Finding 114: repo.doctor() reads the process identity. The viewer must
+    # be a human (who keeps the fix); an agent shell's session identity is
+    # another agent, which by design gets no command for a's live claim.
+    monkeypatch.setenv("WRIT_AGENT_ID", "human")
     project.spec("sa", "a")
     project.spec("sb", "b")
     project.write("a.txt", "a1\n")

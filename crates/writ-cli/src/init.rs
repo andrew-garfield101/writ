@@ -36,8 +36,6 @@ pub struct InitOptions {
     pub format: Option<String>,
     /// Explicit project name.
     pub name: Option<String>,
-    /// GC deployment profile.
-    pub profile: String,
     /// Re-prompt for project-level settings even if global config exists.
     pub reconfigure: bool,
     /// Output display format: "human" or "json".
@@ -47,13 +45,10 @@ pub struct InitOptions {
 /// Result of the interactive init flow, consumed by cmd_init for execution.
 #[derive(Debug, Clone)]
 pub struct InitPlan {
-    pub global_config: Option<GlobalConfig>,
     pub project_config: ProjectConfig,
-    pub enable_git: bool,
     pub enable_claude: bool,
     pub enable_codex: bool,
     pub enable_generic: bool,
-    pub project_name: String,
     pub scan: EnvironmentScan,
 }
 
@@ -235,11 +230,6 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
     // Phase 1: global setup (if needed)
     let fresh_global = !scan.global_config_exists;
     let global_config = maybe_global_setup(&scan, opts);
-    let new_global = if fresh_global {
-        Some(global_config.clone())
-    } else {
-        None
-    };
 
     // Skip format/workflow prompts when:
     // - Global config was just created this run (user already chose them), OR
@@ -322,7 +312,7 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
     // Build project config
     let project_config = ProjectConfig {
         project: Some(ProjectMeta {
-            name: Some(project_name.clone()),
+            name: Some(project_name),
             initialized: Some(chrono::Utc::now()),
         }),
         git: Some(GitConfig {
@@ -379,13 +369,10 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
     }
 
     Ok(InitPlan {
-        global_config: new_global,
         project_config,
-        enable_git,
         enable_claude,
         enable_codex,
         enable_generic,
-        project_name,
         scan,
     })
 }

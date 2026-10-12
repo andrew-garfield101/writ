@@ -64,8 +64,8 @@ pub(super) fn build_action_table(
             }
             if !replacement.is_empty() {
                 actions[run_start] = LineAction::Replace(replacement);
-                for j in (run_start + 1)..i {
-                    actions[j] = LineAction::Delete;
+                for a in actions.iter_mut().take(i).skip(run_start + 1) {
+                    *a = LineAction::Delete;
                 }
             }
         } else {

@@ -672,16 +672,15 @@ fn parse_js_import(line: &str) -> Option<JsImport> {
         return None;
     }
 
-    let (is_export, rest) = if trimmed.starts_with("export ") {
-        (true, trimmed[7..].trim())
-    } else if trimmed.starts_with("import ") {
-        (false, trimmed[7..].trim())
+    let (is_export, rest) = if let Some(stripped) = trimmed.strip_prefix("export ") {
+        (true, stripped.trim())
     } else {
-        return None;
+        let stripped = trimmed.strip_prefix("import ")?;
+        (false, stripped.trim())
     };
 
-    let (is_type, rest) = if rest.starts_with("type ") {
-        (true, rest[5..].trim())
+    let (is_type, rest) = if let Some(stripped) = rest.strip_prefix("type ") {
+        (true, stripped.trim())
     } else {
         (false, rest)
     };
@@ -710,8 +709,8 @@ fn parse_js_import(line: &str) -> Option<JsImport> {
     let mut named_imports = Vec::new();
     let mut namespace = None;
 
-    if binding_part.starts_with("* as ") {
-        namespace = Some(binding_part[5..].trim().to_string());
+    if let Some(stripped) = binding_part.strip_prefix("* as ") {
+        namespace = Some(stripped.trim().to_string());
     } else if binding_part.starts_with('{') {
         // Named only: { X, Y }
         let inner = binding_part
@@ -1192,8 +1191,8 @@ fn parse_python_import(line: &str) -> Option<PyImport> {
     let trimmed = line.trim();
 
     // `from X import Y, Z` or `from X import *`
-    if trimmed.starts_with("from ") {
-        let rest = trimmed[5..].trim();
+    if let Some(stripped) = trimmed.strip_prefix("from ") {
+        let rest = stripped.trim();
         let import_idx = rest.find(" import ")?;
         let module = rest[..import_idx].trim().to_string();
         let names_part = rest[import_idx + 8..].trim();
@@ -1227,8 +1226,8 @@ fn parse_python_import(line: &str) -> Option<PyImport> {
     }
 
     // `import X` or `import X, Y` or `import X as Y`
-    if trimmed.starts_with("import ") {
-        let rest = trimmed[7..].trim();
+    if let Some(stripped) = trimmed.strip_prefix("import ") {
+        let rest = stripped.trim();
         // Could be multiple: `import os, sys` — split by comma.
         let modules: Vec<String> = rest
             .split(',')

@@ -5,6 +5,9 @@
 # the user's own text and settings, and leaves the store and specs alone.
 # Backs the 0.3.0 release note claim; caught findings 71 and 72. Check 27
 # (finding 89, 0.4.1): the hook resolves writ from PATH with a fallback.
+# Checks 28-29 (0.4.2): a project initialized before the SessionEnd hook gains
+# exactly one on rerun, the user's own SessionEnd hook is kept, and the hook
+# runs PATH's `writ session-end`.
 #
 # Usage: bench/release_checks/init_rerun.sh [WRIT_BIN] [SCRATCH_DIR]
 #   WRIT_BIN     writ binary under test (default: <repo>/target/release/writ)
@@ -102,6 +105,8 @@ d["permissions"]["allow"].append("Bash(ls *)")
 d["instructions"] = ["MANDATORY: This project uses writ for version control. STALE-INSTRUCTIONS", "USER-INSTRUCTION"]
 d["hooks"]["SessionStart"][0]["hooks"][0]["command"] = "echo '## Writ VCS Active' && echo STALE-HOOK"
 d["hooks"]["SessionStart"].append({"hooks": [{"type": "command", "command": "echo USER-HOOK"}]})
+# A project initialized by 0.4.1 has no SessionEnd hook; the user has their own.
+d["hooks"]["SessionEnd"] = [{"hooks": [{"type": "command", "command": "echo USER-END-HOOK"}]}]
 st.write_text(json.dumps(d, indent=2))
 PY
 cp .claude/settings.json settings.tampered.json 2>/dev/null || true
@@ -143,11 +148,20 @@ chk "config [project] initialized unchanged (finding 82)" "[ -n \"\$(cfg_val con
 # A fake newer writ stands in for an install through another channel.
 hook_cmd="$(python3 -c 'import json; d = json.load(open(".claude/settings.json")); print(next(h["command"] for e in d["hooks"]["SessionStart"] for h in e["hooks"] if "Writ VCS Active" in h["command"]))')"
 mkdir -p other-install
-printf '#!/bin/sh\necho "context-brief from OTHER-INSTALL"\n' > other-install/writ; chmod +x other-install/writ
+printf '#!/bin/sh\necho "$*" >> "$(dirname "$0")/args.log"\necho "context-brief from OTHER-INSTALL"\n' > other-install/writ; chmod +x other-install/writ
 PATH="$PWD/other-install:/usr/bin:/bin" sh -c "$hook_cmd" > hook.path.out 2>&1 || true
 PATH="/usr/bin:/bin" sh -c "$hook_cmd" > hook.nopath.out 2>&1 || true
 chk "SessionStart hook runs PATH's writ, falls back to the init writ, notes the difference (finding 89)" \
   "grep -q OTHER-INSTALL hook.path.out && [ \$(grep -c '^Note: this session runs $PWD/other-install/writ; writ init ran ' hook.path.out) -eq 1 ] && grep -q 'writ context-brief' hook.nopath.out && ! grep -q '^Note:' hook.nopath.out"
+# 0.4.2: the SessionEnd hook (session end record for `spec release --stale`).
+end_cmds="$(python3 -c 'import json; d = json.load(open(".claude/settings.json")); print("\n".join(h["command"] for e in d["hooks"].get("SessionEnd", []) for h in e["hooks"]))')"
+chk "SessionEnd: rerun adds exactly one writ hook and keeps the user's own (0.4.2)" \
+  "[ \$(printf '%s\n' \"\$end_cmds\" | grep -c 'session-end') -eq 1 ] && printf '%s\n' \"\$end_cmds\" | grep -q USER-END-HOOK"
+end_hook="$(printf '%s\n' "$end_cmds" | grep 'session-end' | head -1 || true)"
+: > other-install/args.log
+end_rc=0; echo '{"reason":"other"}' | PATH="$PWD/other-install:/usr/bin:/bin" sh -c "${end_hook:-:}" > hook.end.out 2>&1 || end_rc=$?
+chk "SessionEnd hook runs PATH's 'writ session-end', silent, exit 0 (0.4.2)" \
+  "[ $end_rc -eq 0 ] && [ ! -s hook.end.out ] && grep -qx 'session-end' other-install/args.log"
 echo "--- config.toml diff (before rerun vs after)"; diff config.before.toml .writ/config.toml || true
 echo "--- init2 output"; cat init2.log
 exit $fail

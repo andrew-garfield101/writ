@@ -161,6 +161,12 @@ pub struct DoctorFinding {
     /// True when no command can be printed and a person must decide.
     #[serde(default)]
     pub needs_human: bool,
+    /// Finding 114: true when any agent may paste `fix_command`, including
+    /// an agent whose spec the finding is not about: writ has checked the
+    /// fix is safe. False when `needs_human`, and false when the fix would
+    /// touch another agent's live claim (a claim writ cannot prove dead).
+    #[serde(default)]
+    pub anyone_may_fix: bool,
     /// Repo-relative paths the finding is about (may be empty).
     #[serde(default)]
     pub paths: Vec<String>,
@@ -193,11 +199,50 @@ impl DoctorFinding {
             severity,
             message: message.into(),
             needs_human: fix_command.is_none(),
+            anyone_may_fix: fix_command.is_some(),
             fix_command,
             paths,
         }
     }
+
+    /// Finding 114: the fix is printed but is not for any agent to run on
+    /// its own; `why` (appended to the message) says whose it is.
+    pub fn for_human(mut self, why: &str) -> Self {
+        self.mark_for_human(why);
+        self
+    }
+
+    /// In-place form of [`DoctorFinding::for_human`].
+    pub fn mark_for_human(&mut self, why: &str) {
+        if self.anyone_may_fix {
+            self.anyone_may_fix = false;
+            self.message
+                .push_str(&format!("; the fix is for a human: {why}"));
+        }
+    }
+
+    /// One line for human output saying who may run the fix (finding 114).
+    pub fn who_may_fix(&self) -> &'static str {
+        if self.needs_human {
+            WHO_HUMAN
+        } else if self.anyone_may_fix {
+            WHO_ANYONE
+        } else {
+            WHO_HOLDER
+        }
+    }
 }
+
+/// Finding 114: printed under a fix any agent may run.
+pub const WHO_ANYONE: &str =
+    "any agent may run this fix, even on another agent's spec; writ checked it is safe";
+/// Printed under a fix that is printed but marked for a human (it touches
+/// another agent's live claim, or changes something outside the repository).
+pub const WHO_HOLDER: &str =
+    "not for any agent to run on its own: only the agent or person the message names";
+/// Printed when there is no fix to paste.
+pub const WHO_HUMAN: &str =
+    "none to paste: not for any agent; the message says who acts (a person, or the agent it names)";
 
 /// The full fast-tier report.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -230,6 +275,10 @@ pub struct DoctorReport {
     /// Wall time per check id, in milliseconds (for the latency budget).
     #[serde(default)]
     pub check_ms: std::collections::BTreeMap<String, u64>,
+    /// The one next action (Aubs 3): `writ handoff` shows this same string,
+    /// so the two never disagree. See [`next_action`].
+    #[serde(default)]
+    pub next_action: String,
 }
 
 impl DoctorReport {
@@ -256,6 +305,7 @@ impl DoctorReport {
             yellow,
             elapsed_ms: started.elapsed().as_millis() as u64,
             check_ms: Default::default(),
+            next_action: String::new(),
         }
     }
 
@@ -275,8 +325,15 @@ impl DoctorReport {
                 ids.push(f.check.as_str());
             }
         }
+        // Finding 114: say when a printed fix is one any agent may run.
+        let anyone = self.findings.iter().filter(|f| f.anyone_may_fix).count();
+        let act = if anyone > 0 {
+            format!("; {anyone} fix(es) any agent may run")
+        } else {
+            String::new()
+        };
         format!(
-            "fast checks: {} red, {} yellow ({}); run `writ doctor`; {}",
+            "fast checks: {} red, {} yellow ({}){act}; run `writ doctor`; {}",
             self.red,
             self.yellow,
             ids.join(", "),
@@ -441,6 +498,7 @@ pub fn run_survival(repo: &Repository) -> WritResult<DoctorReport> {
     // The headline counts the fast tier; the survival note says the rest.
     report.headline = headline_with(fast_red, fast_yellow, &report.survival, state.is_safe());
     report.elapsed_ms += report.check_ms[CHECK_SURVIVAL];
+    report.next_action = next_action(&report.findings, &repo.list_specs()?);
     Ok(report)
 }
 
@@ -482,7 +540,7 @@ pub fn run(repo: &Repository) -> WritResult<DoctorReport> {
 
     let specs = repo.list_specs()?;
     let now = chrono::Utc::now();
-    findings.extend(check_stale_claims(&specs, &config, now));
+    findings.extend(check_stale_claims(repo.writ_dir(), &specs, &config, now));
     done(CHECK_STALE_CLAIM, &mut checks_run, &mut lap);
 
     let actor = Actor::resolve(repo, &specs, now);
@@ -505,10 +563,55 @@ pub fn run(repo: &Repository) -> WritResult<DoctorReport> {
     findings.extend(check_left_out(repo.root(), &specs, &ctx, &claimed, &actor));
     done(CHECK_LEFT_OUT, &mut checks_run, &mut lap);
 
+    mark_live_claims(repo.writ_dir(), &mut findings, &specs, &ctx, &actor);
+
     let mut report = DoctorReport::from_findings(findings, checks_run, started);
     report.check_ms = check_ms;
     apply_survival_state(repo, &mut report);
+    report.next_action = next_action(&report.findings, &specs);
     Ok(report)
+}
+
+/// The single next action for a report (Aubs 3; handoff shows the same):
+/// the first red finding's fix (or who decides), then the first fix any
+/// agent may run, then finishing completed work, then the first other fix,
+/// with whom it is for. On a clean repository with nothing to finish:
+/// "nothing to do". Never converge.
+pub fn next_action(findings: &[DoctorFinding], specs: &[crate::spec::Spec]) -> String {
+    let fix_or_decide = |f: &DoctorFinding| match &f.fix_command {
+        Some(cmd) if f.anyone_may_fix => cmd.clone(),
+        Some(cmd) => format!(
+            "{cmd} (for the agent or person the {} finding names)",
+            f.check
+        ),
+        None => format!(
+            "a person decides the {} finding; see `writ doctor`",
+            f.check
+        ),
+    };
+    if let Some(f) = findings.iter().find(|f| f.severity == Severity::Red) {
+        return fix_or_decide(f);
+    }
+    if let Some(f) = findings.iter().find(|f| f.anyone_may_fix) {
+        return fix_or_decide(f);
+    }
+    let mut waiting: Vec<&str> = specs
+        .iter()
+        .filter(|s| s.is_committable())
+        .map(|s| s.id.as_str())
+        .collect();
+    if !waiting.is_empty() {
+        waiting.sort_unstable();
+        return format!(
+            "a human runs `writ finish`: {} completed spec(s) wait to be committed ({})",
+            waiting.len(),
+            waiting.join(", ")
+        );
+    }
+    match findings.first() {
+        Some(f) => fix_or_decide(f),
+        None => "nothing to do".to_string(),
+    }
 }
 
 /// Event type written when `writ finish` refuses (finding 76).
@@ -584,7 +687,8 @@ pub fn open_refusal_report(err: &WritError) -> Option<DoctorReport> {
         msg,
         "brew upgrade writ",
         Vec::new(),
-    );
+    )
+    .for_human("it upgrades the writ install on this machine, outside the repository");
     Some(DoctorReport::from_findings(
         vec![finding],
         vec![CHECK_VERSION_SKEW.to_string()],
@@ -682,7 +786,8 @@ fn check_store_integrity(
             ),
             allow_missing_command(&accept),
             accept_paths,
-        ));
+        )
+        .for_human("it records the loss of those objects as accepted"));
     }
     Ok(out)
 }
@@ -769,7 +874,7 @@ pub fn stale_verdict(
 
 /// The verdict for `spec` on this machine, reading the process table only
 /// when the claim can be judged by process.
-pub fn stale_verdict_here(spec: &crate::spec::Spec) -> StaleVerdict {
+pub fn stale_verdict_here(writ_dir: &std::path::Path, spec: &crate::spec::Spec) -> StaleVerdict {
     let host = crate::agent::session::host_name();
     let judgeable = spec.claimed_pid.is_some()
         && spec.claimed_pid_start.is_some()
@@ -780,10 +885,26 @@ pub fn stale_verdict_here(spec: &crate::spec::Spec) -> StaleVerdict {
     } else {
         None
     };
-    stale_verdict(spec, host.as_deref(), table.as_deref())
+    // Sprint 5: a host-recorded session end proves an unjudgeable pid gone.
+    crate::hooks::session_end::apply(
+        writ_dir,
+        spec,
+        stale_verdict(spec, host.as_deref(), table.as_deref()),
+    )
+}
+
+/// Finding 114: the stale_claim message when the holder is provably gone.
+/// It says the holder has exited and that any agent may run the fix, so an
+/// agent reading it about someone else's spec knows it is meant to act.
+pub fn stale_gone_message(spec_id: &str, holder: &str, proof: &str) -> String {
+    format!(
+        "spec '{spec_id}' is claimed by '{holder}', but '{holder}' has exited ({proof}); \
+         the claim is dead and any agent may run the fix, which releases only this claim"
+    )
 }
 
 fn check_stale_claims(
+    writ_dir: &std::path::Path,
     specs: &[crate::spec::Spec],
     config: &DoctorConfig,
     now: chrono::DateTime<chrono::Utc>,
@@ -812,12 +933,13 @@ fn check_stale_claims(
         let idle = now - std::cmp::max(spec.last_activity, spec.updated_at);
         // Finding 91: the printed fix is `--stale` and only with proof the
         // holder is gone; without proof a human decides. Never `--force`.
-        let finding = match stale_verdict(spec, host.as_deref(), table.as_deref()) {
+        let verdict = stale_verdict(spec, host.as_deref(), table.as_deref());
+        let finding = match crate::hooks::session_end::apply(writ_dir, spec, verdict) {
             StaleVerdict::Alive(_) => continue,
             StaleVerdict::Gone(proof) => DoctorFinding::new(
                 CHECK_STALE_CLAIM,
                 Severity::Yellow,
-                format!("spec '{}' is claimed by '{holder}', but {proof}", spec.id),
+                stale_gone_message(&spec.id, holder, &proof),
                 format!("writ spec release {} --stale", shell_quote(&spec.id)),
                 Vec::new(),
             ),
@@ -859,7 +981,7 @@ fn check_committed_spec_seals(repo: &Repository, actor: &Actor) -> WritResult<Ve
         let fix = seal_fix(
             actor,
             None,
-            &format!("follow-up to {spec_id}: content the committed spec did not carry"),
+            &format!("follow up to {spec_id}: content the committed spec did not carry"),
             &paths,
         );
         out.push(DoctorFinding::new(
@@ -874,6 +996,57 @@ fn check_committed_spec_seals(repo: &Repository, actor: &Actor) -> WritResult<Ve
         ));
     }
     Ok(out)
+}
+
+/// Injection B (Aubs 2): the one command a seal refused on a committed spec
+/// prints. The follow-up spec's id is `<spec id>-followup`, deterministic so
+/// a second paste reuses it (`spec add --id --claim` is idempotent for the
+/// same claimant) and so handoff and why can say the committed spec
+/// continued as it, with no new state.
+pub fn committed_followup_command(
+    spec_id: &str,
+    title: &str,
+    summary: &str,
+    paths: &[String],
+) -> String {
+    let id = followup_spec_id(spec_id);
+    format!(
+        "writ spec add {} --id {} --claim && writ seal -s {} --spec {} --paths {}",
+        double_quote(&format!("{title} (follow-up)")),
+        shell_quote(&id),
+        double_quote(summary),
+        shell_quote(&id),
+        shell_quote(&paths.join(","))
+    )
+}
+
+/// The id of the follow-up spec for committed spec `spec_id`.
+pub fn followup_spec_id(spec_id: &str) -> String {
+    format!("{spec_id}-followup")
+}
+
+/// The committed spec a follow-up spec continues, by the id convention:
+/// `X-followup` continues `X` when `X` exists. `None` otherwise.
+pub fn continues<'a>(
+    spec_id: &str,
+    specs: &'a [crate::spec::Spec],
+) -> Option<&'a crate::spec::Spec> {
+    let base = spec_id.strip_suffix("-followup")?;
+    specs.iter().find(|s| s.id == base)
+}
+
+/// Double-quote for a POSIX shell (the form agents write: `-s "..."`).
+fn double_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if matches!(c, '"' | '\\' | '$' | '`') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 /// Quote for a POSIX shell when needed, so fix commands paste verbatim.
@@ -1002,7 +1175,7 @@ pub fn other_touchers(
     let ctx = PendingContext::build(repo, &specs, &pending, &config, now, &Default::default())?;
     let mut out = std::collections::BTreeSet::new();
     for (who, _spec, at) in ctx.touches.get(path).into_iter().flatten() {
-        let after = since.map_or(true, |t| *at > t);
+        let after = since.is_none_or(|t| *at > t);
         if after || ctx.active.contains(who) {
             out.insert(who.clone());
         }
@@ -1059,17 +1232,230 @@ fn seal_fix(actor: &Actor, owner: Option<&str>, summary: &str, paths: &[String])
     // idempotent for the same agent, so any paste order works.
     format!(
         "writ spec add {} --id {} --claim && {}",
-        shell_quote("follow-up to writ doctor findings"),
+        shell_quote("follow up to writ doctor findings"),
         actor.follow_up_id,
         seal(&actor.follow_up_id)
     )
 }
 
+/// Finding 114: a seal fix (committed_spec_seal, unsealed_at_risk,
+/// left_out) is for any agent only when it touches no other agent's live
+/// claim. A path belongs to a claim when that claim's open spec sealed it or
+/// has it in its file scope; a claim is live unless writ can prove its
+/// holder gone (the `--stale` proof). Files nobody holds keep their fix.
+///
+/// Pending work on a live claim (unsealed_at_risk, CC's ruling; left_out,
+/// finding 118) is that holder's: sealing it into another spec takes over
+/// live work. The fix is the holder's own seal onto its spec (finding 120),
+/// never for any agent: runnable for the holder, named for the holder or a
+/// human to everyone else. left_out is split so files nobody holds keep the
+/// plain follow up fix.
+fn mark_live_claims(
+    writ_dir: &Path,
+    findings: &mut Vec<DoctorFinding>,
+    specs: &[crate::spec::Spec],
+    ctx: &PendingContext,
+    actor: &Actor,
+) {
+    const SEAL_FIXES: [&str; 3] = [
+        CHECK_COMMITTED_SPEC_SEAL,
+        CHECK_UNSEALED_AT_RISK,
+        CHECK_LEFT_OUT,
+    ];
+    if !findings
+        .iter()
+        .any(|f| f.anyone_may_fix && SEAL_FIXES.contains(&f.check.as_str()))
+    {
+        return;
+    }
+    let live = live_claims(writ_dir, specs);
+    if live.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(findings.len());
+    for mut f in findings.drain(..) {
+        if !f.anyone_may_fix || !SEAL_FIXES.contains(&f.check.as_str()) {
+            out.push(f);
+            continue;
+        }
+        match f.check.as_str() {
+            CHECK_UNSEALED_AT_RISK => {
+                if let Some(owner) = f.paths.iter().find_map(|p| live_owner(p, &live, ctx)) {
+                    address_to_holder(
+                        &mut f,
+                        owner,
+                        actor,
+                        "seal pending work flagged by writ doctor",
+                    );
+                }
+                out.push(f);
+            }
+            CHECK_LEFT_OUT => out.extend(split_left_out(f, &live, ctx, actor)),
+            _ => {
+                let foreign = f
+                    .paths
+                    .iter()
+                    .filter_map(|p| live_owner(p, &live, ctx))
+                    .find(|s| s.claimed_by.as_deref() != Some(actor.id.as_str()));
+                if let Some(s) = foreign {
+                    let holder = s.claimed_by.clone().unwrap_or_default();
+                    f.mark_for_human(&format!(
+                        "it touches the live claim of '{holder}' on spec '{}', so it is for '{holder}' or a human",
+                        s.id
+                    ));
+                }
+                out.push(f);
+            }
+        }
+    }
+    *findings = out;
+}
+
+/// The live claim that owns `path`: its open spec sealed the path, or the
+/// path is in its file scope.
+fn live_owner<'a>(
+    path: &str,
+    live: &[&'a crate::spec::Spec],
+    ctx: &PendingContext,
+) -> Option<&'a crate::spec::Spec> {
+    let sealed_on = |id: &str| {
+        ctx.touches
+            .get(path)
+            .is_some_and(|t| t.iter().any(|(_, spec, _)| spec == id))
+    };
+    let in_scope = |s: &crate::spec::Spec| {
+        s.file_scope
+            .iter()
+            .any(|e| e == path || (e.ends_with('/') && path.starts_with(e.as_str())))
+    };
+    live.iter()
+        .copied()
+        .find(|s| sealed_on(&s.id) || in_scope(s))
+}
+
+/// Address a pending-work fix to the live holder of `owner` (see
+/// [`mark_live_claims`]).
+fn address_to_holder(
+    f: &mut DoctorFinding,
+    owner: &crate::spec::Spec,
+    actor: &Actor,
+    summary: &str,
+) {
+    let holder = owner.claimed_by.clone().unwrap_or_default();
+    let spec = &owner.id;
+    // Finding 120: the fix is the holder's own seal onto its spec, never a
+    // second (follow up) spec.
+    f.fix_command = Some(format!(
+        "writ seal -s {} --spec {} --paths {}",
+        shell_quote(summary),
+        shell_quote(spec),
+        shell_quote(&f.paths.join(","))
+    ));
+    f.needs_human = false;
+    f.anyone_may_fix = false;
+    if holder == actor.id {
+        f.message.push_str(&format!(
+            "; these are your edits on your live claim on spec '{spec}': the fix is yours to run, not any other agent's"
+        ));
+    } else {
+        f.message.push_str(&format!(
+            "; these are edits by '{holder}' on its live claim on spec '{spec}': the fix is for '{holder}' or a human; \
+             another agent sealing them would take over live work"
+        ));
+    }
+}
+
+/// Finding 118: left_out split by live holder. Files nobody holds keep the
+/// fix as built; each live holder's files become their own finding,
+/// addressed to that holder.
+fn split_left_out(
+    f: DoctorFinding,
+    live: &[&crate::spec::Spec],
+    ctx: &PendingContext,
+    actor: &Actor,
+) -> Vec<DoctorFinding> {
+    let mut free: Vec<String> = Vec::new();
+    let mut held: std::collections::BTreeMap<String, (&crate::spec::Spec, Vec<String>)> =
+        Default::default();
+    for p in &f.paths {
+        match live_owner(p, live, ctx) {
+            Some(s) => held
+                .entry(s.id.clone())
+                .or_insert((s, Vec::new()))
+                .1
+                .push(p.clone()),
+            None => free.push(p.clone()),
+        }
+    }
+    if held.is_empty() {
+        return vec![f];
+    }
+    let mut out = Vec::new();
+    if !free.is_empty() {
+        out.push(left_out_finding(actor, None, free));
+    }
+    for (_, (owner, paths)) in held {
+        let own = owner.claimed_by.as_deref() == Some(actor.id.as_str());
+        let mut g = left_out_finding(actor, own.then_some(owner.id.as_str()), paths);
+        address_to_holder(&mut g, owner, actor, "seal work finish would leave out");
+        out.push(g);
+    }
+    out
+}
+
+/// The left_out finding for `paths`, its fix sealing onto `owner` when the
+/// actor holds it.
+fn left_out_finding(actor: &Actor, owner: Option<&str>, paths: Vec<String>) -> DoctorFinding {
+    DoctorFinding::new(
+        CHECK_LEFT_OUT,
+        Severity::Yellow,
+        format!(
+            "{} uncommitted, unsealed file(s) that the next finish will leave out (a human may instead commit them unaudited with `writ finish --include-unsealed`)",
+            paths.len()
+        ),
+        seal_fix(actor, owner, "seal work finish would leave out", &paths),
+        paths,
+    )
+}
+
+/// Open claimed specs whose holder writ cannot prove gone.
+fn live_claims<'a>(writ_dir: &Path, specs: &'a [crate::spec::Spec]) -> Vec<&'a crate::spec::Spec> {
+    let claimed: Vec<&crate::spec::Spec> = specs
+        .iter()
+        .filter(|s| spec_is_open(s) && s.claimed_by.is_some())
+        .collect();
+    if claimed.is_empty() {
+        return claimed;
+    }
+    let host = crate::agent::session::host_name();
+    let table = if claimed
+        .iter()
+        .any(|s| s.claimed_pid.is_some() && s.claimed_host == host)
+    {
+        crate::agent::session::process_table()
+    } else {
+        None
+    };
+    claimed
+        .into_iter()
+        .filter(|s| {
+            // A host-recorded session end is proof too (session-end record).
+            let verdict = stale_verdict(s, host.as_deref(), table.as_deref());
+            !matches!(
+                crate::hooks::session_end::apply(writ_dir, s, verdict),
+                StaleVerdict::Gone(_)
+            )
+        })
+        .collect()
+}
+
 /// The identity running doctor, the open specs it has claimed, and the
 /// follow-up spec doctor's fixes create when it has none.
 struct Actor {
+    /// The resolved agent id doctor runs as.
+    id: String,
     open_claims: Vec<String>,
-    /// `doctor-follow-up-<yyyymmdd>`, suffixed `-2`, `-3`... past ids taken.
+    /// `doctor-followup-<yyyymmdd>`, suffixed `-2`, `-3`... past ids taken.
     follow_up_id: String,
 }
 
@@ -1093,6 +1479,7 @@ impl Actor {
             .collect();
         open_claims.sort();
         Self {
+            id,
             open_claims,
             follow_up_id: follow_up_id(specs, now),
         }
@@ -1101,7 +1488,7 @@ impl Actor {
 
 /// A spec id for doctor's follow-up spec that no existing spec uses.
 fn follow_up_id(specs: &[crate::spec::Spec], now: chrono::DateTime<chrono::Utc>) -> String {
-    let base = format!("doctor-follow-up-{}", now.format("%Y%m%d"));
+    let base = format!("doctor-followup-{}", now.format("%Y%m%d"));
     let taken = |id: &str| specs.iter().any(|s| s.id == id);
     if !taken(&base) {
         return base;
@@ -1202,16 +1589,7 @@ fn check_left_out(
     if paths.is_empty() {
         return Vec::new();
     }
-    vec![DoctorFinding::new(
-        CHECK_LEFT_OUT,
-        Severity::Yellow,
-        format!(
-            "{} uncommitted, unsealed file(s) that the next finish will leave out (a human may instead commit them unaudited with `writ finish --include-unsealed`)",
-            paths.len()
-        ),
-        seal_fix(actor, None, "seal work finish would leave out", &paths),
-        paths,
-    )]
+    vec![left_out_finding(actor, None, paths)]
 }
 
 /// The subset of `paths` whose working-tree content differs from git HEAD
@@ -1417,6 +1795,7 @@ fn path_skew_finding(installs: &[WritInstall]) -> DoctorFinding {
                 cmds.join(" && "),
                 paths,
             )
+            .for_human("it removes a writ install from this machine, outside the repository")
         }
         _ => DoctorFinding::new(
             CHECK_VERSION_SKEW,
@@ -1798,7 +2177,12 @@ mod tests {
             s.last_activity = old;
             s.updated_at = old;
         }
-        let found = check_stale_claims(&specs, &DoctorConfig::default(), now);
+        let found = check_stale_claims(
+            std::path::Path::new("/nonexistent"),
+            &specs,
+            &DoctorConfig::default(),
+            now,
+        );
         assert_eq!(found.len(), 3, "{found:#?}");
         for f in &found {
             let fix = f.fix_command.as_deref().unwrap_or("");
@@ -2079,6 +2463,7 @@ mod tests {
         assert_eq!(
             keys,
             [
+                "anyone_may_fix",
                 "check",
                 "fix_command",
                 "message",
@@ -2088,5 +2473,80 @@ mod tests {
             ]
         );
         assert_eq!(v["severity"], "red");
+        assert_eq!(v["anyone_may_fix"], true);
+    }
+
+    /// Finding 114: the exited-holder message, and who may run each fix.
+    #[test]
+    fn stale_gone_message_says_exited_and_anyone() {
+        let m = stale_gone_message("s", "ghost", "pid 7 on host 'h' has exited");
+        assert!(m.contains("'ghost' has exited"), "{m}");
+        assert!(m.contains("any agent may run the fix"), "{m}");
+        let f = DoctorFinding::new(
+            CHECK_STALE_CLAIM,
+            Severity::Yellow,
+            m,
+            "writ spec release s --stale",
+            vec![],
+        );
+        assert!(f.anyone_may_fix && !f.needs_human);
+        assert_eq!(f.who_may_fix(), WHO_ANYONE);
+        let h = f.clone().for_human("it is someone else's");
+        assert!(!h.anyone_may_fix && h.fix_command.is_some());
+        assert!(h
+            .message
+            .ends_with("the fix is for a human: it is someone else's"));
+        assert_eq!(h.who_may_fix(), WHO_HOLDER);
+        let none = DoctorFinding::new(CHECK_STALE_CLAIM, Severity::Yellow, "m", "", vec![]);
+        assert!(!none.anyone_may_fix && none.needs_human);
+        assert_eq!(none.who_may_fix(), WHO_HUMAN);
+    }
+
+    #[test]
+    fn committed_followup_command_is_the_exact_one_line() {
+        assert_eq!(
+            committed_followup_command("auth", "Auth module", "login returns", &["auth.py".into()]),
+            r#"writ spec add "Auth module (follow-up)" --id auth-followup --claim && writ seal -s "login returns" --spec auth-followup --paths auth.py"#
+        );
+        let q = committed_followup_command(
+            "a",
+            "say \"hi\" $x",
+            "`x`",
+            &["a b.rs".into(), "c.rs".into()],
+        );
+        assert!(q.contains(r#""say \"hi\" \$x (follow-up)""#), "{q}");
+        assert!(q.contains(r#"-s "\`x\`""#), "{q}");
+        assert!(q.ends_with("--paths 'a b.rs,c.rs'"), "{q}");
+        assert!(!q.contains("reopen") && !q.contains("--force"));
+    }
+
+    #[test]
+    fn followup_continues_its_committed_spec_by_id() {
+        let mut a = crate::spec::Spec::new("auth".into(), "Auth".into(), String::new());
+        a.id = "auth".into();
+        let specs = vec![a];
+        assert_eq!(
+            continues("auth-followup", &specs).map(|s| s.id.as_str()),
+            Some("auth")
+        );
+        assert!(continues("auth", &specs).is_none());
+        assert!(continues("other-followup", &specs).is_none());
+    }
+
+    #[test]
+    fn brief_line_counts_fixes_any_agent_may_run() {
+        let f = DoctorFinding::new(
+            CHECK_STALE_CLAIM,
+            Severity::Yellow,
+            "m",
+            "writ spec release s --stale",
+            vec![],
+        );
+        let rep = DoctorReport::from_findings(vec![f], vec![], Instant::now());
+        assert!(
+            rep.brief_line().contains("1 fix(es) any agent may run"),
+            "{}",
+            rep.brief_line()
+        );
     }
 }

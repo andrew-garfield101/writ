@@ -449,8 +449,8 @@ fn left_out_fix_works_for_an_agent_without_an_open_spec() {
     assert_eq!(found[0]["severity"], "yellow");
     let fix = found[0]["fix_command"].as_str().unwrap();
     assert!(
-        fix.starts_with("writ spec add 'follow-up to writ doctor findings' --id doctor-follow-up-")
-            && fix.contains("--spec doctor-follow-up-"),
+        fix.starts_with("writ spec add 'follow up to writ doctor findings' --id doctor-followup-")
+            && fix.contains("--spec doctor-followup-"),
         "{fix}"
     );
     assert!(!fix.contains("--include-unsealed"));
@@ -520,8 +520,8 @@ fn committed_spec_seal_fix_moves_the_file_to_a_follow_up_spec() {
     assert_eq!(found[0]["paths"][0], "f.txt");
     let fix = found[0]["fix_command"].as_str().unwrap();
     assert!(
-        fix.starts_with("writ spec add 'follow-up to writ doctor findings' --id doctor-follow-up-")
-            && fix.contains("--spec doctor-follow-up-"),
+        fix.starts_with("writ spec add 'follow up to writ doctor findings' --id doctor-followup-")
+            && fix.contains("--spec doctor-followup-"),
         "{fix}"
     );
     run_fix_as(&s.0, "ann", fix);
@@ -826,7 +826,7 @@ fn one_follow_up_spec_for_several_findings() {
     assert_eq!(fixes.len(), 2, "{v}");
     let all = fixes.join("\n");
     assert_eq!(all.matches("writ seal").count(), 2, "{all}");
-    let id = format!("doctor-follow-up-{}", chrono::Utc::now().format("%Y%m%d"));
+    let id = format!("doctor-followup-{}", chrono::Utc::now().format("%Y%m%d"));
     // Finding 84: one spec id; each fix carries its own idempotent spec add.
     for f in &fixes {
         assert!(f.contains(&format!("--id {id} --claim")), "{all}");

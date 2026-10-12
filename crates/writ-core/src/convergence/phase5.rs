@@ -249,7 +249,10 @@ fn sanity_check(merged: &str, conflict: &ClassifiedConflict, file_path: &str) ->
         }
     }
 
-    score.max(0.0).min(1.0)
+    // Not `clamp`: max/min maps a NaN score to 0.0, clamp would keep NaN.
+    #[allow(clippy::manual_clamp)]
+    let bounded = score.max(0.0).min(1.0);
+    bounded
 }
 
 // ---------------------------------------------------------------------------

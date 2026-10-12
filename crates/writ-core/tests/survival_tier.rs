@@ -343,3 +343,67 @@ fn sealed_path_ignored_by_git_and_writ_is_info_and_its_deletion_can_be_sealed() 
         Err(WritError::NothingToSeal)
     ));
 }
+
+/// Finding 123: the same note while the sealing spec is still open (not
+/// done, not committed), with the file still on disk: its holder can still
+/// remove the ignore rule and seal, so the state is named now, same text.
+#[cfg(feature = "bridge")]
+#[test]
+fn sealed_path_ignored_by_git_and_writ_is_noted_while_its_spec_is_open() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let git = git2::Repository::init(root).unwrap();
+    let sig = git2::Signature::now("t", "t@t").unwrap();
+    fs::write(root.join(".gitignore"), ".writ/\n").unwrap();
+    let commit = |msg: &str| {
+        let mut idx = git.index().unwrap();
+        idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        idx.write().unwrap();
+        let tree = git.find_tree(idx.write_tree().unwrap()).unwrap();
+        let parent = git.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        git.commit(Some("HEAD"), &sig, &sig, msg, &tree, &parents)
+            .unwrap();
+    };
+    commit("base");
+    let repo = Repository::init(root).unwrap();
+    repo.add_spec(&Spec::new("sa".into(), "sa".into(), String::new()))
+        .unwrap();
+    let path = "out/results/.gitignore";
+    fs::create_dir_all(root.join("out/results")).unwrap();
+    fs::write(root.join(path), "*\n!.gitignore\n").unwrap();
+    let sealed = repo
+        .seal_paths(
+            AgentIdentity {
+                id: "a".into(),
+                agent_type: AgentType::Agent,
+            },
+            "a work".into(),
+            Some("sa".into()),
+            TaskStatus::InProgress,
+            Verification::default(),
+            &[path.to_string()],
+            false,
+        )
+        .unwrap();
+    fs::write(root.join(".gitignore"), ".writ/\nout/results/\n").unwrap();
+    commit("ignore results");
+    assert!(root.join(path).exists());
+
+    let r = doctor::run_survival(&repo).unwrap();
+
+    assert!(
+        r.findings.iter().all(|f| f.check != CHECK_SURVIVAL),
+        "{r:?}"
+    );
+    assert_eq!(r.survival_info.len(), 1, "{r:?}");
+    let note = &r.survival_info[0];
+    assert!(
+        note.contains(path)
+            && note.contains(&sealed.id[..12])
+            && note.contains("stays as history")
+            && note.contains(&format!("writ seal --paths {path}")),
+        "{note}"
+    );
+}

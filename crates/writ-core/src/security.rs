@@ -463,6 +463,7 @@ impl GcAuditRecord {
     }
 
     /// Create a new audit record for a completed GC run.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         triggered_by: GcTrigger,
         actions_planned: usize,

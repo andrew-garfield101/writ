@@ -89,11 +89,10 @@ impl LanguageAnalyzer for JavaScriptAnalyzer {
     }
 
     fn ordering_matters(&self, unit_kind: &UnitKind) -> bool {
-        match unit_kind {
-            UnitKind::Import => false,
-            UnitKind::Comment | UnitKind::Whitespace => false,
-            _ => true,
-        }
+        !matches!(
+            unit_kind,
+            UnitKind::Import | UnitKind::Comment | UnitKind::Whitespace
+        )
     }
 }
 

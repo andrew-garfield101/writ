@@ -7,9 +7,8 @@
 //! `Repository` API. It communicates events via a `Sender<WatchEvent>` channel
 //! and listens for shutdown on a `Receiver<()>` channel.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
@@ -40,6 +39,10 @@ pub struct WatchConfig {
 }
 
 impl Default for WatchConfig {
+    // MostRecent is deprecated (it silently drops work) but is still watch's
+    // default; it is removed in 0.4.3 under U.4 "Cut surface" of
+    // docs/briefs/unattended-release-brief.md. Until then the default stays.
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             interval_secs: 5,
@@ -611,7 +614,7 @@ pub fn load_conflict_records(repo: &Repository) -> WritResult<Vec<ConflictRecord
             }
         }
     }
-    records.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    records.sort_by_key(|a| a.timestamp);
     Ok(records)
 }
 

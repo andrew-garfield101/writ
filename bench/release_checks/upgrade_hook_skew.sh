@@ -4,6 +4,10 @@
 # finding naming .claude/settings.json with `writ init -y` from the new build,
 # and `writ init -y` clears it. Backs "Doctor reports hooks written by 0.4.0 or
 # earlier as version_skew until you do."
+# 0.4.2 (checks 3-4): a project whose settings hold today's start hook but no
+# SessionEnd hook (initialized by 0.4.1) is version_skew on .claude/settings.json
+# with `writ init -y`, which adds the end hook and clears it. Isolated from any
+# start-hook text change by removing only the SessionEnd key from a fresh init.
 #
 # Usage: bench/release_checks/upgrade_hook_skew.sh [WRIT_BIN] [OLD_WRIT] [SCRATCH_DIR]
 #   WRIT_BIN     new writ under test (default: <repo>/target/release/writ)
@@ -42,4 +46,16 @@ chk "old hook reported as version_skew on .claude/settings.json, fix writ init -
   "python3 -c 'import json,sys; r=json.load(open(\"before.json\")); sys.exit(0 if any(f[\"check\"]==\"version_skew\" and f[\"fix_command\"]==\"writ init -y\" and \".claude/settings.json\" in f[\"paths\"] for f in r[\"findings\"]) else 1)'"
 chk "writ init -y clears it (doctor clean)" \
   "python3 -c 'import json,sys; r=json.load(open(\"after.json\")); sys.exit(0 if r[\"clean\"] and not r[\"findings\"] else 1)'"
+python3 - <<'PY2'
+import json
+p = ".claude/settings.json"; d = json.load(open(p)); d["hooks"].pop("SessionEnd", None)
+json.dump(d, open(p, "w"), indent=2)
+PY2
+"$W" doctor --format json > start_only.json 2>/dev/null || true
+"$W" init -y > init-end.log 2>&1
+"$W" doctor --format json > end_after.json 2>/dev/null || true
+chk "start hook without SessionEnd hook reported as version_skew on .claude/settings.json, fix writ init -y (0.4.2)" \
+  "python3 -c 'import json,sys; r=json.load(open(\"start_only.json\")); sys.exit(0 if any(f[\"check\"]==\"version_skew\" and f[\"fix_command\"]==\"writ init -y\" and \".claude/settings.json\" in f[\"paths\"] for f in r[\"findings\"]) else 1)'"
+chk "writ init -y adds the SessionEnd hook and clears it (doctor clean) (0.4.2)" \
+  "python3 -c 'import json,sys; r=json.load(open(\"end_after.json\")); s=json.load(open(\".claude/settings.json\")); sys.exit(0 if r[\"clean\"] and not r[\"findings\"] and \"SessionEnd\" in s[\"hooks\"] else 1)'"
 exit $fail

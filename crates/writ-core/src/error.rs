@@ -265,9 +265,10 @@ impl fmt::Display for WritError {
                     .map(|h| format!(" in {}", &h[..h.len().min(12)]))
                     .unwrap_or_default();
                 let follow_up = format!("{title} (follow-up)").replace('"', "'");
+                let id = crate::doctor::followup_spec_id(spec_id);
                 write!(
                     f,
-                    "spec '{spec_id}' is already committed to git{at}; finish would never stage a new seal on it and it cannot be reopened. Start a new spec for this work:\n    writ spec add \"{follow_up}\" --claim"
+                    "spec '{spec_id}' is already committed to git{at}; finish would never stage a new seal on it. Continue this work on its follow-up spec:\n    writ spec add \"{follow_up}\" --id {id} --claim"
                 )
             }
             WritError::SealClaimConflict {

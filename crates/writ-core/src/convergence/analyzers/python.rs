@@ -339,8 +339,8 @@ fn parse_import_details(line: &str) -> (String, Vec<String>) {
                 .collect();
             return (module, names);
         }
-    } else if trimmed.starts_with("import ") {
-        let module = trimmed[7..].trim().to_string();
+    } else if let Some(stripped) = trimmed.strip_prefix("import ") {
+        let module = stripped.trim().to_string();
         return (module, vec![]);
     }
     (String::new(), vec![])

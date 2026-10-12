@@ -197,6 +197,18 @@ jobs:
         # judgment items (too_many_arguments, deprecated pyo3 to_object, an
         # unused agent_id in py seal), main.rs and repo.rs, and the convergence
         # analyzers' by-hand manual_strip rewrites.
+        # Sprint 5 cap (session-end-and-ci, 2026-10-12): 4 on the working tree
+        # (writ-core 3, writ-py 1, writ-cli 0, writ-mcp 0), 0 errors, after
+        # machine fixes everywhere (ptr_arg, manual_strip, sort_by_key, matches!,
+        # cargo clippy --fix) and function-level allows CC decided on
+        # (too_many_arguments; deprecated MostRecent until its 0.4.3 removal;
+        # manual_clamp where clamp would keep a NaN). Left, judgment:
+        # repo.rs dead_code convergence_epoch/bridge_tree_hash (test-only or
+        # unused), repo.rs large_enum_variant (boxing changes the type),
+        # repo.rs type_complexity, writ-py deprecated pyo3 to_object (the
+        # IntoPyObject migration). Clearing those four lets this step become
+        # `cargo clippy --workspace --all-features -- -D warnings` without
+        # continue-on-error.
         continue-on-error: true
 
       # PREPARED, NOT ENABLED (sprint 3, doctor-ops). Target state once the

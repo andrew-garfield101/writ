@@ -855,6 +855,11 @@ impl Repository {
                 plan.drift.push(path.clone());
             }
         }
+        plan.ignored = self.ignored_and_untracked(&plan.stage);
+        if !plan.ignored.is_empty() {
+            plan.stage.retain(|(p, _)| !plan.ignored.contains(p));
+            plan.drift.retain(|p| !plan.ignored.contains(p));
+        }
         plan.unsealed = pending
             .iter()
             .filter(|p| !sealed.contains(*p))
@@ -867,6 +872,30 @@ impl Repository {
         plan.shared_open = self.shared_with_open_specs(&specs, &wanted, &plan.stage)?;
         plan.stale = self.stale_own_blobs(&specs, &wanted, &plan.stage)?;
         Ok(plan)
+    }
+
+    /// Of `stage`, the paths git and writ both ignore that HEAD does not
+    /// hold: git would refuse to stage them (findings 113, 116). Empty
+    /// without git.
+    fn ignored_and_untracked(&self, stage: &[(String, Option<String>)]) -> Vec<String> {
+        let rules = self.ignore_rules();
+        let candidates: Vec<String> = stage
+            .iter()
+            .map(|(p, _)| p)
+            .filter(|p| rules.is_path_ignored(p))
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let git_ignored = self.git_ignored(&candidates);
+        let Ok(at_head) = self.git_head_blobs(&candidates) else {
+            return Vec::new();
+        };
+        candidates
+            .into_iter()
+            .filter(|p| git_ignored.contains(p) && !at_head.contains_key(p))
+            .collect()
     }
 
     /// Staged paths whose committing spec's own sealed blob is stale: some
@@ -1248,11 +1277,15 @@ impl Repository {
             }
             for l in allowed {
                 let (other_agents, added_by) = self.loss_context(sid, &agent.id, &l)?;
+                let (accepted_from, accepted_lines) =
+                    self.accepted_from(sid, &l.path, &l.lines, &other_agents)?;
                 override_context.push(crate::seal::OverrideContext {
                     path: l.path,
                     other_agents,
                     lines: l.lines,
                     added_by,
+                    accepted_from: Some(accepted_from),
+                    accepted_lines,
                 });
             }
         }
@@ -1637,6 +1670,118 @@ impl Repository {
         }
         let others = crate::doctor::other_touchers(self, &loss.path, spec_id, agent, since)?;
         Ok((others, added_by))
+    }
+
+    /// Finding 122: which removed lines were another agent's call, and whose.
+    /// The lines considered are `lost` plus the spec's own sealed lines this
+    /// seal drops that another spec's removal already excused. A line counts as accepted from agent X when a seal of X removed
+    /// it (X's old blob held it, its new one does not), or when the hunk
+    /// that removes it (diff from this spec's last sealed version of `path`
+    /// to the file on disk) inserts a line X's seal added. Otherwise the
+    /// sealer rewrote its own line. Lines kept from X elsewhere in the file
+    /// are not evidence; blank and very short lines are not evidence;
+    /// unsealed work leaves no record and never counts. Returns the agents
+    /// (in `others` order) and the accepted lines.
+    fn accepted_from(
+        &self,
+        spec_id: &str,
+        path: &str,
+        lost: &[String],
+        others: &[String],
+    ) -> WritResult<(Vec<String>, Vec<String>)> {
+        if others.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let text = |hash: &Option<String>| -> WritResult<String> {
+            match hash {
+                None => Ok(String::new()),
+                Some(h) => Ok(String::from_utf8_lossy(&self.objects.retrieve(h)?).into_owned()),
+            }
+        };
+        // Each other agent's added and removed lines on the path.
+        let mut by_agent: Vec<(String, HashSet<String>, HashSet<String>)> = others
+            .iter()
+            .map(|o| (o.clone(), HashSet::new(), HashSet::new()))
+            .collect();
+        for spec in self.list_specs()? {
+            if spec.id == spec_id || spec.sealed_by.is_empty() {
+                continue;
+            }
+            for seal in self.spec_seals(&spec.id)? {
+                let Some(entry) = by_agent.iter_mut().find(|(a, _, _)| *a == seal.agent.id) else {
+                    continue;
+                };
+                for c in seal.changes.iter().filter(|c| c.path == path) {
+                    let old = text(&c.old_hash)?;
+                    let new = text(&c.new_hash)?;
+                    let was: HashSet<&str> = old.lines().collect();
+                    let now: HashSet<&str> = new.lines().collect();
+                    entry.1.extend(now.difference(&was).map(|l| l.to_string()));
+                    entry.2.extend(was.difference(&now).map(|l| l.to_string()));
+                }
+            }
+        }
+        let mut own = self.spec_seals(spec_id)?;
+        own.sort_by_key(|s| s.timestamp);
+        let previous = own
+            .iter()
+            .rev()
+            .find_map(|s| s.changes.iter().find(|c| c.path == path))
+            .and_then(|c| c.new_hash.clone());
+        let previous = text(&previous)?;
+        let disk = fs::read(self.root.join(path))
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default();
+        let hunks = crate::diff::compute_line_diff(&previous, &disk, 0);
+        // The spec's own lines this seal drops: the refused (lost) lines,
+        // and own lines another spec's informed removal already excused
+        // (they were that agent's call: the mixed case).
+        let mut own_added: HashSet<String> = HashSet::new();
+        for seal in &own {
+            for c in seal.changes.iter().filter(|c| c.path == path) {
+                let old = text(&c.old_hash)?;
+                let new = text(&c.new_hash)?;
+                let was: HashSet<&str> = old.lines().collect();
+                own_added.extend(new.lines().filter(|l| !was.contains(l)).map(str::to_string));
+            }
+        }
+        let on_disk: HashSet<&str> = disk.lines().collect();
+        let mut dropped: Vec<String> = lost.to_vec();
+        for l in previous.lines() {
+            if own_added.contains(l) && !on_disk.contains(l) && !dropped.iter().any(|d| d == l) {
+                dropped.push(l.to_string());
+            }
+        }
+        let mut agents: Vec<String> = Vec::new();
+        let mut accepted: Vec<String> = Vec::new();
+        for line in &dropped {
+            let replacement: Vec<&str> = hunks
+                .iter()
+                .filter(|h| {
+                    h.lines
+                        .iter()
+                        .any(|l| l.op == crate::diff::LineOp::Remove && &l.content == line)
+                })
+                .flat_map(|h| {
+                    h.lines
+                        .iter()
+                        .filter(|l| l.op == crate::diff::LineOp::Add)
+                        .map(|l| l.content.as_str())
+                })
+                .filter(|l| l.trim().len() >= 4)
+                .collect();
+            let by = by_agent.iter().find(|(_, added, removed)| {
+                removed.contains(line) || replacement.iter().any(|r| added.contains(*r))
+            });
+            if let Some((who, _, _)) = by {
+                accepted.push(line.clone());
+                if !agents.contains(who) {
+                    agents.push(who.clone());
+                }
+            }
+        }
+        agents.sort_by_key(|a| others.iter().position(|o| o == a));
+        Ok((agents, accepted))
     }
 
     /// Every seal of every spec other than `spec_id`, with whether its spec
@@ -2480,11 +2625,9 @@ impl Repository {
         seals: &'a [Seal],
         committed: &'a HashSet<String>,
     ) -> impl Iterator<Item = &'a Seal> + 'a {
-        seals.iter().filter(move |s| {
-            s.spec_id
-                .as_ref()
-                .map_or(true, |id| !committed.contains(id))
-        })
+        seals
+            .iter()
+            .filter(move |s| s.spec_id.as_ref().is_none_or(|id| !committed.contains(id)))
     }
 
     /// Detect spec branches whose tip seals are not reachable from global HEAD.
@@ -2809,8 +2952,8 @@ impl Repository {
             .count();
 
         // Sort completed by last_activity descending (most recent first).
-        completed.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
-        in_progress.sort_by(|a, b| b.last_activity.cmp(&a.last_activity));
+        completed.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
+        in_progress.sort_by_key(|s| std::cmp::Reverse(s.last_activity));
 
         // Detect untracked changes: files modified on disk but not captured
         // in any spec's seal chain. These have no writ attribution.
@@ -3236,6 +3379,45 @@ impl Repository {
         Ok(Some(previous))
     }
 
+    /// Finding 124: `writ spec done` after a finish committed the spec.
+    /// Nothing is closed (it already is); a non-empty summary is kept on the
+    /// spec record as a post-commit note so it is in a writ record. Refuses
+    /// a spec that is not committed.
+    pub fn record_post_commit_note(
+        &self,
+        spec_id: &str,
+        agent_id: &str,
+        summary: Option<&str>,
+    ) -> WritResult<Spec> {
+        let mut spec = self.resolve_spec(spec_id)?;
+        if !matches!(
+            spec.commit_state,
+            crate::spec::CommitState::Committed | crate::spec::CommitState::Pushed
+        ) {
+            return Err(WritError::Other(format!(
+                "spec '{}' is not committed; run `writ spec done` on it normally",
+                spec.id
+            )));
+        }
+        if let Some(text) = summary.map(str::trim).filter(|t| !t.is_empty()) {
+            let note = crate::spec::PostCommitNote {
+                agent: agent_id.to_string(),
+                at: chrono::Utc::now(),
+                summary: text.to_string(),
+            };
+            // Idempotent: the same agent and summary twice records once.
+            if !spec
+                .post_commit_notes
+                .iter()
+                .any(|n| n.agent == note.agent && n.summary == note.summary)
+            {
+                spec.post_commit_notes.push(note);
+                self.save_spec(&spec)?;
+            }
+        }
+        Ok(spec)
+    }
+
     /// `writ spec release --stale` (finding 91): release another agent's
     /// claim only with proof its holder is gone (same host, recorded pid
     /// exited or reused; see [`crate::doctor::stale_verdict`]). Without
@@ -3253,7 +3435,7 @@ impl Repository {
             }
             Some(holder) => holder,
         };
-        let proof = match crate::doctor::stale_verdict_here(&spec) {
+        let proof = match crate::doctor::stale_verdict_here(&self.writ_dir, &spec) {
             crate::doctor::StaleVerdict::Gone(proof) => proof,
             crate::doctor::StaleVerdict::Alive(reason)
             | crate::doctor::StaleVerdict::Unproven(reason) => {
@@ -3628,7 +3810,7 @@ impl Repository {
         write_workspace_pointer(&target_dir.join(".writ-workspace"), &pointer)?;
 
         // Canonicalize target_dir now that it exists.
-        let final_path = fs::canonicalize(&target_dir).unwrap_or_else(|_| target_dir);
+        let final_path = fs::canonicalize(&target_dir).unwrap_or(target_dir);
 
         Ok(WorkspaceInfo {
             name: name.to_string(),
@@ -3883,7 +4065,7 @@ impl Repository {
         }
 
         // Sort newest-first by timestamp.
-        all_seals.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        all_seals.sort_by_key(|s| std::cmp::Reverse(s.timestamp));
         Ok(all_seals)
     }
 
@@ -4043,6 +4225,7 @@ impl Repository {
     /// 4. Unsealed changes — agent should checkpoint their work
     /// 5. Session complete — all done, generate summary
     /// 6. None — nothing urgent, keep working
+    ///
     /// Build a lightweight chain integrity summary for context output.
     /// Returns None if no seals have crypto fields (all pre-Sprint A).
     fn build_chain_integrity(&self) -> Option<ChainIntegritySummary> {
@@ -4511,7 +4694,7 @@ impl Repository {
                 let recent: Vec<SealSummary> = seals
                     .iter()
                     .filter(apply_filter)
-                    .filter(|s| ws_filter.map_or(true, |ws| s.workspace == ws))
+                    .filter(|s| ws_filter.is_none_or(|ws| s.workspace == ws))
                     .take(seal_limit)
                     .enumerate()
                     .map(|(i, s)| SealSummary::from_seal_with_paths(s, i < 3))
@@ -4780,7 +4963,7 @@ impl Repository {
                                 agents.push(seal.agent.id.clone());
                             }
                             let ts = seal.timestamp.to_rfc3339();
-                            if latest_at.as_ref().map_or(true, |prev| ts > *prev) {
+                            if latest_at.as_ref().is_none_or(|prev| ts > *prev) {
                                 latest_at = Some(ts);
                             }
                         }
@@ -4995,7 +5178,7 @@ impl Repository {
                         // Include seals on agent's specs (by any agent — cross-agent awareness).
                         s.spec_id
                             .as_ref()
-                            .map_or(false, |sid| agent_spec_ids.contains(sid))
+                            .is_some_and(|sid| agent_spec_ids.contains(sid))
                     })
                     .filter(apply_filter)
                     .take(seal_limit)
@@ -5655,7 +5838,7 @@ impl Repository {
         let dir = self.proposals_dir();
         std::fs::create_dir_all(&dir)?;
 
-        let mut proposal =
+        let proposal =
             crate::proposal::Proposal::new(spec_ids.clone(), message, proposed_by, strategy);
 
         // Supersede any pending proposals with overlapping specs
@@ -5682,7 +5865,7 @@ impl Repository {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "json") {
+            if path.extension().is_some_and(|e| e == "json") {
                 let data = std::fs::read_to_string(&path)?;
                 if let Ok(p) = serde_json::from_str::<crate::proposal::Proposal>(&data) {
                     proposals.push(p);
@@ -5690,7 +5873,7 @@ impl Repository {
             }
         }
 
-        proposals.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        proposals.sort_by_key(|p| std::cmp::Reverse(p.created_at));
         Ok(proposals)
     }
 
@@ -6144,7 +6327,10 @@ impl Repository {
     ) -> WritResult<ConvergeAllReport> {
         use crate::workspace::WorkspaceConfig;
 
-        // Map strategy string to ConvergeStrategy enum.
+        // Map strategy string to ConvergeStrategy enum. MostRecent is
+        // deprecated (it silently drops work) and is removed in 0.4.3 under
+        // U.4 "Cut surface" of docs/briefs/unattended-release-brief.md.
+        #[allow(deprecated)]
         let converge_strategy = match strategy {
             "most-recent" => ConvergeStrategy::MostRecent,
             "escalate" => ConvergeStrategy::Escalate,
@@ -8169,7 +8355,6 @@ impl Repository {
             }
 
             // N-way merge: sequential pairwise, genesis as base.
-            let mut current_merged = spec_versions[0].1.clone();
             let mut file_clean = true;
             let mut version_pairs: Vec<(String, String)> = Vec::new();
             for (spec_id, _, hash) in &spec_versions {
@@ -8182,7 +8367,7 @@ impl Repository {
             let (spec_versions, descents, file_notices) =
                 self.combine_descendants(&own_versions, path, &base_content, spec_versions)?;
             notices.extend(file_notices);
-            current_merged = spec_versions[0].1.clone();
+            let mut current_merged = spec_versions[0].1.clone();
 
             for i in 1..spec_versions.len() {
                 let right_content = &spec_versions[i].1;
@@ -8983,7 +9168,7 @@ impl Repository {
         for entry in fs::read_dir(&agents_dir)? {
             let entry = entry?;
             let path = entry.path();
-            if path.extension().map_or(false, |e| e == "json") {
+            if path.extension().is_some_and(|e| e == "json") {
                 if let Ok(data) = fs::read_to_string(&path) {
                     if let Ok(agent) = serde_json::from_str::<RegisteredAgent>(&data) {
                         agents.push(agent);
@@ -9937,7 +10122,7 @@ impl Repository {
 
         // Recurse into subdirectories
         for (dir_name, sub_index) in &subdirs {
-            let sub_tree_oid = self.build_git_tree(git_repo, &sub_index)?;
+            let sub_tree_oid = self.build_git_tree(git_repo, sub_index)?;
             tree_builder.insert(dir_name, sub_tree_oid, 0o040000)?;
         }
 
@@ -10515,6 +10700,15 @@ impl Repository {
                 .genesis_tree
                 .clone()
                 .or(incoming.genesis_tree.clone()),
+            post_commit_notes: {
+                let mut notes = existing.post_commit_notes.clone();
+                for n in &incoming.post_commit_notes {
+                    if !notes.contains(n) {
+                        notes.push(n.clone());
+                    }
+                }
+                notes
+            },
         }
     }
 
@@ -10636,7 +10830,6 @@ impl Repository {
             return String::new();
         }
         let mut result = String::new();
-        let mut included = 0;
         for (i, item) in items.iter().enumerate() {
             let addition = if i == 0 {
                 item.to_string()
@@ -10644,14 +10837,13 @@ impl Repository {
                 format!(", {item}")
             };
             if !result.is_empty() && result.len() + addition.len() > max_chars {
-                let remaining = items.len() - included;
+                let remaining = items.len() - i;
                 if remaining > 0 {
                     result.push_str(&format!(", +{remaining} more"));
                 }
                 break;
             }
             result.push_str(&addition);
-            included += 1;
         }
         result
     }
@@ -10663,11 +10855,7 @@ impl Repository {
         }
         let count = fs::read_dir(dir)?
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_str()
-                    .map_or(false, |n| n.ends_with(".json"))
-            })
+            .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".json")))
             .count();
         Ok(count)
     }
@@ -10753,7 +10941,7 @@ impl Repository {
                 }
             }
             // Re-sort newest-first.
-            all_seals.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            all_seals.sort_by_key(|s| std::cmp::Reverse(s.timestamp));
         }
 
         // Skip bridge import seals for the summary.
@@ -11370,12 +11558,12 @@ fn post_convergence_validation(
             .filter(|c| matches!(c, '}' | ')' | ']'))
             .count();
         if opens != closes {
-            let left_bal = left_content_map.get(path).map_or(true, |c| {
+            let left_bal = left_content_map.get(path).is_none_or(|c| {
                 let lo: usize = c.chars().filter(|ch| matches!(ch, '{' | '(' | '[')).count();
                 let lc: usize = c.chars().filter(|ch| matches!(ch, '}' | ')' | ']')).count();
                 lo == lc
             });
-            let right_bal = right_content_map.get(path).map_or(true, |c| {
+            let right_bal = right_content_map.get(path).is_none_or(|c| {
                 let ro: usize = c.chars().filter(|ch| matches!(ch, '{' | '(' | '[')).count();
                 let rc: usize = c.chars().filter(|ch| matches!(ch, '}' | ')' | ']')).count();
                 ro == rc
@@ -11411,8 +11599,8 @@ fn post_convergence_validation(
                                 file_dir.map(|d| root.join(d).join(module).join("__init__.py"));
 
                             let found_locally =
-                                local_module_file.as_ref().map_or(false, |p| p.exists())
-                                    || local_module_dir.as_ref().map_or(false, |p| p.exists());
+                                local_module_file.as_ref().is_some_and(|p| p.exists())
+                                    || local_module_dir.as_ref().is_some_and(|p| p.exists());
 
                             if !module_file.exists()
                                 && !module_dir.exists()
@@ -11516,7 +11704,7 @@ fn installed_packages(root: &Path) -> HashSet<String> {
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
                 .collect();
-            if name.len() >= 2 && name.chars().next().map_or(false, |c| c.is_alphabetic()) {
+            if name.len() >= 2 && name.chars().next().is_some_and(|c| c.is_alphabetic()) {
                 pkgs.insert(name.to_lowercase().replace('-', "_"));
             }
         }
@@ -11825,7 +12013,8 @@ fn build_quality_report(
                         let trimmed = line.trim();
                         // Match "from X import Y" and check if Y is used.
                         if trimmed.starts_with("from ") && trimmed.contains(" import ") {
-                            if let Some(after_import) = trimmed.splitn(2, " import ").nth(1) {
+                            if let Some(after_import) = trimmed.split_once(" import ").map(|x| x.1)
+                            {
                                 for name in after_import.split(',') {
                                     let name = name.trim();
                                     // Skip wildcard imports and aliased names.
@@ -11996,7 +12185,7 @@ fn build_quality_report(
         score -= 15; // additional penalty for very low confidence
     }
 
-    let score = score.max(0).min(100) as u32;
+    let score = score.clamp(0, 100) as u32;
 
     // Build summary.
     let n_files = file_decisions.len();
@@ -12057,6 +12246,11 @@ pub struct FinishPlan {
     /// Staged paths whose committing spec's own blob is stale: a later seal
     /// by another spec recorded different content (finding 49, `--strict`).
     pub stale: Vec<StaleFile>,
+    /// Sealed paths git and writ both ignore now and HEAD does not hold:
+    /// no finish can commit them, so they are not staged (findings 113,
+    /// 116). The seal stays as history; the survival tier's info note
+    /// names them.
+    pub ignored: Vec<String>,
 }
 
 /// A committing spec's own blob that a later seal superseded.
@@ -16034,6 +16228,7 @@ mod verify_all_chains_tests {
             claimed_host: None,
             release_forced: false,
             genesis_tree: None,
+            post_commit_notes: Vec::new(),
             created_by: None,
         };
         repo.add_spec(&spec).unwrap();
@@ -16105,6 +16300,7 @@ mod verify_all_chains_tests {
                 claimed_host: None,
                 release_forced: false,
                 genesis_tree: None,
+                post_commit_notes: Vec::new(),
                 created_by: None,
             };
             repo.add_spec(&spec).unwrap();
@@ -18648,6 +18844,7 @@ mod remote_tests {
             claimed_host: None,
             release_forced: false,
             genesis_tree: None,
+            post_commit_notes: Vec::new(),
             created_by: None,
         };
 
@@ -36944,7 +37141,8 @@ mod finding_65_tests {
         );
         assert!(msg.contains("0123456789ab"), "{msg}");
         assert!(
-            msg.contains("writ spec add \"Done work (follow-up)\" --claim"),
+            msg.contains("writ spec add \"Done work (follow-up)\" --id done-followup --claim")
+                && !msg.contains("reopen"),
             "{msg}"
         );
     }
@@ -37415,8 +37613,11 @@ mod own_line_override_tests {
             other_agents: vec!["b".to_string()],
             lines: vec!["line 2 A".to_string()],
             added_by: vec![added.id.clone()],
+            accepted_from: Some(vec!["b".to_string()]),
+            accepted_lines: vec!["line 2 A".to_string()],
         };
         assert_eq!(s.override_context, vec![expect.clone()]);
+        assert_eq!(expect.resolution(), "accepted_after_told");
         assert_eq!(
             repo.load_seal(&s.id).unwrap().override_context,
             vec![expect.clone()]
@@ -37430,11 +37631,64 @@ mod own_line_override_tests {
         );
         // A seal that used no override records none.
         repo.set_allow_removal_paths(Vec::<String>::new());
+        let _ = &dir;
         write(&dir, &numbered(&[(10, "A3"), (30, "B")]));
         assert!(seal(&repo, "a", Some("sa"))
             .unwrap()
             .override_context
             .is_empty());
+    }
+
+    /// Finding 122 negative: b touched the file elsewhere; a replaced its
+    /// own lines with its own new content. Not "accepted b's version".
+    #[test]
+    fn override_of_own_lines_with_own_content_is_rewrote_own() {
+        let (dir, mut repo) = fixture();
+        write(&dir, &numbered(&[(2, "A"), (3, "A")]));
+        seal(&repo, "a", Some("sa")).unwrap();
+        // b works on top of a's version, elsewhere in the file.
+        write(&dir, &numbered(&[(2, "A"), (3, "A"), (30, "B")]));
+        seal(&repo, "b", Some("sb")).unwrap();
+        // a keeps b's line 30, drops its own two lines back to base text
+        // and adds its own helper call elsewhere (Bri's shape): b's content
+        // is not what replaced a's lines.
+        write(&dir, &numbered(&[(30, "B"), (35, "helper call")]));
+        repo.set_allow_removal_paths([FILE.to_string()]);
+        let s = seal(&repo, "a", Some("sa")).unwrap();
+        let ctx = &s.override_context[0];
+        assert_eq!(ctx.other_agents, vec!["b".to_string()], "{ctx:?}");
+        assert_eq!(ctx.accepted_from, Some(Vec::new()), "{ctx:?}");
+        assert_eq!(ctx.resolution(), "rewrote_own");
+        let line = ctx.describe("a", &s.id);
+        assert!(line.starts_with("a removed "), "{line}");
+        assert!(line.contains("on purpose after being told"), "{line}");
+        assert!(
+            line.contains("b touched the file since a's last seal"),
+            "{line}"
+        );
+        assert!(!line.contains("accepted"), "{line}");
+        // Mixed (finding 122, Bri's run B shape): some removed lines were
+        // b's call, the rest a's own rewrite; the sentence says both.
+        let mixed = crate::seal::OverrideContext {
+            lines: vec!["#[ignore] x".into(), "#[ignore] y".into(), "own z".into()],
+            accepted_from: Some(vec!["b".into()]),
+            accepted_lines: vec!["#[ignore] x".into(), "#[ignore] y".into()],
+            ..ctx.clone()
+        };
+        assert_eq!(mixed.resolution(), "mixed");
+        assert_eq!(
+            mixed.describe("a", &s.id),
+            format!(
+                "a accepted b's version of shared.txt for 2 line(s) and removed 1 own line(s) on purpose after being told (seal {})",
+                &s.id[..12]
+            )
+        );
+        // A record from before 0.4.2 (no accepted_from) names no author.
+        let legacy = crate::seal::OverrideContext {
+            accepted_from: None,
+            ..ctx.clone()
+        };
+        assert!(!legacy.describe("a", &s.id).contains("accepted"));
     }
 }
 

@@ -206,6 +206,27 @@ pub struct DoctorParams {
     pub fix: Option<bool>,
 }
 
+/// Parameters for writ_handoff tool.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct HandoffParams {
+    /// Start of the window: a seal id, a time (RFC 3339 or YYYY-MM-DD), or
+    /// "last-finish" (default).
+    pub since: Option<String>,
+    /// Output format: "markdown" (default), "brief" or "json".
+    pub format: Option<String>,
+    /// Also run doctor's survival tier.
+    pub survival: Option<bool>,
+}
+
+/// Parameters for writ_why tool.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct WhyParams {
+    /// Repository-relative path of the file.
+    pub path: String,
+    /// Output format: "markdown" (default) or "json".
+    pub format: Option<String>,
+}
+
 /// Parameters for writ_workspace_create tool.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceCreateParams {
@@ -765,6 +786,44 @@ impl WritMcpServer {
         self.run_writ_owned(&args)
     }
 
+    /// What happened since a point, for the next person or agent.
+    #[tool(
+        name = "writ_handoff",
+        description = "What happened since a point (default: the last finish): agents, specs with seals and state, files more than one spec sealed and how each merge resolved, unsealed work and whose, the doctor result and the one next action (the same as doctor's). Read only."
+    )]
+    async fn writ_handoff(
+        &self,
+        Parameters(params): Parameters<HandoffParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut args = vec!["handoff".to_string()];
+        if let Some(s) = params.since {
+            args.extend(["--since".to_string(), s]);
+        }
+        if let Some(f) = params.format {
+            args.extend(["--format".to_string(), f]);
+        }
+        if params.survival.unwrap_or(false) {
+            args.push("--survival".to_string());
+        }
+        self.run_writ_owned(&args)
+    }
+
+    /// Why a file is the way it is.
+    #[tool(
+        name = "writ_why",
+        description = "Why a file is the way it is: the specs that sealed it in order, what each seal added and removed, any override in its recorded words, and the merge that produced the current content. Read only."
+    )]
+    async fn writ_why(
+        &self,
+        Parameters(params): Parameters<WhyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut args = vec!["why".to_string(), params.path];
+        if let Some(f) = params.format {
+            args.extend(["--format".to_string(), f]);
+        }
+        self.run_writ_owned(&args)
+    }
+
     // ─── Workspaces ─────────────────────────────────────────────
 
     /// Create a new isolated parallel workspace.
@@ -1063,7 +1122,7 @@ mod tests {
     fn test_tool_count() {
         let server = WritMcpServer::new("writ".to_string(), ".".to_string());
         let tools = server.tool_router.list_all();
-        assert_eq!(tools.len(), 23, "Expected 23 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 25, "Expected 25 tools, got {}", tools.len());
     }
 
     #[test]
@@ -1078,6 +1137,8 @@ mod tests {
             "writ_diff",
             "writ_doctor",
             "writ_finish",
+            "writ_handoff",
+            "writ_why",
             "writ_log",
             "writ_restore",
             "writ_seal",
@@ -1814,6 +1875,47 @@ mod tests {
             .unwrap();
         let text = result_text(&result);
         assert_eq!(text, "doctor --fix");
+    }
+
+    #[tokio::test]
+    async fn test_handoff_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_handoff(Parameters(HandoffParams {
+                since: Some("last-finish".to_string()),
+                format: Some("json".to_string()),
+                survival: Some(true),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(
+            result_text(&result),
+            "handoff --since last-finish --format json --survival"
+        );
+        let bare = server
+            .writ_handoff(Parameters(HandoffParams {
+                since: None,
+                format: None,
+                survival: None,
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result_text(&bare), "handoff");
+    }
+
+    #[tokio::test]
+    async fn test_why_args() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = echo_server(dir.path());
+        let result = server
+            .writ_why(Parameters(WhyParams {
+                path: "src/a.rs".to_string(),
+                format: Some("json".to_string()),
+            }))
+            .await
+            .unwrap();
+        assert_eq!(result_text(&result), "why src/a.rs --format json");
     }
 
     // ─── Arg building: Workspaces ──────────────────────────────

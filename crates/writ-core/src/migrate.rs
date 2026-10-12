@@ -291,34 +291,26 @@ pub enum CheckStatus {
 impl DoctorReport {
     /// Run all health checks against the given `.writ/` directory.
     pub fn run(writ_dir: &Path) -> Self {
-        let mut checks = Vec::new();
-
-        // 1. Version file
-        checks.push(check_version_file(writ_dir));
-
-        // 2. Schema version currency
-        checks.push(check_schema_current(writ_dir));
-
-        // 3. Expected directories
-        checks.push(check_directories(writ_dir));
-
-        // 4. Index file (workspace-aware)
-        checks.push(check_index(writ_dir));
-
-        // 4b. Workspace layout
-        checks.push(check_workspace_layout(writ_dir));
-
-        // 5. Config file
-        checks.push(check_config(writ_dir));
-
-        // 6. Master key
-        checks.push(check_master_key(writ_dir));
-
-        // 7. Spec files
-        checks.push(check_specs(writ_dir));
-
-        // 8. Seal files (sample)
-        checks.push(check_seals(writ_dir));
+        let checks = vec![
+            // 1. Version file
+            check_version_file(writ_dir),
+            // 2. Schema version currency
+            check_schema_current(writ_dir),
+            // 3. Expected directories
+            check_directories(writ_dir),
+            // 4. Index file (workspace-aware)
+            check_index(writ_dir),
+            // 4b. Workspace layout
+            check_workspace_layout(writ_dir),
+            // 5. Config file
+            check_config(writ_dir),
+            // 6. Master key
+            check_master_key(writ_dir),
+            // 7. Spec files
+            check_specs(writ_dir),
+            // 8. Seal files (sample)
+            check_seals(writ_dir),
+        ];
 
         let passed = checks
             .iter()

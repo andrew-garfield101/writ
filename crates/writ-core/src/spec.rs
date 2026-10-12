@@ -26,10 +26,11 @@ pub enum SpecStatus {
 /// Tracks whether completed spec work has been committed to git
 /// and pushed to a remote. Separate from `SpecStatus` (work status)
 /// and `LifecycleState` (GC status).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CommitState {
     /// Work not yet committed to git.
+    #[default]
     Uncommitted,
     /// Committed to local git repository.
     Committed,
@@ -37,20 +38,15 @@ pub enum CommitState {
     Pushed,
 }
 
-impl Default for CommitState {
-    fn default() -> Self {
-        CommitState::Uncommitted
-    }
-}
-
 /// GC lifecycle state (separate from user-facing status).
 ///
 /// Added as an additive field — existing repos without this field
 /// deserialize as `Active` via `#[serde(default)]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LifecycleState {
     /// Spec is active and in use.
+    #[default]
     Active,
     /// No seal activity within stale timeout.
     Stale,
@@ -60,12 +56,6 @@ pub enum LifecycleState {
     Cancelled,
     /// Past retention period, metadata only.
     Archived,
-}
-
-impl Default for LifecycleState {
-    fn default() -> Self {
-        LifecycleState::Active
-    }
 }
 
 impl LifecycleState {
@@ -175,6 +165,19 @@ pub struct Spec {
     /// spec-scoped sealing when an agent has no previous seals for this spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub genesis_tree: Option<String>,
+    /// Finding 124: summaries an agent gave with `writ spec done` after a
+    /// finish had already committed this spec. Kept so the summary is in a
+    /// writ record (handoff shows them); the commit itself is unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_commit_notes: Vec<PostCommitNote>,
+}
+
+/// One `spec done` summary given after the spec was committed (finding 124).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostCommitNote {
+    pub agent: String,
+    pub at: DateTime<Utc>,
+    pub summary: String,
 }
 
 impl std::str::FromStr for SpecStatus {
@@ -245,6 +248,7 @@ impl Spec {
             claimed_host: None,
             release_forced: false,
             genesis_tree: None,
+            post_commit_notes: Vec::new(),
             created_by: None,
         }
     }

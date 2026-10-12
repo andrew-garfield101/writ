@@ -197,6 +197,11 @@ pub fn survival_gate(repo: &Repository, specs: &[Spec], force: bool) -> CliResul
     }
     let started = Instant::now();
     let report = audit_finish(repo, &ids, &staged)?;
+    // Findings 113, 116: a sealed file git and writ both ignore is not
+    // staged; finish says what `writ doctor --survival` says about it.
+    for note in writ_core::convergence::survival::info_notes(&report) {
+        println!("  {} survival: {note}", "[info]".cyan());
+    }
     let undone: Vec<String> = report
         .deleted_but_present()
         .map(|(spec, f)| format!("{} (deletion sealed by {spec})", f.path))
@@ -267,21 +272,8 @@ fn print_override_context(repo: &Repository, specs: &[Spec]) {
                 continue;
             };
             for o in &seal.override_context {
-                let short = &seal.id[..12.min(seal.id.len())];
-                let line = match o.other_agents.as_slice() {
-                    [] => format!(
-                        "{} removed {} own line(s) from {} on purpose after being told (seal {short})",
-                        seal.agent.id,
-                        o.lines.len(),
-                        o.path
-                    ),
-                    others => format!(
-                        "{} accepted {}'s version of {} after being told (seal {short})",
-                        seal.agent.id,
-                        others.join(", "),
-                        o.path
-                    ),
-                };
+                // Finding 122: one wording, from the record (seal.rs).
+                let line = o.describe(&seal.agent.id, &seal.id);
                 println!("  {} {line}", "note:".cyan());
             }
         }

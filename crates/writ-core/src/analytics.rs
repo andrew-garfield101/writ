@@ -100,7 +100,7 @@ impl AnalyticsReport {
             let metrics = compute_agent_metrics(&agent_id, &agent_seals);
             agents.push(metrics);
         }
-        agents.sort_by(|a, b| b.seal_count.cmp(&a.seal_count));
+        agents.sort_by_key(|a| std::cmp::Reverse(a.seal_count));
 
         let total_seals = seals.len();
         let total_specs: std::collections::HashSet<&String> =

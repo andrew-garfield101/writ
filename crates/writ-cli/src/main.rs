@@ -708,6 +708,41 @@ enum Commands {
     #[command(name = "mcp-serve")]
     McpServe,
 
+    /// Run by the generated Claude Code SessionEnd hook: record that the
+    /// host ended this session (a second proof for `spec release --stale`).
+    #[command(name = "session-end", hide = true)]
+    SessionEnd,
+
+    /// What happened since a point, for the next person or agent: agents,
+    /// specs, shared files and how each merge resolved, unsealed work, the
+    /// doctor result and the one next action. Read only.
+    Handoff {
+        /// Start of the window: a seal id, a time (RFC 3339 or YYYY-MM-DD),
+        /// or `last-finish` (the default).
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Output format: "markdown" (default), "brief" or "json".
+        #[arg(long, default_value = "markdown")]
+        format: String,
+
+        /// Also run doctor's survival tier (slower; fast tier by default).
+        #[arg(long)]
+        survival: bool,
+    },
+
+    /// Why a file is the way it is: the specs that sealed it in order, what
+    /// each added and removed, any override, and the merge that produced
+    /// the current content. Read only.
+    Why {
+        /// Repository-relative path.
+        path: String,
+
+        /// Output format: "markdown" (default) or "json".
+        #[arg(long, default_value = "markdown")]
+        format: String,
+    },
+
     /// Write .mcp.json config so Claude Code discovers writ's MCP tools.
     #[command(name = "mcp-install")]
     McpInstall {
@@ -1391,7 +1426,6 @@ fn main() {
                 format: output_fmt,
                 name,
                 reconfigure,
-                profile: profile.clone(),
                 output_format: format.clone(),
             };
             cmd_init(&cwd, &format, &profile, spec, title, description, opts)
@@ -1425,7 +1459,6 @@ fn main() {
             );
             let opts = init::InitOptions {
                 yes: true, // deprecated path: non-interactive for backward compat
-                profile: profile.clone(),
                 output_format: format.clone(),
                 ..Default::default()
             };
@@ -1875,6 +1908,13 @@ fn main() {
             } => cmd_workspace_delete(&cwd, &name, keep_files, force),
         },
         Commands::McpServe => cmd_mcp_serve(&cwd),
+        Commands::SessionEnd => cmd_session_end(&cwd),
+        Commands::Handoff {
+            since,
+            format,
+            survival,
+        } => cmd_handoff(&cwd, since.as_deref(), &format, survival),
+        Commands::Why { path, format } => cmd_why(&cwd, &path, &format),
         Commands::McpInstall { desktop } => cmd_mcp_install(&cwd, desktop),
         Commands::Watch {
             interval,
@@ -1945,7 +1985,7 @@ fn current_command_line() -> String {
 
 /// Resolve the effective output format using the full config resolution chain:
 /// CLI flag > WRIT_FORMAT env var > project config > global config > default.
-fn resolve_format(explicit: Option<&str>, cwd: &PathBuf, fallback: &str) -> String {
+fn resolve_format(explicit: Option<&str>, cwd: &Path, fallback: &str) -> String {
     if let Some(f) = explicit {
         return f.to_string();
     }
@@ -1978,7 +2018,7 @@ fn resolve_format(explicit: Option<&str>, cwd: &PathBuf, fallback: &str) -> Stri
 }
 
 /// Resolve the project name from config, falling back to directory name.
-fn resolve_project_name(cwd: &PathBuf) -> Option<String> {
+fn resolve_project_name(cwd: &Path) -> Option<String> {
     Repository::open_from_dir(cwd)
         .ok()
         .and_then(|r| {
@@ -1994,7 +2034,7 @@ fn resolve_project_name(cwd: &PathBuf) -> Option<String> {
 }
 
 /// Create a formatter by name, injecting project context for TOON headers.
-fn make_formatter(name: &str, cwd: &PathBuf) -> Option<Box<dyn format::OutputFormatter>> {
+fn make_formatter(name: &str, cwd: &Path) -> Option<Box<dyn format::OutputFormatter>> {
     let project_name = resolve_project_name(cwd);
     format::formatter_for_project(name, project_name.as_deref())
 }
@@ -2004,7 +2044,7 @@ fn make_formatter(name: &str, cwd: &PathBuf) -> Option<Box<dyn format::OutputFor
 /// Priority: explicit --agent > WRIT_AGENT_ID > settings.default_agent >
 /// framework session variable > "human". See
 /// [`writ_core::agent::resolve_agent_id`].
-fn resolve_agent(explicit: Option<&str>, cwd: &PathBuf) -> String {
+fn resolve_agent(explicit: Option<&str>, cwd: &Path) -> String {
     let repo = Repository::open_from_dir(cwd).ok();
     let default_agent = repo
         .as_ref()
@@ -2029,7 +2069,7 @@ fn detect_agent_from_env() -> Option<String> {
 
 /// Check if `writ context` was run recently by reading the `.writ/.context_token` file.
 /// Returns true if the token exists and is less than 4 hours old.
-fn check_context_token(cwd: &PathBuf) -> bool {
+fn check_context_token(cwd: &Path) -> bool {
     let token_path = cwd.join(".writ").join(".context_token");
     match std::fs::read_to_string(&token_path) {
         Ok(ts) => {
@@ -2045,7 +2085,7 @@ fn check_context_token(cwd: &PathBuf) -> bool {
 }
 
 /// Resolve the effective convergence strategy.
-fn resolve_strategy(explicit: Option<&str>, cwd: &PathBuf) -> String {
+fn resolve_strategy(explicit: Option<&str>, cwd: &Path) -> String {
     if let Some(s) = explicit {
         return s.to_string();
     }
@@ -2058,7 +2098,7 @@ fn resolve_strategy(explicit: Option<&str>, cwd: &PathBuf) -> String {
 /// `writ finish --accept-removals <seal>...`: record each seal's captured
 /// removals as accepted (survival tier) before the finish runs.
 fn accept_captured_removals(
-    cwd: &PathBuf,
+    cwd: &Path,
     seals: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     if seals.is_empty() {
@@ -2318,7 +2358,7 @@ fn cmd_init(
         // Finding 71: only on a first init. A rerun is a refresh of the
         // generated files and never seals; refreshed files show as pending.
         if result.initialized && (result.git_imported || result.already_imported) {
-            let repo = Repository::open_from_dir(&cwd)?;
+            let repo = Repository::open_from_dir(cwd)?;
             let bridge_agent = writ_core::seal::AgentIdentity {
                 id: "writ-bridge".to_string(),
                 agent_type: writ_core::seal::AgentType::Agent,
@@ -2400,7 +2440,7 @@ fn cmd_init(
             if !result.initialized {
                 if let Ok(output) = std::process::Command::new("git")
                     .args(["diff", "--stat", "HEAD"])
-                    .current_dir(&cwd)
+                    .current_dir(cwd)
                     .output()
                 {
                     let diff_output = String::from_utf8_lossy(&output.stdout);
@@ -2510,7 +2550,7 @@ fn cmd_init(
 }
 
 fn cmd_uninit(
-    cwd: &PathBuf,
+    cwd: &Path,
     force: bool,
     keep_writignore: bool,
     format: &str,
@@ -2615,7 +2655,7 @@ fn cmd_uninit(
     Ok(())
 }
 
-fn cmd_state(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_state(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let state = repo.state()?;
 
@@ -2660,7 +2700,7 @@ fn cmd_state(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Erro
 }
 
 fn cmd_task_create(
-    cwd: &PathBuf,
+    cwd: &Path,
     title: &str,
     id: Option<String>,
     format: &str,
@@ -2726,7 +2766,7 @@ fn cmd_task_create(
 }
 
 fn cmd_plan(
-    cwd: &PathBuf,
+    cwd: &Path,
     inline_tasks: Vec<String>,
     file: Option<String>,
     format: &str,
@@ -2796,7 +2836,7 @@ fn cmd_plan(
     Ok(())
 }
 
-fn cmd_task_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_task_list(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
     let repo = Repository::open_from_dir(cwd)?;
@@ -2889,8 +2929,144 @@ fn unclaimed_specs_created_by(
     Ok(ids)
 }
 
+/// Injection B (Aubs 2): a seal refused because its spec was committed by
+/// a finish prints exactly one command, the follow-up, with this seal's
+/// summary and paths filled in; no choice, and no reopen (a human command).
+/// Exits 1: nothing was sealed. Returns for every other error.
+fn exit_if_committed(repo: &Repository, err: &WritError, summary: &str, paths: Option<&[String]>) {
+    let WritError::SpecAlreadyCommitted {
+        spec_id,
+        title,
+        commit_hash,
+    } = err
+    else {
+        return;
+    };
+    let paths: Vec<String> = match paths {
+        Some(p) => p.to_vec(),
+        None => committed_spec_pending(repo, spec_id),
+    };
+    let at = commit_hash
+        .as_deref()
+        .map(|h| format!(" in {}", &h[..h.len().min(12)]))
+        .unwrap_or_default();
+    eprintln!(
+        "{} spec '{spec_id}' was committed to git{at} by a finish, so a seal on it would never be committed. Nothing was sealed.",
+        "ERROR:".red().bold()
+    );
+    eprintln!("  Seal this work on its follow-up spec; paste this as is:");
+    if paths.is_empty() {
+        eprintln!(
+            "  (no pending files of '{spec_id}' found: put your changed files after --paths)"
+        );
+    }
+    eprintln!();
+    eprintln!(
+        "    {}",
+        writ_core::doctor::committed_followup_command(spec_id, title, summary, &paths)
+    );
+    process::exit(1);
+}
+
+/// Finding 124: `writ spec done` whose spec a finish already committed.
+/// Exits 0, names the spec and the commit, records the summary as a
+/// post-commit note; never tells the agent to create a spec.
+fn spec_done_after_commit(
+    repo: &Repository,
+    spec: &writ_core::spec::Spec,
+    agent_id: &str,
+    summary: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let recorded = repo.record_post_commit_note(&spec.id, agent_id, summary)?;
+    let at = spec
+        .commit_hash
+        .as_deref()
+        .map(|h| format!(" in {}", &h[..h.len().min(7)]))
+        .unwrap_or_default();
+    println!(
+        "spec '{}' is already committed{at} by a finish; nothing to close.",
+        spec.id
+    );
+    if summary.is_some_and(|s| !s.trim().is_empty()) {
+        println!(
+            "  your summary is kept on the spec as a post-commit note ({} on record); `writ handoff` shows it.",
+            recorded.post_commit_notes.len()
+        );
+    }
+    Ok(())
+}
+
+/// Finding 121: the committed spec an auto-scoped seal meant: the newest
+/// spec `agent_id` claimed or created that a finish committed, preferring one
+/// whose seals touched `paths`. `None` when the agent's newest spec is open.
+fn committed_spec_of(
+    repo: &Repository,
+    agent_id: &str,
+    paths: Option<&[String]>,
+) -> Option<writ_core::spec::Spec> {
+    use writ_core::spec::CommitState;
+    let mut mine: Vec<writ_core::spec::Spec> = repo
+        .list_specs()
+        .ok()?
+        .into_iter()
+        .filter(|s| {
+            s.claimed_by.as_deref() == Some(agent_id) || s.created_by.as_deref() == Some(agent_id)
+        })
+        .collect();
+    mine.sort_by_key(|s| std::cmp::Reverse(s.updated_at));
+    let committed = |s: &writ_core::spec::Spec| {
+        matches!(s.commit_state, CommitState::Committed | CommitState::Pushed)
+    };
+    if let Some(paths) = paths {
+        let touched = mine.iter().find(|s| {
+            committed(s)
+                && repo.spec_seals(&s.id).is_ok_and(|seals| {
+                    seals
+                        .iter()
+                        .any(|x| x.changes.iter().any(|c| paths.contains(&c.path)))
+                })
+        });
+        if let Some(s) = touched {
+            return Some(s.clone());
+        }
+    }
+    mine.into_iter().next().filter(committed)
+}
+
+/// Pending files the committed spec sealed or scoped: the paths a seal
+/// without `--paths` meant.
+fn committed_spec_pending(repo: &Repository, spec_id: &str) -> Vec<String> {
+    let Ok(state) = repo.state() else {
+        return Vec::new();
+    };
+    let scope = repo
+        .load_spec(spec_id)
+        .map(|s| s.file_scope)
+        .unwrap_or_default();
+    let sealed: std::collections::HashSet<String> = repo
+        .spec_seals(spec_id)
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|s| s.changes.iter().map(|c| c.path.clone()))
+        .collect();
+    let mut out: Vec<String> = state
+        .changes
+        .iter()
+        .map(|f| f.path.clone())
+        .filter(|p| {
+            sealed.contains(p)
+                || scope
+                    .iter()
+                    .any(|e| e == p || (e.ends_with('/') && p.starts_with(e.as_str())))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cmd_seal(
-    cwd: &PathBuf,
+    cwd: &Path,
     summary: &str,
     agent_id: &str,
     explicit_agent: bool,
@@ -2975,6 +3151,16 @@ fn cmd_seal(
                     process::exit(1);
                 // C.13 (findings 98 to 100): no auto-scope available.
                 } else {
+                    // Finding 121: the agent's newest spec was committed by a
+                    // finish; say so with the one follow up command.
+                    if let Some(c) = committed_spec_of(&repo, agent_id, paths.as_deref()) {
+                        let err = WritError::SpecAlreadyCommitted {
+                            spec_id: c.id.clone(),
+                            title: c.title.clone(),
+                            commit_hash: c.commit_hash.clone(),
+                        };
+                        exit_if_committed(&repo, &err, summary, paths.as_deref());
+                    }
                     use writ_core::repo::{no_spec_seal_policy, NoSpecSeal, NO_SPEC_FIX};
                     let strict = repo.claims_strict();
                     match no_spec_seal_policy(is_agent, explicit_agent, strict) {
@@ -3042,8 +3228,13 @@ fn cmd_seal(
     };
 
     let mut left_out_scope: Option<SealScope> = None;
+    let named_paths = paths.clone();
+    let refused = |e: WritError| -> Box<dyn std::error::Error> {
+        exit_if_committed(&repo, &e, summary, named_paths.as_deref());
+        e.into()
+    };
     let (seal, conflict_warning) = if let Some(paths) = paths {
-        let s = repo.seal_paths(
+        match repo.seal_paths(
             agent,
             summary.to_string(),
             spec_id,
@@ -3051,8 +3242,23 @@ fn cmd_seal(
             verification,
             &paths,
             allow_empty,
-        )?;
-        (s, None)
+        ) {
+            Ok(s) => (s, None),
+            // Finding 114: a doctor seal fix run a second time (by the same
+            // agent, or seconds after another) finds nothing left to seal.
+            // The state is clear, so this is success, said plainly.
+            // A path that is not on disk (a typo, or a deletion) keeps the
+            // error: only files that exist and have no unsealed change are
+            // "already clear".
+            Err(WritError::NothingToSeal) if paths.iter().all(|p| cwd.join(p).is_file()) => {
+                println!(
+                    "nothing to seal: none of {} has unsealed changes; the state is already clear",
+                    paths.join(", ")
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(refused(e)),
+        }
     } else if expected_head.is_some() {
         match repo.seal_with_check_scoped(
             agent,
@@ -3071,7 +3277,7 @@ fn cmd_seal(
                 print_nothing_in_scope(&spec_id, &scope, summary, agent_id, false);
                 process::exit(1);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(refused(e)),
         }
     } else {
         let result = repo.seal_scoped(
@@ -3092,7 +3298,7 @@ fn cmd_seal(
                 print_nothing_in_scope(&spec_id, &scope, summary, agent_id, false);
                 process::exit(1);
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(refused(e)),
         }
     };
 
@@ -3111,7 +3317,7 @@ fn cmd_seal(
     println!(
         "{} {}{}",
         "sealed".green().bold(),
-        &seal.id[..12].cyan(),
+        seal.id[..12].cyan(),
         spec_slug_display
     );
     // Finding 102: an override is stated, with who else worked on the file.
@@ -3305,7 +3511,7 @@ fn print_nothing_in_scope(
 }
 
 fn cmd_log(
-    cwd: &PathBuf,
+    cwd: &Path,
     format: &str,
     limit: Option<usize>,
     spec: Option<String>,
@@ -3438,8 +3644,9 @@ fn print_diverged_branch_warnings(repo: &Repository) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_diff(
-    cwd: &PathBuf,
+    cwd: &Path,
     from: Option<String>,
     to: Option<String>,
     format: &str,
@@ -3663,8 +3870,9 @@ fn collect_filtered_paths(
     Ok(paths)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_context(
-    cwd: &PathBuf,
+    cwd: &Path,
     spec: Option<String>,
     for_agent: Option<String>,
     seal_limit: usize,
@@ -3761,6 +3969,7 @@ fn cmd_context(
                         .unwrap_or("none to paste; needs your decision");
                     println!("    [{}] {}: {}", f.severity.as_str(), f.check, f.message);
                     println!("      fix: {fix}");
+                    println!("      who: {}", f.who_may_fix());
                 }
             }
 
@@ -3977,7 +4186,7 @@ fn cmd_context(
     Ok(())
 }
 
-fn cmd_summary(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_summary(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let summary = repo.summary()?;
 
@@ -4112,8 +4321,9 @@ fn cmd_summary(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_status(
-    cwd: &PathBuf,
+    cwd: &Path,
     show_completed: bool,
     show_active: bool,
     filter_agent: Option<String>,
@@ -4492,7 +4702,7 @@ fn cmd_status(
 
 /// W.2: Watch mode — live-updating terminal view with keyboard shortcuts.
 fn cmd_status_watch(
-    cwd: &PathBuf,
+    cwd: &Path,
     show_completed: bool,
     show_active: bool,
     filter_agent: Option<String>,
@@ -4574,8 +4784,8 @@ fn cmd_status_watch(
                 .specs_completed
                 .iter()
                 .filter(|b| {
-                    filter_agent.as_ref().map_or(true, |a| b.agent == *a)
-                        && filter_spec.as_ref().map_or(true, |s| b.id == *s)
+                    filter_agent.as_ref().is_none_or(|a| b.agent == *a)
+                        && filter_spec.as_ref().is_none_or(|s| b.id == *s)
                 })
                 .collect();
 
@@ -4603,8 +4813,8 @@ fn cmd_status_watch(
                 .specs_in_progress
                 .iter()
                 .filter(|b| {
-                    filter_agent.as_ref().map_or(true, |a| b.agent == *a)
-                        && filter_spec.as_ref().map_or(true, |s| b.id == *s)
+                    filter_agent.as_ref().is_none_or(|a| b.agent == *a)
+                        && filter_spec.as_ref().is_none_or(|s| b.id == *s)
                 })
                 .collect();
 
@@ -4739,7 +4949,7 @@ struct FinishOpts {
 }
 
 fn cmd_finish(
-    cwd: &PathBuf,
+    cwd: &Path,
     opts: FinishOpts,
     strategy: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -5550,7 +5760,7 @@ fn stage_finish_plan(
 }
 
 fn finish_legacy(
-    cwd: &PathBuf,
+    cwd: &Path,
     commit_message: &str,
     files_to_stage: &[String],
     dry_run: bool,
@@ -5606,7 +5816,7 @@ fn finish_legacy(
 
 /// Create a proposal instead of committing directly.
 fn cmd_finish_propose(
-    cwd: &PathBuf,
+    cwd: &Path,
     full: bool,
     strategy: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -5660,7 +5870,7 @@ fn cmd_finish_propose(
 }
 
 /// List pending proposals.
-fn cmd_finish_proposals(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_finish_proposals(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
     let repo = Repository::open_from_dir(cwd)?;
@@ -5703,7 +5913,7 @@ fn cmd_finish_proposals(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>>
 
 /// Accept a proposal: commit and mark accepted.
 fn cmd_finish_accept(
-    cwd: &PathBuf,
+    cwd: &Path,
     proposal_id: &str,
     strategy: &str,
     strict: bool,
@@ -5778,11 +5988,11 @@ fn cmd_finish_accept(
 }
 
 /// Reject a proposal.
-fn cmd_finish_reject(cwd: &PathBuf, proposal_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_finish_reject(cwd: &Path, proposal_id: &str) -> Result<(), Box<dyn std::error::Error>> {
     use colored::Colorize;
 
     let repo = Repository::open_from_dir(cwd)?;
-    let proposal = repo.reject_proposal(proposal_id)?;
+    let _proposal = repo.reject_proposal(proposal_id)?;
 
     println!();
     println!(
@@ -5970,7 +6180,7 @@ fn cmd_finish_auto(
 }
 
 fn cmd_restore(
-    cwd: &PathBuf,
+    cwd: &Path,
     seal_id: &str,
     force: bool,
     format: &str,
@@ -6023,7 +6233,7 @@ fn cmd_restore(
 }
 
 fn cmd_show(
-    cwd: &PathBuf,
+    cwd: &Path,
     seal_id: &str,
     show_diff: bool,
     format: &str,
@@ -6067,7 +6277,7 @@ fn cmd_show(
             );
         }
         _ => {
-            println!("{} {}", "seal".bold(), &seal.id[..12].cyan());
+            println!("{} {}", "seal".bold(), seal.id[..12].cyan());
             println!("  {} {}", "full id:".dimmed(), seal.id);
             println!(
                 "  {} {} ({:?})",
@@ -6084,7 +6294,7 @@ fn cmd_show(
                     .dimmed()
             );
             if let Some(ref parent) = seal.parent {
-                println!("  {} {}", "parent:".dimmed(), &parent[..12].cyan());
+                println!("  {} {}", "parent:".dimmed(), parent[..12].cyan());
             } else {
                 println!(
                     "  {} {}",
@@ -6179,8 +6389,9 @@ fn cmd_show(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_spec_update(
-    cwd: &PathBuf,
+    cwd: &Path,
     id: &str,
     status: Option<String>,
     depends_on: Option<Vec<String>>,
@@ -6193,7 +6404,7 @@ fn cmd_spec_update(
     let repo = Repository::open_from_dir(cwd)?;
 
     let parsed_status = match status {
-        Some(s) => Some(s.parse::<writ_core::spec::SpecStatus>().map_err(|e| e)?),
+        Some(s) => Some(s.parse::<writ_core::spec::SpecStatus>()?),
         None => None,
     };
 
@@ -6236,8 +6447,9 @@ fn cmd_spec_update(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_spec_add(
-    cwd: &PathBuf,
+    cwd: &Path,
     summary: Option<&str>,
     id: Option<&str>,
     title: Option<&str>,
@@ -6361,7 +6573,7 @@ fn normalize_scope_entries(entries: &[String]) -> Result<Vec<String>, WritError>
 }
 
 fn cmd_spec_status(
-    cwd: &PathBuf,
+    cwd: &Path,
     state_filter: Option<&str>,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -6429,8 +6641,9 @@ fn cmd_spec_status(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_spec_done(
-    cwd: &PathBuf,
+    cwd: &Path,
     id: Option<&str>,
     summary: Option<String>,
     agent: Option<&str>,
@@ -6465,6 +6678,16 @@ fn cmd_spec_done(
                         id
                     }
                     Err(e) => {
+                        // Finding 124: the agent's spec was committed by a
+                        // finish under it. Nothing to close; keep the summary.
+                        if let Some(c) = committed_spec_of(&repo, &agent_id, None) {
+                            return spec_done_after_commit(
+                                &repo,
+                                &c,
+                                &agent_id,
+                                summary.as_deref(),
+                            );
+                        }
                         eprintln!("error: {}", e);
                         std::process::exit(1);
                     }
@@ -6542,7 +6765,7 @@ fn cmd_spec_done(
         println!(
             "{} {} final seal, {} file(s)",
             "sealed".green().bold(),
-            &seal.id[..12].cyan(),
+            seal.id[..12].cyan(),
             seal.changes.len()
         );
         for c in &seal.changes {
@@ -6614,14 +6837,14 @@ fn report_final_seal(
     }
 }
 
-fn cmd_spec_cancel(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_spec_cancel(cwd: &Path, id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     repo.cancel_spec(id)?;
     println!("spec '{}' cancelled", id);
     Ok(())
 }
 
-fn cmd_spec_complete(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_spec_complete(cwd: &Path, id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let spec = repo.resolve_spec(id)?;
     let resolved_id = spec.id.clone();
@@ -6630,7 +6853,7 @@ fn cmd_spec_complete(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-fn cmd_spec_reopen(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_spec_reopen(cwd: &Path, id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
 
     // Load spec for display info before reopening.
@@ -6654,7 +6877,7 @@ fn cmd_spec_reopen(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Er
 }
 
 fn cmd_spec_claim(
-    cwd: &PathBuf,
+    cwd: &Path,
     id: &str,
     agent: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -6668,7 +6891,7 @@ fn cmd_spec_claim(
 }
 
 fn cmd_spec_release(
-    cwd: &PathBuf,
+    cwd: &Path,
     id: &str,
     agent: Option<&str>,
     stale: bool,
@@ -6692,13 +6915,17 @@ fn cmd_spec_release(
         Some(previous) => {
             println!("Released spec '{resolved_id}' from '{previous}' (--force by '{agent_id}').")
         }
-        None => println!("Spec '{resolved_id}' was not claimed; nothing to release."),
+        // Finding 114: a second verbatim `--stale` run (two agents acting
+        // on the same finding seconds apart) exits 0 and says so.
+        None => println!(
+            "Spec '{resolved_id}' is not claimed: claim already released; nothing to do."
+        ),
     }
     Ok(())
 }
 
 fn cmd_spec_assign(
-    cwd: &PathBuf,
+    cwd: &Path,
     id: &str,
     workspace: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -6720,7 +6947,7 @@ fn cmd_spec_assign(
     Ok(())
 }
 
-fn cmd_spec_unassign(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_spec_unassign(cwd: &Path, id: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let spec = repo.resolve_spec(id)?;
     let resolved_id = spec.id.clone();
@@ -6745,7 +6972,7 @@ fn cmd_spec_unassign(cwd: &PathBuf, id: &str) -> Result<(), Box<dyn std::error::
 }
 
 fn cmd_converge(
-    cwd: &PathBuf,
+    cwd: &Path,
     left_spec: &str,
     right_spec: &str,
     format: &str,
@@ -6907,7 +7134,7 @@ fn cmd_converge(
 }
 
 fn cmd_converge_all(
-    cwd: &PathBuf,
+    cwd: &Path,
     format: &str,
     apply: bool,
     dry_run: bool,
@@ -7345,7 +7572,7 @@ fn cmd_converge_all(
 // -------------------------------------------------------------------
 
 fn cmd_converge_workspaces(
-    cwd: &PathBuf,
+    cwd: &Path,
     workspaces: &[String],
     format: &str,
     strategy: &str,
@@ -7473,7 +7700,7 @@ fn print_converge_workspaces_report(
 // -------------------------------------------------------------------
 
 fn cmd_resolve(
-    cwd: &PathBuf,
+    cwd: &Path,
     file: Option<String>,
     accept: Option<String>,
     all: bool,
@@ -7620,7 +7847,7 @@ fn cmd_resolve(
 }
 
 fn resolve_single(
-    cwd: &PathBuf,
+    cwd: &Path,
     esc: &writ_core::convergence::PipelineEscalation,
     accept: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -7670,7 +7897,7 @@ fn resolve_single(
     Ok(())
 }
 
-fn cmd_spec_show(cwd: &PathBuf, id: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_spec_show(cwd: &Path, id: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let spec = repo.resolve_spec(id)?;
 
@@ -7721,7 +7948,7 @@ fn cmd_spec_show(cwd: &PathBuf, id: &str, format: &str) -> Result<(), Box<dyn st
 }
 
 fn cmd_bridge_import(
-    cwd: &PathBuf,
+    cwd: &Path,
     git_ref: &str,
     agent_id: &str,
     format: &str,
@@ -7752,7 +7979,7 @@ fn cmd_bridge_import(
 }
 
 fn cmd_bridge_export(
-    cwd: &PathBuf,
+    cwd: &Path,
     branch: &str,
     pr_body: bool,
     format: &str,
@@ -7802,7 +8029,7 @@ fn cmd_bridge_export(
     Ok(())
 }
 
-fn cmd_bridge_status(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_bridge_status(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
 
     let status = repo.bridge_status()?;
@@ -7837,7 +8064,7 @@ fn cmd_bridge_status(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::err
     Ok(())
 }
 
-fn cmd_push(cwd: &PathBuf, remote: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_push(cwd: &Path, remote: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let result = repo.push(remote)?;
 
@@ -7867,7 +8094,7 @@ fn cmd_push(cwd: &PathBuf, remote: &str, format: &str) -> Result<(), Box<dyn std
     Ok(())
 }
 
-fn cmd_pull(cwd: &PathBuf, remote: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_pull(cwd: &Path, remote: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let result = repo.pull(remote)?;
 
@@ -7906,27 +8133,27 @@ fn cmd_pull(cwd: &PathBuf, remote: &str, format: &str) -> Result<(), Box<dyn std
     Ok(())
 }
 
-fn cmd_remote_init(path: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_remote_init(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     Repository::remote_init(path)?;
     println!("initialized bare remote at {}", path.display());
     Ok(())
 }
 
-fn cmd_remote_add(cwd: &PathBuf, name: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_remote_add(cwd: &Path, name: &str, path: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     repo.remote_add(name, path)?;
     println!("remote '{name}' added → {path}");
     Ok(())
 }
 
-fn cmd_remote_remove(cwd: &PathBuf, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_remote_remove(cwd: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     repo.remote_remove(name)?;
     println!("remote '{name}' removed");
     Ok(())
 }
 
-fn cmd_remote_list(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_remote_list(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let remotes = repo.remote_list()?;
 
@@ -7942,7 +8169,7 @@ fn cmd_remote_list(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn cmd_remote_status(
-    cwd: &PathBuf,
+    cwd: &Path,
     remote: &str,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -8327,7 +8554,7 @@ fn cmd_verify_all_chains(
 // ---------------------------------------------------------------------------
 
 fn cmd_agent_register(
-    cwd: &PathBuf,
+    cwd: &Path,
     name: &str,
     trust_level: &str,
     scope: Option<Vec<String>>,
@@ -8365,7 +8592,7 @@ fn cmd_agent_register(
     Ok(())
 }
 
-fn cmd_agent_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_agent_list(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let agents = repo.list_agents()?;
 
@@ -8383,10 +8610,7 @@ fn cmd_agent_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error:
             println!("{json}");
         }
         _ => {
-            println!(
-                "{:<20} {:<12} {:<10} {}",
-                "AGENT", "TRUST", "STATUS", "SCOPE"
-            );
+            println!("{:<20} {:<12} {:<10} SCOPE", "AGENT", "TRUST", "STATUS");
             for agent in &agents {
                 let scope = if agent.scope_constraints.is_empty() {
                     "unrestricted".to_string()
@@ -8407,11 +8631,7 @@ fn cmd_agent_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn cmd_agent_show(
-    cwd: &PathBuf,
-    name: &str,
-    format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_agent_show(cwd: &Path, name: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let agent = repo.load_agent(name)?;
 
@@ -8448,7 +8668,7 @@ fn cmd_agent_show(
 }
 
 fn cmd_agent_revoke(
-    cwd: &PathBuf,
+    cwd: &Path,
     name: &str,
     reason: &str,
     compromise_timestamp: Option<&str>,
@@ -8485,14 +8705,14 @@ fn cmd_agent_revoke(
     Ok(())
 }
 
-fn cmd_agent_suspend(cwd: &PathBuf, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_agent_suspend(cwd: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     repo.suspend_agent(name)?;
     println!("agent '{name}' suspended");
     Ok(())
 }
 
-fn cmd_agent_reactivate(cwd: &PathBuf, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_agent_reactivate(cwd: &Path, name: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     repo.reactivate_agent(name)?;
     println!("agent '{name}' reactivated");
@@ -8500,7 +8720,7 @@ fn cmd_agent_reactivate(cwd: &PathBuf, name: &str) -> Result<(), Box<dyn std::er
 }
 
 fn cmd_agent_scope(
-    cwd: &PathBuf,
+    cwd: &Path,
     name: &str,
     add: Option<String>,
     remove: Option<String>,
@@ -8583,7 +8803,7 @@ fn cmd_agent_scope(
 // -------------------------------------------------------------------
 
 fn cmd_security_events(
-    cwd: &PathBuf,
+    cwd: &Path,
     severity: Option<&str>,
     event_type: Option<&str>,
     limit: Option<usize>,
@@ -8682,7 +8902,7 @@ fn cmd_security_events(
 // -------------------------------------------------------------------
 
 fn cmd_analytics(
-    cwd: &PathBuf,
+    cwd: &Path,
     agent_filter: Option<&str>,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -8805,7 +9025,7 @@ fn cmd_analytics(
 // GC commands
 // -------------------------------------------------------------------
 
-fn cmd_gc_audit(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_gc_audit(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     use writ_core::gc::{
         find_committed_prunable, find_orphaned_objects, load_all_seals, StorageReport,
     };
@@ -8983,7 +9203,7 @@ fn gc_store_precheck(
 }
 
 fn cmd_gc_committed(
-    cwd: &PathBuf,
+    cwd: &Path,
     dry_run: bool,
     yes: bool,
     keep_days: u64,
@@ -9087,7 +9307,7 @@ fn cmd_gc_committed(
 }
 
 fn cmd_gc_run(
-    cwd: &PathBuf,
+    cwd: &Path,
     dry_run: bool,
     yes: bool,
     format: &str,
@@ -9347,7 +9567,7 @@ fn cmd_gc_run(
     Ok(())
 }
 
-fn cmd_gc_status(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_gc_status(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let writ_dir = cwd.join(".writ");
     if !writ_dir.exists() {
         return Err("not a writ repository (no .writ directory)".into());
@@ -9453,7 +9673,7 @@ fn cmd_gc_status(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::
     Ok(())
 }
 
-fn cmd_gc_storage(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_gc_storage(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let storage = repo.storage_report()?;
 
@@ -9546,7 +9766,7 @@ fn cmd_gc_storage(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-fn cmd_gc_log(cwd: &PathBuf, limit: usize, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_gc_log(cwd: &Path, limit: usize, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let writ_dir = cwd.join(".writ");
     if !writ_dir.exists() {
         return Err("not a writ repository (no .writ directory)".into());
@@ -9607,7 +9827,7 @@ fn cmd_gc_log(cwd: &PathBuf, limit: usize, format: &str) -> Result<(), Box<dyn s
 // ---------------------------------------------------------------------------
 
 fn cmd_config_set(
-    cwd: &PathBuf,
+    cwd: &Path,
     key: &str,
     value: &str,
     format: &str,
@@ -9644,11 +9864,7 @@ fn cmd_config_set(
     Ok(())
 }
 
-fn cmd_config_get(
-    cwd: &PathBuf,
-    key: &str,
-    format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_config_get(cwd: &Path, key: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let writ_dir = cwd.join(".writ");
     if !writ_dir.exists() {
         return Err("not a writ repository (no .writ directory)".into());
@@ -9693,7 +9909,7 @@ fn cmd_config_get(
     Ok(())
 }
 
-fn cmd_config_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_config_list(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let writ_dir = cwd.join(".writ");
     if !writ_dir.exists() {
         return Err("not a writ repository (no .writ directory)".into());
@@ -9731,11 +9947,7 @@ fn cmd_config_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error
     Ok(())
 }
 
-fn cmd_config_unset(
-    cwd: &PathBuf,
-    key: &str,
-    format: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_config_unset(cwd: &Path, key: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let writ_dir = cwd.join(".writ");
     if !writ_dir.exists() {
         return Err("not a writ repository (no .writ directory)".into());
@@ -9810,7 +10022,7 @@ fn append_watch_config_comment(config_path: &std::path::Path) {
 /// existing writ entry is never rewritten. With `leave_tracked` (init), a
 /// git-tracked file without a writ entry is left alone and reported;
 /// `writ mcp-install` passes false and adds the entry.
-fn generate_mcp_json(cwd: &PathBuf, leave_tracked: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn generate_mcp_json(cwd: &Path, leave_tracked: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mcp_path = cwd.join(".mcp.json");
     if !mcp_path.exists() {
         let config = serde_json::json!({ "mcpServers": { "writ": writ_mcp_entry() } });
@@ -9877,7 +10089,7 @@ enum McpRemoval {
 /// Remove writ from `.mcp.json` on uninit. A git-tracked file is never
 /// touched (a clone must not lose a committed file); an untracked one loses
 /// only writ's entry, and is deleted when nothing else is left.
-fn remove_mcp_json(cwd: &PathBuf) -> McpRemoval {
+fn remove_mcp_json(cwd: &Path) -> McpRemoval {
     let mcp_path = cwd.join(".mcp.json");
     let Ok(content) = std::fs::read_to_string(&mcp_path) else {
         return McpRemoval::Untouched;
@@ -9898,7 +10110,7 @@ fn remove_mcp_json(cwd: &PathBuf) -> McpRemoval {
         return McpRemoval::Untouched;
     };
     servers.remove("writ");
-    let only_writ = servers.is_empty() && config.as_object().map_or(false, |o| o.len() == 1);
+    let only_writ = servers.is_empty() && config.as_object().is_some_and(|o| o.len() == 1);
     let written = if only_writ {
         std::fs::remove_file(&mcp_path).map(|_| McpRemoval::Deleted)
     } else {
@@ -9913,7 +10125,62 @@ fn remove_mcp_json(cwd: &PathBuf) -> McpRemoval {
     })
 }
 
-fn cmd_mcp_serve(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+/// `writ session-end` (hidden; the SessionEnd hook). Never opens the
+/// repository (no migration, no lock) and never fails the host's exit:
+/// problems go to stderr, which the hook discards.
+fn cmd_session_end(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(writ_dir) = cwd
+        .ancestors()
+        .map(|d| d.join(".writ"))
+        .find(|d| d.is_dir())
+    else {
+        return Ok(());
+    };
+    let mut input = String::new();
+    if !std::io::stdin().is_terminal() {
+        use std::io::Read;
+        let _ = std::io::stdin().take(64 * 1024).read_to_string(&mut input);
+    }
+    if let Err(e) = writ_core::hooks::session_end::record_current(&writ_dir, &input) {
+        eprintln!("writ session-end: {e}");
+    }
+    Ok(())
+}
+
+/// `writ handoff` (U.3). Read only.
+fn cmd_handoff(
+    cwd: &Path,
+    since: Option<&str>,
+    format: &str,
+    survival: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use writ_core::handoff;
+    let repo = Repository::open_from_dir(cwd)?;
+    let h = handoff::handoff(&repo, since.map(handoff::Since::parse), survival)?;
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&h)?),
+        "brief" => print!("{}", handoff::to_brief(&h)),
+        "markdown" | "md" | "human" => print!("{}", handoff::to_markdown(&h)),
+        other => {
+            return Err(format!("unknown --format '{other}': use markdown, brief or json").into())
+        }
+    }
+    Ok(())
+}
+
+/// `writ why <file>` (U.3). Read only.
+fn cmd_why(cwd: &Path, path: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let repo = Repository::open_from_dir(cwd)?;
+    let w = writ_core::why::why(&repo, path)?;
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(&w)?),
+        "markdown" | "md" | "human" => print!("{}", writ_core::why::to_markdown(&w)),
+        other => return Err(format!("unknown --format '{other}': use markdown or json").into()),
+    }
+    Ok(())
+}
+
+fn cmd_mcp_serve(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let writ_binary = std::env::current_exe()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| "writ".to_string());
@@ -9926,7 +10193,7 @@ fn cmd_mcp_serve(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_mcp_install(cwd: &PathBuf, desktop: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_mcp_install(cwd: &Path, desktop: bool) -> Result<(), Box<dyn std::error::Error>> {
     if desktop {
         let config_path = dirs_mcp_desktop_config();
         write_mcp_desktop_config(&config_path)?;
@@ -10016,7 +10283,7 @@ fn write_mcp_desktop_config(path: &PathBuf) -> Result<(), Box<dyn std::error::Er
 // ---------------------------------------------------------------------------
 
 fn cmd_workspace_create(
-    cwd: &PathBuf,
+    cwd: &Path,
     name: &str,
     path: Option<&Path>,
     specs: Option<&str>,
@@ -10083,7 +10350,7 @@ fn cmd_workspace_create(
 }
 
 fn cmd_workspace_status(
-    cwd: &PathBuf,
+    cwd: &Path,
     name: Option<&str>,
     format: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -10142,7 +10409,7 @@ fn cmd_workspace_status(
     Ok(())
 }
 
-fn cmd_workspace_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_workspace_list(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let workspaces = repo.list_workspaces()?;
 
@@ -10179,7 +10446,7 @@ fn cmd_workspace_list(cwd: &PathBuf, format: &str) -> Result<(), Box<dyn std::er
 }
 
 fn cmd_workspace_delete(
-    cwd: &PathBuf,
+    cwd: &Path,
     name: &str,
     keep_files: bool,
     force: bool,
@@ -10284,6 +10551,7 @@ fn print_doctor_section(d: &writ_core::context::ContextDoctor) {
             Some(cmd) => println!("    fix: {cmd}"),
             None => println!("    fix: none to paste; needs your decision"),
         }
+        println!("    who: {}", f.who_may_fix());
     }
 }
 
@@ -10312,10 +10580,15 @@ fn print_doctor_human(report: &writ_core::doctor::DoctorReport) {
             Some(cmd) => println!("    fix:   {cmd}"),
             None => println!("    fix:   none to paste; this needs your decision (see above)"),
         }
+        println!("    who:   {}", f.who_may_fix());
     }
     for note in &report.survival_info {
         println!();
         println!("  [{}] survival: {note}", "info".cyan());
+    }
+    if !report.next_action.is_empty() {
+        println!();
+        println!("next: {}", report.next_action);
     }
 }
 
@@ -10324,7 +10597,7 @@ fn print_doctor_human(report: &writ_core::doctor::DoctorReport) {
 // ---------------------------------------------------------------------------
 
 fn cmd_watch(
-    cwd: &PathBuf,
+    cwd: &Path,
     interval: Option<u64>,
     no_auto_converge: bool,
     daemon: bool,
@@ -10487,6 +10760,7 @@ mod tests {
             claimed_host: None,
             release_forced: false,
             genesis_tree: None,
+            post_commit_notes: Vec::new(),
             created_by: None,
         }
     }

@@ -153,6 +153,18 @@ pub struct OverrideContext {
     pub lines: Vec<String>,
     /// Full ids of this spec's seals that added the removed lines.
     pub added_by: Vec<String>,
+    /// Finding 122: the agents among `other_agents` whose sealed content is
+    /// the replacement (a line this seal added on the path that the other
+    /// agent's seal added). Empty when the sealer replaced its own lines
+    /// with its own content. `None` on records written before 0.4.2, which
+    /// did not check: they are described without naming an author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_from: Option<Vec<String>>,
+    /// The removed lines that were another agent's call (they removed them,
+    /// or their sealed lines replaced them); the rest of `lines` the sealer
+    /// rewrote itself. Both non-empty: a mixed override.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_lines: Vec<String>,
 }
 
 impl OverrideContext {
@@ -160,22 +172,61 @@ impl OverrideContext {
     /// removed their own lines, after being told (seal `seal_id`).
     pub fn describe(&self, agent: &str, seal_id: &str) -> String {
         let id12 = &seal_id[..seal_id.len().min(12)];
-        match self.other_agents.first() {
-            Some(other) => format!(
-                "{agent} accepted {}'s version of {} after being told (seal {id12})",
-                join_names(&self.other_agents).unwrap_or_else(|| other.clone()),
+        let from = self
+            .accepted_from
+            .as_deref()
+            .and_then(join_names)
+            .unwrap_or_default();
+        let own = self.own_rewritten();
+        match self.resolution() {
+            "accepted_after_told" => format!(
+                "{agent} accepted {from}'s version of {} after being told (seal {id12})",
                 self.path
             ),
-            None => format!(
-                "{agent} removed {} own line(s) from {} on purpose after being told (seal {id12})",
-                self.lines.len(),
-                self.path
+            "mixed" => format!(
+                "{agent} accepted {from}'s version of {} for {} line(s) and removed {own} own line(s) on purpose after being told (seal {id12})",
+                self.path,
+                self.accepted_lines.len()
             ),
+            _ => {
+                let mut out = format!(
+                    "{agent} removed {} own line(s) from {} on purpose after being told (seal {id12})",
+                    self.lines.len(),
+                    self.path
+                );
+                // Finding 122: another toucher is context, never the author.
+                if let Some(others) = join_names(&self.other_agents) {
+                    out.push_str(&format!("; {others} touched the file since {agent}'s last seal"));
+                }
+                out
+            }
+        }
+    }
+
+    /// Removed lines the sealer rewrote itself (not another agent's call).
+    pub fn own_rewritten(&self) -> usize {
+        self.lines
+            .iter()
+            .filter(|l| !self.accepted_lines.contains(l))
+            .count()
+    }
+
+    /// Finding 122: how the override resolved, for handoff and why:
+    /// `accepted_after_told` when every removed line was another agent's
+    /// call, `mixed` when some were, `rewrote_own` when none were (or the
+    /// record predates the check).
+    pub fn resolution(&self) -> &'static str {
+        let named = self.accepted_from.as_deref().is_some_and(|f| !f.is_empty());
+        if !named {
+            "rewrote_own"
+        } else if self.accepted_lines.is_empty() || self.own_rewritten() == 0 {
+            "accepted_after_told"
+        } else {
+            "mixed"
         }
     }
 }
 
-/// "a", "a, and b", "a, b, and c"; None when empty.
 pub fn join_names(names: &[String]) -> Option<String> {
     match names {
         [] => None,
@@ -225,6 +276,7 @@ impl Seal {
     /// first seal in a chain). The cryptographic fields (`content_hash`,
     /// `chain_hash`, `signature`) are populated after construction using
     /// the `crypto` module.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         parent: Option<String>,
         tree: String,

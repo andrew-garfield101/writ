@@ -24,6 +24,7 @@ pub mod fsutil;
 pub mod gc;
 #[cfg(feature = "bridge")]
 pub mod git_ops;
+pub mod handoff;
 pub mod hash;
 pub mod hooks;
 pub mod ignore;
@@ -48,6 +49,7 @@ pub mod stat_cache;
 pub mod state;
 pub mod status;
 pub mod watch;
+pub mod why;
 pub mod workspace;
 
 pub use error::{WritError, WritResult};

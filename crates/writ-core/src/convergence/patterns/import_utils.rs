@@ -186,15 +186,15 @@ fn parse_module_from_content(content: &str, lang: &ImportLang) -> Option<String>
         }
         ImportLang::Rust => {
             // Strip visibility prefix.
-            let after_vis = if trimmed.starts_with("pub(crate) ") {
-                &trimmed[11..]
-            } else if trimmed.starts_with("pub ") {
-                &trimmed[4..]
+            let after_vis = if let Some(stripped) = trimmed.strip_prefix("pub(crate) ") {
+                stripped
+            } else if let Some(stripped) = trimmed.strip_prefix("pub ") {
+                stripped
             } else {
                 trimmed
             };
-            if after_vis.starts_with("use ") {
-                let rest = after_vis[4..].trim_end_matches(';').trim();
+            if let Some(stripped) = after_vis.strip_prefix("use ") {
+                let rest = stripped.trim_end_matches(';').trim();
                 if let Some(brace_start) = rest.find('{') {
                     Some(rest[..brace_start].trim_end_matches("::").to_string())
                 } else {

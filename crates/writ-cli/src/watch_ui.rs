@@ -5,7 +5,7 @@
 //! This module consumes `WatchEvent`s from the core loop and renders them.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,7 @@ use writ_core::watch::{
 /// Shows seal activity and convergence events as they happen.
 /// Press 'q' to quit.
 pub fn cmd_watch_foreground(
-    cwd: &PathBuf,
+    cwd: &Path,
     interval: u64,
     auto_converge: bool,
     max_retries: u32,
@@ -121,11 +121,12 @@ fn run_terminal_loop(
     loop {
         // Check for keyboard input.
         if event::poll(poll_timeout)? {
-            if let Event::Key(KeyEvent { code, .. }) = event::read()? {
-                match code {
-                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                    _ => {}
-                }
+            if let Event::Key(KeyEvent {
+                code: KeyCode::Char('q') | KeyCode::Esc,
+                ..
+            }) = event::read()?
+            {
+                return Ok(());
             }
         }
 
@@ -316,7 +317,7 @@ fn format_duration(d: Duration) -> String {
 
 /// Start watch as a background daemon process.
 pub fn cmd_watch_daemon(
-    cwd: &PathBuf,
+    cwd: &Path,
     interval: u64,
     auto_converge: bool,
     _max_retries: u32,
@@ -372,7 +373,7 @@ pub fn cmd_watch_daemon(
 }
 
 /// Stop a running watch daemon.
-pub fn cmd_watch_stop(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub fn cmd_watch_stop(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let writ_dir = cwd.join(".writ");
 
     match platform::stop_daemon(&writ_dir) {
@@ -402,7 +403,7 @@ pub fn cmd_watch_stop(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Show the status of a running watch daemon.
-pub fn cmd_watch_status(cwd: &PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub fn cmd_watch_status(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let writ_dir = cwd.join(".writ");
     let log_file = writ_dir.join("watch.log");
 

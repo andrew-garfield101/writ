@@ -94,6 +94,10 @@ writ context
         cmd_seal_with!("what you did"),
         r#"`.
 
+5. **Doctor findings** (the `doctor` section): "#,
+        doctor_note!(),
+        r#".
+
 ## When to Re-Run Context
 
 - After completing a major piece of work (check for new activity from other agents)
@@ -814,23 +818,30 @@ Checks content hashes, chain hashes, and Ed25519 signatures for every seal in th
 
 const WRIT_DOCTOR_SKILL: SkillTemplate = SkillTemplate {
     name: "writ-doctor",
-    skill_md: r#"---
+    skill_md: concat!(
+        r#"---
 name: "writ-doctor"
 description: "Diagnose writ repository health and configuration issues"
 ---
 
 # Writ Doctor
 
-Run diagnostics on the writ repository.
+Name every bad state writ can leave the repository in, with the command that fixes it.
 
 ## Command
 
 ```bash
-writ doctor
+writ doctor              # fast tier: store, claims, committed-spec seals, unsealed work, versions, left-out files
+writ doctor --survival   # adds the survival tier: sealed lines that went missing
 ```
 
-Checks: .writ/ integrity, index consistency, spec health, seal chain, git sync status, storage usage.
+## Acting on findings
+
 "#,
+        doctor_note!(),
+        r#". Each finding prints its `fix:` and who may run it: `any agent may run this fix` means paste it as printed; a fix marked `for a human` is left to the person (tell them); `none to paste` needs a person's decision. In JSON, `anyone_may_fix: true` marks the fixes any agent may run.
+"#
+    ),
     supporting_files: &[],
 };
 

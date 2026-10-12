@@ -331,8 +331,10 @@ fn seal_and_done_on_a_committed_spec_are_refused_with_the_follow_up_command() {
         let text = combined(&out);
         assert!(!out.status.success(), "{args:?} succeeded:\n{text}");
         assert!(text.contains(&hash[..12]), "{args:?}:\n{text}");
+        // Injection B (Aubs 2): reopen is a human command, never printed.
+        assert!(!text.to_lowercase().contains("reopen"), "{text}");
         assert!(
-            text.contains("writ spec add \"sa (follow-up)\" --claim"),
+            text.contains("writ spec add \"sa (follow-up)\" --id sa-followup --claim"),
             "{text}"
         );
     }

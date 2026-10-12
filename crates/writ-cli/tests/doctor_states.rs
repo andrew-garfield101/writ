@@ -1935,6 +1935,832 @@ fn safe_to_finish_absent_when_survival_unavailable_or_stale() {
 }
 
 // ---------------------------------------------------------------------------
+// Sprint 5 (0.4.2): finding 114 (anyone_may_fix), Aubs's double run, and
+// injection B's single printed exit. Written before the code (retro rule 1);
+// each is ignored on EXPECTED_IGNORED until it lands.
+// ---------------------------------------------------------------------------
+
+/// Finding 114: what the stale_claim message must say when the holder is
+/// provably gone.
+const SAYS_EXITED: &str = "has exited";
+const SAYS_ANYONE: &str = "any agent may run";
+
+/// A third session claims `ghost` and exits (same host, dead pid): the run 4
+/// injection shape.
+fn exited_session_claim(p: &Project) {
+    p.ok(
+        "human",
+        &["spec", "add", "--id", "ghost", "--title", "ghost"],
+    );
+    #[cfg(unix)]
+    std::os::unix::fs::symlink("/bin/sh", p.bin.join("claude")).unwrap();
+    let session = p
+        .cmd(p.bin.join("claude").to_str().unwrap(), "ghost-session")
+        .args(["-c", "writ spec claim ghost --agent ghost-session && :"])
+        .output()
+        .unwrap();
+    assert!(session.status.success(), "{}", out_text(&session));
+}
+
+/// Aubs addition 1: a fix any agent may run will be run by two agents
+/// seconds apart. The second verbatim run exits 0, says the state is
+/// already clear, and doctor stays clean.
+fn assert_double_run(p: &Project, agent: &str, finding: &serde_json::Value) {
+    let fix = finding["fix_command"].as_str().unwrap();
+    let again = p.cmd("sh", agent).args(["-c", fix]).output().unwrap();
+    let text = out_text(&again);
+    assert!(
+        again.status.success(),
+        "second verbatim run of `{fix}` failed ({:?}):\n{text}",
+        again.status.code()
+    );
+    assert!(
+        text.to_lowercase().contains("already"),
+        "second run of `{fix}` does not say the state is already clear:\n{text}"
+    );
+    p.assert_clean(agent, &format!("after the second run of `{fix}`"));
+}
+
+/// Finding 114, the run 4 shape: message says the holder has exited and any
+/// agent may run the fix; `anyone_may_fix: true` in doctor JSON, in the
+/// human output, in context JSON's doctor block and in default context; an
+/// agent with no stake pastes it, then a second agent pastes it again.
+#[test]
+fn f114_stale_claim_exited_says_anyone_may_fix_everywhere_and_double_run() {
+    let p = Project::new("f114-anyone");
+    exited_session_claim(&p);
+    let (code, v) = p.doctor("other");
+    assert_eq!(code, Some(1), "{v:#}");
+    let f = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["check"] == CHECK_STALE_CLAIM)
+        .cloned()
+        .unwrap_or_else(|| panic!("exited-session claim not named:\n{v:#}"));
+    let msg = f["message"].as_str().unwrap();
+    assert!(
+        msg.contains(SAYS_EXITED),
+        "message lacks '{SAYS_EXITED}': {msg}"
+    );
+    assert!(
+        msg.contains(SAYS_ANYONE),
+        "message lacks '{SAYS_ANYONE}': {msg}"
+    );
+    assert_eq!(f["anyone_may_fix"], true, "doctor json: {f:#}");
+    assert_eq!(f["needs_human"], false, "{f:#}");
+
+    let human = out_text(&p.writ("other", &["doctor"]));
+    assert!(
+        human.contains(SAYS_EXITED) && human.contains(SAYS_ANYONE),
+        "human doctor output does not carry the message:\n{human}"
+    );
+
+    let ctx = p.writ(
+        "other",
+        &["context", "--format", "json", "--for-agent", "other"],
+    );
+    let ctx: serde_json::Value = serde_json::from_slice(&ctx.stdout).unwrap();
+    let cf = ctx["doctor"]["findings"]
+        .as_array()
+        .and_then(|a| a.iter().find(|x| x["check"] == CHECK_STALE_CLAIM).cloned())
+        .unwrap_or_else(|| panic!("context json lacks the finding: {}", ctx["doctor"]));
+    assert_eq!(cf["anyone_may_fix"], true, "context json: {cf:#}");
+    let toon = out_text(&p.writ("other", &["context", "--for-agent", "other"]));
+    assert!(
+        toon.contains(SAYS_ANYONE),
+        "default `writ context` does not say any agent may run the fix:\n{toon}"
+    );
+
+    p.run_fix("other", &f);
+    p.assert_clean("other", "after the first run");
+    assert_double_run(&p, "third", &f);
+}
+
+/// Finding 114 negative: a fix that touches another agent's live claim
+/// never carries anyone_may_fix. a holds sa (live: sealed minutes ago, same
+/// host); a's pending edit is 45 minutes old while b is active; the
+/// unsealed_at_risk fix seals to sa. False for every viewer, a included
+/// (the flag says who may run it, not who is reading).
+#[test]
+fn f114_fix_on_live_claim_never_carries_anyone_may_fix() {
+    let p = Project::new("f114-live");
+    p.spec("sa", "a");
+    p.spec("sb", "b");
+    p.write("a.txt", "a1\n");
+    p.seal("a", "sa", "a.txt");
+    p.write("a.txt", "a1\na2\n");
+    p.set_mtime("a.txt", Duration::from_secs(45 * 60));
+    p.write("b.txt", "b1\n");
+    p.seal("b", "sb", "b.txt");
+    for viewer in ["other", "human", "b", "a"] {
+        let (_, v) = p.doctor(viewer);
+        let f = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["check"] == CHECK_UNSEALED_AT_RISK)
+            .cloned()
+            .unwrap_or_else(|| panic!("{viewer}: no unsealed_at_risk:\n{v:#}"));
+        assert_eq!(
+            f["anyone_may_fix"], false,
+            "{viewer}: a fix on a's live claim carries anyone_may_fix: {f:#}"
+        );
+        assert!(
+            !f["message"].as_str().unwrap().contains(SAYS_ANYONE),
+            "{viewer}: {f:#}"
+        );
+    }
+}
+
+/// Finding 114, every state at once (the noforce fixture's seven states):
+/// anyone_may_fix is present on every finding; when true, needs_human is
+/// false, a fix is printed, and the fix names no spec held by a live agent
+/// (sa, sb); needs_human findings (foreign-host idle claim) carry false.
+/// Every true fix is then pasted twice by an agent with no stake (Aubs 1).
+#[test]
+fn f114_anyone_may_fix_is_consistent_in_every_state_and_double_runs() {
+    let p = Project::new("f114-all");
+    p.spec("sf", "far");
+    p.write("far.txt", "far\n");
+    p.seal("far", "sf", "far.txt");
+    p.age_spec("sf", Duration::from_secs(3 * 3600));
+    p.set_spec_field(
+        "sf",
+        "claimed_host",
+        serde_json::json!("other-host.invalid"),
+    );
+    exited_session_claim(&p);
+    p.spec("sa", "a");
+    p.spec("sb", "b");
+    p.write("a.txt", "a1\n");
+    p.seal("a", "sa", "a.txt");
+    p.write("a.txt", "a1\na2\n");
+    p.set_mtime("a.txt", Duration::from_secs(45 * 60));
+    p.write("b.txt", "b1\n");
+    p.seal("b", "sb", "b.txt");
+    p.write("stray.txt", "nobody sealed me\n");
+
+    let (_, v) = p.doctor("other");
+    let findings = v["findings"].as_array().unwrap().clone();
+    assert!(
+        findings.len() >= 3,
+        "fixture did not produce the states:\n{v:#}"
+    );
+    let mut anyone = Vec::new();
+    for f in &findings {
+        let flag = f["anyone_may_fix"]
+            .as_bool()
+            .unwrap_or_else(|| panic!("anyone_may_fix missing or not bool: {f:#}"));
+        if f["needs_human"] == true {
+            assert!(!flag, "needs_human finding carries anyone_may_fix: {f:#}");
+        }
+        if flag {
+            let fix = f["fix_command"].as_str().unwrap_or("");
+            assert!(!fix.is_empty(), "anyone_may_fix without a fix: {f:#}");
+            for live in ["sa", "sb"] {
+                assert!(
+                    !fix.split_whitespace()
+                        .any(|w| w.trim_matches(|c| c == '\'' || c == '"') == live),
+                    "anyone_may_fix fix touches live claim {live}: {fix}"
+                );
+            }
+            // a.txt and b.txt are the live holders' files: sealing them
+            // into any other spec takes over a live agent's work.
+            for held in ["a.txt", "b.txt"] {
+                assert!(
+                    !finding_paths(f).contains(&held.to_string()) && !fix.contains(held),
+                    "anyone_may_fix fix touches {held}, a live claim's file: {fix}"
+                );
+            }
+            anyone.push(f.clone());
+        }
+    }
+    assert!(
+        anyone.iter().any(|f| f["check"] == CHECK_STALE_CLAIM),
+        "the exited-session stale_claim is not anyone_may_fix:\n{v:#}"
+    );
+    for f in &anyone {
+        p.run_fix("other", f);
+        let fix = f["fix_command"].as_str().unwrap();
+        let again = p.cmd("sh", "third").args(["-c", fix]).output().unwrap();
+        let text = out_text(&again);
+        assert!(
+            again.status.success(),
+            "second run of `{fix}` failed:\n{text}"
+        );
+        assert!(
+            text.to_lowercase().contains("already"),
+            "second run of `{fix}` does not say already clear:\n{text}"
+        );
+        let (_, after) = p.doctor("other");
+        assert!(
+            !after["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|x| x["check"] == f["check"] && x["fix_command"] == f["fix_command"]),
+            "`{fix}` twice did not clear its finding:\n{after:#}"
+        );
+    }
+}
+
+/// Finding 118 (itsdangerous stranger run, 2026-10-12): `left_out` named
+/// agent-1's in-progress files while agent-1 was live, and its fix sealed
+/// them into a doctor follow-up spec: taking over a live agent's work. Same
+/// ruling as 117: files in a live claim's scope that it has not sealed yet
+/// never carry anyone_may_fix, and other viewers are told whose they are.
+/// b finishes its spec (so left_out runs); a holds sa (scope signer.py,
+/// test_signer.py), live, with both files new and unsealed.
+fn left_out_during_live_run(tag: &str) -> Project {
+    let p = Project::new(tag);
+    p.ok(
+        "a",
+        &[
+            "spec",
+            "add",
+            "--id",
+            "sa",
+            "--title",
+            "signer repr",
+            "--scope",
+            "signer.py,test_signer.py",
+        ],
+    );
+    p.ok("a", &["spec", "claim", "sa", "--agent", "a"]);
+    p.spec("sb", "b");
+    p.write("serializer.py", "class Serializer: ...\n");
+    p.seal("b", "sb", "serializer.py");
+    p.ok("b", &["spec", "done", "sb", "--agent", "b", "--no-seal"]);
+    p.write("signer.py", "class Signer:\n    def __repr__(self): ...\n");
+    p.write("test_signer.py", "def test_repr(): ...\n");
+    p
+}
+
+#[test]
+fn f118_left_out_on_live_agents_pending_files_is_not_anyone_may_fix() {
+    let p = left_out_during_live_run("f118-live");
+    for viewer in ["b", "other", "human"] {
+        let (_, v) = p.doctor(viewer);
+        let hits: Vec<&serde_json::Value> = v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| {
+                f["check"] == CHECK_LEFT_OUT
+                    && finding_paths(f)
+                        .iter()
+                        .any(|x| x == "signer.py" || x == "test_signer.py")
+            })
+            .collect();
+        assert!(
+            !hits.is_empty(),
+            "{viewer}: a's pending files not named at all:\n{v:#}"
+        );
+        for f in hits {
+            assert_eq!(
+                f["anyone_may_fix"], false,
+                "{viewer}: left_out on a's live pending files carries anyone_may_fix: {f:#}"
+            );
+            let msg = f["message"].as_str().unwrap();
+            assert!(
+                msg.contains("'a'") && !msg.contains(SAYS_ANYONE),
+                "{viewer}: message does not name the live holder 'a': {msg}"
+            );
+        }
+        for f in v["findings"].as_array().unwrap() {
+            if f["anyone_may_fix"] == true {
+                let fix = f["fix_command"].as_str().unwrap_or("");
+                assert!(
+                    !fix.contains("signer.py"),
+                    "{viewer}: an anyone_may_fix fix seals a's pending file: {fix}"
+                );
+            }
+        }
+    }
+}
+
+/// Finding 118 guard: a stray file in no live claim's scope stays as is
+/// (anyone_may_fix true, the fix pasted verbatim clears it).
+#[test]
+fn f118_left_out_stray_file_in_no_claims_scope_stays_anyone_may_fix() {
+    let p = left_out_during_live_run("f118-stray");
+    fs::remove_file(p.path("signer.py")).unwrap();
+    fs::remove_file(p.path("test_signer.py")).unwrap();
+    p.write("stray.txt", "nobody's\n");
+    let (_, v) = p.doctor("other");
+    let f = v["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["check"] == CHECK_LEFT_OUT)
+        .cloned()
+        .unwrap_or_else(|| panic!("stray not named:\n{v:#}"));
+    assert_eq!(finding_paths(&f), ["stray.txt"], "{f:#}");
+    assert_eq!(f["anyone_may_fix"], true, "{f:#}");
+    p.run_fix("other", &f);
+}
+
+/// Injection B, auto-scoped form (Bri dry run on ea59f117fd8c): agents
+/// seal without `--spec`. After a finish commits the agent's only spec, a
+/// plain `writ seal` today says "No active spec for this seal" and offers a
+/// generic `writ spec add "brief description of your task" --claim`, so the
+/// agent never learns its spec was committed. The refusal must be the same
+/// one command as the `--spec` form, naming the committed spec.
+#[test]
+fn injection_b_auto_scoped_seal_after_commit_prints_the_same_followup_command() {
+    let p = Project::new("inj-b-auto");
+    p.ok(
+        "a",
+        &["spec", "add", "--id", "auth", "--title", "Auth module"],
+    );
+    p.ok("a", &["spec", "claim", "auth", "--agent", "a"]);
+    p.write("auth.py", "def login():\n    pass\n");
+    p.seal("a", "auth", "auth.py");
+    p.ok("human", &["spec", "update", "auth", "--status", "complete"]);
+    p.ok("human", &["finish", "-y", "--no-check"]);
+    p.write("auth.py", "def login():\n    return True\n");
+    let refused = p.writ("a", &["seal", "-s", "login returns", "--paths", "auth.py"]);
+    let text = out_text(&refused);
+    assert!(!refused.status.success(), "{text}");
+    assert!(
+        text.contains("'auth'") && text.contains("committed"),
+        "spec not named:\n{text}"
+    );
+    let (want, id) = followup_command(&text, "Auth module", "login returns", "auth.py");
+    let want = want.as_str();
+    let out = p.cmd("sh", "a").args(["-c", want]).output().unwrap();
+    assert!(out.status.success(), "{}", out_text(&out));
+    p.assert_clean("a", "after the follow-up");
+}
+
+/// Injection B, `spec done` form (live run B, 2026-10-12): the agent sealed,
+/// a finish committed its spec seconds later, and its auto-scoped
+/// `writ spec done -s "<summary>"` printed "error: no spec claimed — create
+/// one with `writ spec add "your task"`": it never named the committed spec,
+/// and the agent's summary was never recorded. With nothing left to seal,
+/// spec done on a spec already committed is done: exit 0, say it is already
+/// committed (naming it), never tell the agent to create a spec; the summary
+/// is kept on the spec as a post-commit summary that handoff shows (finding
+/// 124, CC).
+#[test]
+fn injection_b_spec_done_after_commit_says_already_committed() {
+    let p = Project::new("inj-b-done");
+    p.ok(
+        "a",
+        &["spec", "add", "--id", "auth", "--title", "Auth module"],
+    );
+    p.ok("a", &["spec", "claim", "auth", "--agent", "a"]);
+    p.write("auth.py", "def login():\n    pass\n");
+    p.seal("a", "auth", "auth.py");
+    p.ok("human", &["spec", "update", "auth", "--status", "complete"]);
+    p.ok("human", &["finish", "-y", "--no-check"]);
+    let out = p.writ("a", &["spec", "done", "-s", "added login"]);
+    let text = out_text(&out);
+    let lower = text.to_lowercase();
+    assert!(!lower.contains("no spec claimed"), "{text}");
+    assert!(!lower.contains("create one"), "{text}");
+    assert!(
+        text.contains("auth") && lower.contains("already committed"),
+        "does not name the committed spec:\n{text}"
+    );
+    assert!(
+        out.status.success(),
+        "spec done on a committed spec failed:\n{text}"
+    );
+    // CC decision: the summary is kept on the committed spec as a
+    // post-commit summary, and handoff shows it.
+    let show = p.ok("a", &["spec", "show", "auth", "--format", "json"]);
+    assert!(
+        String::from_utf8_lossy(&show.stdout).contains("added login"),
+        "post-commit summary not on the spec:\n{}",
+        String::from_utf8_lossy(&show.stdout)
+    );
+    let h = p.ok("a", &["handoff", "--format", "json"]);
+    assert!(
+        String::from_utf8_lossy(&h.stdout).contains("added login"),
+        "handoff does not show the post-commit summary"
+    );
+    p.assert_clean("a", "after spec done on a committed spec");
+}
+
+/// Finding 114, template: the generated CLAUDE.md block (every surface comes
+/// from template.rs) tells agents to act on any finding not marked for a
+/// human, including findings about other agents' specs.
+#[test]
+fn f114_template_tells_agents_to_act_on_non_human_findings() {
+    let p = Project::new("f114-template");
+    let text = p.read("CLAUDE.md").to_lowercase();
+    assert!(
+        text.contains("other agents' specs") && text.contains("for a human"),
+        "managed block lacks the act-on-it line:\n{text}"
+    );
+}
+
+/// Injection B's one printed command (Aubs 2), with the title wording left
+/// to finding 120 ("(follow-up)" or "(follow up)") and the id read back:
+/// `writ spec add "<title> (follow up)" --id <id> --claim && writ seal -s
+/// "<summary>" --spec <id> --paths <paths>`, the only `writ ` line printed.
+fn followup_command(text: &str, title: &str, summary: &str, paths: &str) -> (String, String) {
+    let cmds: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("writ "))
+        .collect();
+    assert_eq!(
+        cmds.len(),
+        1,
+        "refusal must print exactly one command:\n{text}"
+    );
+    let cmd = cmds[0];
+    let head = ["(follow-up)", "(follow up)"]
+        .iter()
+        .map(|t| format!("writ spec add \"{title} {t}\" --id "))
+        .find(|h| cmd.starts_with(h.as_str()))
+        .unwrap_or_else(|| panic!("not the follow-up spec add for {title:?}: {cmd}"));
+    let rest = &cmd[head.len()..];
+    let id = rest.split_whitespace().next().unwrap().to_string();
+    let tail = format!("{id} --claim && writ seal -s \"{summary}\" --spec {id} --paths {paths}");
+    assert_eq!(rest, tail, "follow-up command shape: {cmd}");
+    assert!(id.starts_with("auth"), "id not from the spec slug: {id}");
+    (cmd.to_string(), id)
+}
+
+/// Injection B (Aubs 2): an agent's spec is committed under it by a finish
+/// mid-run and it seals again. The refusal prints exactly one command, the
+/// follow-up, with the agent's summary and paths filled in, no choice and no
+/// reopen; pasted verbatim it seals the work on `<slug>-followup`; pasted a
+/// second time it exits 0, says already, and creates nothing new; doctor
+/// clean after.
+#[test]
+fn injection_b_committed_spec_seal_prints_one_followup_command_that_works_twice() {
+    let p = Project::new("inj-b");
+    p.ok(
+        "a",
+        &["spec", "add", "--id", "auth", "--title", "Auth module"],
+    );
+    p.ok("a", &["spec", "claim", "auth", "--agent", "a"]);
+    p.write("auth.py", "def login():\n    pass\n");
+    p.seal("a", "auth", "auth.py");
+    p.ok("a", &["spec", "done", "auth", "--agent", "a", "--no-seal"]);
+    p.ok("human", &["finish", "-y", "--no-check"]);
+    p.write("auth.py", "def login():\n    return True\n");
+    let refused = p.writ(
+        "a",
+        &[
+            "seal",
+            "-s",
+            "login returns",
+            "--agent",
+            "a",
+            "--spec",
+            "auth",
+            "--paths",
+            "auth.py",
+        ],
+    );
+    let text = out_text(&refused);
+    assert!(
+        !refused.status.success(),
+        "seal on a committed spec passed:\n{text}"
+    );
+    let (want, id) = followup_command(&text, "Auth module", "login returns", "auth.py");
+    let want = want.as_str();
+    let lower = text.to_lowercase();
+    assert!(!lower.contains("reopen"), "refusal offers reopen:\n{text}");
+    assert!(!text.contains("--force"), "{text}");
+
+    for run in 1..=2 {
+        let out = p.cmd("sh", "a").args(["-c", want]).output().unwrap();
+        let t = out_text(&out);
+        assert!(out.status.success(), "paste {run} failed:\n{t}");
+        if run == 2 {
+            assert!(t.to_lowercase().contains("already"), "second paste:\n{t}");
+        }
+    }
+    let show = p.ok("a", &["spec", "show", &id, "--format", "json"]);
+    let spec: serde_json::Value = serde_json::from_slice(&show.stdout).unwrap();
+    assert_eq!(spec["claimed_by"], "a", "{spec:#}");
+    let log = p.ok("a", &["log", "--all", "--format", "json", "--limit", "50"]);
+    let seals: Vec<serde_json::Value> = serde_json::from_slice(&log.stdout).unwrap();
+    let on_followup: Vec<_> = seals
+        .iter()
+        .filter(|s| s["spec_id"] == id.as_str())
+        .collect();
+    assert_eq!(
+        on_followup.len(),
+        1,
+        "double paste made {} seals",
+        on_followup.len()
+    );
+    let specs = p.ok("a", &["spec", "status", "--format", "json"]);
+    assert!(
+        !String::from_utf8_lossy(&specs.stdout).contains(&format!("{id}-2")),
+        "second paste created a second spec"
+    );
+    assert_eq!(p.read("auth.py"), "def login():\n    return True\n");
+    p.assert_clean("a", "after the follow-up");
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 5 (0.4.2): findings 115, 113, 116 (merge-descendant). Written before
+// the code; ignored on EXPECTED_IGNORED until each lands.
+// ---------------------------------------------------------------------------
+
+/// The sprint 4 shape (test_adoption_gates.py: base 4ce7f56928, harness
+/// seal bd0c1a7e72c4 -> c122eba5e6, Amis's seal 5917307945a1 -> be9c20b936
+/// built on it), reconstructed on 40 numbered lines. Harness spec sh adds an
+/// anchor import after line 1, a five-line xfail block after line 10, a
+/// decorator on line 20 and three helper lines after line 30. The informed
+/// spec sm keeps sh's anchors (import, helpers), replaces the xfail block
+/// with a three-line header and drops the decorator: it removes lines its
+/// base held, as Amis did. The stale sm rewrote the git base: no anchors,
+/// the header in the same region, and line 20 changed differently (a true
+/// same-line conflict). Seal order, and so any recorded base, is the same
+/// in both: the recorded base is not evidence; the anchors are.
+fn sh_content() -> String {
+    let mut m = String::new();
+    for i in 0..40 {
+        match i {
+            20 => m.push_str("line 20 @X\n"),
+            _ => m.push_str(&format!("line {i}\n")),
+        }
+        match i {
+            1 => m.push_str("import json\n"),
+            10 => (1..=5).for_each(|k| m.push_str(&format!("xfail {k}\n"))),
+            30 => (1..=3).for_each(|k| m.push_str(&format!("helper {k}\n"))),
+            _ => {}
+        }
+    }
+    m
+}
+
+fn sm_content(informed: bool) -> String {
+    let mut m = String::new();
+    for i in 0..40 {
+        match (i, informed) {
+            (20, false) => m.push_str("line 20 S\n"),
+            _ => m.push_str(&format!("line {i}\n")),
+        }
+        match i {
+            1 if informed => m.push_str("import json\n"),
+            10 => (1..=3).for_each(|k| m.push_str(&format!("header S{k}\n"))),
+            30 if informed => (1..=3).for_each(|k| m.push_str(&format!("helper {k}\n"))),
+            _ => {}
+        }
+    }
+    m
+}
+
+fn descendant_fixture(tag: &str, informed: bool) -> (Project, String) {
+    let p = Project::new(tag);
+    shared_base(&p);
+    p.spec("sh", AGENT_A);
+    p.spec("sm", AGENT_B);
+    p.write("shared.txt", &sh_content());
+    p.seal(AGENT_A, "sh", "shared.txt");
+    let m = sm_content(informed);
+    p.write("shared.txt", &m);
+    p.seal(AGENT_B, "sm", "shared.txt");
+    for (spec, agent) in [("sh", AGENT_A), ("sm", AGENT_B)] {
+        p.ok(
+            agent,
+            &["spec", "done", spec, "--agent", agent, "--no-seal"],
+        );
+    }
+    (p, m)
+}
+
+/// Numbered shape, informed: merges cleanly on 0.4.1 already (Bri probe,
+/// 2026-10-12); a guard that the 115 work keeps it so. Survival green and
+/// "safe to finish"; finish commits sm's content exactly.
+#[test]
+fn f115_numbered_informed_descendant_merges_to_its_content() {
+    let (p, merged) = descendant_fixture("f115-informed", true);
+    let (code, v, _) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(0), "informed descendant is not green:\n{v:#}");
+    let fin = p.writ("human", &["finish", "-y"]);
+    assert!(fin.status.success(), "{}", out_text(&fin));
+    assert_eq!(p.git_ok(&["show", "HEAD:shared.txt"]), merged);
+}
+
+/// Numbered shape, stale rewrite (115 negative, exit criterion): sm never
+/// held sh's ten lines and changed line 20 differently. 0.4.1: survival red,
+/// finish refuses. A 115 rule that trusts the seal order or recorded base
+/// commits sm's version and loses all ten of sh's lines with survival green
+/// (the working tree on 2026-10-12, Bri repro). Never safe; finish refuses;
+/// HEAD unchanged; no sh line silently dropped.
+#[test]
+fn f115_numbered_stale_rewrite_still_refuses() {
+    let (p, _) = descendant_fixture("f115-stale", false);
+    let (code, v, _) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(1), "stale rewrite not red:\n{v:#}");
+    assert_never_safe(&p, "human", "stale rewrite");
+    let head = p.head();
+    let fin = p.writ("human", &["finish", "-y"]);
+    let text = out_text(&fin);
+    assert!(
+        !fin.status.success(),
+        "finish committed a stale rewrite; HEAD:shared.txt holds {} of sh's 10 lines:\n{text}",
+        p.git_ok(&["show", "HEAD:shared.txt"])
+            .lines()
+            .filter(|l| l.contains("import json")
+                || l.contains("xfail")
+                || l.contains("helper")
+                || l.contains("@X"))
+            .count()
+    );
+    assert_eq!(p.head(), head, "finish moved HEAD on a refusal");
+}
+
+// The real sprint 4 blobs (test_adoption_gates.py): git base 4ce7f56928,
+// harness seals 7e8828d07e then c122eba5e6, Amis's seal be9c20b936 built on
+// c122. `stale` is the git base with Amis's three header lines inserted
+// where harness inserted its xfail block, never holding harness's lines.
+const F115_BASE: &str = include_str!("fixtures/f115/base.py.txt");
+const F115_H1: &str = include_str!("fixtures/f115/harness1.py.txt");
+const F115_H2: &str = include_str!("fixtures/f115/harness2.py.txt");
+const F115_AMIS: &str = include_str!("fixtures/f115/amis.py.txt");
+const F115_STALE: &str = include_str!("fixtures/f115/stale.py.txt");
+
+fn real_sprint4_fixture(tag: &str, second: &str) -> Project {
+    let p = Project::new(tag);
+    p.write("t.py", F115_BASE);
+    p.git_ok(&["add", "t.py"]);
+    p.git_ok(&["commit", "-q", "--no-verify", "-m", "base"]);
+    p.spec("harness", "bri");
+    p.spec("stale-release", "amis");
+    p.write("t.py", F115_H1);
+    p.seal("bri", "harness", "t.py");
+    p.write("t.py", F115_H2);
+    p.seal("bri", "harness", "t.py");
+    p.write("t.py", second);
+    p.seal("amis", "stale-release", "t.py");
+    for (spec, agent) in [("harness", "bri"), ("stale-release", "amis")] {
+        p.ok(
+            agent,
+            &["spec", "done", spec, "--agent", agent, "--no-seal"],
+        );
+    }
+    p
+}
+
+/// Finding 115, the real shape: 0.4.1 says survival red (3 lines) and
+/// finish refuses, dropping Amis's header. With 115: survival green and
+/// "safe to finish"; finish exits 0 and commits Amis's version byte for byte
+/// (the converged df28f7d071b0 differs only by a trailing newline); no
+/// conflict or escalation in the output; survival green after.
+#[test]
+fn f115_informed_descendant_merges_without_conflict() {
+    let p = real_sprint4_fixture("f115-real", F115_AMIS);
+    let (code, v, _) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(0), "informed descendant is not green:\n{v:#}");
+    assert!(
+        v["headline"].as_str().unwrap_or("").ends_with(SAFE),
+        "{v:#}"
+    );
+    let head = p.head();
+    let fin = p.writ("human", &["finish", "-y"]);
+    let text = out_text(&fin);
+    assert!(
+        fin.status.success(),
+        "finish refused an informed descendant:\n{text}"
+    );
+    assert_ne!(p.head(), head, "finish committed nothing");
+    assert_eq!(
+        p.git_ok(&["show", "HEAD:t.py"]),
+        F115_AMIS,
+        "the merge did not take the descendant's content"
+    );
+    let lower = text.to_lowercase();
+    assert!(
+        !lower.contains("conflict") && !lower.contains("escalat") && !lower.contains("refus"),
+        "finish reports a conflict on an informed descendant:\n{text}"
+    );
+    let (code, v, _) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(0), "after finish:\n{v:#}");
+}
+
+/// Finding 115 negative on the real blobs: the stale rewrite (no harness
+/// line in it) still conflicts: survival red, never safe, finish refuses,
+/// HEAD unchanged. Passes on 0.4.1; must keep passing.
+#[test]
+fn f115_real_stale_rewrite_still_conflicts_and_finish_refuses() {
+    let p = real_sprint4_fixture("f115-real-stale", F115_STALE);
+    let (code, v, _) = doctor_survival(&p, "human");
+    assert_eq!(code, Some(1), "stale rewrite not red:\n{v:#}");
+    assert_never_safe(&p, "human", "real stale rewrite");
+    let head = p.head();
+    let fin = p.writ("human", &["finish", "-y"]);
+    assert!(
+        !fin.status.success(),
+        "finish committed a stale rewrite:\n{}",
+        out_text(&fin)
+    );
+    assert_eq!(p.head(), head);
+}
+
+const IGNORED_PATH: &str = "out/results/.gitignore";
+
+/// A sealed file that later becomes ignored by both git and writ (the 111
+/// fixture), spec sa done but never finished.
+fn sealed_then_ignored(tag: &str) -> Project {
+    let p = Project::new(tag);
+    p.spec("sa", "agent-a");
+    p.write(IGNORED_PATH, "*\n!.gitignore\n");
+    p.seal("agent-a", "sa", IGNORED_PATH);
+    let gi = p.read(".gitignore");
+    p.write(".gitignore", &format!("{gi}out/results/\n"));
+    p.git_ok(&["commit", "-q", "--no-verify", "-am", "ignore results"]);
+    p.ok(
+        "agent-a",
+        &["spec", "done", "sa", "--agent", "agent-a", "--no-seal"],
+    );
+    p
+}
+
+fn info_lines(human: &str) -> Vec<String> {
+    human
+        .lines()
+        .filter(|l| l.contains("[info]") && l.contains(IGNORED_PATH))
+        .map(|l| l.trim().to_string())
+        .collect()
+}
+
+/// Finding 113: the note is on the first `doctor --survival`, before any
+/// finish has run; it is info, not a finding. The finish output for that
+/// file says the same thing as the note ("git and writ both ignore it",
+/// "stays as history", the `writ seal --paths` retirement), never "Sealed but
+/// NOT staged".
+#[test]
+fn f113_sealed_ignored_note_on_first_survival_and_finish_says_the_same() {
+    let p = sealed_then_ignored("f113");
+    let (_, v, human) = doctor_survival(&p, "human");
+    let notes = info_lines(&human);
+    assert_eq!(
+        notes.len(),
+        1,
+        "first doctor --survival, before any finish:\n{human}"
+    );
+    assert!(
+        !v["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["check"] == CHECK_SURVIVAL),
+        "the note became a finding:\n{v:#}"
+    );
+    let fin = p.writ("human", &["finish", "-y"]);
+    let text = out_text(&fin);
+    assert!(!text.contains("Sealed but NOT staged"), "finish:\n{text}");
+    for want in [
+        "git and writ both ignore it",
+        "stays as history",
+        &format!("writ seal --paths {IGNORED_PATH}")[..],
+    ] {
+        assert!(text.contains(want), "finish output lacks {want:?}:\n{text}");
+    }
+}
+
+/// Finding 116: a seal that recorded the deletion of the ignored path
+/// retires the note: the next `doctor --survival` is silent on it, a finish
+/// is silent on it, and `doctor --survival` after that finish is silent on
+/// it (the deletion seal is never itself cited as sealed-but-ignored).
+#[test]
+fn f116_deletion_seal_retires_note_before_and_after_finish() {
+    let p = sealed_then_ignored("f116");
+    p.ok("human", &["finish", "-y"]);
+    p.spec("sb", "agent-b");
+    fs::remove_file(p.path(IGNORED_PATH)).unwrap();
+    p.seal("agent-b", "sb", IGNORED_PATH);
+    let retire = newest_seal(&p);
+    let (_, _, human) = doctor_survival(&p, "human");
+    assert!(
+        info_lines(&human).is_empty(),
+        "note after the deletion seal:\n{human}"
+    );
+    p.ok(
+        "agent-b",
+        &["spec", "done", "sb", "--agent", "agent-b", "--no-seal"],
+    );
+    let fin = p.writ("human", &["finish", "-y"]);
+    let text = out_text(&fin);
+    assert!(
+        !text.contains(IGNORED_PATH),
+        "finish mentions the retired path:\n{text}"
+    );
+    let (_, _, human) = doctor_survival(&p, "human");
+    assert!(
+        info_lines(&human).is_empty()
+            && !human
+                .lines()
+                .any(|l| l.contains("[info]") && l.contains(&retire[..12])),
+        "note (or the retirement seal {}) after finish:\n{human}",
+        &retire[..12]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Harness self-checks (always on): the fixture itself is sound.
 // ---------------------------------------------------------------------------
 

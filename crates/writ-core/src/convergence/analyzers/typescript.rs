@@ -54,11 +54,10 @@ impl LanguageAnalyzer for TypeScriptAnalyzer {
     }
 
     fn ordering_matters(&self, unit_kind: &UnitKind) -> bool {
-        match unit_kind {
-            UnitKind::Import => false,
-            UnitKind::Comment | UnitKind::Whitespace => false,
-            _ => true,
-        }
+        !matches!(
+            unit_kind,
+            UnitKind::Import | UnitKind::Comment | UnitKind::Whitespace
+        )
     }
 }
 
@@ -313,25 +312,25 @@ fn strip_ts_prefix(trimmed: &str) -> &str {
 pub(crate) fn parse_ts_def_header(trimmed: &str, is_typescript: bool) -> (String, String) {
     let after_prefix = strip_ts_prefix(trimmed);
 
-    if after_prefix.starts_with("async function ") {
-        let name = extract_js_ident(&after_prefix[15..]);
+    if let Some(stripped) = after_prefix.strip_prefix("async function ") {
+        let name = extract_js_ident(stripped);
         return ("function".into(), name);
     }
-    if after_prefix.starts_with("function*") {
-        let rest = after_prefix[9..].trim_start_matches(['(', ' ']);
+    if let Some(stripped) = after_prefix.strip_prefix("function*") {
+        let rest = stripped.trim_start_matches(['(', ' ']);
         let name = extract_js_ident(rest);
         return ("function".into(), name);
     }
-    if after_prefix.starts_with("function ") {
-        let name = extract_js_ident(&after_prefix[9..]);
+    if let Some(stripped) = after_prefix.strip_prefix("function ") {
+        let name = extract_js_ident(stripped);
         return ("function".into(), name);
     }
-    if after_prefix.starts_with("abstract class ") {
-        let name = extract_js_ident(&after_prefix[15..]);
+    if let Some(stripped) = after_prefix.strip_prefix("abstract class ") {
+        let name = extract_js_ident(stripped);
         return ("class".into(), name);
     }
-    if after_prefix.starts_with("class ") {
-        let name = extract_js_ident(&after_prefix[6..]);
+    if let Some(stripped) = after_prefix.strip_prefix("class ") {
+        let name = extract_js_ident(stripped);
         return ("class".into(), name);
     }
     if is_typescript && after_prefix.starts_with("interface ") {
@@ -350,16 +349,16 @@ pub(crate) fn parse_ts_def_header(trimmed: &str, is_typescript: bool) -> (String
         let name = extract_js_ident(&after_prefix[10..]);
         return ("namespace".into(), name);
     }
-    if after_prefix.starts_with("const ") {
-        let name = extract_js_ident(&after_prefix[6..]);
+    if let Some(stripped) = after_prefix.strip_prefix("const ") {
+        let name = extract_js_ident(stripped);
         return ("variable".into(), name);
     }
-    if after_prefix.starts_with("let ") {
-        let name = extract_js_ident(&after_prefix[4..]);
+    if let Some(stripped) = after_prefix.strip_prefix("let ") {
+        let name = extract_js_ident(stripped);
         return ("variable".into(), name);
     }
-    if after_prefix.starts_with("var ") {
-        let name = extract_js_ident(&after_prefix[4..]);
+    if let Some(stripped) = after_prefix.strip_prefix("var ") {
+        let name = extract_js_ident(stripped);
         return ("variable".into(), name);
     }
 

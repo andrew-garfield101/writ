@@ -515,13 +515,32 @@ pub fn additions<'a>(base: &str, version: &'a str) -> Vec<(usize, &'a str)> {
 /// Only distinctive lines count: non-blank, and in neither the merge `base`
 /// nor the file before that seal (a rewrite that restores base text says
 /// nothing about which version was copied).
+///
+/// Finding 115 (the 105 rule, [`saw_addition_in`] clause 2, anchored): a
+/// seal that replaced lines was also seen when `later` already carries an
+/// earlier anchored seal of the same spec and lacks every non-blank line
+/// this seal replaced, each of them that spec's own content (in the
+/// anchored version, not in the base). This is the sprint 4 shape: a
+/// descendant that deleted the block a seal had relabelled carries none of
+/// the relabel's lines, and lacks the lines it replaced. Without an anchor,
+/// or when a replaced line is base text, absence is no evidence: a stale
+/// rewrite of the same lines lacks them too, and still conflicts.
 pub fn anchor_seal(base: &str, first_old: &str, versions: &[&str], later: &str) -> Option<usize> {
     let have = counts(later.lines());
     let in_base = counts(base.lines());
-    let mut anchor = None;
+    let mut anchor: Option<usize> = None;
     let mut prev = first_old;
     for (k, v) in versions.iter().enumerate() {
         let adds = additions(prev, v);
+        let ancestor = anchor.map(|a| counts(versions[a].lines()));
+        // A replaced line is evidence only when it was the other spec's own
+        // content that `later` demonstrably carried: in the anchored seal's
+        // version and not in the base. A base line (or one `later` never
+        // had) says nothing by being absent: a stale rewrite of the same
+        // base line lacks it too (Bri's 115 negative).
+        let held = |l: &str| {
+            !in_base.contains_key(l) && ancestor.as_ref().is_some_and(|c| c.contains_key(l))
+        };
         let seen = if adds.is_empty() {
             let kept = counts(v.lines());
             let removed = informed_removals(prev, v);
@@ -536,12 +555,25 @@ pub fn anchor_seal(base: &str, first_old: &str, versions: &[&str], later: &str) 
             // A seal with no distinctive line is undecidable: not seen,
             // which keeps its work.
             let before = counts(prev.lines());
-            adds.iter().any(|(_, l)| {
+            let kept_one = adds.iter().any(|(_, l)| {
                 !l.trim().is_empty()
                     && !before.contains_key(l)
                     && !in_base.contains_key(l)
                     && have.contains_key(l)
-            })
+            });
+            kept_one || {
+                let kept = counts(v.lines());
+                let replaced: Vec<&str> = informed_removals(prev, v)
+                    .into_keys()
+                    .filter(|l| !l.trim().is_empty())
+                    .collect();
+                !replaced.is_empty()
+                    && replaced.iter().all(|l| {
+                        held(l)
+                            && have.get(l).copied().unwrap_or(0)
+                                <= kept.get(l).copied().unwrap_or(0)
+                    })
+            }
         };
         if seen {
             anchor = Some(k);
@@ -764,7 +796,7 @@ impl ConvergenceNotice {
             .collect();
         let more = lines.len().saturating_sub(20);
         let message = format!(
-            "{path}: line(s) {label} added by spec '{added_by_spec}' (agent {added_by_agent}) were not in spec '{spec}''s version and were kept: {}{}. If '{spec}' meant to remove them, remove them again and seal: {command}",
+            "{path}: line(s) {label} added by spec '{added_by_spec}' (agent {added_by_agent}) were not in the version of spec '{spec}' and were kept: {}{}. If '{spec}' meant to remove them, remove them again and seal: {command}",
             shown.join(", "),
             if more > 0 { format!(" and {more} more") } else { String::new() },
         );
@@ -1331,6 +1363,46 @@ struct PathEvent<'a> {
     deleted: bool,
 }
 
+/// Per-path data derived from its events, computed on first use and
+/// shared by every spec that sealed the path (survival tier latency).
+struct PathShared<'e> {
+    events: &'e [PathEvent<'e>],
+    /// Each event's sealed version, as line counts.
+    counts: std::cell::OnceCell<Vec<HashMap<&'e str, usize>>>,
+    /// Each event's removed lines per copy ([`informed_removals`] of its
+    /// recorded base and version); `None` without a recorded base.
+    removals: std::cell::OnceCell<Vec<Option<HashMap<&'e str, usize>>>>,
+}
+
+impl<'e> PathShared<'e> {
+    fn new(events: &'e [PathEvent<'e>]) -> Self {
+        Self {
+            events,
+            counts: std::cell::OnceCell::new(),
+            removals: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn counts(&self) -> &Vec<HashMap<&'e str, usize>> {
+        self.counts
+            .get_or_init(|| self.events.iter().map(|e| counts(e.new.lines())).collect())
+    }
+
+    fn removals(&self) -> &Vec<Option<HashMap<&'e str, usize>>> {
+        self.removals.get_or_init(|| {
+            self.events
+                .iter()
+                .map(|e| {
+                    e.old
+                        .as_deref()
+                        .map(|old| informed_removals(old, &e.new))
+                        .filter(|r| !r.is_empty())
+                })
+                .collect()
+        })
+    }
+}
+
 /// Blob text by hash, loaded once per audit. `None`: binary.
 struct Texts<'r> {
     repo: &'r crate::Repository,
@@ -1458,9 +1530,18 @@ fn audit_with(
         cache: HashMap::new(),
     };
 
-    let mut histories: HashMap<String, HashMap<String, chrono::DateTime<chrono::Utc>>> =
-        HashMap::new();
-    let mut specs = Vec::with_capacity(spec_ids.len());
+    // Phase 1, per spec: its seals, own versions, paths and targets.
+    struct Prep {
+        spec_rec: crate::spec::Spec,
+        spec_id: String,
+        seals: Vec<Seal>,
+        own: HashMap<String, OwnVersion>,
+        paths: Vec<String>,
+        targets: HashMap<String, Vec<u8>>,
+        git_ignored: HashSet<String>,
+        at_head: bool,
+    }
+    let mut preps: Vec<Prep> = Vec::with_capacity(spec_ids.len());
     for spec_id in spec_ids {
         let spec_rec = repo.resolve_spec(spec_id)?;
         let resolved = spec_rec.id.clone();
@@ -1471,7 +1552,7 @@ fn audit_with(
         let mut seals = repo.spec_seals(spec_id)?;
         seals.reverse();
         let own = own_versions(&seals);
-        let mut paths: Vec<&String> = own.keys().collect();
+        let mut paths: Vec<String> = own.keys().cloned().collect();
         paths.sort();
 
         let mut git_ignored = HashSet::new();
@@ -1481,19 +1562,38 @@ fn audit_with(
             Against::WorkingTree => false,
         };
         let targets: HashMap<String, Vec<u8>> = match at_head {
-            false => paths
-                .iter()
-                .filter_map(|p| {
-                    std::fs::read(repo.root().join(p.as_str()))
-                        .ok()
-                        .map(|c| ((*p).clone(), c))
-                })
-                .collect(),
+            false => {
+                // Finding 123: an open spec's sealed path that git and writ
+                // both ignore (and HEAD does not hold) is named now, while
+                // its holder can still fix it, whether or not it is on disk.
+                let both: Vec<String> = paths
+                    .iter()
+                    .filter(|p| writ_ignore.is_path_ignored(p))
+                    .cloned()
+                    .collect();
+                if !both.is_empty() {
+                    if let Ok(at) = repo.git_head_blobs(&both) {
+                        git_ignored = repo
+                            .git_ignored(&both)
+                            .into_iter()
+                            .filter(|p| !at.contains_key(p))
+                            .collect();
+                    }
+                }
+                paths
+                    .iter()
+                    .filter_map(|p| {
+                        std::fs::read(repo.root().join(p.as_str()))
+                            .ok()
+                            .map(|c| (p.clone(), c))
+                    })
+                    .collect()
+            }
             true => {
                 let owned: Vec<String> = paths
                     .iter()
-                    .map(|p| (*p).clone())
-                    .filter(|p| !staged.is_some_and(|m| m.contains_key(p)))
+                    .filter(|p| !staged.is_some_and(|m| m.contains_key(*p)))
+                    .cloned()
                     .collect();
                 let mut blobs = repo.git_head_blobs(&owned)?;
                 let absent: Vec<String> = owned
@@ -1511,9 +1611,26 @@ fn audit_with(
                 blobs
             }
         };
+        preps.push(Prep {
+            spec_rec,
+            spec_id: spec_id.clone(),
+            seals,
+            own,
+            paths,
+            targets,
+            git_ignored,
+            at_head,
+        });
+    }
 
-        let mut files = Vec::with_capacity(paths.len());
-        for path in paths {
+    // Phase 2, per path (shared by every spec that sealed it): its events
+    // in store order. Built once per path, not once per spec and path.
+    let mut path_events: HashMap<&str, Vec<PathEvent<'_>>> = HashMap::new();
+    for prep in &preps {
+        for path in &prep.paths {
+            if path_events.contains_key(path.as_str()) {
+                continue;
+            }
             let mut events = Vec::new();
             for &(si, ci) in by_path.get(path.as_str()).map(Vec::as_slice).unwrap_or(&[]) {
                 let seal = &all_seals[si];
@@ -1538,6 +1655,34 @@ fn audit_with(
                     deleted,
                 });
             }
+            path_events.insert(path.as_str(), events);
+        }
+    }
+    // Per path, derived from its events on first use and shared by every
+    // spec: each event's line counts and the lines it removed.
+    let shared: HashMap<&str, PathShared<'_>> = path_events
+        .iter()
+        .map(|(p, ev)| (*p, PathShared::new(ev)))
+        .collect();
+
+    // Phase 3, per spec and path: the audit.
+    let mut histories: HashMap<&str, HashMap<String, chrono::DateTime<chrono::Utc>>> =
+        HashMap::new();
+    let mut specs = Vec::with_capacity(preps.len());
+    for prep in &preps {
+        let Prep {
+            spec_rec,
+            spec_id,
+            seals,
+            own,
+            paths,
+            targets,
+            git_ignored,
+            at_head,
+        } = prep;
+        let mut files = Vec::with_capacity(paths.len());
+        for path in paths {
+            let events = &path_events[path.as_str()];
             let target = targets
                 .get(path)
                 .map(|b| String::from_utf8_lossy(b).into_owned());
@@ -1546,7 +1691,15 @@ fn audit_with(
                 && events
                     .last()
                     .is_some_and(|e| e.deleted && e.seal.timestamp > own_last);
-            if deleted_later || (target.is_none() && git_ignored.contains(path.as_str())) {
+            // Finding 116: when the spec's own last seal of an ignored path
+            // recorded its deletion, that seal retired it: the path is
+            // checked as a sealed deletion, never noted as sealed-but-ignored.
+            let retired = own[path].last_new.is_none();
+            if deleted_later
+                || ((target.is_none() || !*at_head)
+                    && !retired
+                    && git_ignored.contains(path.as_str()))
+            {
                 let status = if deleted_later {
                     FileAuditStatus::DeletedLater
                 } else if writ_ignore.is_path_ignored(path) {
@@ -1572,15 +1725,16 @@ fn audit_with(
                 continue;
             }
             let history = histories
-                .entry(path.clone())
-                .or_insert_with(|| line_history(&events));
+                .entry(path.as_str())
+                .or_insert_with(|| line_history(events));
             files.push(audit_file(
-                &spec_rec,
+                spec_rec,
                 spec_id,
                 path,
-                &seals,
+                seals,
                 &own[path],
-                &events,
+                events,
+                &shared[path.as_str()],
                 history,
                 target.as_deref(),
                 &committed,
@@ -1667,6 +1821,7 @@ fn audit_file(
     own_seals: &[Seal],
     v: &OwnVersion,
     events: &[PathEvent<'_>],
+    shared: &PathShared<'_>,
     history: &HashMap<String, chrono::DateTime<chrono::Utc>>,
     target: Option<&str>,
     committed: &HashSet<String>,
@@ -1817,10 +1972,7 @@ fn audit_file(
     // unless the override recorded another spec's sealed content in their
     // place (captured: yellow).
     // Line counts of each event's sealed version, computed once, on use.
-    let event_counts_cell = std::cell::OnceCell::new();
-    let event_counts = || -> &Vec<HashMap<&str, usize>> {
-        event_counts_cell.get_or_init(|| events.iter().map(|e| counts(e.new.lines())).collect())
-    };
+    let event_counts = || shared.counts();
     // Per event, the lines it replaced in place with text new to the file
     // (finding 105), computed on first use.
     let in_place: Vec<std::cell::OnceCell<HashSet<&str>>> =
@@ -1980,11 +2132,8 @@ fn audit_file(
         .iter()
         .zip(event_counts())
         .enumerate()
-        .filter_map(|(i, (e, have))| {
-            let old = e.old.as_deref()?;
-            let r = informed_removals(old, &e.new);
-            (!r.is_empty()).then_some((i, e.seal, have, r))
-        })
+        .zip(shared.removals())
+        .filter_map(|((i, (e, have)), r)| Some((i, e.seal, have, r.clone()?)))
         .collect();
     for c in candidates {
         let informed = removers.iter_mut().find_map(|(i, seal, new, removed)| {
@@ -2553,7 +2702,7 @@ pub fn findings(
                     CHECK_SURVIVAL,
                     Severity::Yellow,
                     format!(
-                        "override captured another spec's version: spec '{}' seal {} overrode the removal check on {} and recorded spec '{}''s content (seal {}) in place of {} of its own line(s): {}{}. If that was meant, confirm it with `writ finish --accept-removals {}`; else restore the lines and seal",
+                        "override captured another spec's version: spec '{}' seal {} overrode the removal check on {} and recorded the content of spec '{}' (seal {}) in place of {} of its own line(s): {}{}. If that was meant, confirm it with `writ finish --accept-removals {}`; else restore the lines and seal",
                         spec.spec_id,
                         short(&seal),
                         f.path,

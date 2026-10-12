@@ -312,6 +312,7 @@ impl PyRepository {
     /// agent sealed in between. If so, the returned dict includes a
     /// `conflict_warning` field with details.
     #[pyo3(signature = (summary, agent_id=None, agent_type=None, spec_id=None, status="in-progress", paths=None, tests_passed=None, tests_failed=None, linted=false, allow_empty=false))]
+    #[allow(clippy::too_many_arguments)]
     fn seal(
         &self,
         py: Python,
@@ -399,6 +400,7 @@ impl PyRepository {
     ///
     /// Returns a dict with `seal` and optional `conflict_warning`.
     #[pyo3(signature = (summary, agent_id=None, agent_type=None, spec_id=None, status="in-progress", tests_passed=None, tests_failed=None, linted=false, allow_empty=false, expected_head=None))]
+    #[allow(clippy::too_many_arguments)]
     fn seal_with_check(
         &self,
         py: Python,
@@ -414,7 +416,6 @@ impl PyRepository {
         expected_head: Option<String>,
     ) -> PyResult<PyObject> {
         let agent = resolve_py_agent(&self.inner, agent_id, agent_type)?;
-        let agent_id = agent.id.as_str();
         let task_status = parse_task_status(status)?;
         let verification = Verification {
             tests_passed,
@@ -541,6 +542,7 @@ impl PyRepository {
     /// `format` controls the return type: "dict" (default), "json",
     /// "json-compact", or "toon".
     #[pyo3(signature = (spec=None, agent=None, completed=false, include_all=false, file=None, format="dict"))]
+    #[allow(clippy::too_many_arguments)]
     fn diff(
         &self,
         py: Python,
@@ -785,6 +787,7 @@ impl PyRepository {
 
     /// Update a spec's mutable fields.
     #[pyo3(signature = (id, status=None, depends_on=None, file_scope=None, acceptance_criteria=None, design_notes=None, tech_stack=None))]
+    #[allow(clippy::too_many_arguments)]
     fn update_spec(
         &self,
         py: Python,
@@ -1789,11 +1792,57 @@ impl PyRepository {
     ///   survival_last_green: None until the survival tier exists (0.4.1)
     ///   checks_run: list[str]
     ///   findings: list of {check, severity ("red"|"yellow"), message,
-    ///             fix_command, paths}
+    ///             fix_command, needs_human, anyone_may_fix, paths};
+    ///             anyone_may_fix is true when any agent may run the fix
+    ///             (finding 114)
     ///   clean: bool, red: int, yellow: int, elapsed_ms: int
     fn doctor(&self, py: Python) -> PyResult<PyObject> {
         let report = writ_core::doctor::run(&self.inner).map_err(writ_err)?;
         to_pydict(py, &report)
+    }
+
+    /// `writ handoff` (U.3): what happened since `since` (a seal id, a time
+    /// in RFC 3339 or YYYY-MM-DD, or "last-finish"; default the last
+    /// finish). Returns a dict: window, agents, specs [{id, title, seals,
+    /// state, agents, continues?}], merges [{path, specs, resolution,
+    /// detail, commit?}], stale_rewrites, unsealed [{path, agent}], doctor
+    /// {headline, tier, red, yellow, findings}, next_action (doctor's).
+    /// Read only.
+    #[pyo3(signature = (since=None, survival=false))]
+    fn handoff(&self, py: Python, since: Option<&str>, survival: bool) -> PyResult<PyObject> {
+        let h = writ_core::handoff::handoff(
+            &self.inner,
+            since.map(writ_core::handoff::Since::parse),
+            survival,
+        )
+        .map_err(writ_err)?;
+        to_pydict(py, &h)
+    }
+
+    /// `writ handoff` as markdown (the CLI default) or "brief".
+    #[pyo3(signature = (since=None, format="markdown", survival=false))]
+    fn handoff_text(&self, since: Option<&str>, format: &str, survival: bool) -> PyResult<String> {
+        let h = writ_core::handoff::handoff(
+            &self.inner,
+            since.map(writ_core::handoff::Since::parse),
+            survival,
+        )
+        .map_err(writ_err)?;
+        match format {
+            "markdown" => Ok(writ_core::handoff::to_markdown(&h)),
+            "brief" => Ok(writ_core::handoff::to_brief(&h)),
+            other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown format '{other}': use markdown or brief"
+            ))),
+        }
+    }
+
+    /// `writ why <path>` (U.3): {path, history [{seal, spec, agent,
+    /// timestamp, change, added, removed, override, continues?}], merge
+    /// {commit, specs, resolution, detail} or None}. Read only.
+    fn why(&self, py: Python, path: &str) -> PyResult<PyObject> {
+        let w = writ_core::why::why(&self.inner, path).map_err(writ_err)?;
+        to_pydict(py, &w)
     }
 
     /// Return version metadata for this repository. Returns a dict with:

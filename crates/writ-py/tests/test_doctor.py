@@ -22,7 +22,15 @@ CHECK_IDS = {
     "version_skew",
     "left_out",
 }
-FINDING_KEYS = {"check", "severity", "message", "fix_command", "needs_human", "paths"}
+FINDING_KEYS = {
+    "check",
+    "severity",
+    "message",
+    "fix_command",
+    "needs_human",
+    "anyone_may_fix",
+    "paths",
+}
 
 
 def _seal(repo: writ.Repository, summary: str) -> dict:

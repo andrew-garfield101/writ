@@ -364,10 +364,21 @@ fn settings_hook_stale(settings: &serde_json::Value) -> bool {
     if LEGACY_HOOK_EVENTS.iter().any(|e| !commands(e).is_empty()) {
         return true;
     }
-    commands(WRIT_HOOK_EVENT).iter().any(|cmd| {
+    let starts = commands(WRIT_HOOK_EVENT);
+    let ends = commands(WRIT_END_HOOK_EVENT);
+    let start_stale = starts.iter().any(|cmd| {
         let fallback = hook_writ_path(cmd);
         session_start_command(&fallback) != *cmd || fallback_is_gone(&fallback)
-    })
+    });
+    // Sprint 5: a project initialized before the SessionEnd hook existed
+    // (writ 0.4.1 and earlier) has the start hook only; `writ init -y` adds
+    // the end hook, which gives `--stale` its second proof.
+    let end_stale = !starts.is_empty() && ends.is_empty()
+        || ends.iter().any(|cmd| {
+            let fallback = hook_writ_path(cmd);
+            session_end_command(&fallback) != *cmd || fallback_is_gone(&fallback)
+        });
+    start_stale || end_stale
 }
 
 /// Finding 89: an absolute fallback that no longer exists (its install was
@@ -461,6 +472,27 @@ fn session_start_command(fallback: &str) -> String {
     )
 }
 
+/// The SessionEnd hook: records that the host (Claude Code) ended this
+/// session, so `writ spec release --stale` has a proof besides the pid
+/// (see [`session_end`]). Same PATH-first resolution as the start hook
+/// (finding 89); silent, and never fails the session's exit.
+fn session_end_command(fallback: &str) -> String {
+    let quoted = fallback.replace('\'', "'\\''");
+    format!(
+        "{HOOK_FALLBACK_PREFIX}{quoted}{HOOK_FALLBACK_SUFFIX} 2>/dev/null) || W=\"$F\"; \
+         \"$W\" {SESSION_END_SUBCOMMAND} >/dev/null 2>&1 || true"
+    )
+}
+
+/// The hidden CLI subcommand the SessionEnd hook runs.
+pub const SESSION_END_SUBCOMMAND: &str = "session-end";
+
+/// Text every writ SessionEnd hook command contains.
+const WRIT_END_HOOK_MARKER: &str = "\"$W\" session-end";
+
+/// The hook event where writ records a host-reported session end.
+const WRIT_END_HOOK_EVENT: &str = "SessionEnd";
+
 /// The hook event where writ injects context: once, when a session begins.
 ///
 /// Context is never injected per prompt; agents pull scoped context with
@@ -474,7 +506,9 @@ const LEGACY_HOOK_EVENTS: &[&str] = &["UserPromptSubmit"];
 /// True for a hook command writ generated, current or older, including a
 /// hand-edited one that kept either marker (finding 72).
 fn is_writ_hook_command(cmd: &str) -> bool {
-    cmd.contains(WRIT_HOOK_MARKER) || cmd.contains(WRIT_HOOK_BANNER)
+    cmd.contains(WRIT_HOOK_MARKER)
+        || cmd.contains(WRIT_HOOK_BANNER)
+        || cmd.contains(WRIT_END_HOOK_MARKER)
 }
 
 /// First line every writ SessionStart hook prints.
@@ -544,6 +578,22 @@ fn ensure_claude_hook(root: &Path) -> WritResult<Option<String>> {
             }
         ]
     }));
+
+    let end_hooks = hooks_obj
+        .entry(WRIT_END_HOOK_EVENT)
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(arr) = end_hooks.as_array_mut() {
+        remove_writ_hook_entries(arr);
+        arr.push(serde_json::json!({
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": session_end_command(&init_writ_path()),
+                    "timeout": 10
+                }
+            ]
+        }));
+    }
 
     if settings == original {
         return Ok(None);
@@ -618,7 +668,10 @@ fn remove_claude_hook(root: &Path) -> WritResult<Option<String>> {
     };
 
     let mut any_removed = false;
-    for event_name in std::iter::once(&WRIT_HOOK_EVENT).chain(LEGACY_HOOK_EVENTS) {
+    for event_name in [&WRIT_HOOK_EVENT, &WRIT_END_HOOK_EVENT]
+        .into_iter()
+        .chain(LEGACY_HOOK_EVENTS)
+    {
         any_removed |= remove_writ_hooks_from_event(hooks_obj, event_name);
     }
     if !any_removed {
@@ -1400,6 +1453,350 @@ until sealed. NEVER run git commit or writ finish."
     .pipe_template()
 }
 
+/// Host-recorded session ends (sprint 5): the second proof for
+/// `writ spec release --stale` besides the pid.
+///
+/// Claude Code runs the generated SessionEnd hook when a session ends; the
+/// hook runs `writ session-end`, which writes one record for the session
+/// process (the same process a claim records, found the same way) under
+/// `.writ/agents/claudecode/ended/<session key>.json`. A claim whose pid
+/// cannot be judged here (another host, no process table) is proven gone
+/// when such a record matches its host, pid and pid start time. Reading is
+/// read-only: doctor and `--stale` never write a record. A live pid always
+/// wins over a record, and `/clear` or `/resume` (the process continues)
+/// write none.
+pub mod session_end {
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Serialize};
+
+    use crate::agent::session::{self, ProcInfo};
+    use crate::doctor::StaleVerdict;
+    use crate::error::WritResult;
+    use crate::fsutil::atomic_write;
+
+    /// Directory under `.writ` holding the records.
+    pub const DIR: &str = "agents/claudecode/ended";
+
+    /// SessionEnd reasons after which the session process keeps running
+    /// (`/clear`, `/resume` switch conversations in the same process); no
+    /// record is written for them, so the pid proof still applies.
+    const PROCESS_CONTINUES: &[&str] = &["clear", "resume"];
+
+    /// A claim the session held when it ended (informational).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct EndedClaim {
+        pub spec: String,
+        pub agent: String,
+    }
+
+    /// One host-recorded session end.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct SessionEndRecord {
+        /// Host the session ran on.
+        pub host: String,
+        /// The session process (as a claim records it).
+        pub pid: u32,
+        /// Its start time as `ps -o lstart` prints it.
+        pub pid_start: String,
+        /// When writ wrote the record (RFC 3339, UTC).
+        pub ended_at: String,
+        /// The host's reason (Claude Code's `reason`), when given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reason: Option<String>,
+        /// The host's own session id, when given.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub host_session_id: Option<String>,
+        /// Open claims recorded by this session process at its end.
+        #[serde(default)]
+        pub claims: Vec<EndedClaim>,
+    }
+
+    /// Path of the record for a session process.
+    pub fn record_path(writ_dir: &Path, pid: u32, pid_start: &str) -> PathBuf {
+        let key = session::session_key(&ProcInfo {
+            pid,
+            ppid: 0,
+            start: pid_start.to_string(),
+            comm: String::new(),
+        });
+        writ_dir.join(DIR).join(format!("{key}.json"))
+    }
+
+    /// Fields of the hook's stdin JSON writ uses; anything unparseable is
+    /// treated as empty (a record is still written).
+    #[derive(Debug, Default, Deserialize)]
+    struct HookInput {
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        session_id: Option<String>,
+    }
+
+    /// Build the record for `proc` on `host` (pure; see [`record_current`]).
+    /// None when the reason means the process continues.
+    pub fn build_record(
+        writ_dir: &Path,
+        proc: &ProcInfo,
+        host: &str,
+        hook_input: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<SessionEndRecord> {
+        let input: HookInput = serde_json::from_str(hook_input.trim()).unwrap_or_default();
+        if input
+            .reason
+            .as_deref()
+            .is_some_and(|r| PROCESS_CONTINUES.contains(&r))
+        {
+            return None;
+        }
+        let mut claims: Vec<EndedClaim> = open_specs(writ_dir)
+            .into_iter()
+            .filter(|s| {
+                s.claimed_pid == Some(proc.pid)
+                    && s.claimed_pid_start.as_deref() == Some(proc.start.as_str())
+                    && s.claimed_host.as_deref() == Some(host)
+            })
+            .filter_map(|s| s.claimed_by.map(|agent| EndedClaim { spec: s.id, agent }))
+            .collect();
+        claims.sort_by(|a, b| a.spec.cmp(&b.spec));
+        Some(SessionEndRecord {
+            host: host.to_string(),
+            pid: proc.pid,
+            pid_start: proc.start.clone(),
+            ended_at: now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            reason: input.reason.filter(|r| !r.is_empty()),
+            host_session_id: input.session_id.filter(|r| !r.is_empty()),
+            claims,
+        })
+    }
+
+    /// `writ session-end`: record that the host ended this session. Returns
+    /// the record's path, or None when nothing was written (the session
+    /// process or host name cannot be found, or the process continues).
+    pub fn record_current(writ_dir: &Path, hook_input: &str) -> WritResult<Option<PathBuf>> {
+        let (Some(proc), Some(host)) = (session::current_session_process(), session::host_name())
+        else {
+            return Ok(None);
+        };
+        let Some(record) = build_record(writ_dir, &proc, &host, hook_input, chrono::Utc::now())
+        else {
+            return Ok(None);
+        };
+        let path = record_path(writ_dir, record.pid, &record.pid_start);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let json = serde_json::to_string_pretty(&record)
+            .map_err(|e| crate::error::WritError::Other(format!("JSON serialize: {e}")))?;
+        atomic_write(&path, format!("{json}\n").as_bytes())?;
+        Ok(Some(path))
+    }
+
+    /// The record matching a claim's host, pid and pid start, if any.
+    /// Read-only.
+    pub fn record_for(writ_dir: &Path, spec: &crate::spec::Spec) -> Option<SessionEndRecord> {
+        let (Some(pid), Some(start), Some(host)) = (
+            spec.claimed_pid,
+            spec.claimed_pid_start.as_deref(),
+            spec.claimed_host.as_deref(),
+        ) else {
+            return None;
+        };
+        let text = std::fs::read_to_string(record_path(writ_dir, pid, start)).ok()?;
+        let record: SessionEndRecord = serde_json::from_str(&text).ok()?;
+        (record.pid == pid && record.pid_start == start && record.host == host).then_some(record)
+    }
+
+    /// Upgrade an `Unproven` verdict to `Gone` when a matching record shows
+    /// the host ended the holder's session. `Gone` and `Alive` are returned
+    /// unchanged: the pid proof, when it can be judged, decides.
+    pub fn apply(writ_dir: &Path, spec: &crate::spec::Spec, verdict: StaleVerdict) -> StaleVerdict {
+        match verdict {
+            StaleVerdict::Unproven(why) => match record_for(writ_dir, spec) {
+                Some(r) => StaleVerdict::Gone(proof_text(&r)),
+                None => StaleVerdict::Unproven(why),
+            },
+            other => other,
+        }
+    }
+
+    /// The proof sentence for a record.
+    pub fn proof_text(r: &SessionEndRecord) -> String {
+        let reason = r
+            .reason
+            .as_deref()
+            .map(|x| format!(", reason '{x}'"))
+            .unwrap_or_default();
+        format!(
+            "Claude Code ended the holder's session on host '{}' (pid {}, started {}) at {}{reason}, recorded by its SessionEnd hook",
+            r.host, r.pid, r.pid_start, r.ended_at
+        )
+    }
+
+    /// Open specs with a claim, read straight from `.writ/specs` (the hook
+    /// runs without opening a repository; unreadable files are skipped).
+    fn open_specs(writ_dir: &Path) -> Vec<crate::spec::Spec> {
+        let Ok(entries) = std::fs::read_dir(writ_dir.join("specs")) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|t| serde_json::from_str::<crate::spec::Spec>(&t).ok())
+            .filter(|s| s.claimed_by.is_some())
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn proc() -> ProcInfo {
+            ProcInfo {
+                pid: 4242,
+                ppid: 1,
+                start: "Sun Oct 4 13:59:41 2026".into(),
+                comm: "claude".into(),
+            }
+        }
+
+        fn claimed(
+            dir: &Path,
+            id: &str,
+            agent: &str,
+            host: &str,
+            p: &ProcInfo,
+        ) -> crate::spec::Spec {
+            let mut s = crate::spec::Spec::new(id.into(), id.into(), String::new());
+            s.claimed_by = Some(agent.into());
+            s.claimed_pid = Some(p.pid);
+            s.claimed_pid_start = Some(p.start.clone());
+            s.claimed_host = Some(host.into());
+            std::fs::create_dir_all(dir.join("specs")).unwrap();
+            std::fs::write(
+                dir.join("specs").join(format!("{id}.json")),
+                serde_json::to_string(&s).unwrap(),
+            )
+            .unwrap();
+            s
+        }
+
+        fn write(dir: &Path, r: &SessionEndRecord) {
+            let path = record_path(dir, r.pid, &r.pid_start);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, serde_json::to_string(r).unwrap()).unwrap();
+        }
+
+        #[test]
+        fn record_lists_only_this_sessions_claims() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = proc();
+            claimed(dir.path(), "mine", "a", "h", &p);
+            let other = ProcInfo { pid: 7, ..proc() };
+            claimed(dir.path(), "theirs", "b", "h", &other);
+            claimed(dir.path(), "far", "c", "elsewhere", &p);
+            let r = build_record(
+                dir.path(),
+                &p,
+                "h",
+                r#"{"session_id":"s1","reason":"prompt_input_exit","hook_event_name":"SessionEnd"}"#,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+            assert_eq!(
+                r.claims,
+                vec![EndedClaim {
+                    spec: "mine".into(),
+                    agent: "a".into()
+                }]
+            );
+            assert_eq!(r.reason.as_deref(), Some("prompt_input_exit"));
+            assert_eq!(r.host_session_id.as_deref(), Some("s1"));
+        }
+
+        #[test]
+        fn clear_writes_no_record_and_bad_input_still_records() {
+            let dir = tempfile::tempdir().unwrap();
+            assert!(build_record(
+                dir.path(),
+                &proc(),
+                "h",
+                r#"{"reason":"clear"}"#,
+                chrono::Utc::now()
+            )
+            .is_none());
+            for reason in ["clear", "resume"] {
+                let input = format!(r#"{{"reason":"{reason}"}}"#);
+                assert!(
+                    build_record(dir.path(), &proc(), "h", &input, chrono::Utc::now()).is_none()
+                );
+            }
+            let r = build_record(dir.path(), &proc(), "h", "not json", chrono::Utc::now()).unwrap();
+            assert_eq!(r.reason, None);
+            assert!(r.claims.is_empty());
+        }
+
+        #[test]
+        fn unproven_becomes_gone_only_with_a_matching_record() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = proc();
+            let spec = claimed(dir.path(), "far", "c", "other-host", &p);
+            let unproven = || StaleVerdict::Unproven("another host".into());
+            assert_eq!(apply(dir.path(), &spec, unproven()), unproven());
+            let mut r =
+                build_record(dir.path(), &p, "other-host", "{}", chrono::Utc::now()).unwrap();
+            // A record for the same pid on another host does not match.
+            r.host = "third-host".into();
+            write(dir.path(), &r);
+            assert_eq!(apply(dir.path(), &spec, unproven()), unproven());
+            r.host = "other-host".into();
+            write(dir.path(), &r);
+            match apply(dir.path(), &spec, unproven()) {
+                StaleVerdict::Gone(proof) => {
+                    assert!(
+                        proof.contains("SessionEnd hook") && proof.contains("other-host"),
+                        "{proof}"
+                    )
+                }
+                v => panic!("expected Gone, got {v:?}"),
+            }
+        }
+
+        #[test]
+        fn alive_and_gone_are_never_changed_by_a_record() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = proc();
+            let spec = claimed(dir.path(), "x", "a", "h", &p);
+            write(
+                dir.path(),
+                &build_record(dir.path(), &p, "h", "{}", chrono::Utc::now()).unwrap(),
+            );
+            let alive = StaleVerdict::Alive("pid 4242 is running".into());
+            assert_eq!(apply(dir.path(), &spec, alive.clone()), alive);
+            let gone = StaleVerdict::Gone("pid 4242 has exited".into());
+            assert_eq!(apply(dir.path(), &spec, gone.clone()), gone);
+        }
+
+        #[test]
+        fn a_recycled_pid_does_not_match_the_record() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = proc();
+            write(
+                dir.path(),
+                &build_record(dir.path(), &p, "h", "{}", chrono::Utc::now()).unwrap(),
+            );
+            let later = ProcInfo {
+                start: "Mon Oct 5 09:00:00 2026".into(),
+                ..proc()
+            };
+            let spec = claimed(dir.path(), "y", "a", "h", &later);
+            assert!(record_for(dir.path(), &spec).is_none());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1646,7 +2043,10 @@ mod tests {
                 assert!(s.contains(&step), "missing {step:?}");
             }
             assert!(writ_instruction().contains(&step), "settings: {step:?}");
-            assert!(hook.contains(&step.replace('`', "")), "hook: {step:?}");
+            // The hook echoes single-quoted lines: an apostrophe (finding
+            // 114's "other agents' specs") appears as '\''.
+            let echoed = step.replace('`', "").replace('\'', "'\\''");
+            assert!(hook.contains(&echoed), "hook: {step:?}");
         }
         for s in surfaces.iter().chain([&hook]) {
             assert!(!s.contains('@'), "unfilled placeholder:\n{s}");
@@ -2579,7 +2979,7 @@ mod tests {
                 arr.iter()
                     .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
                     .filter_map(|h| h["command"].as_str().map(String::from))
-                    .filter(|c| c.contains(WRIT_HOOK_MARKER))
+                    .filter(|c| is_writ_hook_command(c))
                     .collect()
             })
             .unwrap_or_default()
@@ -2605,7 +3005,14 @@ mod tests {
 
         let parsed = read_settings(dir.path());
         let hooks = parsed["hooks"].as_object().unwrap();
-        assert_eq!(hooks.len(), 1, "only SessionStart: {hooks:?}");
+        assert_eq!(
+            hooks.len(),
+            2,
+            "SessionStart and SessionEnd only: {hooks:?}"
+        );
+        let ends = writ_commands(&parsed, "SessionEnd");
+        assert_eq!(ends.len(), 1, "{hooks:?}");
+        assert!(ends[0].contains("\"$W\" session-end"), "{ends:?}");
         let entries = parsed["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         let inner = &entries[0]["hooks"][0];
@@ -3268,8 +3675,71 @@ mod hook_path_resolution_tests {
         }
     }
 
+    /// Settings holding `cmd` as the start hook and today's end hook for
+    /// the same recorded writ.
     fn settings_with(cmd: &str) -> serde_json::Value {
-        serde_json::json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": cmd}]}]}})
+        let end = session_end_command(&hook_writ_path(cmd));
+        serde_json::json!({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": cmd}]}],
+            "SessionEnd": [{"hooks": [{"type": "command", "command": end}]}]
+        }})
+    }
+
+    #[test]
+    fn start_hook_without_end_hook_is_stale() {
+        // A project initialized by 0.4.1: start hook only.
+        let start = session_start_command("writ");
+        let only_start = serde_json::json!({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": start}]}]
+        }});
+        assert!(settings_hook_stale(&only_start));
+        let gone_end = serde_json::json!({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": start}]}],
+            "SessionEnd": [{"hooks": [{"type": "command",
+                "command": session_end_command("/nonexistent/writ")}]}]
+        }});
+        assert!(settings_hook_stale(&gone_end));
+        assert!(!settings_hook_stale(&settings_with(&start)));
+    }
+
+    #[test]
+    fn end_hook_fallback_round_trips() {
+        for p in ["writ", "/opt/homebrew/bin/writ", "/tmp/it's/writ"] {
+            let cmd = session_end_command(p);
+            assert_eq!(hook_writ_path(&cmd), p);
+            assert!(is_writ_hook_command(&cmd));
+        }
+    }
+
+    /// The end hook runs PATH's writ with the session-end subcommand, prints
+    /// nothing, and exits 0 even when no writ can run.
+    #[cfg(unix)]
+    #[test]
+    fn end_hook_runs_path_writ_silently_and_never_fails() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let log = dir.path().join("args.log");
+        let w = bin.join("writ");
+        fs::write(
+            &w,
+            format!(
+                "#!/bin/sh\necho \"$@\" > '{}'\necho noise\nexit 3\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&w, fs::Permissions::from_mode(0o755)).unwrap();
+        let cmd = session_end_command("/nonexistent/writ");
+        let out = run_hook(&cmd, &format!("{}:/usr/bin:/bin", bin.display()));
+        assert_eq!(out, "");
+        assert_eq!(
+            fs::read_to_string(&log).unwrap().trim(),
+            SESSION_END_SUBCOMMAND
+        );
+        // No writ anywhere: still exit 0, silent.
+        assert_eq!(run_hook(&cmd, "/usr/bin:/bin"), "");
     }
 
     #[test]

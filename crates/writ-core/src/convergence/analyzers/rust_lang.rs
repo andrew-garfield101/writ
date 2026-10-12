@@ -326,8 +326,8 @@ fn strip_visibility(trimmed: &str) -> &str {
             return trimmed[close + 2..].trim_start();
         }
     }
-    if trimmed.starts_with("pub ") {
-        return &trimmed[4..];
+    if let Some(stripped) = trimmed.strip_prefix("pub ") {
+        return stripped;
     }
     trimmed
 }
@@ -336,44 +336,44 @@ fn strip_visibility(trimmed: &str) -> &str {
 fn parse_rust_def_header(trimmed: &str) -> (String, String) {
     let after_vis = strip_visibility(trimmed);
 
-    if after_vis.starts_with("async fn ") {
-        let name = extract_ident(&after_vis[9..]);
+    if let Some(stripped) = after_vis.strip_prefix("async fn ") {
+        let name = extract_ident(stripped);
         return ("function".into(), name);
     }
-    if after_vis.starts_with("const fn ") {
-        let name = extract_ident(&after_vis[9..]);
+    if let Some(stripped) = after_vis.strip_prefix("const fn ") {
+        let name = extract_ident(stripped);
         return ("function".into(), name);
     }
-    if after_vis.starts_with("unsafe fn ") {
-        let name = extract_ident(&after_vis[10..]);
+    if let Some(stripped) = after_vis.strip_prefix("unsafe fn ") {
+        let name = extract_ident(stripped);
         return ("function".into(), name);
     }
-    if after_vis.starts_with("fn ") {
-        let name = extract_ident(&after_vis[3..]);
+    if let Some(stripped) = after_vis.strip_prefix("fn ") {
+        let name = extract_ident(stripped);
         return ("function".into(), name);
     }
-    if after_vis.starts_with("struct ") {
-        let name = extract_ident(&after_vis[7..]);
+    if let Some(stripped) = after_vis.strip_prefix("struct ") {
+        let name = extract_ident(stripped);
         return ("struct".into(), name);
     }
-    if after_vis.starts_with("enum ") {
-        let name = extract_ident(&after_vis[5..]);
+    if let Some(stripped) = after_vis.strip_prefix("enum ") {
+        let name = extract_ident(stripped);
         return ("enum".into(), name);
     }
-    if after_vis.starts_with("trait ") {
-        let name = extract_ident(&after_vis[6..]);
+    if let Some(stripped) = after_vis.strip_prefix("trait ") {
+        let name = extract_ident(stripped);
         return ("trait".into(), name);
     }
-    if after_vis.starts_with("type ") {
-        let name = extract_ident(&after_vis[5..]);
+    if let Some(stripped) = after_vis.strip_prefix("type ") {
+        let name = extract_ident(stripped);
         return ("type_alias".into(), name);
     }
-    if after_vis.starts_with("const ") {
-        let name = extract_ident(&after_vis[6..]);
+    if let Some(stripped) = after_vis.strip_prefix("const ") {
+        let name = extract_ident(stripped);
         return ("const".into(), name);
     }
-    if after_vis.starts_with("static ") {
-        let name = extract_ident(&after_vis[7..]);
+    if let Some(stripped) = after_vis.strip_prefix("static ") {
+        let name = extract_ident(stripped);
         return ("const".into(), name);
     }
     if after_vis.starts_with("impl<") || after_vis.starts_with("impl ") {
@@ -388,12 +388,12 @@ fn parse_rust_def_header(trimmed: &str) -> (String, String) {
         let name = extract_ident(rest);
         return ("impl".into(), name);
     }
-    if after_vis.starts_with("mod ") {
-        let name = extract_ident(&after_vis[4..]);
+    if let Some(stripped) = after_vis.strip_prefix("mod ") {
+        let name = extract_ident(stripped);
         return ("module".into(), name);
     }
-    if after_vis.starts_with("macro_rules! ") {
-        let name = extract_ident(&after_vis[13..]);
+    if let Some(stripped) = after_vis.strip_prefix("macro_rules! ") {
+        let name = extract_ident(stripped);
         return ("macro".into(), name);
     }
     if after_vis.starts_with("extern ") {
@@ -492,12 +492,12 @@ fn find_semicolon_end(lines: &[&str], start: usize) -> usize {
 /// Extract the module path from a `use` statement.
 fn extract_use_module(trimmed: &str) -> String {
     let after_vis = strip_visibility(trimmed);
-    let rest = if after_vis.starts_with("use ") {
-        &after_vis[4..]
-    } else if after_vis.starts_with("extern crate ") {
-        &after_vis[13..]
-    } else if after_vis.starts_with("mod ") {
-        &after_vis[4..]
+    let rest = if let Some(stripped) = after_vis.strip_prefix("use ") {
+        stripped
+    } else if let Some(stripped) = after_vis.strip_prefix("extern crate ") {
+        stripped
+    } else if let Some(stripped) = after_vis.strip_prefix("mod ") {
+        stripped
     } else {
         return String::new();
     };
@@ -514,8 +514,8 @@ fn parse_use_details(line: &str) -> (String, Vec<String>) {
     let trimmed = line.trim();
     let after_vis = strip_visibility(trimmed);
 
-    if after_vis.starts_with("use ") {
-        let rest = after_vis[4..].trim_end_matches(';').trim();
+    if let Some(stripped) = after_vis.strip_prefix("use ") {
+        let rest = stripped.trim_end_matches(';').trim();
         // Check for grouped imports: `use crate::{A, B};`
         if let Some(brace_start) = rest.find('{') {
             let module = rest[..brace_start].trim_end_matches("::").to_string();
@@ -533,8 +533,8 @@ fn parse_use_details(line: &str) -> (String, Vec<String>) {
         let module = rest.split([' ', ';']).next().unwrap_or("").to_string();
         return (module, vec![]);
     }
-    if after_vis.starts_with("extern crate ") {
-        let module = after_vis[13..]
+    if let Some(stripped) = after_vis.strip_prefix("extern crate ") {
+        let module = stripped
             .trim_end_matches(';')
             .split_whitespace()
             .next()

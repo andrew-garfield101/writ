@@ -8,6 +8,11 @@
 #     `writ seal --paths <path>` records the deletion and the note goes away.
 #   112: `writ finish` prints a check mark beside the doctor and survival
 #     lines only when survival is safe; when survival is red it does not.
+#   113 (0.4.2): the note appears on the first `writ doctor --survival` once the
+#     spec is done, before any finish, and finish's output for that file says the same thing.
+#   123 (0.4.2): the note shows while the spec is still open, too.
+#   116 (0.4.2): once a seal records the file's deletion, a later finish and a
+#     later `writ doctor --survival` are both silent on it.
 #
 # Usage: bench/release_checks/survival_notes.sh [WRIT_BIN] [SCRATCH_DIR]
 # Exit 0 when every check passes, 1 on any FAIL, 2 on bad arguments.
@@ -44,6 +49,32 @@ rc=0; w seal -s "retire results/.gitignore" --agent agent-b --spec sb --paths "$
 w doctor --survival > "$D/111.after" 2>&1 || true
 chk "111: writ seal --paths records the deletion and the note goes away" \
   "[ $rc -eq 0 ] && grep -q '^sealed' $D/111.del && ! grep -q '\[info\]' $D/111.after"
+
+# 113: the note before any finish, and finish says the same
+rc_git_project "$D/p113"
+w init -y > /dev/null 2>&1; git add -A; g commit -qm init
+w spec add --id sa --title a --agent agent-a --claim > /dev/null
+mkdir -p out/results; printf '*\n!.gitignore\n' > "$P"
+w seal -s "results dir" --agent agent-a --spec sa --paths "$P" > /dev/null 2>&1
+echo "out/results/" >> .gitignore; git add .gitignore; g commit -qm "ignore results"
+w doctor --survival > "$D/113.open" 2>&1 || true
+chk "123: with the spec still open, doctor --survival already shows the [info] note for the path" \
+  "[ \$(grep -c '\[info\] survival: $P was sealed' $D/113.open) -eq 1 ]"
+w spec done sa --agent agent-a --no-seal > /dev/null 2>&1
+w doctor --survival > "$D/113.first" 2>&1 || true
+chk "113: the first doctor --survival (spec done, no finish yet) shows the [info] note for the path" \
+  "[ \$(grep -c '\[info\] survival: $P was sealed' $D/113.first) -eq 1 ]"
+w finish -y > "$D/113.finish" 2>&1 || true
+chk "113: finish's output for the file says what the note says (names it, both exits)" \
+  "grep -q '$P' $D/113.finish && grep -q 'remove the ignore rule' $D/113.finish && grep -q 'stays as history' $D/113.finish"
+
+# 116: the recorded deletion retires the note for finish too (p111 continued)
+cd "$D/p111"
+w spec done sb --agent agent-b --no-seal > /dev/null 2>&1 || true
+w finish -y > "$D/116.finish" 2>&1 || true
+w doctor --survival > "$D/116.after" 2>&1 || true
+chk "116: after the deletion seal, finish is silent on the path" "! grep -q '$P' $D/116.finish"
+chk "116: and a later doctor --survival is silent on it" "! grep -q '$P' $D/116.after && ! grep -q '\[info\]' $D/116.after"
 
 # 112: red survival (stale whole-file rewrite on a git base, as survival_tier.sh case 3)
 rc_git_project "$D/p112"

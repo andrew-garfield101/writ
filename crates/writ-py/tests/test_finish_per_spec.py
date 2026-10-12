@@ -65,7 +65,7 @@ def test_seal_and_spec_done_on_committed_spec_are_refused(tmp_path):
     (tmp_path / "a.txt").write_text("late\n")
     before = len(repo.log_all())
 
-    with pytest.raises(writ.WritError, match=r'writ spec add "A \(follow-up\)" --claim'):
+    with pytest.raises(writ.WritError, match=r'writ spec add "A \(follow-up\)" --id sa-followup --claim'):
         repo.seal(summary="late", agent_id="a", spec_id="sa", paths=["a.txt"])
     with pytest.raises(writ.WritError, match=commit[:12]):
         repo.spec_done("sa", summary="again", agent_id="a")

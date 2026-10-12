@@ -120,11 +120,10 @@ pub trait LanguageAnalyzer {
     /// preference). For statements and definitions, ordering usually
     /// matters. This informs the pattern registry.
     fn ordering_matters(&self, unit_kind: &UnitKind) -> bool {
-        match unit_kind {
-            UnitKind::Import => false,
-            UnitKind::Comment | UnitKind::Whitespace => false,
-            _ => true,
-        }
+        !matches!(
+            unit_kind,
+            UnitKind::Import | UnitKind::Comment | UnitKind::Whitespace
+        )
     }
 }
 

@@ -98,6 +98,85 @@ pub fn compute_state(repo_root: &Path, index: &Index, rules: &IgnoreRules) -> Wo
     state
 }
 
+/// [`compute_state`] restricted to `paths` (finding 158: a one-path seal
+/// need not walk the tree). Each path is a repo-relative file; the result
+/// is exactly the entries `compute_state` would list for those paths.
+/// Returns `None` when a path is a directory (or not a plain file or
+/// absent), so the caller falls back to the full scan.
+pub fn compute_state_for_paths(
+    repo_root: &Path,
+    index: &Index,
+    rules: &IgnoreRules,
+    paths: &[String],
+) -> Option<WorkingState> {
+    let mut changes = Vec::new();
+    for p in paths {
+        if p.is_empty() || p.ends_with('/') {
+            return None;
+        }
+        let full = repo_root.join(p);
+        // The walk never enters an ignored directory.
+        let mut prefix = String::new();
+        let mut in_ignored_dir = false;
+        let parts: Vec<&str> = p.split('/').collect();
+        for part in &parts[..parts.len() - 1] {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(part);
+            if rules.is_dir_ignored(&prefix) {
+                in_ignored_dir = true;
+                break;
+            }
+        }
+        match std::fs::symlink_metadata(&full) {
+            Ok(m) if m.file_type().is_file() => {
+                if in_ignored_dir || rules.is_file_ignored(p) {
+                    continue;
+                }
+                let bytes = std::fs::read(&full).ok()?;
+                let hash = crate::hash::hash_bytes(&bytes);
+                match index.get_hash(p) {
+                    Some(h) if h == hash => {}
+                    Some(_) => changes.push(FileState {
+                        path: p.clone(),
+                        status: FileStatus::Modified,
+                        hash: Some(hash),
+                    }),
+                    None => changes.push(FileState {
+                        path: p.clone(),
+                        status: FileStatus::New,
+                        hash: Some(hash),
+                    }),
+                }
+            }
+            Ok(_) => return None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // A tracked path gone from disk is a deletion unless ignored;
+                // a directory's tracked children need the full scan.
+                let dir = format!("{p}/");
+                if index.entries.keys().any(|k| k.starts_with(&dir)) {
+                    return None;
+                }
+                if index.get_hash(p).is_some() && !rules.is_path_ignored(p) {
+                    changes.push(FileState {
+                        path: p.clone(),
+                        status: FileStatus::Deleted,
+                        hash: None,
+                    });
+                }
+            }
+            Err(_) => return None,
+        }
+    }
+    changes.sort_by(|a, b| a.path.cmp(&b.path));
+    changes.dedup_by(|a, b| a.path == b.path);
+    Some(WorkingState {
+        changes,
+        tracked_count: index.entries.len(),
+    })
+}
+
 fn scan(
     repo_root: &Path,
     index: &Index,
@@ -189,6 +268,129 @@ fn scan(
     }
 }
 
+/// Stat signature of one file: size, modification time (ns) and inode.
+pub type FileSig = (u64, i128, u64);
+
+/// The pending-state signature of the working tree (finding 153, ruling
+/// 155): every file the state scan would look at (not ignored, not inside
+/// an ignored directory), keyed by repo-relative path, with its stat
+/// signature only. No hashing, no index, no store lock: the Bash hook takes
+/// one before a Bash tool call and one after, and seals exactly the paths
+/// [`changed_paths`] names.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct TreeSignature {
+    pub files: BTreeMap<String, FileSig>,
+    /// When the walk started, ns since the Unix epoch, from the same wall
+    /// clock the file system stamps mtimes with (ruling on attribution by
+    /// write instant: compare a path's mtime with this).
+    #[serde(default)]
+    pub taken_at_ns: i128,
+}
+
+/// One path that differs between two signatures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, serde::Deserialize)]
+pub struct PathChange {
+    pub path: String,
+    /// The path's mtime in the later signature at the file system's full
+    /// resolution (ns since the epoch); None when the path was removed.
+    pub mtime_ns: Option<i128>,
+}
+
+impl TreeSignature {
+    /// The mtime resolution these stamps show: 1 ns when any file carries
+    /// a sub-second part (APFS, ext4), else 1 s (a file system that rounds
+    /// to seconds, or a tree whose every stamp fell on a whole second; the
+    /// caller should then widen its candidates by a second either side).
+    pub fn mtime_resolution_ns(&self) -> i128 {
+        if self.files.values().any(|(_, m, _)| m % 1_000_000_000 != 0) {
+            1
+        } else {
+            1_000_000_000
+        }
+    }
+}
+
+fn now_ns() -> i128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i128)
+}
+
+/// Take the signature of the working tree now.
+pub fn tree_signature(repo_root: &Path, rules: &IgnoreRules) -> TreeSignature {
+    let taken_at_ns = now_ns();
+    let mut files = BTreeMap::new();
+    for entry in WalkDir::new(repo_root)
+        .into_iter()
+        .filter_entry(|e| {
+            if e.depth() == 0 || !e.file_type().is_dir() {
+                return true;
+            }
+            match e.path().strip_prefix(repo_root) {
+                Ok(rel) => !rules.is_dir_ignored(&rel_path_string(rel)),
+                Err(_) => true,
+            }
+        })
+        .filter_map(|e| e.ok())
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let Ok(rel) = entry.path().strip_prefix(repo_root) else {
+            continue;
+        };
+        let rel = rel_path_string(rel);
+        if rules.is_file_ignored(&rel) {
+            continue;
+        }
+        let Ok(m) = entry.metadata() else {
+            continue;
+        };
+        let mtime = m
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos() as i128);
+        #[cfg(unix)]
+        let ino = std::os::unix::fs::MetadataExt::ino(&m);
+        #[cfg(not(unix))]
+        let ino = 0u64;
+        files.insert(rel, (m.len(), mtime, ino));
+    }
+    TreeSignature { files, taken_at_ns }
+}
+
+/// [`changed_paths`] with each path's mtime in `after` (None: removed).
+pub fn changes_between(before: &TreeSignature, after: &TreeSignature) -> Vec<PathChange> {
+    changed_paths(before, after)
+        .into_iter()
+        .map(|path| PathChange {
+            mtime_ns: after.files.get(&path).map(|(_, m, _)| *m),
+            path,
+        })
+        .collect()
+}
+
+/// Paths added, removed or with a different stat signature between two
+/// signatures, sorted.
+pub fn changed_paths(before: &TreeSignature, after: &TreeSignature) -> Vec<String> {
+    let mut out: Vec<String> = after
+        .files
+        .iter()
+        .filter(|(p, sig)| before.files.get(*p) != Some(sig))
+        .map(|(p, _)| p.clone())
+        .collect();
+    out.extend(
+        before
+            .files
+            .keys()
+            .filter(|p| !after.files.contains_key(*p))
+            .cloned(),
+    );
+    out.sort();
+    out
+}
+
 /// Repo-relative path as a `/`-separated string on every platform.
 fn rel_path_string(rel: &Path) -> String {
     rel.components()
@@ -199,6 +401,36 @@ fn rel_path_string(rel: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tree_signature_names_added_changed_and_removed_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        std::fs::write(root.join("b.txt"), "b\n").unwrap();
+        std::fs::create_dir_all(root.join("target")).unwrap();
+        std::fs::write(root.join("target/out"), "x").unwrap();
+        let rules = IgnoreRules::load(root);
+        let before = tree_signature(root, &rules);
+        assert!(
+            !before.files.contains_key("target/out"),
+            "ignored dir is skipped"
+        );
+        std::fs::write(root.join("a.txt"), "a changed\n").unwrap();
+        std::fs::remove_file(root.join("b.txt")).unwrap();
+        std::fs::write(root.join("c.txt"), "c\n").unwrap();
+        let after = tree_signature(root, &rules);
+        assert_eq!(
+            changed_paths(&before, &after),
+            vec!["a.txt".to_string(), "b.txt".into(), "c.txt".into()]
+        );
+        assert!(changed_paths(&after, &after).is_empty());
+        let ch = changes_between(&before, &after);
+        assert_eq!(ch[1].mtime_ns, None, "removed b.txt has no mtime");
+        let a = ch[0].mtime_ns.unwrap();
+        assert!(a > 0 && a <= now_ns());
+        assert!(after.taken_at_ns >= before.taken_at_ns);
+    }
+
     use super::*;
     use crate::ignore::IgnoreRules;
     use crate::index::Index;

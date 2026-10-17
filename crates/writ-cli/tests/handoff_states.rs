@@ -74,6 +74,18 @@ impl Project {
         p.git_ok(&["add", "-A"]);
         p.git_ok(&["commit", "-q", "-m", "init"]);
         p.ok("human", &["init", "-y"]);
+        // Ruling 183: these fixtures build concurrent versions by hand
+        // sealing; the test-fixture switch turns the seal-time
+        // foreign-line check off (writ init never writes it).
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p.root.join(".writ").join("config.toml"))
+                .unwrap();
+            writeln!(f, "\n[seal]\nforeign_line_check = false").unwrap();
+        }
         p.git_ok(&["add", "-A"]);
         p.git_ok(&["commit", "-q", "--no-verify", "-m", "writ init"]);
         p
@@ -497,8 +509,15 @@ fn handoff_lists_unsealed_work_and_whose() {
 #[test]
 fn handoff_next_action_equals_doctor_on_every_state() {
     let check = |p: &Project, since: &str, when: &str| -> String {
+        // Ruling 183: the fixture-wide switch shows as a seal_check_disabled
+        // yellow that is not part of this comparison; lift the key for the
+        // two reads, then put it back for the seals that follow.
+        let cfg = p.path(".writ/config.toml");
+        let orig = fs::read_to_string(&cfg).unwrap();
+        fs::write(&cfg, orig.replace("\n[seal]\nforeign_line_check = false\n", "")).unwrap();
         let h = p.json("human", &["handoff", "--since", since, "--format", "json"]);
         let d = p.json("human", &["doctor", "--format", "json"]);
+        fs::write(&cfg, &orig).unwrap();
         let hn = h["next_action"]
             .as_str()
             .unwrap_or_else(|| panic!("{when}: handoff has no next_action:\n{h:#}"));

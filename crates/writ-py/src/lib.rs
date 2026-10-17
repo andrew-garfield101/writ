@@ -284,7 +284,9 @@ impl PyRepository {
     #[staticmethod]
     fn open(path: &str) -> PyResult<Self> {
         let p = PathBuf::from(path);
-        let inner = writ_core::Repository::open(&p).map_err(writ_err)?;
+        let mut inner = writ_core::Repository::open(&p).map_err(writ_err)?;
+        // Ruling 181/183: the Python surface is agent-facing.
+        inner.enable_survival_checks();
         Ok(PyRepository { inner })
     }
 

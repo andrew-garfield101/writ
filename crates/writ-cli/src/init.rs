@@ -346,6 +346,9 @@ pub fn plan_init(opts: &InitOptions) -> Result<InitPlan, Box<dyn std::error::Err
         workspace: None,
         watch: None,
         doctor: None,
+        hooks: None,
+        seal: None,
+        store: None,
     };
 
     // Summary and confirmation (I.10)

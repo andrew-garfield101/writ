@@ -41,6 +41,14 @@ pub const CHECK_VERSION_SKEW: &str = "version_skew";
 /// (finding 75).
 pub const CHECK_LEFT_OUT: &str = "left_out";
 
+/// Ruling 183: the test-fixture switch `[seal] foreign_line_check = false`
+/// is set (a needs-human yellow; not in [`CHECK_IDS`], which lists the six
+/// fast checks every report runs).
+pub const CHECK_SEAL_CHECK_DISABLED: &str = "seal_check_disabled";
+
+/// The phrase the disabled-check finding and the brief line both carry.
+pub const SEAL_CHECK_DISABLED_PHRASE: &str = "foreign-line check on seal is disabled in config";
+
 /// Every check id, in the order the fast tier runs them.
 pub const CHECK_IDS: [&str; 6] = [
     CHECK_STORE_INTEGRITY,
@@ -332,8 +340,14 @@ impl DoctorReport {
         } else {
             String::new()
         };
+        // Ruling 183: a disabled seal check is never reduced to a count.
+        let disabled = if ids.contains(&CHECK_SEAL_CHECK_DISABLED) {
+            format!("; {SEAL_CHECK_DISABLED_PHRASE}, the finish check still applies")
+        } else {
+            String::new()
+        };
         format!(
-            "fast checks: {} red, {} yellow ({}){act}; run `writ doctor`; {}",
+            "fast checks: {} red, {} yellow ({}){act}{disabled}; run `writ doctor`; {}",
             self.red,
             self.yellow,
             ids.join(", "),
@@ -564,6 +578,8 @@ pub fn run(repo: &Repository) -> WritResult<DoctorReport> {
     done(CHECK_LEFT_OUT, &mut checks_run, &mut lap);
 
     mark_live_claims(repo.writ_dir(), &mut findings, &specs, &ctx, &actor);
+    // Finding 169: ambiguous Bash writes are for their candidates only.
+    crate::auto_seal::address_ambiguous(repo.writ_dir(), &mut findings);
 
     let mut report = DoctorReport::from_findings(findings, checks_run, started);
     report.check_ms = check_ms;
@@ -1640,6 +1656,19 @@ fn git_head_blobs(root: &Path) -> Option<impl Fn(&str) -> Option<git2::Oid>> {
 
 fn check_version_skew(root: &Path) -> Vec<DoctorFinding> {
     let mut out = Vec::new();
+    // Ruling 183: the fixture switch is never quiet in a real repository.
+    if !crate::repo::foreign_line_check_configured(&root.join(".writ")) {
+        let mut f = DoctorFinding::new(
+            CHECK_SEAL_CHECK_DISABLED,
+            Severity::Yellow,
+            "foreign-line check on seal is disabled in config; the finish check still applies (spec done's survival check is off too; a person removes `[seal] foreign_line_check` from .writ/config.toml, a test-fixture setting, to turn both back on)",
+            "",
+            vec![".writ/config.toml".to_string()],
+        );
+        f.needs_human = true;
+        f.anyone_may_fix = false;
+        out.push(f);
+    }
     let stale = crate::hooks::stale_managed_text(root);
     if !stale.is_empty() {
         out.push(DoctorFinding::new(
@@ -1952,12 +1981,16 @@ pub fn cached_store_check(writ_dir: &Path) -> WritResult<crate::gc::StoreCheck> 
         cache.seals.extend(new_ids);
         // Advisory: a failed write only costs the next run a rescan.
         if let Ok(bytes) = serde_json::to_vec(&cache) {
-            let _ = crate::fsutil::atomic_write(&cache_path, &bytes);
+            let _ = crate::fsutil::write_advisory(&cache_path, &bytes);
         }
     }
 
     // Roots that change in place: scanned every run.
     let mut fresh = crate::gc::LiveObjects::new(writ_dir);
+    // Finding 158: a spec's genesis tree is almost always a seal's tree the
+    // cache already expanded (entries in `cache.refs`, object stat checked
+    // on load); reading it again every run was most of the fast tier.
+    fresh.assume_expanded(cache.trees.keys().cloned());
     for spec in crate::gc::load_all_specs(writ_dir)? {
         fresh.add_spec(&spec);
     }

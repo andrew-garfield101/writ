@@ -130,6 +130,11 @@ pub struct Seal {
     /// bypassed for every file. Absent when false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub forced: bool,
+    /// Ruling 183: the seal was made while the fixture switch
+    /// `[seal] foreign_line_check = false` turned the foreign-line check
+    /// off. Absent when the check ran (the default).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub foreign_line_check_off: bool,
     /// Paths named with `--allow-removals`: the own-line check was bypassed
     /// for these files only. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -165,6 +170,10 @@ pub struct OverrideContext {
     /// rewrote itself. Both non-empty: a mixed override.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub accepted_lines: Vec<String>,
+    /// Finding 173: written by the auto seal hook for the agent's own fresh
+    /// edit (finding 144); nobody was told, so the line never says so.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub by_hook: bool,
 }
 
 impl OverrideContext {
@@ -178,6 +187,13 @@ impl OverrideContext {
             .and_then(join_names)
             .unwrap_or_default();
         let own = self.own_rewritten();
+        if self.by_hook {
+            return format!(
+                "{agent} rewrote {} own line(s) of {} in its own edit, recorded by writ's auto seal (seal {id12})",
+                self.lines.len(),
+                self.path
+            );
+        }
         match self.resolution() {
             "accepted_after_told" => format!(
                 "{agent} accepted {from}'s version of {} after being told (seal {id12})",
@@ -308,6 +324,7 @@ impl Seal {
             workspace: default_workspace(),
             convergence: None,
             forced: false,
+            foreign_line_check_off: false,
             allow_removals: Vec::new(),
             override_context: Vec::new(),
         };

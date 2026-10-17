@@ -85,7 +85,36 @@ pub const SPEC_ADD: &str = cmd_spec_add!();
 pub const SEAL: &str = cmd_seal!();
 pub const SPEC_DONE: &str = cmd_spec_done!();
 
-/// The required workflow, in order. Each step is one line of markdown.
+/// Sprint 6 (0.4.3): what an agent under Claude Code still needs to know
+/// when its edits are sealed by the hooks. The CLAUDE.md and AGENTS.md
+/// blocks, the SessionStart echo and the settings.json instruction are
+/// these lines and nothing else: no mandatory command, no identity
+/// instruction (subagents get their own identity from the hook, finding
+/// 131). Each is one line of markdown.
+pub fn auto_steps() -> [String; 4] {
+    [
+        r#"This project uses writ. In Claude Code, writ seals the edits it can attribute and asks you with one line about the rest; in other tools, seal with `writ seal -s "<summary>" --paths <files>`. Leave git commits and `writ finish` to the user."#.to_string(),
+        format!("`writ context` shows project state and other agents' work. When a task is done, `{SPEC_DONE}` records your own summary (optional)."),
+        // Aubs, c409 transcripts: a subagent declined the ambiguity fix
+        // because its brief said "run no writ commands"; the template says
+        // the one line is meant to be run.
+        "If writ cannot tell whose change a file is, it asks you with one line; run that command.".to_string(),
+        format!("{DOCTOR_NOTE}."),
+    ]
+}
+
+/// [`auto_steps`] as markdown lines.
+pub fn auto_markdown() -> String {
+    auto_steps().iter().map(|s| format!("{s}\n")).collect()
+}
+
+/// [`auto_steps`] as plain text for a shell `echo` (backticks dropped).
+pub fn auto_plain() -> Vec<String> {
+    auto_steps().iter().map(|s| s.replace('`', "")).collect()
+}
+
+/// The hand-run workflow, in order, for hosts with no auto seal hook
+/// (`.writ/AGENT_INSTRUCTIONS.md`). Each step is one line of markdown.
 pub fn workflow_steps() -> [String; 5] {
     [
         "BEFORE starting any work, run `writ context` to check project state".to_string(),
@@ -120,6 +149,31 @@ pub const CLAIM_NOTE: &str = "`--claim` on `writ spec add` makes the spec yours;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_steps_are_zero_instruction() {
+        let all = auto_markdown();
+        assert_eq!(all.lines().count(), 4);
+        assert!(all.contains("it asks you with one line; run that command"));
+        assert!(!all.contains("nothing to run"));
+        for w in [
+            "MANDATORY",
+            "MUST",
+            "EVERY TASK",
+            "NOT complete",
+            "BEFORE",
+            "FIRST ACTION",
+            "WRIT_AGENT_ID",
+        ] {
+            assert!(!all.contains(w), "{w}: {all}");
+        }
+        // Finding 146: the one seal command, scoped to tools without the hook.
+        assert_eq!(all.matches("writ seal -s").count(), 1);
+        assert!(all.contains("In Claude Code, writ seals the edits it can attribute and asks you with one line about the rest; in other tools, seal with"));
+        assert!(!all.contains("sealed automatically"), "ruling 175: {all}");
+        assert!(all.contains("writ context") && all.contains("writ spec done -s"));
+        assert!(auto_plain().iter().all(|l| !l.contains('`')));
+    }
 
     #[test]
     fn steps_use_the_comma_scope_and_a_done_summary() {

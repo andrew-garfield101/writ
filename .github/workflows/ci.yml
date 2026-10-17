@@ -163,6 +163,34 @@ jobs:
               sys.exit(1)
           EOF
 
+      # Auto seal hooks without `claude` (sprint 6, 0.4.3). The hook tests in
+      # crates/writ-cli/tests/auto_seal_states.rs run in the writ-cli step above
+      # once un-ignored; they and this step drive the hooks the way Claude Code
+      # does, with no `claude` binary: read the writ hook commands from
+      # .claude/settings.json and run each with `sh -c`, stdin = the live hook
+      # JSON in crates/writ-cli/tests/fixtures/claude_hooks/ fed by hand. The
+      # script's PATH is its own bin dir plus system dirs, so `claude` is never
+      # reachable. Latency is printed, not enforced (debug build, shared
+      # runner); the release budget is checked on the release build before a tag.
+      # A build whose `init -y` installs no PostToolUse hook (before auto seal
+      # lands) is skipped with a visible notice; anything else that fails, fails.
+      - name: Auto seal hooks (stdin fed by hand, no claude)
+        shell: bash
+        run: |
+          W="$GITHUB_WORKSPACE/target/debug/writ"
+          P="$RUNNER_TEMP/writ-hook-probe"
+          rm -rf "$P"; mkdir -p "$P"; cd "$P"
+          unset WRIT_AGENT_ID
+          git init -q -b main
+          git -c user.name=ci -c user.email=ci@localhost commit -q --allow-empty -m base
+          "$W" init -y > init.log 2>&1 || { cat init.log; exit 1; }
+          if ! python3 -c 'import json,sys; h=json.load(open(".claude/settings.json")).get("hooks",{}).get("PostToolUse") or []; sys.exit(0 if any("writ" in x.get("command","") for e in h for x in e.get("hooks",[])) else 1)'; then
+            echo "::notice title=auto seal skipped::this build's init -y installs no PostToolUse hook"
+            exit 0
+          fi
+          cd "$GITHUB_WORKSPACE"
+          LATENCY_BUDGET=0 bench/release_checks/auto_seal.sh "$W" "$RUNNER_TEMP/auto-seal-check"
+
       # Finding 107 (sprint 4): every crate that seals must link writ-core with
       # the bridge feature, or the seal-time check on files whose base came
       # from git (finding 106) silently does not run. Asserted on each crate's

@@ -1,0 +1,8 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000004",
+  "transcript_path": "/home/user/.claude/projects/-repo/00000000-0000-4000-8000-000000000004.jsonl",
+  "cwd": "/repo",
+  "prompt_id": "00000000-0000-4000-8000-000000000003",
+  "hook_event_name": "SessionEnd",
+  "reason": "other"
+}

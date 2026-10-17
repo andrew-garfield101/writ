@@ -54,6 +54,17 @@ const CHECK_LEFT_OUT: &str = "left_out";
 // Hermetic project
 // ---------------------------------------------------------------------------
 
+/// Ruling 183 fixture switch, per test (thread): the test builds two agents'
+/// concurrent versions with plain hand seals, which 181 now refuses.
+const SEAL_CHECK_OFF: &str = "\n[seal]\nforeign_line_check = false\n";
+thread_local! {
+    static CHECK_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn seal_check_off_for_this_test() {
+    CHECK_OFF.with(|c| c.set(true));
+}
+
 struct Project {
     root: PathBuf,
     home: PathBuf,
@@ -99,7 +110,19 @@ impl Project {
         // Commit what init wrote so the baseline repo has nothing left out.
         p.git_ok(&["add", "-A"]);
         p.git_ok(&["commit", "-q", "--no-verify", "-m", "writ init"]);
+        if CHECK_OFF.with(|c| c.get()) {
+            let c = p.read(".writ/config.toml");
+            p.write(".writ/config.toml", &format!("{c}{SEAL_CHECK_OFF}"));
+        }
         p
+    }
+
+    /// Remove the ruling 183 fixture key, if this test set it.
+    fn check_on(&self) {
+        let c = self.read(".writ/config.toml");
+        if c.contains(SEAL_CHECK_OFF) {
+            self.write(".writ/config.toml", &c.replace(SEAL_CHECK_OFF, ""));
+        }
     }
 
     fn path(&self, rel: &str) -> PathBuf {
@@ -143,10 +166,25 @@ impl Project {
     }
 
     fn writ(&self, agent: &str, args: &[&str]) -> Output {
-        self.cmd(self.bin.join("writ").to_str().unwrap(), agent)
+        // Ruling 183: a test that builds concurrent versions by hand seals
+        // turns the 181 seal check off; the doctor and finish it then runs
+        // must see the store with the check back on (no seal_check_disabled
+        // yellow), so the key is lifted for the duration of that one call.
+        let lift = matches!(args.first(), Some(&"doctor") | Some(&"finish"))
+            && self.read(".writ/config.toml").contains(SEAL_CHECK_OFF);
+        if lift {
+            self.check_on();
+        }
+        let out = self
+            .cmd(self.bin.join("writ").to_str().unwrap(), agent)
             .args(args)
             .output()
-            .unwrap()
+            .unwrap();
+        if lift {
+            let c = self.read(".writ/config.toml");
+            self.write(".writ/config.toml", &format!("{c}{SEAL_CHECK_OFF}"));
+        }
+        out
     }
 
     fn ok(&self, agent: &str, args: &[&str]) -> Output {
@@ -1427,6 +1465,7 @@ fn b_sealed_then_a_seals_on_top(tag: &str) -> (Project, String, Output) {
 
 #[test]
 fn variant_b_seal_refusal_names_other_agent_and_both_choices() {
+    seal_check_off_for_this_test();
     let (p, _added, refused) = b_sealed_then_a_seals_on_top("f102-refusal");
     let text = out_text(&refused);
     assert!(
@@ -1456,6 +1495,7 @@ fn variant_b_seal_refusal_names_other_agent_and_both_choices() {
 /// override context: the path, the other agent and the lines.
 #[test]
 fn variant_b_override_after_refusal_records_context() {
+    seal_check_off_for_this_test();
     let (p, _added, refused) = b_sealed_then_a_seals_on_top("f102-context");
     assert!(!refused.status.success(), "{}", out_text(&refused));
     let ov = seal_shared(&p, AGENT_A, "sa", &["--allow-removals", "shared.txt"]);
@@ -1629,6 +1669,7 @@ fn variant_b_pure_override_is_clean_and_safe_to_finish() {
 /// records finish_refused/survival_check.
 #[test]
 fn survival_red_without_override_matches_finish_refusal() {
+    seal_check_off_for_this_test();
     let p = Project::new("surv-nooverride");
     shared_base(&p);
     p.spec("sa", AGENT_A);
@@ -1691,6 +1732,7 @@ fn survival_red_without_override_matches_finish_refusal() {
 /// keeps a's line: it reaches HEAD, and the tier and finish both say green.
 #[test]
 fn survival_green_when_convergence_keeps_the_line_finish_commits_it() {
+    seal_check_off_for_this_test();
     let (p, _added) = shared_with_a_line("f105-green", true);
     p.write("shared.txt", &numbered(&[(30, "B")]));
     p.seal(AGENT_B, "sb", "shared.txt");
@@ -1749,6 +1791,7 @@ fn survival_green_when_convergence_keeps_the_line_finish_commits_it() {
 /// stages nothing, and records finish_refused/survival_check.
 #[test]
 fn survival_red_when_the_merge_drops_a_sealed_line_names_line_and_seal() {
+    seal_check_off_for_this_test();
     let p = Project::new("f105-red");
     shared_base(&p);
     p.spec("sa", AGENT_A);
@@ -2536,6 +2579,7 @@ fn descendant_fixture(tag: &str, informed: bool) -> (Project, String) {
 /// "safe to finish"; finish commits sm's content exactly.
 #[test]
 fn f115_numbered_informed_descendant_merges_to_its_content() {
+    seal_check_off_for_this_test();
     let (p, merged) = descendant_fixture("f115-informed", true);
     let (code, v, _) = doctor_survival(&p, "human");
     assert_eq!(code, Some(0), "informed descendant is not green:\n{v:#}");
@@ -2552,6 +2596,7 @@ fn f115_numbered_informed_descendant_merges_to_its_content() {
 /// HEAD unchanged; no sh line silently dropped.
 #[test]
 fn f115_numbered_stale_rewrite_still_refuses() {
+    seal_check_off_for_this_test();
     let (p, _) = descendant_fixture("f115-stale", false);
     let (code, v, _) = doctor_survival(&p, "human");
     assert_eq!(code, Some(1), "stale rewrite not red:\n{v:#}");
@@ -2612,6 +2657,7 @@ fn real_sprint4_fixture(tag: &str, second: &str) -> Project {
 /// conflict or escalation in the output; survival green after.
 #[test]
 fn f115_informed_descendant_merges_without_conflict() {
+    seal_check_off_for_this_test();
     let p = real_sprint4_fixture("f115-real", F115_AMIS);
     let (code, v, _) = doctor_survival(&p, "human");
     assert_eq!(code, Some(0), "informed descendant is not green:\n{v:#}");
@@ -2646,6 +2692,7 @@ fn f115_informed_descendant_merges_without_conflict() {
 /// HEAD unchanged. Passes on 0.4.1; must keep passing.
 #[test]
 fn f115_real_stale_rewrite_still_conflicts_and_finish_refuses() {
+    seal_check_off_for_this_test();
     let p = real_sprint4_fixture("f115-real-stale", F115_STALE);
     let (code, v, _) = doctor_survival(&p, "human");
     assert_eq!(code, Some(1), "stale rewrite not red:\n{v:#}");
@@ -2789,4 +2836,420 @@ fn harness_fixture_is_hermetic_and_initialized() {
 fn harness_chrono_like_formats_rfc3339() {
     let t = SystemTime::UNIX_EPOCH + Duration::from_secs(1_759_708_800) + Duration::from_micros(42);
     assert_eq!(chrono_like(t), "2025-10-06T00:00:00.000042Z");
+}
+
+// ---------------------------------------------------------------------------
+// Finding 136 (Djo, sprint 6): `doctor --survival` with a warm
+// survival_cache.json and with it removed disagreed on one store (warm "safe
+// to finish"; cold four "override captured" notes on specs committed in
+// 68ee77f). Rule asserted (CC, pending Haris's root cause): on one store the
+// two runs print the same headline, the same survival notes and the same
+// presence or absence of "safe to finish"; a captured-override note on a spec
+// already committed (by `finish --accept-removals` or a plain finish) is
+// history, not a finding: neither tier prints it or offers
+// `writ finish --accept-removals` for it; a note on an uncommitted spec
+// survives a cache write. Synthetic two-spec fixture (the survival_captured
+// shape above); the real seals 1b63da8109cf / c81e76ca3812 are reproduced by
+// Djo's bench/release_checks/doctor_timing.sh on a copy of this repo.
+// Ignored on EXPECTED_IGNORED until it lands.
+// ---------------------------------------------------------------------------
+
+const CACHE: &str = ".writ/survival_cache.json";
+
+/// What must agree between tiers: headline, sorted survival notes, safe.
+fn survival_view(p: &Project) -> (String, Vec<String>, bool, String) {
+    let (_code, v, human) = doctor_survival(p, "human");
+    let headline = v["headline"].as_str().unwrap_or_default().to_string();
+    let mut notes: Vec<String> = v["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|f| f["check"] == CHECK_SURVIVAL)
+        .map(|f| f["message"].as_str().unwrap_or_default().to_string())
+        .collect();
+    notes.sort();
+    let safe = headline.to_lowercase().contains(SAFE) || human.to_lowercase().contains(SAFE);
+    (headline, notes, safe, human)
+}
+
+fn warm_then_cold(p: &Project, when: &str) -> (String, Vec<String>, bool, String) {
+    let warm = survival_view(p);
+    assert!(p.path(CACHE).exists(), "{when}: survival wrote no cache");
+    fs::remove_file(p.path(CACHE)).unwrap();
+    let cold = survival_view(p);
+    assert_eq!(warm.0, cold.0, "{when}: headline warm vs cold");
+    assert_eq!(warm.1, cold.1, "{when}: survival notes warm vs cold");
+    assert_eq!(warm.2, cold.2, "{when}: 'safe to finish' warm vs cold");
+    cold
+}
+
+/// sb seals "line 30 B"; sa seals "line 2 A" on top, then closes with its
+/// override taking sb's version (its own line 2 A gone): a captured override.
+fn captured_override(tag: &str) -> (Project, String) {
+    let p = Project::new(tag);
+    shared_base(&p);
+    p.spec("sa", AGENT_A);
+    p.spec("sb", AGENT_B);
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    p.write("shared.txt", &numbered(&[(2, "A"), (30, "B")]));
+    p.seal(AGENT_A, "sa", "shared.txt");
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    p.ok(
+        AGENT_A,
+        &[
+            "spec",
+            "done",
+            "sa",
+            "--agent",
+            AGENT_A,
+            "-s",
+            "done",
+            "--paths",
+            "shared.txt",
+            "--allow-removals",
+            "shared.txt",
+        ],
+    );
+    let override_seal = newest_seal(&p);
+    p.ok(
+        AGENT_B,
+        &["spec", "done", "sb", "--agent", AGENT_B, "--no-seal"],
+    );
+    (p, override_seal)
+}
+
+/// An unrelated later seal, so the next warm run is incremental (Djo's case:
+/// the cache was written incrementally after the 0.4.2 bump seal).
+fn unrelated_seal(p: &Project, id: &str) {
+    p.spec(id, "agent-charlie");
+    p.write(&format!("{id}.txt"), "charlie\n");
+    p.seal("agent-charlie", id, &format!("{id}.txt"));
+}
+
+#[test]
+fn f136_uncommitted_captured_override_note_survives_cache_and_tiers_agree() {
+    let (p, _ov) = captured_override("f136-open");
+    let first = survival_view(&p);
+    assert!(
+        first
+            .1
+            .iter()
+            .any(|m| m.contains("override captured another spec's version")),
+        "fixture: no captured-override note: {first:?}"
+    );
+    assert!(!first.2, "safe to finish with an open note");
+    unrelated_seal(&p, "sc");
+    let cold = warm_then_cold(&p, "uncommitted override, after an incremental run");
+    assert!(
+        cold.1
+            .iter()
+            .any(|m| m.contains("override captured another spec's version")),
+        "the note on an uncommitted spec was dropped: {cold:?}"
+    );
+    assert!(!cold.2);
+}
+
+#[test]
+fn f136_override_committed_by_accept_removals_is_history_in_both_tiers() {
+    let (p, ov) = captured_override("f136-accepted");
+    let _ = survival_view(&p);
+    let accept = format!("writ finish --accept-removals {}", &ov[..12]);
+    let out = p.cmd("sh", "human").args(["-c", &accept]).output().unwrap();
+    assert!(out.status.success(), "`{accept}`:\n{}", out_text(&out));
+    unrelated_seal(&p, "sc");
+    let cold = warm_then_cold(&p, "accepted and committed override");
+    for m in &cold.1 {
+        assert!(
+            !m.contains("override captured another spec's version"),
+            "committed override reported again: {m}"
+        );
+    }
+    assert!(
+        !cold.3.contains("--accept-removals"),
+        "offers a finish with nothing to finish:\n{}",
+        cold.3
+    );
+    assert!(cold.2, "green store not 'safe to finish': {cold:?}");
+}
+
+#[test]
+fn f136_override_committed_by_plain_finish_is_history_in_both_tiers() {
+    let (p, _ov) = captured_override("f136-plain");
+    let _ = survival_view(&p);
+    let before = p.head();
+    let fin = p.writ("human", &["finish", "-y"]);
+    if !fin.status.success() || p.head() == before {
+        // Finish refused on the yellow: the plain-finish path does not exist
+        // for this state; nothing to assert beyond the accept test.
+        return;
+    }
+    unrelated_seal(&p, "sc");
+    let cold = warm_then_cold(&p, "override committed by a plain finish");
+    for m in &cold.1 {
+        assert!(
+            !m.contains("override captured another spec's version"),
+            "committed override reported again: {m}"
+        );
+    }
+    assert!(!cold.3.contains("--accept-removals"), "{}", cold.3);
+}
+
+#[test]
+fn f136_warm_and_cold_agree_on_a_clean_store() {
+    let (p, _added) = shared_with_a_line("f136-clean", false);
+    p.ok(
+        AGENT_A,
+        &["spec", "done", "sa", "--agent", AGENT_A, "--no-seal"],
+    );
+    let _ = survival_view(&p);
+    unrelated_seal(&p, "sc");
+    let cold = warm_then_cold(&p, "clean store");
+    assert!(cold.1.is_empty(), "{cold:?}");
+    assert!(cold.2, "{cold:?}");
+}
+
+// -- Finding 136, Haris's root cause (fixes A, B, C) -------------------------
+// Warm half: a run with notes advanced last_green, so the next incremental
+// run audited only specs after that bound and a committed spec's standing
+// note fell out (warm green "safe to finish", cold notes). Cold half:
+// captured_from ignored order, reporting a seal as having captured content
+// sealed after it (the four notes on this repo were anachronisms). A: only a
+// foreign seal EARLIER IN STORE ORDER than the overriding seal can be the
+// source; B: a plain finish that commits the spec is acceptance; C: a run
+// with notes does not advance last_green; its headline says "a person
+// decides".
+
+/// Rewrite a seal record's timestamp on disk (clock skew between sealing
+/// processes; store order is unchanged). Integrity of the record is not the
+/// point of the tests that use it: only the survival notes are asserted.
+fn skew_seal_timestamp(p: &Project, seal: &str, ts: &str) {
+    let f = p.path(&format!(".writ/seals/{seal}.json"));
+    let mut v: serde_json::Value = serde_json::from_str(&fs::read_to_string(&f).unwrap()).unwrap();
+    v["timestamp"] = serde_json::json!(ts);
+    fs::write(&f, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+}
+
+fn captured_notes(p: &Project) -> Vec<String> {
+    survival_view(p)
+        .1
+        .into_iter()
+        .filter(|m| m.contains("override captured another spec's version"))
+        .collect()
+}
+
+/// (5) The warm-drop shape: the captured override is committed by a finish,
+/// a survival run happens AFTER the commit (the bound), then one unrelated
+/// seal, then a warm (incremental) run and a cold run. They must agree.
+#[test]
+fn f136_committed_before_the_bound_warm_and_cold_agree() {
+    // Haris's minimal pre-fix sequence: commit at Tc; unrelated seal X (Tx >
+    // Tc); a survival run sets last_green_at = Tx; unrelated seal Y; the warm
+    // run's since = Tx > Tc drops sa; cold still audits it.
+    let (p, _ov) = captured_override("f136-bound");
+    let fin = p.writ("human", &["finish", "-y"]);
+    assert!(fin.status.success(), "fixture finish: {}", out_text(&fin));
+    unrelated_seal(&p, "sc");
+    let _bound = survival_view(&p);
+    unrelated_seal(&p, "sd");
+    let cold = warm_then_cold(&p, "committed before the bound");
+    assert!(
+        !cold
+            .1
+            .iter()
+            .any(|m| m.contains("override captured another spec's version")),
+        "fix B: a plain finish is acceptance: {cold:?}"
+    );
+}
+
+/// (C) A run with notes does not advance last_green; its headline names a
+/// person deciding, never "safe to finish".
+#[test]
+fn f136_run_with_notes_does_not_advance_last_green() {
+    let p = Project::new("f136-c");
+    shared_base(&p);
+    p.spec("s0", AGENT_A);
+    p.write("zero.txt", "zero\n");
+    p.seal(AGENT_A, "s0", "zero.txt");
+    let (_c, v0, _h) = doctor_survival(&p, "human");
+    let green0 = v0["survival_last_green"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(!green0.is_empty(), "fixture: no green bound: {v0:#}");
+    p.spec("sa", AGENT_A);
+    p.spec("sb", AGENT_B);
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    p.write("shared.txt", &numbered(&[(2, "A"), (30, "B")]));
+    p.seal(AGENT_A, "sa", "shared.txt");
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    let ov = seal_shared(&p, AGENT_A, "sa", &["--allow-removals", "shared.txt"]);
+    assert!(ov.status.success(), "{}", out_text(&ov));
+    let (_c, v1, human) = doctor_survival(&p, "human");
+    assert!(
+        v1.to_string().contains("override captured"),
+        "fixture: no note: {v1:#}"
+    );
+    assert_eq!(
+        v1["survival_last_green"].as_str().unwrap_or_default(),
+        green0,
+        "a run with notes advanced last_green"
+    );
+    let head = v1["headline"].as_str().unwrap_or_default();
+    assert!(head.contains("a person decides"), "headline: {head}");
+    assert!(!head.to_lowercase().contains(SAFE) && !human.to_lowercase().contains(SAFE));
+}
+
+/// (6) Anachronism: sa removes its own line under its override, writing a
+/// version no one sealed yet; sb seals that same line LATER. sa captured
+/// nothing: content sealed after the override is never its source.
+#[test]
+fn f136_content_sealed_after_the_override_is_never_reported_captured() {
+    let p = Project::new("f136-anachronism");
+    shared_base(&p);
+    p.spec("sa", AGENT_A);
+    p.spec("sb", AGENT_B);
+    p.write("shared.txt", &numbered(&[(2, "A")]));
+    p.seal(AGENT_A, "sa", "shared.txt");
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    let ov = seal_shared(&p, AGENT_A, "sa", &["--allow-removals", "shared.txt"]);
+    assert!(ov.status.success(), "{}", out_text(&ov));
+    // Later, sb records exactly sa's override content (whole-file match, the
+    // capture signature HEAD's unordered scan finds): first its own version,
+    // then back to sa's under its own override.
+    p.write("shared.txt", &numbered(&[(30, "B"), (35, "B2")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    let back = seal_shared(&p, AGENT_B, "sb", &["--allow-removals", "shared.txt"]);
+    assert!(back.status.success(), "{}", out_text(&back));
+    p.ok(
+        AGENT_A,
+        &["spec", "done", "sa", "--agent", AGENT_A, "--no-seal"],
+    );
+    p.ok(
+        AGENT_B,
+        &["spec", "done", "sb", "--agent", AGENT_B, "--no-seal"],
+    );
+    // sb taking sa's earlier version may be a real capture; sa capturing
+    // sb's later one never is.
+    let notes: Vec<String> = captured_notes(&p)
+        .into_iter()
+        .filter(|m| m.contains("spec 'sa' seal"))
+        .collect();
+    assert!(
+        notes.is_empty(),
+        "anachronistic capture reported: {notes:?}"
+    );
+}
+
+/// (7a) Store order beats wall clock: sb's seal is earlier in store order but
+/// carries a LATER timestamp (clock skew). It is still a valid source: sa's
+/// override that took sb's version is reported as captured.
+#[test]
+fn f136_store_earlier_seal_with_later_timestamp_is_a_valid_source() {
+    let p = Project::new("f136-order-a");
+    shared_base(&p);
+    p.spec("sa", AGENT_A);
+    p.spec("sb", AGENT_B);
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    let b_seal = newest_seal(&p);
+    p.write("shared.txt", &numbered(&[(2, "A"), (30, "B")]));
+    p.seal(AGENT_A, "sa", "shared.txt");
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    let ov = seal_shared(&p, AGENT_A, "sa", &["--allow-removals", "shared.txt"]);
+    assert!(ov.status.success(), "{}", out_text(&ov));
+    skew_seal_timestamp(&p, &b_seal, "2099-01-01T00:00:00.000000Z");
+    let notes = captured_notes(&p);
+    assert_eq!(
+        notes.len(),
+        1,
+        "store-earlier source not reported: {notes:?}"
+    );
+    assert!(notes[0].contains("'sb'"), "{}", notes[0]);
+}
+
+/// (7b) The reverse: sb's seal is LATER in store order but carries an EARLIER
+/// timestamp. It is not a source: nothing captured.
+#[test]
+fn f136_store_later_seal_with_earlier_timestamp_is_not_a_source() {
+    let p = Project::new("f136-order-b");
+    shared_base(&p);
+    p.spec("sa", AGENT_A);
+    p.spec("sb", AGENT_B);
+    p.write("shared.txt", &numbered(&[(2, "A")]));
+    p.seal(AGENT_A, "sa", "shared.txt");
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    let ov = seal_shared(&p, AGENT_A, "sa", &["--allow-removals", "shared.txt"]);
+    assert!(ov.status.success(), "{}", out_text(&ov));
+    p.write("shared.txt", &numbered(&[(30, "B"), (35, "B2")]));
+    p.seal(AGENT_B, "sb", "shared.txt");
+    p.write("shared.txt", &numbered(&[(30, "B")]));
+    let back = seal_shared(&p, AGENT_B, "sb", &["--allow-removals", "shared.txt"]);
+    assert!(back.status.success(), "{}", out_text(&back));
+    let b_seal = newest_seal(&p);
+    skew_seal_timestamp(&p, &b_seal, "2000-01-01T00:00:00.000000Z");
+    let notes: Vec<String> = captured_notes(&p)
+        .into_iter()
+        .filter(|m| m.contains("spec 'sa' seal"))
+        .collect();
+    assert!(
+        notes.is_empty(),
+        "store-later seal reported as source: {notes:?}"
+    );
+}
+
+/// Haris suggested a non-capture yellow (a sealed path git ignores) to pin C
+/// independently of B; on this build that state is an [info] note with a
+/// green "safe to finish" run, so it cannot pin C. What it pins instead: the
+/// 136 rule "same notes in both tiers" for info notes. On 5be41ec6cd07 the
+/// cold run prints "[info] survival: gen.txt was sealed ... git and writ both
+/// ignore it now" and the warm run does not (same headline, both safe to
+/// finish). Either both or neither; Haris picks. C itself is pinned by
+/// f136_run_with_notes_does_not_advance_last_green.
+#[test]
+#[ignore = "finding 136 info-note variant (Haris), warm and cold differ"]
+fn f136_info_note_on_a_committed_spec_survives_the_bound_in_both_tiers() {
+    let p = Project::new("f136-c-ignored");
+    p.spec("sg", AGENT_A);
+    p.write("gen.txt", "generated\n");
+    p.seal(AGENT_A, "sg", "gen.txt");
+    p.ok(
+        AGENT_A,
+        &["spec", "done", "sg", "--agent", AGENT_A, "--no-seal"],
+    );
+    let fin = p.writ("human", &["finish", "-y"]);
+    assert!(fin.status.success(), "fixture finish: {}", out_text(&fin));
+    // git now ignores the sealed path.
+    let gi = p.read(".gitignore");
+    p.write(".gitignore", &format!("{gi}gen.txt\n"));
+    p.git_ok(&["rm", "-q", "--cached", "gen.txt"]);
+    p.git_ok(&["add", ".gitignore"]);
+    p.git_ok(&["commit", "-q", "--no-verify", "-m", "ignore gen.txt"]);
+    unrelated_seal(&p, "sc");
+    let bound = survival_view(&p);
+    assert!(
+        bound.3.contains("gen.txt was sealed"),
+        "fixture: no info note: {}",
+        bound.3
+    );
+    unrelated_seal(&p, "sd");
+    let warm = survival_view(&p);
+    fs::remove_file(p.path(CACHE)).unwrap();
+    let cold = survival_view(&p);
+    assert_eq!(warm.0, cold.0, "headline warm vs cold");
+    let info = |h: &str| -> Vec<String> {
+        h.lines()
+            .filter(|l| l.contains("[info] survival:"))
+            .map(|l| l.trim().to_string())
+            .collect()
+    };
+    assert_eq!(
+        info(&warm.3),
+        info(&cold.3),
+        "warm and cold print different survival info notes\nwarm:\n{}\ncold:\n{}",
+        warm.3,
+        cold.3
+    );
 }

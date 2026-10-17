@@ -22,13 +22,28 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 W="$(rc_bin "${1:-$ROOT/target/release/writ}")"
 echo "binary: $W ($("$W" --version))"
 rc_setup .survival_notes_scratch writ-survival-notes "${2:-}"
-w() { env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$W" "$@"; }
+# Ruling 183 (0.4.3): a hand seal that drops another spec's sealed lines is refused at seal
+# time. This script's fixture builds that divergence on purpose to test what finish, doctor
+# and handoff do with it, so the fixture seals with `[seal] foreign_line_check = false` (the
+# test-fixture setting) and every diagnostic runs with the key removed again: fx_key on|off.
+fx_key() { [ -f .writ/config.toml ] || return 0
+  python3 - "$1" <<'FXPY'
+import re, sys
+p = ".writ/config.toml"; s = open(p).read()
+s = re.sub(r"\n?\[seal\]\nforeign_line_check = false\n", "\n", s)
+if sys.argv[1] == "on":
+    s = s.rstrip("\n") + "\n\n[seal]\nforeign_line_check = false\n"
+open(p, "w").write(s)
+FXPY
+}
+w_raw() { env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$W" "$@"; }
+w() { local a; for a in "$@"; do case "$a" in doctor|finish|handoff|why|context) fx_key off; w_raw "$@"; local rc=$?; fx_key on; return $rc ;; seal|spec|log|show|init|status|diff) break ;; esac; done; w_raw "$@"; }
 g() { git -c user.name=t -c user.email=t@localhost "$@"; }
 P=out/results/.gitignore
 
 # 111
 rc_git_project "$D/p111"
-w init -y > /dev/null 2>&1; git add -A; g commit -qm init
+w init -y > /dev/null 2>&1; fx_key on; git add -A; g commit -qm init
 w spec add --id sa --title a --agent agent-a --claim > /dev/null
 mkdir -p out/results; printf '*\n!.gitignore\n' > "$P"
 w seal -s "results dir" --agent agent-a --spec sa --paths "$P" > /dev/null 2>&1
@@ -52,7 +67,7 @@ chk "111: writ seal --paths records the deletion and the note goes away" \
 
 # 113: the note before any finish, and finish says the same
 rc_git_project "$D/p113"
-w init -y > /dev/null 2>&1; git add -A; g commit -qm init
+w init -y > /dev/null 2>&1; fx_key on; git add -A; g commit -qm init
 w spec add --id sa --title a --agent agent-a --claim > /dev/null
 mkdir -p out/results; printf '*\n!.gitignore\n' > "$P"
 w seal -s "results dir" --agent agent-a --spec sa --paths "$P" > /dev/null 2>&1
@@ -78,7 +93,7 @@ chk "116: and a later doctor --survival is silent on it" "! grep -q '$P' $D/116.
 
 # 112: red survival (stale whole-file rewrite on a git base, as survival_tier.sh case 3)
 rc_git_project "$D/p112"
-w init -y > /dev/null 2>&1; git add -A; g commit -qm init
+w init -y > /dev/null 2>&1; fx_key on; git add -A; g commit -qm init
 python3 -c 'open("shared.txt","w").write("".join(f"line {i}\n" for i in range(40)))'; git add -A; g commit -qm shared
 w spec add --id sa --title a --agent agent-a --claim > /dev/null; w spec add --id sb --title b --agent agent-b --claim > /dev/null
 sed -i.bak 's/^line 2$/line 2 A/' shared.txt; rm -f shared.txt.bak

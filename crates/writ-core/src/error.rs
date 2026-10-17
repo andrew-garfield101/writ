@@ -36,6 +36,22 @@ pub enum WritError {
         /// Full ids of the spec's seals that added the lost lines.
         added_by: Vec<String>,
     },
+    /// Ruling 181 (finding 145 closed): a seal would record the removal of
+    /// lines another open spec sealed. Each entry: (other spec, the agent
+    /// that sealed the lines, the seal that added them, path, line count).
+    ForeignLinesRemoved {
+        losses: Vec<(String, String, Option<String>, String, usize)>,
+    },
+    /// Ruling 181 (2): `spec done` found the closing identity's sealed lines
+    /// missing from the files on disk. Nothing was closed.
+    SpecDoneLinesLost {
+        lost: usize,
+        shown: Vec<String>,
+        ms: u64,
+    },
+    /// Ruling 181 (2): the survival check for `spec done` did not finish
+    /// inside its budget. Nothing was closed.
+    SpecDoneSurvivalNotRun { budget_ms: u64 },
     /// Seal rejected under strict claim enforcement: the spec is claimed by
     /// a different agent.
     SealClaimConflict {
@@ -126,6 +142,36 @@ pub enum WritError {
 const LOST_LINES_SHOWN: usize = 5;
 
 impl WritError {
+    /// Ruling 181: the one-line refusal for [`WritError::ForeignLinesRemoved`].
+    /// The same text for the same state whether a hand seal or the auto
+    /// seal hook was refused (Aubs's condition): the file, the other agent
+    /// by name, its spec and seal, the lines it would remove, and the two
+    /// exits, the pasteable one last after "fix:". None otherwise.
+    pub fn foreign_lines_message(&self) -> Option<String> {
+        let WritError::ForeignLinesRemoved { losses } = self else {
+            return None;
+        };
+        let what: Vec<String> = losses
+            .iter()
+            .map(|(spec, by, seal, path, n)| {
+                let seal = seal
+                    .as_deref()
+                    .map(|s| format!(", seal {}", &s[..s.len().min(12)]))
+                    .unwrap_or_default();
+                format!("{n} line(s) of {path} that agent {by} sealed (spec {spec}{seal})")
+            })
+            .collect();
+        let mut paths: Vec<&str> = losses.iter().map(|l| l.3.as_str()).collect();
+        paths.dedup();
+        let p = paths.join(",");
+        Some(format!(
+            "writ did not seal {p}: it drops {}. Merge their lines back and seal again, \
+             or keep your version and record the removal on purpose; \
+             fix: writ seal --paths {p} --auto --allow-removals {p}",
+            what.join(" and ")
+        ))
+    }
+
     /// Paths of an [`WritError::OwnLinesRemoved`] refusal, in order, deduped.
     pub fn own_lines_paths(&self) -> Vec<String> {
         let WritError::OwnLinesRemoved { losses, .. } = self else {
@@ -255,6 +301,18 @@ impl fmt::Display for WritError {
                 let cmd = format!("writ seal <same arguments> --allow-removals {paths}");
                 f.write_str(&self.own_lines_message(&cmd).unwrap_or_default())
             }
+            WritError::SpecDoneLinesLost { lost, shown, ms } => write!(
+                f,
+                "spec done refused: {lost} of your sealed line(s) are not in the files on disk ({}); merge them back and run spec done again. Nothing was closed. (survival check {ms} ms)",
+                shown.join("; ")
+            ),
+            WritError::SpecDoneSurvivalNotRun { budget_ms } => write!(
+                f,
+                "spec done refused: survival not run (the check did not finish within {budget_ms} ms), so writ cannot say your sealed lines are intact. Nothing was closed. Run `writ doctor --survival`, then spec done again."
+            ),
+            WritError::ForeignLinesRemoved { .. } => f.write_str(
+                &self.foreign_lines_message().unwrap_or_default(),
+            ),
             WritError::SpecAlreadyCommitted {
                 spec_id,
                 title,

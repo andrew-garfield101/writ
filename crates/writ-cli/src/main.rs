@@ -199,8 +199,13 @@ enum Commands {
     /// Create a seal (structured checkpoint) from current changes.
     Seal {
         /// Summary of what changed and why.
-        #[arg(long, short)]
-        summary: String,
+        #[arg(long, short, required_unless_present = "auto")]
+        summary: Option<String>,
+
+        /// Let writ write the summary ("auto: seal <paths>"); needs --paths.
+        /// The fix an auto seal refusal hands the agent (sprint 6).
+        #[arg(long, requires = "paths")]
+        auto: bool,
 
         /// Agent or human identifier. Uses `default_agent` setting if configured,
         /// otherwise defaults to "human" (sets agent_type=human).
@@ -468,6 +473,11 @@ enum Commands {
         #[arg(long = "accept-removals", value_name = "SEAL")]
         accept_removals: Vec<String>,
 
+        /// Also write the full receipt (what each commit's body
+        /// summarizes, as markdown for a PR description) to this file.
+        #[arg(long, value_name = "PATH")]
+        receipt: Option<PathBuf>,
+
         /// Create a proposal instead of committing directly (propose mode).
         #[arg(long)]
         propose: bool,
@@ -713,6 +723,12 @@ enum Commands {
     #[command(name = "session-end", hide = true)]
     SessionEnd,
 
+    /// Run by the generated Claude Code hooks (sprint 6 auto seal): reads the
+    /// hook event as JSON on stdin; always exits 0 (errors go to
+    /// .writ/hooks.log).
+    #[command(name = "hook", hide = true)]
+    Hook,
+
     /// What happened since a point, for the next person or agent: agents,
     /// specs, shared files and how each merge resolved, unsealed work, the
     /// doctor result and the one next action. Read only.
@@ -722,13 +738,21 @@ enum Commands {
         #[arg(long)]
         since: Option<String>,
 
-        /// Output format: "markdown" (default), "brief" or "json".
+        /// Output format: "markdown" (default), "brief", "json", "pr" (the
+        /// full receipt for a PR description) or "receipt" (the commit body
+        /// form). "pr" and "receipt" describe what a finish would commit
+        /// now, or with --commit what a finish committed.
         #[arg(long, default_value = "markdown")]
         format: String,
 
         /// Also run doctor's survival tier (slower; fast tier by default).
         #[arg(long)]
         survival: bool,
+
+        /// The receipt of this finish commit (any git revision), rebuilt
+        /// from its records. Implies --format pr unless "receipt" or "json".
+        #[arg(long, value_name = "REV")]
+        commit: Option<String>,
     },
 
     /// Why a file is the way it is: the specs that sealed it in order, what
@@ -1492,6 +1516,7 @@ fn main() {
         }
         Commands::Seal {
             summary,
+            auto,
             agent,
             spec,
             status,
@@ -1506,28 +1531,90 @@ fn main() {
             allow_removals,
         } => {
             // Finding 98: an explicit --agent is enforced like a detected agent.
-            let explicit_agent = agent.is_some();
-            let agent = resolve_agent(agent.as_deref(), &cwd);
-            with_doctor_notice(
-                &cwd,
-                cmd_seal(
-                    &cwd,
-                    &summary,
-                    &agent,
-                    explicit_agent,
-                    spec,
-                    &status,
-                    paths,
-                    tests_passed,
-                    tests_failed,
-                    linted,
-                    allow_empty,
-                    expected_head,
-                    enforce_scope,
-                    force,
-                    allow_removals,
+            let mut explicit_agent = agent.is_some();
+            let mut agent = resolve_agent(agent.as_deref(), &cwd);
+            // Finding 169: an ambiguous path is sealed only by one of the
+            // identities that could have written it. Finding 168: a
+            // subagent's hand-typed --auto fix resolves to its parent; the
+            // one subagent candidate is used instead.
+            let mut spec = spec;
+            if let (Some(ps), Some(writ_dir)) = (
+                paths.as_deref(),
+                cwd.ancestors()
+                    .map(|d| d.join(".writ"))
+                    .find(|d| d.is_dir()),
+            ) {
+                match writ_core::auto_seal::ambiguous_gate(&writ_dir, &agent, ps, auto) {
+                    Ok(None) => {}
+                    Ok(Some(sub)) => {
+                        eprintln!("note: sealing as your subagent '{sub}', the one candidate for these paths");
+                        agent = sub;
+                        explicit_agent = true;
+                    }
+                    Err(line) => {
+                        eprintln!("{} {line}", "ERROR:".red().bold());
+                        process::exit(1);
+                    }
+                }
+            }
+            // Finding 168: --auto clears the state in every state it is
+            // printed in: no spec, or the auto spec closed.
+            if auto && spec.is_none() {
+                match Repository::open_from_dir(&cwd)
+                    .and_then(|repo| writ_core::auto_seal::spec_for_hand_auto(&repo, &agent))
+                {
+                    Ok(Some(id)) => spec = Some(id),
+                    Ok(None) => {}
+                    Err(e) => {
+                        eprintln!("{} {e}", "ERROR:".red().bold());
+                        process::exit(1);
+                    }
+                }
+            }
+            let sealed_paths = paths.clone();
+            let summary = match (summary, auto) {
+                (Some(s), _) => s,
+                (None, _) => format!(
+                    "{} seal {}",
+                    writ_core::auto_seal::AUTO_PREFIX,
+                    paths.as_deref().unwrap_or_default().join(", ")
                 ),
-            )
+            };
+            let result = cmd_seal(
+                &cwd,
+                &summary,
+                &agent,
+                explicit_agent,
+                spec,
+                &status,
+                paths,
+                tests_passed,
+                tests_failed,
+                linted,
+                allow_empty,
+                expected_head,
+                enforce_scope,
+                force,
+                allow_removals,
+                !auto,
+            );
+            if result.is_ok() {
+                if let (Some(ps), Some(writ_dir)) = (
+                    sealed_paths.as_deref(),
+                    cwd.ancestors()
+                        .map(|d| d.join(".writ"))
+                        .find(|d| d.is_dir()),
+                ) {
+                    writ_core::auto_seal::clear_ambiguous(&writ_dir, ps);
+                }
+            }
+            // Ruling 149 (4): no advisories under --auto (no doctor notice,
+            // no context-token warning); the seal result itself still prints.
+            if auto {
+                result
+            } else {
+                with_doctor_notice(&cwd, result)
+            }
         }
         Commands::Show {
             seal_id,
@@ -1621,6 +1708,7 @@ fn main() {
             no_check,
             force,
             accept_removals,
+            receipt,
         } => {
             if let Err(e) = accept_captured_removals(&cwd, &accept_removals) {
                 eprintln!("{} {e}", "error:".red().bold());
@@ -1650,6 +1738,7 @@ fn main() {
                         strict,
                         no_check,
                         force,
+                        receipt,
                     },
                     &strategy,
                 )
@@ -1909,11 +1998,13 @@ fn main() {
         },
         Commands::McpServe => cmd_mcp_serve(&cwd),
         Commands::SessionEnd => cmd_session_end(&cwd),
+        Commands::Hook => cmd_hook(&cwd),
         Commands::Handoff {
             since,
             format,
             survival,
-        } => cmd_handoff(&cwd, since.as_deref(), &format, survival),
+            commit,
+        } => cmd_handoff(&cwd, since.as_deref(), &format, survival, commit.as_deref()),
         Commands::Why { path, format } => cmd_why(&cwd, &path, &format),
         Commands::McpInstall { desktop } => cmd_mcp_install(&cwd, desktop),
         Commands::Watch {
@@ -1950,6 +2041,11 @@ fn main() {
                     current_command_line()
                 ))
             });
+        // Ruling 181: the foreign-line refusal, with the caller's command.
+        let own_lines = own_lines.or_else(|| {
+            e.downcast_ref::<writ_core::error::WritError>()
+                .and_then(|w| w.foreign_lines_message())
+        });
         match own_lines {
             Some(msg) => eprintln!("{} {msg}", "error:".red().bold()),
             None => eprintln!("{} {e}", "error:".red().bold()),
@@ -2118,8 +2214,10 @@ fn accept_captured_removals(
 /// Return an actionable hint for a given error, or None if no hint is needed.
 fn error_hint(err: &(dyn std::error::Error + 'static)) -> Option<String> {
     // Finding 102: the own-line refusal already names both choices.
-    if let Some(writ_core::error::WritError::OwnLinesRemoved { .. }) =
-        err.downcast_ref::<writ_core::error::WritError>()
+    if let Some(
+        writ_core::error::WritError::OwnLinesRemoved { .. }
+        | writ_core::error::WritError::ForeignLinesRemoved { .. },
+    ) = err.downcast_ref::<writ_core::error::WritError>()
     {
         return None;
     }
@@ -3081,10 +3179,12 @@ fn cmd_seal(
     enforce_scope: bool,
     force: bool,
     allow_removals: Vec<String>,
+    advisories: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let is_agent = detect_agent_from_env().is_some();
 
     let mut repo = Repository::open_from_dir(cwd)?;
+    repo.enable_survival_checks();
     // The flag can only turn enforcement on; `[security] scope_enforcement`
     // in config.toml is honoured when the flag is absent (finding 35).
     if enforce_scope {
@@ -3194,7 +3294,7 @@ fn cmd_seal(
 
     // C.14: Context token check — warn if writ context wasn't run recently.
     // After spec resolution, so a refused seal prints one message only.
-    if is_agent && !check_context_token(cwd) {
+    if advisories && is_agent && !check_context_token(cwd) {
         eprintln!(
             "{} No `writ context` run detected this session.",
             "warning:".yellow().bold()
@@ -3535,7 +3635,22 @@ fn cmd_log(
             }
         }
         "brief" => {
-            for seal in &seals {
+            use writ_core::auto_seal::{collapse, run_summary, LogItem};
+            for item in collapse(&seals) {
+                let seal = match item {
+                    LogItem::One(s) => s,
+                    LogItem::AutoRun(run) => {
+                        println!(
+                            "{}..{} {} {} spec:{}",
+                            &run[0].id[..12],
+                            &run[run.len() - 1].id[..12],
+                            run[0].agent.id,
+                            run_summary(&run),
+                            run[0].spec_id.as_deref().unwrap_or("-")
+                        );
+                        continue;
+                    }
+                };
                 let spec_part = seal
                     .spec_id
                     .as_deref()
@@ -3568,10 +3683,18 @@ fn cmd_log(
                 return Ok(());
             }
 
-            for (i, seal) in seals.iter().enumerate() {
+            use writ_core::auto_seal::{collapse, run_summary, LogItem};
+            for (i, item) in collapse(&seals).into_iter().enumerate() {
                 if i > 0 {
                     println!();
                 }
+                let seal = match item {
+                    LogItem::One(s) => s,
+                    LogItem::AutoRun(run) => {
+                        print_auto_run(&repo, &run, run_summary(&run));
+                        continue;
+                    }
+                };
                 println!("{} {}", "seal".yellow(), seal.id[..12].yellow().bold());
                 println!("  agent:   {}", seal.agent.id.cyan());
                 println!(
@@ -3612,6 +3735,39 @@ fn cmd_log(
     print_diverged_branch_warnings(&repo);
 
     Ok(())
+}
+
+/// Text log block for a run of consecutive auto seals (sprint 6): one
+/// block, one summary line with the count and span; `--format json` keeps
+/// every seal.
+fn print_auto_run(repo: &Repository, run: &[&writ_core::seal::Seal], summary: String) {
+    let (newest, oldest) = (run[0], run[run.len() - 1]);
+    println!(
+        "{} {}..{}",
+        "seals".yellow(),
+        newest.id[..12].yellow().bold(),
+        oldest.id[..12].yellow()
+    );
+    println!("  agent:   {}", newest.agent.id.cyan());
+    println!(
+        "  time:    {}",
+        format!(
+            "{} .. {}",
+            oldest.timestamp.format("%Y-%m-%d %H:%M:%S"),
+            newest.timestamp.format("%H:%M:%S UTC")
+        )
+        .dimmed()
+    );
+    if let Some(ref spec_id) = newest.spec_id {
+        let slug_part = repo
+            .load_spec(spec_id)
+            .ok()
+            .filter(|s| !s.slug.is_empty())
+            .map(|s| format!("  {}", s.slug))
+            .unwrap_or_default();
+        println!("  spec:    {}{}", spec_id.cyan(), slug_part.dimmed());
+    }
+    println!("  summary: {summary}");
 }
 
 fn print_diverged_branch_warnings(repo: &Repository) {
@@ -4892,6 +5048,7 @@ fn cmd_status_watch(
                     strict: false,
                     no_check: false,
                     force: false,
+                    receipt: None,
                 },
                 "single",
             )?;
@@ -4946,6 +5103,7 @@ struct FinishOpts {
     strict: bool,
     no_check: bool,
     force: bool,
+    receipt: Option<PathBuf>,
 }
 
 fn cmd_finish(
@@ -4966,6 +5124,7 @@ fn cmd_finish(
         strict,
         no_check,
         force,
+        receipt,
     } = opts;
 
     let repo = Repository::open_from_dir(cwd)?;
@@ -5264,6 +5423,7 @@ fn cmd_finish(
         strict,
         check: finish::resolve_check(&repo, no_check),
         force,
+        receipt,
     };
     let committable_specs: Vec<Spec> = committable.iter().map(|s| (*s).clone()).collect();
     let made = finish::commit_specs(
@@ -5945,6 +6105,7 @@ fn cmd_finish_accept(
         strict,
         check: finish::resolve_check(&repo, no_check),
         force,
+        receipt: None,
     };
     let plan = repo.finish_plan(&proposal.spec_ids)?;
     print_finish_left_out(repo.root(), &plan, false);
@@ -6097,6 +6258,7 @@ fn cmd_finish_auto(
         strict,
         check: finish::resolve_check(&repo, no_check),
         force,
+        receipt: None,
     };
     let mut total_committed = 0;
 
@@ -6655,8 +6817,9 @@ fn cmd_spec_done(
     use colored::Colorize;
 
     let mut repo = Repository::open_from_dir(cwd)?;
+    repo.enable_survival_checks();
     repo.set_allow_own_line_removal(force);
-    repo.set_allow_removal_paths(allow_removals);
+    repo.set_allow_removal_paths(allow_removals.clone());
 
     // SK.3b: Auto-scope spec ID. If an agent identity is available,
     // use resolve_spec_for_agent to find their claimed spec. Otherwise
@@ -6678,6 +6841,28 @@ fn cmd_spec_done(
                         id
                     }
                     Err(e) => {
+                        // Ruling 157 (3): the agent's one unclaimed open
+                        // spec that it created is claimed by `spec done`,
+                        // the rule its first seal already follows (finding 87).
+                        let created = unclaimed_specs_created_by(&repo, &agent_id)?;
+                        if created.len() == 1 {
+                            repo.spec_claim(&created[0], &agent_id)?;
+                            eprintln!(
+                                "{} claimed spec {} (you created it) to close it",
+                                "note:".cyan().bold(),
+                                created[0]
+                            );
+                            return cmd_spec_done(
+                                cwd,
+                                Some(&created[0]),
+                                summary,
+                                Some(&agent_id),
+                                paths,
+                                no_seal,
+                                force,
+                                allow_removals,
+                            );
+                        }
                         // Finding 124: the agent's spec was committed by a
                         // finish under it. Nothing to close; keep the summary.
                         if let Some(c) = committed_spec_of(&repo, &agent_id, None) {
@@ -6752,6 +6937,13 @@ fn cmd_spec_done(
         },
     };
     let outcome = repo.spec_done(seal_agent, summary, &spec_id, paths.as_deref(), no_seal)?;
+    // Ruling 181 (2): the survival check spec done ran, and its time.
+    if let Some((checked, specs, ms)) = outcome.survival {
+        println!(
+            "  {} {checked} sealed line(s) of your {specs} spec(s) are on disk ({ms} ms)",
+            "survival:".dimmed()
+        );
+    }
     if let Some(ref warning) = outcome.claim_warning {
         println!("{} {}", "warning:".yellow().bold(), warning);
     }
@@ -10125,6 +10317,24 @@ fn remove_mcp_json(cwd: &Path) -> McpRemoval {
     })
 }
 
+/// `writ hook` (hidden; every sprint 6 Claude Code hook). Never fails:
+/// what the agent should read goes to stdout as the hook's JSON, problems
+/// to `.writ/hooks.log`; the exit status is always 0.
+fn cmd_hook(cwd: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let mut input = String::new();
+    if !std::io::stdin().is_terminal() {
+        use std::io::Read;
+        let _ = std::io::stdin()
+            .take(4 * 1024 * 1024)
+            .read_to_string(&mut input);
+    }
+    let outcome = writ_core::auto_seal::run(cwd, &input);
+    if let Some(out) = outcome.stdout {
+        println!("{out}");
+    }
+    Ok(())
+}
+
 /// `writ session-end` (hidden; the SessionEnd hook). Never opens the
 /// repository (no migration, no lock) and never fails the host's exit:
 /// problems go to stderr, which the hook discards.
@@ -10153,16 +10363,38 @@ fn cmd_handoff(
     since: Option<&str>,
     format: &str,
     survival: bool,
+    commit: Option<&str>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use writ_core::handoff;
     let repo = Repository::open_from_dir(cwd)?;
+    // The receipt (0.4.3): one code path with `writ finish`.
+    if commit.is_some() || matches!(format, "pr" | "receipt") {
+        use writ_core::receipt;
+        let receipts = match (commit, since) {
+            (Some(rev), _) => vec![receipt::for_commit(&repo, rev)?],
+            (None, Some(s)) => {
+                let after = handoff::window_after(&repo, Some(handoff::Since::parse(s)))?;
+                receipt::for_window(&repo, after)?
+            }
+            (None, None) => vec![receipt::pending(&repo)?],
+        };
+        match format {
+            "json" => println!("{}", serde_json::to_string_pretty(&receipts)?),
+            "receipt" => println!("{}", receipt::render_all(&receipts, false)),
+            _ => print!("{}", receipt::render_all(&receipts, true)),
+        }
+        return Ok(());
+    }
     let h = handoff::handoff(&repo, since.map(handoff::Since::parse), survival)?;
     match format {
         "json" => println!("{}", serde_json::to_string_pretty(&h)?),
         "brief" => print!("{}", handoff::to_brief(&h)),
         "markdown" | "md" | "human" => print!("{}", handoff::to_markdown(&h)),
         other => {
-            return Err(format!("unknown --format '{other}': use markdown, brief or json").into())
+            return Err(format!(
+                "unknown --format '{other}': use markdown, brief, json, pr or receipt"
+            )
+            .into())
         }
     }
     Ok(())
@@ -10761,6 +10993,8 @@ mod tests {
             release_forced: false,
             genesis_tree: None,
             post_commit_notes: Vec::new(),
+            auto: None,
+            continues: None,
             created_by: None,
         }
     }

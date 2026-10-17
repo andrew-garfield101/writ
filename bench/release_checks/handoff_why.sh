@@ -26,10 +26,25 @@ W="$(rc_bin "${1:-$ROOT/target/release/writ}")"
 echo "binary: $W ($("$W" --version))"
 rc_setup .handoff_why_scratch writ-handoff-why "${2:-}"
 mkdir home
-w() { local who="$1"; shift; env -i HOME="$D/home" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
+# Ruling 183 (0.4.3): a hand seal that drops another spec's sealed lines is refused at seal
+# time. This script's fixture builds that divergence on purpose to test what finish, doctor
+# and handoff do with it, so the fixture seals with `[seal] foreign_line_check = false` (the
+# test-fixture setting) and every diagnostic runs with the key removed again: fx_key on|off.
+fx_key() { [ -f .writ/config.toml ] || return 0
+  python3 - "$1" <<'FXPY'
+import re, sys
+p = ".writ/config.toml"; s = open(p).read()
+s = re.sub(r"\n?\[seal\]\nforeign_line_check = false\n", "\n", s)
+if sys.argv[1] == "on":
+    s = s.rstrip("\n") + "\n\n[seal]\nforeign_line_check = false\n"
+open(p, "w").write(s)
+FXPY
+}
+w_raw() { local who="$1"; shift; env -i HOME="$D/home" PATH=/usr/bin:/bin:/usr/sbin:/sbin \
       WRIT_AGENT_ID="$who" WRIT_EXCLUDES_FILE="$D/home/none" GIT_CONFIG_NOSYSTEM=1 \
       GIT_AUTHOR_NAME=fixture GIT_AUTHOR_EMAIL=fixture@example.invalid \
       GIT_COMMITTER_NAME=fixture GIT_COMMITTER_EMAIL=fixture@example.invalid "$W" "$@" < /dev/null; }
+w() { local a; for a in "$@"; do case "$a" in doctor|finish|handoff|why|context) fx_key off; w_raw "$@"; local rc=$?; fx_key on; return $rc ;; seal|spec|log|show|init|status|diff) break ;; esac; done; w_raw "$@"; }
 numbered() { python3 -c 'import sys; n=int(sys.argv[1]); e=dict(a.split("=",1) for a in sys.argv[2:]); print("".join(f"line {i} {e[str(i)]}\n" if str(i) in e else f"line {i}\n" for i in range(n)), end="")' "$@"; }
 snap() { find .writ/objects .writ/seals .writ/specs -type f -print0 2>/dev/null | sort -z | xargs -0 shasum | shasum; }
 TOLD="alpha accepted bravo's version of shared.txt after being told"
@@ -42,7 +57,7 @@ fixture() {
     printf '# fixture\n' > README.md; printf 'target/\n' > .gitignore
     numbered 40 > shared.txt; numbered 20 > two.txt
     git add -A; git -c user.name=t -c user.email=t@localhost commit -qm fixture
-    w human init -y > /dev/null 2>&1; git add -A; git -c user.name=t -c user.email=t@localhost commit -qm "writ init" --no-verify
+    w human init -y > /dev/null 2>&1; fx_key on; git add -A; git -c user.name=t -c user.email=t@localhost commit -qm "writ init" --no-verify
     SINCE="$(w human log --all --format json --limit 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])')"
     for s in sa:alpha sb:bravo sc:charlie; do
         w "${s#*:}" spec add --id "${s%%:*}" --title "spec ${s%%:*}" > /dev/null

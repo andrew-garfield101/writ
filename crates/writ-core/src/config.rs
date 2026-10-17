@@ -171,6 +171,52 @@ pub struct ProjectConfig {
     /// round-trips the `[doctor]` table instead of dropping it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doctor: Option<crate::doctor::DoctorConfig>,
+
+    /// Claude Code hook settings (sprint 6 auto seal).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hooks: Option<HooksConfig>,
+
+    /// Seal-time checks (ruling 181/183). A test-fixture switch only;
+    /// `writ init` never writes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seal: Option<SealChecksConfig>,
+
+    /// Store durability settings (finding 158).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<StoreConfig>,
+}
+
+/// `[store]` in `.writ/config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct StoreConfig {
+    /// On Apple platforms, flush the drive's write cache on every store
+    /// write (`F_FULLFSYNC`, writ 0.4.2 and earlier). Default false: plain
+    /// `fsync(2)`, which keeps data ordered before each rename (finding
+    /// 158). No effect elsewhere.
+    #[serde(default)]
+    pub full_fsync: bool,
+}
+
+/// `[seal]` in `.writ/config.toml` (ruling 183): a test-fixture switch,
+/// never written by `writ init`. `writ doctor` reports it when off.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SealChecksConfig {
+    /// Ruling 181: a seal refuses to record the removal of another open
+    /// spec's sealed lines without `--allow-removals`, and `spec done`
+    /// refuses while the closer's sealed lines are missing on disk. Default
+    /// true. The finish survival check is unaffected by this key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub foreign_line_check: Option<bool>,
+}
+
+/// `[hooks]` in `.writ/config.toml`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct HooksConfig {
+    /// Longest wait, in milliseconds, for the repository lock in an auto
+    /// seal hook before the path is left pending for the next hook
+    /// (ruling 149, finding 151). Default 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lock_wait_ms: Option<u64>,
 }
 
 /// Project metadata section.
@@ -843,8 +889,21 @@ mod tests {
     }
 
     #[test]
+    fn store_full_fsync_round_trips_and_defaults_off() {
+        let c: ProjectConfig = toml::from_str("[store]\nfull_fsync = true\n").unwrap();
+        assert!(c.store.as_ref().is_some_and(|s| s.full_fsync));
+        let back = toml::to_string(&c).unwrap();
+        assert!(back.contains("full_fsync = true"), "{back}");
+        let none: ProjectConfig = toml::from_str("").unwrap();
+        assert!(none.store.is_none());
+    }
+
+    #[test]
     fn test_project_config_roundtrip_toml() {
         let config = ProjectConfig {
+            hooks: None,
+            seal: None,
+            store: None,
             project: Some(ProjectMeta {
                 name: Some("my-project".into()),
                 initialized: Some(Utc::now()),
@@ -896,6 +955,8 @@ mod tests {
     fn test_project_config_save_and_load() {
         let dir = TempDir::new().unwrap();
         let config = ProjectConfig {
+            hooks: None,
+            seal: None,
             output: Some(OutputConfig {
                 format: Some("json-compact".into()),
             }),
@@ -972,6 +1033,8 @@ cursor = true
     #[test]
     fn test_resolve_cli_wins() {
         let project = ProjectConfig {
+            hooks: None,
+            seal: None,
             output: Some(OutputConfig {
                 format: Some("toon".into()),
             }),
@@ -990,6 +1053,8 @@ cursor = true
     #[test]
     fn test_resolve_project_over_global() {
         let project = ProjectConfig {
+            hooks: None,
+            seal: None,
             output: Some(OutputConfig {
                 format: Some("toon".into()),
             }),
@@ -1045,6 +1110,8 @@ cursor = true
     #[test]
     fn test_project_config_output_format_accessor() {
         let config = ProjectConfig {
+            hooks: None,
+            seal: None,
             output: Some(OutputConfig {
                 format: Some("json-compact".into()),
             }),
@@ -1116,6 +1183,8 @@ cursor = true
     #[test]
     fn test_frameworks_config_only_set_fields_serialized() {
         let config = ProjectConfig {
+            hooks: None,
+            seal: None,
             frameworks: Some(FrameworksConfig {
                 claude: Some(true),
                 codex: None,
@@ -1143,6 +1212,8 @@ cursor = true
     #[test]
     fn test_resolve_full_chain_cli_wins_everything() {
         let project = ProjectConfig {
+            hooks: None,
+            seal: None,
             output: Some(OutputConfig {
                 format: Some("json-compact".into()),
             }),
@@ -1161,6 +1232,8 @@ cursor = true
     #[test]
     fn test_project_config_git_section() {
         let config = ProjectConfig {
+            hooks: None,
+            seal: None,
             git: Some(GitConfig {
                 enabled: true,
                 baseline_ref: Some("abc1234".into()),
@@ -1307,6 +1380,8 @@ commit_mode = "propose"
     fn test_workflow_config_save_and_load() {
         let dir = TempDir::new().unwrap();
         let config = ProjectConfig {
+            hooks: None,
+            seal: None,
             workflow: Some(WorkflowConfig {
                 commit_mode: Some("auto".into()),
                 commit_strategy: Some("grouped".into()),
@@ -1339,6 +1414,8 @@ commit_mode = "propose"
     #[test]
     fn test_resolve_commit_mode_cli_wins() {
         let project = ProjectConfig {
+            hooks: None,
+            seal: None,
             workflow: Some(WorkflowConfig {
                 commit_mode: Some("propose".into()),
                 ..Default::default()
@@ -1361,6 +1438,8 @@ commit_mode = "propose"
     #[test]
     fn test_resolve_commit_mode_project_over_global() {
         let project = ProjectConfig {
+            hooks: None,
+            seal: None,
             workflow: Some(WorkflowConfig {
                 commit_mode: Some("propose".into()),
                 ..Default::default()
@@ -1404,6 +1483,8 @@ commit_mode = "propose"
     #[test]
     fn test_resolve_commit_strategy_cli_wins() {
         let project = ProjectConfig {
+            hooks: None,
+            seal: None,
             workflow: Some(WorkflowConfig {
                 commit_strategy: Some("grouped".into()),
                 ..Default::default()
@@ -1430,6 +1511,8 @@ commit_mode = "propose"
     #[test]
     fn test_resolve_commit_strategy_rejects_invalid() {
         let project = ProjectConfig {
+            hooks: None,
+            seal: None,
             workflow: Some(WorkflowConfig {
                 commit_strategy: Some("chaos".into()),
                 ..Default::default()
@@ -1444,6 +1527,8 @@ commit_mode = "propose"
     #[test]
     fn test_resolve_stale_timeout_project_over_global() {
         let project = ProjectConfig {
+            hooks: None,
+            seal: None,
             workflow: Some(WorkflowConfig {
                 stale_timeout: Some(600),
                 ..Default::default()
@@ -1470,6 +1555,8 @@ commit_mode = "propose"
     #[test]
     fn test_resolve_stale_timeout_zero_from_project() {
         let project = ProjectConfig {
+            hooks: None,
+            seal: None,
             workflow: Some(WorkflowConfig {
                 stale_timeout: Some(0),
                 ..Default::default()
@@ -1521,6 +1608,8 @@ commit_mode = "propose"
     #[test]
     fn test_workspace_root_custom() {
         let config = ProjectConfig {
+            hooks: None,
+            seal: None,
             workspace: Some(WorkspaceSettings {
                 root: Some("agents".into()),
             }),
@@ -1532,6 +1621,8 @@ commit_mode = "propose"
     #[test]
     fn test_workspace_root_none_falls_to_default() {
         let config = ProjectConfig {
+            hooks: None,
+            seal: None,
             workspace: Some(WorkspaceSettings { root: None }),
             ..Default::default()
         };
@@ -1713,6 +1804,8 @@ interval = 15
     #[test]
     fn test_resolve_watch_config_project_over_global() {
         let project = ProjectConfig {
+            hooks: None,
+            seal: None,
             watch: Some(WatchConfig {
                 interval: 10,
                 ..Default::default()
@@ -1757,6 +1850,8 @@ interval = 15
     #[test]
     fn test_resolve_watch_config_rejects_invalid() {
         let project = ProjectConfig {
+            hooks: None,
+            seal: None,
             watch: Some(WatchConfig {
                 interval: 0, // invalid
                 ..Default::default()

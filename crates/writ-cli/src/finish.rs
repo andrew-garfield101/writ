@@ -36,6 +36,9 @@ pub struct CommitOptions {
     /// `--force`: commit even when the survival check finds lost lines
     /// (they are printed, with the seals that added them).
     pub force: bool,
+    /// `--receipt <path>`: also write the full receipt markdown (the PR
+    /// description form, `writ handoff --format pr`) here.
+    pub receipt: Option<PathBuf>,
 }
 
 /// One commit: the specs it closes, its message, and what it stages.
@@ -49,6 +52,9 @@ pub struct Committed {
     pub hash: String,
     pub message: String,
     pub spec_ids: Vec<String>,
+    /// The receipt in this commit's body; None when it could not be built
+    /// (reported on stderr; the commit is made without it).
+    pub receipt: Option<writ_core::receipt::Receipt>,
 }
 
 /// The check command for this project: `[workflow] finish_check` when set
@@ -90,7 +96,10 @@ pub fn commit_specs(
     opts: &CommitOptions,
 ) -> CliResult<Vec<Committed>> {
     let units = plan_units(repo, specs, strategy, single_message)?;
-    survival_gate(repo, specs, opts.force)?;
+    let survival = survival_gate(repo, specs, opts.force)?;
+    // The receipt's range starts after the previous finish, the same for
+    // every commit of this finish.
+    let receipt_after = writ_core::receipt::last_finish(&repo.list_specs()?);
     if opts.strict {
         if let Err(e) = refuse_stale(repo, specs) {
             let ids: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
@@ -147,7 +156,47 @@ pub fn commit_specs(
             }
         }
         let message = with_carried_note(&unit.message, &already);
+        // 0.4.3 receipt: built from records after staging (the content is
+        // the index this commit is made from), before committing.
+        let receipt = match writ_core::receipt::for_finish(
+            repo,
+            &ids,
+            receipt_after,
+            chrono::Utc::now(),
+            survival.clone(),
+        ) {
+            Ok(r) => Some(r),
+            Err(e) => {
+                eprintln!(
+                    "{} the receipt could not be built ({e}); committing without it",
+                    "warning:".yellow().bold()
+                );
+                None
+            }
+        };
+        let message = match &receipt {
+            Some(r) => format!("{message}\n\n{}", writ_core::receipt::render_commit(r)),
+            None => message,
+        };
         let hash = git.commit(&message)?;
+        let receipt = receipt.map(|mut r| {
+            r.commit = Some(hash.clone());
+            let record = writ_core::receipt::ReceiptRecord {
+                commit: hash.clone(),
+                specs: ids.clone(),
+                after: r.after,
+                until: r.until,
+                survival: r.survival.clone(),
+            };
+            if let Err(e) = writ_core::receipt::write_record(repo.writ_dir(), &record) {
+                eprintln!(
+                    "{} could not record the receipt for {} in .writ/receipts: {e}",
+                    "warning:".yellow().bold(),
+                    &hash[..hash.len().min(8)]
+                );
+            }
+            r
+        });
         for (path, _) in &plan.stage {
             let owner = unit
                 .specs
@@ -164,7 +213,11 @@ pub fn commit_specs(
             hash,
             message,
             spec_ids: ids,
+            receipt,
         });
+    }
+    if let Some(path) = &opts.receipt {
+        write_receipt_file(path, &made)?;
     }
     Ok(made)
 }
@@ -175,28 +228,24 @@ pub fn commit_specs(
 /// Lost lines refuse the finish before anything is staged, naming each
 /// line and the seal that added it, and record a `finish_refused` event
 /// (`survival_check`), unless `force`.
-pub fn survival_gate(repo: &Repository, specs: &[Spec], force: bool) -> CliResult<()> {
-    use writ_core::convergence::survival::{audit_finish, describe_lost};
+pub fn survival_gate(
+    repo: &Repository,
+    specs: &[Spec],
+    force: bool,
+) -> CliResult<writ_core::receipt::SurvivalLine> {
+    use writ_core::convergence::survival::{audit_finish_plan, describe_lost};
+    use writ_core::receipt::SurvivalLine;
     let ids: Vec<String> = specs
         .iter()
         .filter(|s| !s.sealed_by.is_empty())
         .map(|s| s.id.clone())
         .collect();
     if ids.is_empty() {
-        return Ok(());
+        return Ok(SurvivalLine::nothing_sealed());
     }
     print_override_context(repo, specs);
-    let plan = repo.finish_plan(&ids)?;
-    let mut staged = std::collections::HashMap::new();
-    for (path, hash) in &plan.stage {
-        let content = match hash {
-            Some(h) => Some(repo.object_content(h)?),
-            None => None,
-        };
-        staged.insert(path.clone(), content);
-    }
     let started = Instant::now();
-    let report = audit_finish(repo, &ids, &staged)?;
+    let report = audit_finish_plan(repo, &ids)?;
     // Findings 113, 116: a sealed file git and writ both ignore is not
     // staged; finish says what `writ doctor --survival` says about it.
     for note in writ_core::convergence::survival::info_notes(&report) {
@@ -214,7 +263,7 @@ pub fn survival_gate(repo: &Repository, specs: &[Spec], force: bool) -> CliResul
             ids.len(),
             started.elapsed().as_millis()
         );
-        return Ok(());
+        return Ok(SurvivalLine::from_report(&report, ids.len(), false));
     }
     let mut lines: Vec<String> = report
         .lost_lines()
@@ -239,7 +288,7 @@ pub fn survival_gate(repo: &Repository, specs: &[Spec], force: bool) -> CliResul
             "warning:".yellow().bold(),
             lines.len()
         );
-        return Ok(());
+        return Ok(SurvivalLine::from_report(&report, ids.len(), true));
     }
     let mut files: Vec<String> = report
         .lost_lines()
@@ -263,6 +312,24 @@ pub fn survival_gate(repo: &Repository, specs: &[Spec], force: bool) -> CliResul
     .into())
 }
 
+/// Write the full receipt markdown of each commit made (`--receipt`).
+fn write_receipt_file(path: &Path, made: &[Committed]) -> CliResult<()> {
+    let receipts: Vec<writ_core::receipt::Receipt> =
+        made.iter().filter_map(|c| c.receipt.clone()).collect();
+    if receipts.is_empty() {
+        println!(
+            "  {} no commit made, no receipt written to {}",
+            "·".dimmed(),
+            path.display()
+        );
+        return Ok(());
+    }
+    std::fs::write(path, writ_core::receipt::render_all(&receipts, true))
+        .map_err(|e| format!("could not write the receipt to {}: {e}", path.display()))?;
+    println!("  {} receipt written to {}", "✓".green(), path.display());
+    Ok(())
+}
+
 /// Finding 102: each removal a committing spec confirmed after the
 /// seal-time refusal, as the record states it.
 fn print_override_context(repo: &Repository, specs: &[Spec]) {
@@ -273,7 +340,8 @@ fn print_override_context(repo: &Repository, specs: &[Spec]) {
             };
             for o in &seal.override_context {
                 // Finding 122: one wording, from the record (seal.rs).
-                let line = o.describe(&seal.agent.id, &seal.id);
+                // Ruling 177: a move says moved.
+                let line = writ_core::convergence::survival::describe_override(repo, &seal, o).1;
                 println!("  {} {line}", "note:".cyan());
             }
         }

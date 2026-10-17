@@ -1,0 +1,9 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000004",
+  "transcript_path": "/home/user/.claude/projects/-repo/00000000-0000-4000-8000-000000000004.jsonl",
+  "cwd": "/repo",
+  "prompt_id": "00000000-0000-4000-8000-000000000002",
+  "permission_mode": "bypassPermissions",
+  "hook_event_name": "UserPromptSubmit",
+  "prompt": "<task-notification>\n<task-id>a9e8d7c6b5a4f3e2d</task-id>\n<tool-use-id>toolu_01FAKE000000000000000006</tool-use-id>\n<output-file>/tmp/writ-scratch/-repo/00000000-0000-4000-8000-000000000004/tasks/a9e8d7c6b5a4f3e2d.output</output-file>\n<status>completed</status>\n<summary>Agent \"Create d.py\" completed</summary>\n</task-notification>"
+}

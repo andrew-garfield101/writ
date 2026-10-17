@@ -120,10 +120,28 @@ if [[ -z "$survival_rc" ]]; then  # 0.4.0-style binary without the tier: phrase 
     safe_hits="$(LC_ALL=C grep -l -i "safe to finish" "$DOCTOR_BIN" 2>/dev/null || true)
 $(grep -rli "safe to finish" crates/writ-py/python 2>/dev/null || true)"
 fi
+# Auto seal (sprint 6, 0.4.3, ruling 149): one identity, 50 sequential edits
+# through the PostToolUse hook `writ init -y` installs, on a clone of this
+# repo, release binary. hook_ms is the hook RETURN time (finding 151): p50 < 150 ms uncontended, max
+# < 500 ms. window_ms (edit to seal) is reported, not budgeted. Then 50
+# identities x 5 edits concurrently on 1,000 files: every edit sealed by the
+# end (a later hook or Stop), hook exit 0, no cross-identity seal. sim.py
+# exits 3 when the build installs no PostToolUse hook (pending, not failed).
+hook_json="$(dirname "$OUT")/test-gate-hook-latency.json"
+hook_rc=0
+python3 "$ROOT/bench/fleet/sim.py" --writ "$DOCTOR_BIN" --clone "$ROOT" --agents 1 --edits 50 \
+    --sequential --budget-p50-ms 150 --budget-max-ms 500 --json "$hook_json" \
+    >"$(dirname "$OUT")/test-gate-hook-latency.txt" 2>&1 || hook_rc=$?
+fleet_json="$(dirname "$OUT")/test-gate-fleet.json"
+fleet_rc=0
+if [[ $hook_rc -ne 3 ]]; then
+    python3 "$ROOT/bench/fleet/sim.py" --writ "$DOCTOR_BIN" --agents 50 --edits 5 --files 1000 \
+        --json "$fleet_json" >"$(dirname "$OUT")/test-gate-fleet.txt" 2>&1 || fleet_rc=$?
+fi
 brief_out="$(dirname "$OUT")/test-gate-brief.txt"
 "$DOCTOR_BIN" context --format brief >"$brief_out" 2>/dev/null || true
 
-python -m pytest crates/writ-py/tests bench/test_verify_check.py -q -p no:cacheprovider -rxXf >"$py_log" 2>&1
+python -m pytest crates/writ-py/tests bench/test_verify_check.py bench/fleet tools/stranger_kit -q -p no:cacheprovider -rxXf >"$py_log" 2>&1
 py_rc=$?
 
 BUILD_RC=$build_rc BUILD_LOG="$build_log" \
@@ -131,7 +149,7 @@ TIMING_LOG="$timing_log" TIMING_RC=$timing_rc TIMING_LOAD="$timing_load" TIMING_
 RUST_LOG="$rust_log" PY_LOG="$py_log" RUST_RC=$rust_rc PY_RC=$py_rc \
 VERIFY_JSON="$verify_json" VERIFY_RC=$verify_rc \
 SURVIVAL_JSON="$survival_json" SURVIVAL_MS="$survival_ms" SURVIVAL_RC="$survival_rc" NEWEST_SEAL="$newest_seal" \
-DOCTOR_JSON="$doctor_json" DOCTOR_RC=$doctor_rc DOCTOR_MS="$doctor_ms" SAFE_HITS="$safe_hits" BRIEF_OUT="$brief_out" \
+HOOK_JSON="$hook_json" HOOK_RC=$hook_rc FLEET_JSON="$fleet_json" FLEET_RC=$fleet_rc DOCTOR_JSON="$doctor_json" DOCTOR_RC=$doctor_rc DOCTOR_MS="$doctor_ms" SAFE_HITS="$safe_hits" BRIEF_OUT="$brief_out" \
 BARE="$bare_ignores" OUT="$OUT" python3 - <<'PY'
 import json, os, re, datetime as dt
 
@@ -159,6 +177,7 @@ timing["seconds"] = float(m[1]) if m else None
 # Every ignored Rust test must be on this list; each names its finding.
 EXPECTED_IGNORED = {
     "ignore::tests::repo_level::test_rejected_scope_violation_seal_leaves_object_count_unchanged",  # 17
+    "f136_info_note_on_a_committed_spec_survives_the_bound_in_both_tiers",  # 136 info variant (Haris)
 }
 # Gate checks waiting on an implementation: reported, not failed, and a
 # problem once they pass (remove the entry then), like EXPECTED_IGNORED.
@@ -284,6 +303,38 @@ if brief_line is None:
         problems.append("brief: no doctor: line in context --format brief")
 elif "brief_doctor_line" in PENDING_GATE_CHECKS:
     problems.append("gate: brief_doctor_line passes now, remove it from PENDING_GATE_CHECKS")
+hook_rc = int(os.environ["HOOK_RC"])
+hook = {"rc": hook_rc}
+try:
+    hook.update(json.load(open(os.environ["HOOK_JSON"])))
+except (OSError, json.JSONDecodeError):
+    pass
+if hook_rc == 3:
+    if "auto_seal_hook_latency" in PENDING_GATE_CHECKS:
+        pending.append("auto_seal_hook_latency")
+    else:
+        problems.append("hook: the release build installs no PostToolUse hook")
+elif hook_rc != 0:
+    problems.append(f"hook: latency over budget or harness error (rc {hook_rc}): "
+                    f"{hook.get('over_budget') or 'see test-gate-hook-latency.txt'}")
+else:
+    if "auto_seal_hook_latency" in PENDING_GATE_CHECKS:
+        problems.append("gate: auto seal hook exists now, remove auto_seal_hook_latency from PENDING_GATE_CHECKS")
+    if hook.get("hook_exit_nonzero") or hook.get("cross") or hook.get("edits_never_sealed"):
+        problems.append(f"hook: exit nonzero {hook.get('hook_exit_nonzero')}, cross {hook.get('cross')}, "
+                        f"never sealed {hook.get('edits_never_sealed')}")
+    try:
+        fleet = json.load(open(os.environ["FLEET_JSON"]))
+    except (OSError, json.JSONDecodeError):
+        fleet = {}
+    hook["fleet_50"] = {k: fleet.get(k) for k in ("hook_ms", "window_ms", "edits", "edits_never_sealed",
+                                                   "hook_exit_nonzero", "cross", "store_ok")}
+    if int(os.environ["FLEET_RC"]) != 0 or not fleet:
+        problems.append(f"fleet: sim.py 50 x 5 failed (rc {os.environ['FLEET_RC']}), see test-gate-fleet.txt")
+    elif fleet.get("edits_never_sealed") or fleet.get("hook_exit_nonzero") or fleet.get("cross") \
+            or not fleet.get("store_ok"):
+        problems.append(f"fleet: 50 x 5 never sealed {fleet.get('edits_never_sealed')}, exit nonzero "
+                        f"{fleet.get('hook_exit_nonzero')}, cross {fleet.get('cross')}, store_ok {fleet.get('store_ok')}")
 doctor["pending"] = pending
 result_failures = re.findall(r"^test (\S+) \.\.\. FAILED", rust, re.M)
 # Finding 27 watch list: tests seen failing once under full-suite load and
@@ -297,7 +348,7 @@ FLAKY_WATCH = {
 result = {
     "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
     "build_rc": int(os.environ["BUILD_RC"]),
-    "rust": r, "python": p, "timing": timing, "verify": verify, "doctor": doctor, "bare_ignores": bare,
+    "rust": r, "python": p, "timing": timing, "verify": verify, "doctor": doctor, "hook_latency": hook, "bare_ignores": bare,
     "rust_failures": result_failures,
     "flaky_watch_hits": sorted(
         t for t in FLAKY_WATCH

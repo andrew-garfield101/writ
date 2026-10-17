@@ -1,0 +1,31 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000004",
+  "transcript_path": "/home/user/.claude/projects/-repo/00000000-0000-4000-8000-000000000004.jsonl",
+  "cwd": "/repo",
+  "prompt_id": "00000000-0000-4000-8000-000000000001",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "NotebookEdit",
+  "tool_input": {
+    "notebook_path": "/repo/src/nb.ipynb",
+    "cell_id": "cell-0",
+    "new_source": "x = 2"
+  },
+  "tool_response": {
+    "new_source": "x = 2",
+    "old_source": "x=1",
+    "cell_type": "code",
+    "language": "python",
+    "edit_mode": "replace",
+    "cell_id": "cell-0",
+    "error": "",
+    "notebook_path": "/repo/src/nb.ipynb",
+    "original_file": "{\"cells\":[{\"cell_type\":\"code\",\"metadata\":{},\"source\":[\"x=1\"],\"outputs\":[],\"execution_count\":null}],\"metadata\":{},\"nbformat\":4,\"nbformat_minor\":5}",
+    "updated_file": "{\n \"cells\": [\n  {\n   \"cell_type\": \"code\",\n   \"metadata\": {},\n   \"source\": \"x = 2\",\n   \"outputs\": [],\n   \"execution_count\": null\n  }\n ],\n \"metadata\": {},\n \"nbformat\": 4,\n \"nbformat_minor\": 5\n}"
+  },
+  "tool_use_id": "toolu_01FAKE000000000000000004",
+  "duration_ms": 2
+}

@@ -6,7 +6,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use fs2::FileExt;
 
@@ -40,17 +40,29 @@ impl RepoLock {
             .truncate(false)
             .open(&lock_path)?;
 
-        let start = Instant::now();
-        let poll_interval = Duration::from_millis(10);
-
-        loop {
-            match file.try_lock_exclusive() {
-                Ok(()) => return Ok(RepoLock { _file: file }),
-                Err(_) if start.elapsed() >= timeout => {
-                    return Err(WritError::LockTimeout);
-                }
-                Err(_) => std::thread::sleep(poll_interval),
+        if file.try_lock_exclusive().is_ok() {
+            return Ok(RepoLock { _file: file });
+        }
+        // Finding 158: wait in the kernel (a blocking flock on a helper
+        // thread), not by polling every 10 ms: fifty polling waiters burnt
+        // most of the machine in system time and the lock went to whoever
+        // polled at the right instant. On timeout the waiter is abandoned;
+        // when it gets the lock later it finds the receiver gone and drops
+        // its descriptor, which releases the lock (the original descriptor
+        // is closed by then: same open file description).
+        let waiter = file.try_clone()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let got = waiter.lock_exclusive().map(|()| waiter);
+            let _ = tx.send(got);
+        });
+        match rx.recv_timeout(timeout) {
+            Ok(Ok(locked)) => {
+                drop(file);
+                Ok(RepoLock { _file: locked })
             }
+            Ok(Err(e)) => Err(WritError::Io(e)),
+            Err(_) => Err(WritError::LockTimeout),
         }
     }
 }
@@ -92,7 +104,7 @@ mod tests {
 
         let _lock = RepoLock::acquire(&dir_path, Duration::from_secs(1)).unwrap();
 
-        let start = Instant::now();
+        let start = std::time::Instant::now();
         let result = RepoLock::acquire(&dir_path, Duration::from_millis(100));
         let elapsed = start.elapsed();
 

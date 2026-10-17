@@ -199,7 +199,7 @@ impl StatCache {
             entries: self.new,
         };
         if let Ok(bytes) = serde_json::to_vec(&file) {
-            let _ = crate::fsutil::atomic_write(&path, &bytes);
+            let _ = crate::fsutil::write_advisory(&path, &bytes);
         }
     }
 }

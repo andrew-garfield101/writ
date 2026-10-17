@@ -148,7 +148,7 @@ chk "config [project] initialized unchanged (finding 82)" "[ -n \"\$(cfg_val con
 # A fake newer writ stands in for an install through another channel.
 hook_cmd="$(python3 -c 'import json; d = json.load(open(".claude/settings.json")); print(next(h["command"] for e in d["hooks"]["SessionStart"] for h in e["hooks"] if "Writ VCS Active" in h["command"]))')"
 mkdir -p other-install
-printf '#!/bin/sh\necho "$*" >> "$(dirname "$0")/args.log"\necho "context-brief from OTHER-INSTALL"\n' > other-install/writ; chmod +x other-install/writ
+printf '#!/bin/sh\necho "$*" >> "$(dirname "$0")/args.log"\ncase "$1" in hook|session-end) ;; *) echo "context-brief from OTHER-INSTALL" ;; esac\n' > other-install/writ; chmod +x other-install/writ
 PATH="$PWD/other-install:/usr/bin:/bin" sh -c "$hook_cmd" > hook.path.out 2>&1 || true
 PATH="/usr/bin:/bin" sh -c "$hook_cmd" > hook.nopath.out 2>&1 || true
 chk "SessionStart hook runs PATH's writ, falls back to the init writ, notes the difference (finding 89)" \
@@ -156,12 +156,16 @@ chk "SessionStart hook runs PATH's writ, falls back to the init writ, notes the 
 # 0.4.2: the SessionEnd hook (session end record for `spec release --stale`).
 end_cmds="$(python3 -c 'import json; d = json.load(open(".claude/settings.json")); print("\n".join(h["command"] for e in d["hooks"].get("SessionEnd", []) for h in e["hooks"]))')"
 chk "SessionEnd: rerun adds exactly one writ hook and keeps the user's own (0.4.2)" \
-  "[ \$(printf '%s\n' \"\$end_cmds\" | grep -c 'session-end') -eq 1 ] && printf '%s\n' \"\$end_cmds\" | grep -q USER-END-HOOK"
-end_hook="$(printf '%s\n' "$end_cmds" | grep 'session-end' | head -1 || true)"
+  "[ \$(printf '%s\n' \"\$end_cmds\" | grep -cE 'session-end|\" hook') -eq 1 ] && printf '%s\n' \"\$end_cmds\" | grep -q USER-END-HOOK"
+end_hook="$(printf '%s\n' "$end_cmds" | grep -E 'session-end|" hook' | head -1 || true)"
 : > other-install/args.log
-end_rc=0; echo '{"reason":"other"}' | PATH="$PWD/other-install:/usr/bin:/bin" sh -c "${end_hook:-:}" > hook.end.out 2>&1 || end_rc=$?
-chk "SessionEnd hook runs PATH's 'writ session-end', silent, exit 0 (0.4.2)" \
-  "[ $end_rc -eq 0 ] && [ ! -s hook.end.out ] && grep -qx 'session-end' other-install/args.log"
+end_rc=0; echo '{"hook_event_name":"SessionEnd","reason":"other"}' | PATH="$PWD/other-install:/usr/bin:/bin" sh -c "${end_hook:-:}" > hook.end.out 2>&1 || end_rc=$?
+chk "SessionEnd hook runs PATH's writ ('session-end' in 0.4.2, the 'hook' dispatcher in 0.4.3), silent, exit 0" \
+  "[ $end_rc -eq 0 ] && [ ! -s hook.end.out ] && grep -qxE 'session-end|hook' other-install/args.log"
+# The real writ on the SessionEnd event prints nothing (stdout reaches the agent in 0.4.3).
+mkdir -p real-bin; ln -sf "$W" real-bin/writ
+real_rc=0; real_out="$(echo '{"hook_event_name":"SessionEnd","session_id":"t-rerun","reason":"other"}' | PATH="$PWD/real-bin:/usr/bin:/bin" sh -c "${end_hook:-:}" 2>&1)" || real_rc=$?
+chk "SessionEnd hook with the real writ: exit 0, prints nothing" "[ $real_rc -eq 0 ] && [ -z \"\$real_out\" ]"
 echo "--- config.toml diff (before rerun vs after)"; diff config.before.toml .writ/config.toml || true
 echo "--- init2 output"; cat init2.log
 exit $fail

@@ -80,6 +80,18 @@ impl Project {
         p.git(&["add", "-A"]);
         p.git(&["commit", "-q", "-m", "base"]);
         p.ok("setup", &["init", "-y", "--bare"]);
+        // Ruling 183: these fixtures build concurrent versions by hand
+        // sealing; the test-fixture switch turns the seal-time
+        // foreign-line check off (writ init never writes it).
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p.root.join(".writ").join("config.toml"))
+                .unwrap();
+            writeln!(f, "\n[seal]\nforeign_line_check = false").unwrap();
+        }
         p
     }
 

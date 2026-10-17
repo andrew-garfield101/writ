@@ -329,8 +329,28 @@ pub mod session {
         session_process(&chain).cloned()
     }
 
-    /// The whole process table, or None without `ps` (non-Unix).
+    /// The whole process table, or None without `ps` (non-Unix). A read
+    /// serves calls in the next second (finding 158: a seal followed by its
+    /// doctor notice ran `ps` up to three times, about 30 ms of wall time
+    /// each). Never longer: a long-lived process (watch, MCP) must not judge
+    /// a session that started since the snapshot as exited.
     pub fn process_table() -> Option<Vec<ProcInfo>> {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        type Snap = Option<(Instant, Option<Vec<ProcInfo>>)>;
+        static TABLE: Mutex<Snap> = Mutex::new(None);
+        let mut guard = TABLE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, table)) = guard.as_ref() {
+            if at.elapsed() < Duration::from_secs(1) {
+                return table.clone();
+            }
+        }
+        let table = read_process_table();
+        *guard = Some((Instant::now(), table.clone()));
+        table
+    }
+
+    fn read_process_table() -> Option<Vec<ProcInfo>> {
         if !cfg!(unix) {
             return None;
         }

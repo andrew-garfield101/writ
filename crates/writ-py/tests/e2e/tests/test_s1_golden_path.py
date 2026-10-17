@@ -54,7 +54,7 @@ class TestS1Init:
         section = file_between_markers(claude_md)
         assert section is not None, "CLAUDE.md missing writ config markers"
         assert "writ context" in section
-        assert "writ seal" in section
+        assert "writ seals the edits it can attribute" in section
 
     def test_agent_instructions_created(self, writ_project: Path):
         """1.3.4: .writ/AGENT_INSTRUCTIONS.md created."""

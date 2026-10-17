@@ -199,17 +199,11 @@ fn remove_claude_permissions(root: &Path) -> WritResult<Option<String>> {
 /// usage as a mandatory directive, not optional project documentation.
 /// Rendered from [`crate::template`] (finding 67).
 fn writ_instruction() -> String {
-    let steps: Vec<String> = crate::template::workflow_steps()
-        .iter()
-        .enumerate()
-        .map(|(i, s)| format!("{}) {}.", i + 1, s))
-        .collect();
+    // Sprint 6: the zero-instruction lines (template::auto_steps), and the
+    // marker phrase init uses to find this entry again.
     format!(
-        "MANDATORY: This project uses writ for version control. \
-         You MUST follow this workflow — it is not optional. {} \
-         Your task is NOT complete until you have sealed your work. \
-         NEVER run `git commit`, `git add`, `git push`, or `writ finish` — the user handles git.",
-        steps.join(" ")
+        "This project uses writ for version control. {}",
+        crate::template::auto_steps().join(" ")
     )
 }
 
@@ -343,42 +337,69 @@ pub fn stale_managed_text(root: &Path) -> Vec<String> {
 }
 
 /// True when the settings hold a writ hook that is not today's command (for
-/// whatever writ path it names) or sits on a legacy event.
+/// whatever writ path it names), sits on a legacy event, or when a project
+/// with writ's SessionStart hook lacks one of the sprint 6 auto seal hooks
+/// (`writ init -y` adds them).
 fn settings_hook_stale(settings: &serde_json::Value) -> bool {
     let Some(hooks) = settings.get("hooks").and_then(|h| h.as_object()) else {
         return false;
     };
-    let commands = |event: &str| -> Vec<String> {
+    let entries = |event: &str| -> Vec<(Option<String>, String)> {
         hooks
             .get(event)
             .and_then(|v| v.as_array())
             .into_iter()
             .flatten()
-            .filter_map(|e| e.get("hooks").and_then(|h| h.as_array()))
-            .flatten()
-            .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
-            .filter(|c| is_writ_hook_command(c))
-            .map(str::to_string)
+            .flat_map(|e| {
+                let matcher = e
+                    .get("matcher")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string);
+                e.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+                    .filter(|c| is_writ_hook_command(c))
+                    .map(move |c| (matcher.clone(), c.to_string()))
+                    .collect::<Vec<_>>()
+            })
             .collect()
     };
-    if LEGACY_HOOK_EVENTS.iter().any(|e| !commands(e).is_empty()) {
+    let starts = entries(WRIT_HOOK_EVENT);
+    if starts.is_empty() {
+        // Not opted in through init's hooks: only a legacy hook is stale.
+        return LEGACY_HOOK_EVENTS.iter().any(|e| {
+            entries(e)
+                .iter()
+                .any(|(_, c)| !c.contains(WRIT_AUTO_HOOK_MARKER))
+        });
+    }
+    let fallback = hook_writ_path(&starts[0].1);
+    if fallback_is_gone(&fallback) {
         return true;
     }
-    let starts = commands(WRIT_HOOK_EVENT);
-    let ends = commands(WRIT_END_HOOK_EVENT);
-    let start_stale = starts.iter().any(|cmd| {
-        let fallback = hook_writ_path(cmd);
-        session_start_command(&fallback) != *cmd || fallback_is_gone(&fallback)
-    });
-    // Sprint 5: a project initialized before the SessionEnd hook existed
-    // (writ 0.4.1 and earlier) has the start hook only; `writ init -y` adds
-    // the end hook, which gives `--stale` its second proof.
-    let end_stale = !starts.is_empty() && ends.is_empty()
-        || ends.iter().any(|cmd| {
-            let fallback = hook_writ_path(cmd);
-            session_end_command(&fallback) != *cmd || fallback_is_gone(&fallback)
-        });
-    start_stale || end_stale
+    let expected = expected_hooks(&fallback);
+    let all_events: Vec<&str> = expected
+        .iter()
+        .map(|(e, _, _)| *e)
+        .chain(LEGACY_HOOK_EVENTS.iter().copied())
+        .collect();
+    for event in all_events {
+        let want: Vec<(Option<String>, String)> = expected
+            .iter()
+            .filter(|(e, _, _)| *e == event)
+            .map(|(_, m, c)| (m.map(str::to_string), c.clone()))
+            .collect();
+        let mut have = entries(event);
+        have.sort();
+        let mut want = want;
+        want.sort();
+        if have != want {
+            return true;
+        }
+    }
+    false
 }
 
 /// Finding 89: an absolute fallback that no longer exists (its install was
@@ -407,6 +428,7 @@ fn hook_writ_path(cmd: &str) -> String {
 }
 
 /// Build the hook command, recording the writ that ran init as the fallback.
+#[cfg(test)]
 fn writ_hook_command() -> String {
     session_start_command(&init_writ_path())
 }
@@ -451,12 +473,8 @@ const HOOK_FALLBACK_SUFFIX: &str = "'; W=$(command -v writ";
 /// runs only when PATH has no `writ` (an app launched outside a login shell).
 /// When the two differ the hook prints one line naming both.
 fn session_start_command(fallback: &str) -> String {
-    let mut lines = vec![
-        WRIT_HOOK_BANNER.to_string(),
-        "This project uses writ for version control. Follow these steps:".to_string(),
-    ];
-    lines.extend(crate::template::workflow_plain());
-    lines.push(crate::template::CLAIM_NOTE.replace('`', ""));
+    let mut lines = vec![WRIT_HOOK_BANNER.to_string()];
+    lines.extend(crate::template::auto_plain());
     lines.push(String::new());
     let echoes: Vec<String> = lines
         .iter()
@@ -472,10 +490,10 @@ fn session_start_command(fallback: &str) -> String {
     )
 }
 
-/// The SessionEnd hook: records that the host (Claude Code) ended this
-/// session, so `writ spec release --stale` has a proof besides the pid
-/// (see [`session_end`]). Same PATH-first resolution as the start hook
-/// (finding 89); silent, and never fails the session's exit.
+/// The SessionEnd hook writ 0.4.2 wrote: records that the host ended the
+/// session. Recognized for upgrade and removal; 0.4.3 runs [`auto_hook_command`]
+/// on SessionEnd instead (which records the end too).
+#[cfg(test)]
 fn session_end_command(fallback: &str) -> String {
     let quoted = fallback.replace('\'', "'\\''");
     format!(
@@ -484,11 +502,54 @@ fn session_end_command(fallback: &str) -> String {
     )
 }
 
-/// The hidden CLI subcommand the SessionEnd hook runs.
+/// The sprint 6 hook command, on every event writ hooks besides
+/// SessionStart: runs `writ hook`, which reads the event from stdin
+/// ([`crate::auto_seal`]). Same PATH-first resolution as the start hook
+/// (finding 89). Always exits 0: a missing writ or a writ error never fails
+/// the agent's tool call; stderr is discarded (writ logs to
+/// `.writ/hooks.log`), stdout is the hook's answer to the agent.
+fn auto_hook_command(fallback: &str) -> String {
+    let quoted = fallback.replace('\'', "'\\''");
+    format!(
+        "{HOOK_FALLBACK_PREFIX}{quoted}{HOOK_FALLBACK_SUFFIX} 2>/dev/null) || W=\"$F\"; \
+         \"$W\" {} 2>/dev/null || true",
+        crate::auto_seal::HOOK_SUBCOMMAND
+    )
+}
+
+/// Every hook entry writ installs: (event, matcher, command).
+fn expected_hooks(fallback: &str) -> Vec<(&'static str, Option<&'static str>, String)> {
+    let auto = auto_hook_command(fallback);
+    let matcher = crate::auto_seal::POST_TOOL_MATCHER;
+    vec![
+        (WRIT_HOOK_EVENT, None, session_start_command(fallback)),
+        ("PreToolUse", Some("Bash"), auto.clone()),
+        ("PostToolUse", Some(matcher), auto.clone()),
+        ("UserPromptSubmit", None, auto.clone()),
+        ("Stop", None, auto.clone()),
+        ("SubagentStop", None, auto.clone()),
+        (WRIT_END_HOOK_EVENT, None, auto),
+    ]
+}
+
+/// Events writ may hold a hook on, current and legacy (for removal).
+const WRIT_AUTO_EVENTS: &[&str] = &[
+    "PreToolUse",
+    "PostToolUse",
+    "UserPromptSubmit",
+    "Stop",
+    "SubagentStop",
+    "SessionEnd",
+];
+
+/// The hidden CLI subcommand the 0.4.2 SessionEnd hook runs.
 pub const SESSION_END_SUBCOMMAND: &str = "session-end";
 
-/// Text every writ SessionEnd hook command contains.
+/// Text every writ 0.4.2 SessionEnd hook command contains.
 const WRIT_END_HOOK_MARKER: &str = "\"$W\" session-end";
+
+/// Text every sprint 6 `writ hook` command contains.
+const WRIT_AUTO_HOOK_MARKER: &str = "\"$W\" hook ";
 
 /// The hook event where writ records a host-reported session end.
 const WRIT_END_HOOK_EVENT: &str = "SessionEnd";
@@ -509,6 +570,7 @@ fn is_writ_hook_command(cmd: &str) -> bool {
     cmd.contains(WRIT_HOOK_MARKER)
         || cmd.contains(WRIT_HOOK_BANNER)
         || cmd.contains(WRIT_END_HOOK_MARKER)
+        || cmd.contains(WRIT_AUTO_HOOK_MARKER)
 }
 
 /// First line every writ SessionStart hook prints.
@@ -562,37 +624,28 @@ fn ensure_claude_hook(root: &Path) -> WritResult<Option<String>> {
         remove_writ_hooks_from_event(hooks_obj, event_name);
     }
 
-    let event_hooks = hooks_obj
-        .entry(WRIT_HOOK_EVENT)
-        .or_insert_with(|| serde_json::json!([]));
-    let Some(arr) = event_hooks.as_array_mut() else {
-        return Ok(None); // Not an array — don't touch it
-    };
-    remove_writ_hook_entries(arr);
-    arr.push(serde_json::json!({
-        "hooks": [
-            {
-                "type": "command",
-                "command": writ_hook_command(),
-                "timeout": 10
-            }
-        ]
-    }));
-
-    let end_hooks = hooks_obj
-        .entry(WRIT_END_HOOK_EVENT)
-        .or_insert_with(|| serde_json::json!([]));
-    if let Some(arr) = end_hooks.as_array_mut() {
+    let fallback = init_writ_path();
+    for (event, matcher, command) in expected_hooks(&fallback) {
+        let event_hooks = hooks_obj
+            .entry(event)
+            .or_insert_with(|| serde_json::json!([]));
+        let Some(arr) = event_hooks.as_array_mut() else {
+            continue; // Not an array: the user's own shape, left alone.
+        };
         remove_writ_hook_entries(arr);
-        arr.push(serde_json::json!({
+        let mut entry = serde_json::json!({
             "hooks": [
                 {
                     "type": "command",
-                    "command": session_end_command(&init_writ_path()),
+                    "command": command,
                     "timeout": 10
                 }
             ]
-        }));
+        });
+        if let Some(m) = matcher {
+            entry["matcher"] = serde_json::json!(m);
+        }
+        arr.push(entry);
     }
 
     if settings == original {
@@ -668,8 +721,8 @@ fn remove_claude_hook(root: &Path) -> WritResult<Option<String>> {
     };
 
     let mut any_removed = false;
-    for event_name in [&WRIT_HOOK_EVENT, &WRIT_END_HOOK_EVENT]
-        .into_iter()
+    for event_name in std::iter::once(&WRIT_HOOK_EVENT)
+        .chain(WRIT_AUTO_EVENTS)
         .chain(LEGACY_HOOK_EVENTS)
     {
         any_removed |= remove_writ_hooks_from_event(hooks_obj, event_name);
@@ -1257,6 +1310,7 @@ trait PipeTemplate {
 impl PipeTemplate for str {
     fn pipe_template(&self) -> String {
         self.replace("@STEPS@", &crate::template::workflow_markdown())
+            .replace("@AUTO@", &crate::template::auto_markdown())
             .replace("@SPEC_ADD@", crate::template::SPEC_ADD)
             .replace("@SEAL@", crate::template::SEAL)
             .replace("@SPEC_DONE@", crate::template::SPEC_DONE)
@@ -1264,73 +1318,15 @@ impl PipeTemplate for str {
     }
 }
 
+/// The CLAUDE.md managed block (sprint 6: zero instructions; sealing is
+/// the hooks' job). Under 5 lines, no mandatory command.
 fn writ_claude_md_section() -> String {
-    r#"## Writ Version Control (MANDATORY)
-
-**FIRST ACTION: Run `writ context` before doing anything else.**
-
-**EVERY TASK follows these steps — no exceptions, no matter how small the task:**
-@STEPS@
-Your task is NOT complete until you have run them all.
-Do NOT run `git commit`, `git add`, `git push`, or `writ finish`.
-
-### Commands
-- `writ context` — structured project state (files, specs, activity). Run this FIRST.
-- `writ seal -s "<summary>" --paths <changed files, comma-separated>` — checkpoint your work (auto-scoped to your claimed spec)
-- `@SPEC_ADD@` — create a task spec (ID auto-generated)
-- `writ spec status` — view active specs
-- `@SPEC_DONE@` — mark your task complete (auto-scoped to your claimed spec)
-- `writ status` — project overview (agents, specs, progress)
-- `writ diff` — preview file changes
-- `writ log` — recent seal history
-
-### Rules
-- You MUST run `writ context` before starting work
-- You MUST run `@SEAL@` after each meaningful unit of work
-- You MUST run `@SPEC_DONE@` before reporting results to the user
-- You MUST include meaningful summaries in seals and in `spec done -s` so other agents understand your work
-- `--scope` on `writ spec add` declares the files your task owns; `writ seal` without `--paths` then captures only those. Otherwise pass `--paths` with the files you changed: another agent's pending files are never sealed for you
-- If `writ seal` or `writ spec done` prints `left out:` or `NOT SEALED:`, read the reason and run the command it prints if those files are yours
-- Do NOT run `git add`, `git commit`, or `git push` — the user manages the git round-trip via `writ finish`
-- Do NOT run `writ finish` — this is the git integration command managed by the user or orchestrator
-
-### Multi-Agent (Same Directory)
-- Multiple agents can work in the same directory simultaneously
-- Seals are auto-scoped to your claimed spec — no need for explicit `--spec`
-- Check `writ context` to see other agents' activity and convergence state
-
-### Agent identity
-- writ names you from `WRIT_AGENT_ID`, else your framework session (e.g. `claude-code-a3f2`), else `human`. `--agent <name>` on a command overrides it.
-- Subagents inherit the parent session's identity. If you are a subagent, or several agents share one session, set your own: prefix every writ command with `WRIT_AGENT_ID=<your-name>` (each shell call is fresh) or pass `--agent <your-name>`
-- @CLAIM_NOTE@ Release a claim you no longer need with `writ spec release <id>`
-"#
-    .pipe_template()
+    "## Writ\n@AUTO@".pipe_template()
 }
 
+/// The AGENTS.md managed block: the CLAUDE.md block's lines.
 fn writ_agents_md_section() -> String {
-    r#"## Version Control — Writ (MANDATORY)
-
-This project uses writ for version control. You MUST follow this workflow.
-
-### Required Workflow
-@STEPS@
-Your task is NOT complete until you have sealed your work.
-`--scope` declares the files your task owns; without it, pass `--paths` with the files you changed.
-If a seal prints `left out:` or `NOT SEALED:`, run the command it prints if those files are yours.
-
-### Commands
-- `writ context` — structured project state. Run this FIRST.
-- `writ seal -s "<summary>" --paths <changed files, comma-separated>` — checkpoint work (auto-scoped to your spec)
-- `@SPEC_ADD@` — create a spec (ID auto-generated)
-- `@SPEC_DONE@` — mark task complete (auto-scoped)
-- `writ status` — project overview
-- `writ log` — seal history
-
-Subagents inherit the parent's identity: set `WRIT_AGENT_ID=<your-name>` on every writ command (or pass `--agent <your-name>`).
-Do NOT run `git commit` or `writ finish` — the user manages the git round-trip.
-`writ restore <seal-id>` overwrites working directory files — use only when reverting to a known-good state.
-"#
-    .pipe_template()
+    "## Writ\n@AUTO@".pipe_template()
 }
 
 /// Content for `.writ/AGENT_INSTRUCTIONS.md`.
@@ -1481,7 +1477,7 @@ pub mod session_end {
     /// SessionEnd reasons after which the session process keeps running
     /// (`/clear`, `/resume` switch conversations in the same process); no
     /// record is written for them, so the pid proof still applies.
-    const PROCESS_CONTINUES: &[&str] = &["clear", "resume"];
+    pub const PROCESS_CONTINUES: &[&str] = &["clear", "resume"];
 
     /// A claim the session held when it ended (informational).
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1903,10 +1899,7 @@ mod tests {
         let content = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
         assert!(content.contains(MARKER_BEGIN), "missing begin marker");
         assert!(content.contains(MARKER_END), "missing end marker");
-        assert!(
-            content.contains("## Writ Version Control"),
-            "missing writ section"
-        );
+        assert!(content.contains("## Writ\n"), "missing writ section");
     }
 
     #[test]
@@ -1950,7 +1943,7 @@ mod tests {
         assert!(before.contains(MARKER_BEGIN));
 
         // Simulate template change by manually modifying the marked section.
-        let modified = before.replace("## Writ Version Control", "## Writ OLD");
+        let modified = before.replace("## Writ\n", "## Writ OLD\n");
         fs::write(dir.path().join("CLAUDE.md"), &modified).unwrap();
 
         // Reinit should replace the section.
@@ -1958,7 +1951,7 @@ mod tests {
         assert!(result.files_updated.contains(&"CLAUDE.md".to_string()));
 
         let after = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
-        assert!(after.contains("## Writ Version Control"));
+        assert!(after.contains("## Writ\n"));
         assert!(!after.contains("## Writ OLD"));
     }
 
@@ -1978,7 +1971,7 @@ mod tests {
         let content = fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
         assert!(content.contains(MARKER_BEGIN), "should have markers now");
         assert!(
-            content.contains("## Writ Version Control"),
+            content.contains("writ seals the edits it can attribute"),
             "should have new content"
         );
         assert!(
@@ -2028,39 +2021,45 @@ mod tests {
 
     // --- Template content tests ---
 
-    /// Finding 67: the hook, the CLAUDE.md block, AGENTS.md, the agent
-    /// instructions and the settings instruction carry the same steps.
+    /// Finding 67, sprint 6: the hook, the CLAUDE.md and AGENTS.md blocks
+    /// and the settings instruction carry the same zero-instruction lines;
+    /// the generic agent instructions (hosts with no hooks) carry the hand
+    /// workflow.
     #[test]
-    fn every_surface_renders_the_same_workflow_steps() {
+    fn every_surface_renders_the_same_auto_steps() {
         let hook = session_start_command("writ");
-        let surfaces = [
-            writ_claude_md_section(),
-            writ_agents_md_section(),
-            agent_instructions_content(),
-        ];
-        for step in crate::template::workflow_steps() {
-            for s in &surfaces {
+        let blocks = [writ_claude_md_section(), writ_agents_md_section()];
+        for step in crate::template::auto_steps() {
+            for s in &blocks {
                 assert!(s.contains(&step), "missing {step:?}");
             }
             assert!(writ_instruction().contains(&step), "settings: {step:?}");
-            // The hook echoes single-quoted lines: an apostrophe (finding
-            // 114's "other agents' specs") appears as '\''.
+            // The hook echoes single-quoted lines: an apostrophe appears as '\''.
             let echoed = step.replace('`', "").replace('\'', "'\\''");
             assert!(hook.contains(&echoed), "hook: {step:?}");
         }
-        for s in surfaces.iter().chain([&hook]) {
+        for step in crate::template::workflow_steps() {
+            assert!(agent_instructions_content().contains(&step), "{step:?}");
+        }
+        let all = [
+            blocks[0].clone(),
+            blocks[1].clone(),
+            agent_instructions_content(),
+            hook,
+        ];
+        for s in &all {
             assert!(!s.contains('@'), "unfilled placeholder:\n{s}");
         }
     }
 
     /// Finding 70: the generated skills teach the same seal, spec add and
-    /// spec done commands as the CLAUDE.md block; none teaches a bare
+    /// spec done commands as the template; none teaches a bare
     /// `writ seal -s "..."` without `--paths` or a `spec add` without
     /// `--scope`.
     #[test]
     fn skills_teach_the_same_commands_as_the_block() {
         let block = writ_claude_md_section();
-        assert!(block.contains(crate::template::SEAL));
+        assert!(block.contains(crate::template::SPEC_DONE));
         let texts: Vec<(&str, &str)> = crate::skills::SKILL_TEMPLATES
             .iter()
             .flat_map(|t| {
@@ -2087,175 +2086,70 @@ mod tests {
     }
 
     #[test]
-    fn hook_and_block_agree_on_claims_and_the_scope_form() {
-        let hook = session_start_command("writ");
-        let block = writ_claude_md_section();
-        let note = "without it, your first seal claims the one spec you created";
-        assert!(hook.contains(note));
-        assert!(block.contains(note));
-        assert!(hook.contains("--claim"));
-        assert!(!hook.contains("brief task description"));
-        assert!(hook.contains(r#"--scope "<files you will change, comma-separated>""#));
-        assert!(hook.contains(r#"writ spec done -s "<what you did>""#));
-    }
-
-    #[test]
-    fn hook_command_runs_in_sh_and_prints_the_steps() {
+    fn hook_command_runs_in_sh_and_prints_the_lines() {
         let out = std::process::Command::new("sh")
             .args(["-c", &session_start_command("true")])
             .output()
             .unwrap();
         let text = String::from_utf8_lossy(&out.stdout);
         assert!(out.status.success());
-        assert!(text.contains("4. When the task is complete"), "{text}");
-        assert!(text.contains("writ spec claim <id>"), "{text}");
+        assert!(
+            text.contains("writ seals the edits it can attribute"),
+            "{text}"
+        );
+        assert!(
+            text.contains(r#"writ spec done -s "<what you did>""#),
+            "{text}"
+        );
+        // The echoed lines, before the PATH note and the brief context.
+        let lines = text
+            .lines()
+            .take_while(|l| !l.starts_with("Note:") && !l.starts_with("# writ context"))
+            .filter(|l| !l.trim().is_empty())
+            .count();
+        assert!(lines <= 5, "{lines} lines:\n{text}");
     }
 
+    /// Sprint 6: the managed block is under 5 lines with no mandatory
+    /// command and no identity instruction; it still says writ context
+    /// exists, how to close with a summary, and to leave git to the user.
     #[test]
-    fn test_claude_md_section_has_spec_done_workflow() {
-        let section = writ_claude_md_section();
-        assert!(
-            section.contains("writ spec done"),
-            "missing writ spec done in workflow"
-        );
-        assert!(
-            section.contains("EVERY TASK follows these steps"),
-            "missing front-loaded mandatory workflow"
-        );
-    }
-
-    #[test]
-    fn test_claude_md_section_has_round_trip_commands() {
-        let section = writ_claude_md_section();
-        assert!(
-            section.contains("writ status"),
-            "missing writ status command"
-        );
-        assert!(section.contains("writ diff"), "missing writ diff command");
-        assert!(
-            section.contains("writ spec done"),
-            "missing writ spec done command"
-        );
-    }
-
-    #[test]
-    fn test_claude_md_section_prohibits_git_and_finish() {
-        let section = writ_claude_md_section();
-        assert!(
-            section.contains("Do NOT run `git add`, `git commit`, or `git push`"),
-            "missing git prohibition"
-        );
-        assert!(
-            section.contains("Do NOT run `writ finish`"),
-            "missing writ finish prohibition"
-        );
-    }
-
-    #[test]
-    fn test_claude_md_section_has_writ_finish_prohibition() {
-        let section = writ_claude_md_section();
-        assert!(
-            section.contains("writ finish"),
-            "missing writ finish reference"
-        );
-        // The template should tell agents NOT to run writ finish
-        assert!(
-            section.contains("Do NOT run `writ finish`"),
-            "agents should be told not to run writ finish"
-        );
-    }
-
-    #[test]
-    fn test_claude_md_section_has_guidelines_section() {
-        let section = writ_claude_md_section();
-        assert!(section.contains("### Rules"), "missing rules heading");
-        assert!(
-            section.contains("writ seal"),
-            "missing seal checkpoint guideline"
-        );
-    }
-
-    #[test]
-    fn test_claude_md_section_has_mandatory_language() {
-        let section = writ_claude_md_section();
-        assert!(section.contains("MUST"), "missing MUST directive");
-        assert!(
-            section.contains("NOT complete"),
-            "missing completion gate language"
-        );
-    }
-
-    #[test]
-    fn test_claude_md_section_has_mandatory_commands() {
-        let section = writ_claude_md_section();
-        // Front-loaded mandatory commands must be present
-        for cmd in &[
-            "writ context",
-            "writ seal",
-            "writ spec add",
-            "writ spec done",
+    fn claude_md_block_is_zero_instruction() {
+        let block = writ_claude_md_section();
+        let lines = block.lines().filter(|l| !l.trim().is_empty()).count();
+        assert!(lines <= 5, "{lines} lines:\n{block}");
+        for w in [
+            "MANDATORY",
+            "MUST",
+            "EVERY TASK",
+            "NOT complete",
+            "BEFORE",
+            "FIRST ACTION",
+            "WRIT_AGENT_ID",
         ] {
-            assert!(section.contains(cmd), "missing {} command", cmd);
+            assert!(!block.contains(w), "{w}:\n{block}");
         }
+        // Finding 146: sealing is automatic only in Claude Code; the one seal
+        // command is for other tools, on the same line.
+        let line = block.lines().find(|l| l.contains("writ seal -s")).unwrap();
+        assert!(line.contains("writ seals the edits it can attribute and asks you with one line about the rest; in other tools"));
+        assert_eq!(block.matches("writ seal -s").count(), 1);
+        assert!(block.contains("writ context"));
+        assert!(block.contains(r#"writ spec done -s "<what you did>""#));
+        assert!(block.contains("Leave git commits and `writ finish` to the user"));
+        assert!(!writ_instruction().contains("MANDATORY"));
     }
 
     #[test]
-    fn test_agents_md_section_has_spec_done_workflow() {
-        let section = writ_agents_md_section();
-        assert!(
-            section.contains("writ spec done"),
-            "missing writ spec done in workflow"
-        );
-    }
-
-    #[test]
-    fn test_agents_md_section_has_round_trip_commands() {
-        let section = writ_agents_md_section();
-        assert!(
-            section.contains("writ status"),
-            "missing writ status command"
-        );
-        assert!(
-            section.contains("writ spec add"),
-            "missing spec add command"
-        );
-        assert!(
-            section.contains("writ spec done"),
-            "missing spec done command"
-        );
-    }
-
-    #[test]
-    fn test_agents_md_section_prohibits_git_and_finish() {
-        let section = writ_agents_md_section();
-        assert!(
-            section.contains("Do NOT run `git commit` or `writ finish`"),
-            "missing git/finish prohibition"
-        );
+    fn agents_md_block_is_the_claude_md_block() {
+        assert_eq!(writ_agents_md_section(), writ_claude_md_section());
     }
 
     #[test]
     fn test_agents_md_section_is_focused() {
         let section = writ_agents_md_section();
-        // Round-trip templates are streamlined — no convergence/rollback/human round-trip
-        assert!(
-            !section.contains("Convergence"),
-            "agents template should not include convergence details"
-        );
-        assert!(
-            !section.contains("Rollback"),
-            "agents template should not include rollback details"
-        );
-    }
-
-    #[test]
-    fn test_agents_md_section_has_mandatory_language() {
-        let section = writ_agents_md_section();
-        assert!(section.contains("MUST"), "missing MUST directive");
-        assert!(
-            section.contains("NOT complete"),
-            "missing completion gate language"
-        );
+        assert!(!section.contains("Convergence"));
+        assert!(!section.contains("Rollback"));
     }
 
     // --- Generic agent instructions tests ---
@@ -2766,28 +2660,6 @@ mod tests {
     }
 
     #[test]
-    fn test_claude_md_has_git_commit_prohibition() {
-        let section = writ_claude_md_section();
-        assert!(
-            section.contains("Do NOT run `git commit`"),
-            "CLAUDE.md template should prohibit git commit"
-        );
-        assert!(
-            section.contains("Do NOT run `writ finish`"),
-            "CLAUDE.md template should prohibit writ finish"
-        );
-    }
-
-    #[test]
-    fn test_agents_md_has_restore_warning() {
-        let section = writ_agents_md_section();
-        assert!(
-            section.contains("writ restore"),
-            "AGENTS.md template should mention writ restore"
-        );
-    }
-
-    #[test]
     fn test_agent_instructions_has_restore_warning() {
         let content = agent_instructions_content();
         assert!(
@@ -3007,12 +2879,16 @@ mod tests {
         let hooks = parsed["hooks"].as_object().unwrap();
         assert_eq!(
             hooks.len(),
-            2,
-            "SessionStart and SessionEnd only: {hooks:?}"
+            7,
+            "SessionStart plus the six auto seal events: {hooks:?}"
         );
         let ends = writ_commands(&parsed, "SessionEnd");
         assert_eq!(ends.len(), 1, "{hooks:?}");
-        assert!(ends[0].contains("\"$W\" session-end"), "{ends:?}");
+        assert!(ends[0].contains("\"$W\" hook "), "{ends:?}");
+        assert_eq!(
+            parsed["hooks"]["PostToolUse"][0]["matcher"],
+            "Edit|Write|MultiEdit|NotebookEdit|Bash"
+        );
         let entries = parsed["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(entries.len(), 1);
         let inner = &entries[0]["hooks"][0];
@@ -3021,7 +2897,11 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("context --format brief"));
-        assert!(parsed["hooks"].get("UserPromptSubmit").is_none());
+        let prompt = writ_commands(&parsed, "UserPromptSubmit");
+        assert!(
+            prompt.len() == 1 && !prompt[0].contains("context"),
+            "{prompt:?}"
+        );
     }
 
     #[test]
@@ -3085,7 +2965,10 @@ mod tests {
         let session = writ_commands(&parsed, "SessionStart");
         assert_eq!(session.len(), 1, "replaced, not appended");
         assert!(session[0].contains("--format brief"));
-        assert!(parsed["hooks"].get("UserPromptSubmit").is_none());
+        // The legacy context hook is gone; the prompt stash hook replaces it.
+        let prompt = writ_commands(&parsed, "UserPromptSubmit");
+        assert_eq!(prompt.len(), 1);
+        assert!(prompt[0].contains("\"$W\" hook "), "{prompt:?}");
     }
 
     #[test]
@@ -3102,7 +2985,7 @@ mod tests {
 
         let parsed = read_settings(dir.path());
         let ups = parsed["hooks"]["UserPromptSubmit"].as_array().unwrap();
-        assert_eq!(ups.len(), 1);
+        assert_eq!(ups.len(), 2, "the user's hook plus writ's stash hook");
         assert_eq!(ups[0]["hooks"][0]["command"], "echo custom");
     }
 
@@ -3119,7 +3002,10 @@ mod tests {
         ensure_claude_hook(dir.path()).unwrap();
 
         let parsed = read_settings(dir.path());
-        assert_eq!(parsed["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
+        // The user's hook stays, first; writ's Bash snapshot hook joins it.
+        let pre = parsed["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre.len(), 2);
+        assert_eq!(pre[0]["hooks"][0]["command"], "echo hi");
         assert_eq!(writ_commands(&parsed, "SessionStart").len(), 1);
     }
 
@@ -3212,12 +3098,13 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_claude_code_adds_session_start_only() {
+    fn test_hook_claude_code_adds_one_hook_per_event() {
         let dir = tempdir().unwrap();
         hook_claude_code(dir.path()).unwrap();
         let parsed = read_settings(dir.path());
-        assert_eq!(writ_commands(&parsed, "SessionStart").len(), 1);
-        assert!(parsed["hooks"].get("UserPromptSubmit").is_none());
+        for event in std::iter::once(WRIT_HOOK_EVENT).chain(WRIT_AUTO_EVENTS.iter().copied()) {
+            assert_eq!(writ_commands(&parsed, event).len(), 1, "{event}");
+        }
     }
 
     #[test]
@@ -3528,12 +3415,15 @@ mod stale_managed_text_tests {
         let md = fs::read_to_string(root.join("CLAUDE.md")).unwrap();
         fs::write(
             root.join("CLAUDE.md"),
-            md.replace("FIRST ACTION", "FIRST STEP"),
+            md.replace(
+                "writ seals the edits it can attribute",
+                "writ seals your edits",
+            ),
         )
         .unwrap();
         let path = root.join(".claude/settings.json");
         let text = fs::read_to_string(&path).unwrap();
-        fs::write(&path, text.replace("Follow these steps", "Do this")).unwrap();
+        fs::write(&path, text.replace("## Writ VCS Active", "## Writ VCS On")).unwrap();
         assert_eq!(
             stale_managed_text(root),
             vec!["CLAUDE.md".to_string(), ".claude/settings.json".to_string()]
@@ -3678,11 +3568,41 @@ mod hook_path_resolution_tests {
     /// Settings holding `cmd` as the start hook and today's end hook for
     /// the same recorded writ.
     fn settings_with(cmd: &str) -> serde_json::Value {
-        let end = session_end_command(&hook_writ_path(cmd));
-        serde_json::json!({"hooks": {
-            "SessionStart": [{"hooks": [{"type": "command", "command": cmd}]}],
-            "SessionEnd": [{"hooks": [{"type": "command", "command": end}]}]
-        }})
+        let mut hooks = serde_json::Map::new();
+        for (event, matcher, c) in expected_hooks(&hook_writ_path(cmd)) {
+            let c = if event == WRIT_HOOK_EVENT {
+                cmd.to_string()
+            } else {
+                c
+            };
+            let mut entry = serde_json::json!({"hooks": [{"type": "command", "command": c}]});
+            if let Some(m) = matcher {
+                entry["matcher"] = serde_json::json!(m);
+            }
+            hooks
+                .entry(event)
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut()
+                .unwrap()
+                .push(entry);
+        }
+        serde_json::json!({ "hooks": hooks })
+    }
+
+    /// Sprint 6: a 0.4.2 project (start hook and `session-end` only) is
+    /// stale until `writ init -y` adds the auto seal hooks.
+    #[test]
+    fn project_without_auto_seal_hooks_is_stale() {
+        let start = session_start_command("writ");
+        let v042 = serde_json::json!({"hooks": {
+            "SessionStart": [{"hooks": [{"type": "command", "command": start}]}],
+            "SessionEnd": [{"hooks": [{"type": "command",
+                "command": session_end_command("writ")}]}]
+        }});
+        assert!(settings_hook_stale(&v042));
+        let mut wrong_matcher = settings_with(&start);
+        wrong_matcher["hooks"]["PostToolUse"][0]["matcher"] = serde_json::json!("Edit");
+        assert!(settings_hook_stale(&wrong_matcher));
     }
 
     #[test]

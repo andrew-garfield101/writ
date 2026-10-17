@@ -29,13 +29,15 @@ for s in ghost live far ended cleared; do writ spec add --id $s --title $s --age
 # the session process, the hook's JSON on stdin).
 END_HOOK="$(python3 -c 'import json; print(json.load(open(".claude/settings.json")).get("hooks",{}).get("SessionEnd",[{}])[0].get("hooks",[{}])[0].get("command",""))')"
 export END_HOOK
-chk "writ init -y installed a SessionEnd hook that runs 'writ session-end'" \
-  "case \"\$END_HOOK\" in *'\"\$W\" session-end'*) true ;; *) false ;; esac"
+# 0.4.2 ran `writ session-end`; 0.4.3 runs one dispatcher, `writ hook`, that reads the
+# event from stdin's hook_event_name (which Claude Code always sends). Either is writ's.
+chk "writ init -y installed a SessionEnd hook that runs writ (session-end, or the hook dispatcher)" \
+  "case \"\$END_HOOK\" in *'\"\$W\" session-end'*|*'\"\$W\" hook'*) true ;; *) false ;; esac"
 [ -n "$END_HOOK" ] || END_HOOK=:
 claude -c "writ spec claim ghost --agent ghost-session && :" > /dev/null
 # The live holder also runs the end hook (a host reporting an end while its
 # process lives on): the pid proof must still decide.
-claude -c "writ spec claim live --agent live-session && echo '{\"reason\":\"other\"}' | sh -c \"\$END_HOOK\" && sleep 60" > /dev/null 2>&1 &
+claude -c "writ spec claim live --agent live-session && echo '{\"hook_event_name\":\"SessionEnd\",\"reason\":\"other\"}' | sh -c \"\$END_HOOK\" && sleep 60" > /dev/null 2>&1 &
 live_pid=$!; trap 'kill $live_pid 2>/dev/null || true' EXIT
 for _ in $(seq 50); do ls .writ/agents/claudecode/ended/*.json > /dev/null 2>&1 && break; sleep 0.1; done
 writ spec claim far --agent far-session > /dev/null
@@ -44,9 +46,9 @@ import json
 p = ".writ/specs/far.json"; d = json.load(open(p)); d["claimed_host"] = "other-host.invalid"
 json.dump(d, open(p, "w"), indent=2)
 PY
-claude -c "writ spec claim ended --agent ended-session && echo '{\"session_id\":\"t-ended\",\"reason\":\"prompt_input_exit\"}' | sh -c \"\$END_HOOK\"; :" > /dev/null
-claude -c "writ spec claim cleared --agent cleared-session && echo '{\"reason\":\"clear\"}' | sh -c \"\$END_HOOK\"; :" > /dev/null
-claude -c "echo '{\"reason\":\"resume\"}' | sh -c \"\$END_HOOK\"; :" > /dev/null
+claude -c "writ spec claim ended --agent ended-session && echo '{\"hook_event_name\":\"SessionEnd\",\"session_id\":\"t-ended\",\"reason\":\"prompt_input_exit\"}' | sh -c \"\$END_HOOK\"; :" > /dev/null
+claude -c "writ spec claim cleared --agent cleared-session && echo '{\"hook_event_name\":\"SessionEnd\",\"reason\":\"clear\"}' | sh -c \"\$END_HOOK\"; :" > /dev/null
+claude -c "echo '{\"hook_event_name\":\"SessionEnd\",\"reason\":\"resume\"}' | sh -c \"\$END_HOOK\"; :" > /dev/null
 ls .writ/agents/claudecode/ended/ > ended.ls 2>/dev/null || true
 chk "the SessionEnd hook wrote one record per ended session (ended, live), none for /clear or /resume" \
   "[ \$(wc -l < ended.ls) -eq 2 ]"

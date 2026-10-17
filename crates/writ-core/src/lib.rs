@@ -9,6 +9,7 @@ pub mod template;
 
 pub mod agent;
 pub mod analytics;
+pub mod auto_seal;
 #[cfg(feature = "bridge")]
 pub mod bridge;
 pub mod config;
@@ -35,6 +36,7 @@ pub mod migrate;
 pub mod object;
 pub mod platform;
 pub mod proposal;
+pub mod receipt;
 pub mod remote;
 pub mod repair;
 pub mod repo;

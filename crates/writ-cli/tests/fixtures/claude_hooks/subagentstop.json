@@ -1,0 +1,33 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000004",
+  "transcript_path": "/home/user/.claude/projects/-repo/00000000-0000-4000-8000-000000000004.jsonl",
+  "cwd": "/repo",
+  "prompt_id": "00000000-0000-4000-8000-000000000001",
+  "permission_mode": "bypassPermissions",
+  "agent_id": "a9e8d7c6b5a4f3e2d",
+  "agent_type": "general-purpose",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "SubagentStop",
+  "stop_hook_active": false,
+  "agent_transcript_path": "/home/user/.claude/projects/-repo/00000000-0000-4000-8000-000000000004/subagents/agent-a9e8d7c6b5a4f3e2d.jsonl",
+  "last_assistant_message": "I created `src/d.py` containing `D = 1`, using the Write tool.",
+  "background_tasks": [
+    {
+      "id": "a1b2c3d4e5f6a7b8c",
+      "type": "subagent",
+      "status": "running",
+      "description": "Create c.py then edit",
+      "agent_type": "general-purpose"
+    },
+    {
+      "id": "a9e8d7c6b5a4f3e2d",
+      "type": "subagent",
+      "status": "running",
+      "description": "Create d.py",
+      "agent_type": "general-purpose"
+    }
+  ],
+  "session_crons": []
+}

@@ -1,0 +1,15 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000004",
+  "transcript_path": "/home/user/.claude/projects/-repo/00000000-0000-4000-8000-000000000004.jsonl",
+  "cwd": "/repo",
+  "prompt_id": "00000000-0000-4000-8000-000000000002",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "Stop",
+  "stop_hook_active": false,
+  "last_assistant_message": "The `d.py` subagent finished: it created `src/d.py` containing `D = 1`. The `c.py` subagent hasn't reported yet, so I can't confirm `src/c.py` yet.",
+  "background_tasks": [],
+  "session_crons": []
+}

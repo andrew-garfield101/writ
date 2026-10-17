@@ -68,7 +68,9 @@ class TestInstallHooksClaudeMd:
         content = (tmp_path / "CLAUDE.md").read_text()
         assert BEGIN_MARKER in content
         assert END_MARKER in content
-        assert "Writ Version Control" in content
+        # Sprint 6: the zero-instruction block.
+        assert "## Writ\n" in content
+        assert "writ seals the edits it can attribute" in content
 
     def test_install_hooks_preserves_existing_content(self, tmp_path: Path):
         """Existing CLAUDE.md content preserved when hooks append."""
@@ -82,7 +84,7 @@ class TestInstallHooksClaudeMd:
         assert "Important Rules" in content
         assert "Always test your code" in content
         assert BEGIN_MARKER in content
-        assert "Writ Version Control" in content
+        assert "writ seals the edits it can attribute" in content
 
     def test_install_hooks_claudemd_has_separator(self, tmp_path: Path):
         """Separator (---) appears between writ section and existing content (prepend order)."""
@@ -102,10 +104,11 @@ class TestInstallHooksClaudeMd:
         writ.install_hooks(str(tmp_path))
 
         content = (tmp_path / "CLAUDE.md").read_text()
+        # Sprint 6: sealing is the hooks' job; the block names writ context
+        # and the optional closing summary, and no mandatory command.
         assert "writ context" in content
-        assert "writ seal" in content
-        assert "writ spec" in content
-        assert "writ log" in content
+        assert 'writ spec done -s "<what you did>"' in content
+        assert "MANDATORY" not in content and "MUST" not in content
 
     def test_install_hooks_creates_slash_commands(self, tmp_path: Path):
         """install_hooks() creates .claude/commands/ slash command files."""
@@ -147,7 +150,7 @@ class TestInstallHooksAgentsMd:
         content = (tmp_path / "AGENTS.md").read_text()
         assert BEGIN_MARKER in content
         assert END_MARKER in content
-        assert "Version Control" in content
+        assert "writ seals the edits it can attribute" in content
 
     def test_install_hooks_agentsmd_preserves_content(self, tmp_path: Path):
         """Existing AGENTS.md content preserved when hooks append."""
@@ -555,6 +558,16 @@ def _writ_hook_commands(settings: dict, event: str) -> list[str]:
     ]
 
 
+def _writ_auto_commands(settings: dict, event: str) -> list[str]:
+    """Sprint 6 auto seal hook commands (`writ hook`) on one event."""
+    return [
+        hook["command"]
+        for entry in settings.get("hooks", {}).get(event, [])
+        for hook in entry.get("hooks", [])
+        if '"$W" hook ' in hook.get("command", "")
+    ]
+
+
 @pytest.mark.skipif(WRIT_BIN is None, reason="writ binary not found")
 class TestInitSessionStartHook:
     """A.4: init writes one brief SessionStart hook and no per-prompt hook."""
@@ -565,7 +578,10 @@ class TestInitSessionStartHook:
         commands = _writ_hook_commands(settings, "SessionStart")
         assert len(commands) == 1
         assert "--format brief" in commands[0]
-        assert "UserPromptSubmit" not in settings["hooks"]
+        # Sprint 6: the only UserPromptSubmit hook is writ's silent title stash.
+        prompt = _writ_auto_commands(settings, "UserPromptSubmit")
+        assert len(prompt) == 1 and '"$W" hook ' in prompt[0], prompt
+        assert "context" not in prompt[0]
 
     def test_init_replaces_legacy_two_hook_block(self, tmp_path: Path):
         legacy_entry = {"hooks": [{"type": "command", "command": LEGACY_CMD, "timeout": 10}]}
@@ -584,7 +600,9 @@ class TestInitSessionStartHook:
         commands = _writ_hook_commands(settings, "SessionStart")
         assert len(commands) == 1, "legacy hook replaced, not appended"
         assert "--format brief" in commands[0]
-        assert settings["hooks"]["UserPromptSubmit"] == [custom_entry]
+        ups = settings["hooks"]["UserPromptSubmit"]
+        assert ups[0] == custom_entry, "the user's hook is kept"
+        assert len(ups) == 2 and '"$W" hook ' in ups[1]["hooks"][0]["command"]
 
     def test_reinit_does_not_duplicate_hook(self, tmp_path: Path):
         run_writ(["init", "-y"], cwd=str(tmp_path))
@@ -684,7 +702,8 @@ class TestSessionStartHookEndToEnd:
         settings = _settings(tmp_path)
         assert len(_writ_hook_commands(settings, "SessionStart")) == 1
         assert "--format brief" in _writ_hook_commands(settings, "SessionStart")[0]
-        assert not settings["hooks"].get("UserPromptSubmit"), settings["hooks"]
+        prompt = _writ_auto_commands(settings, "UserPromptSubmit")
+        assert len(prompt) == 1 and "context" not in prompt[0], settings["hooks"]
 
     def test_uninit_restores_preexisting_settings_exactly(self, tmp_path: Path):
         original = {

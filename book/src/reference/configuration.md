@@ -165,6 +165,25 @@ Set during initialization with `writ init --profile <name>`. Controls storage bu
 | `production` | 100 GB | 90 days | Level 3 | Production systems |
 | `enterprise` | Unlimited | 365 days | Level 6 | Enterprise deployments |
 
+## Test Fixture Settings
+
+These settings exist for writ's own test fixtures. Do not set them in a project where agents work.
+
+### `[seal] foreign_line_check`
+
+By default every seal an agent makes (by hand, through the hook, from Python or over MCP) is refused when it would record the removal of lines another agent's spec sealed, and writ names that agent and the lines. Test fixtures that build two diverged versions of a file on purpose turn this off in `.writ/config.toml`:
+
+```toml
+[seal]
+foreign_line_check = false
+```
+
+`writ init` never writes this key. While it is set to `false`:
+
+- `writ doctor` reports a yellow finding: "foreign-line check on seal is disabled in config; the finish check still applies". It is marked for a person, and its fix is to remove the key. `writ context` shows the same line.
+- `writ finish` still checks that the merge keeps every sealed line, as it always does.
+- The commit receipt says how many seals in the commit were made with the check off: "N seal(s) made with the foreign-line check disabled in config".
+
 ## Files
 
 | File | Location | Purpose |

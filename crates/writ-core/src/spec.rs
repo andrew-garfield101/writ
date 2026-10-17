@@ -170,6 +170,45 @@ pub struct Spec {
     /// writ record (handoff shows them); the commit itself is unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_commit_notes: Vec<PostCommitNote>,
+    /// Sprint 6 (0.4.3): set on a spec the auto seal hook created for a
+    /// session that had none. None for every spec made by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto: Option<AutoSpec>,
+    /// Finding 168: the closed spec this follow-up continues
+    /// (`<id>-followup` opened by `writ seal --auto`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continues: Option<String>,
+}
+
+/// Where an auto spec came from, and how it closed (sprint 6). Records only:
+/// a spec SessionEnd closes carries no summary text, only the count and span
+/// of its seals (the receipt prints "no summary from the agent").
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoSpec {
+    /// The host's session id (Claude Code `session_id`).
+    pub session: String,
+    /// For a subagent: the parent session's writ identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// For a subagent: the host's `agent_id` and `agent_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_agent_type: Option<String>,
+    /// Set when SessionEnd closed the spec (never when the agent did).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by_session_end: Option<AutoClose>,
+}
+
+/// SessionEnd's close of an auto spec: the seal count and span, no words.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoClose {
+    pub at: DateTime<Utc>,
+    pub seals: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seal_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seal_at: Option<DateTime<Utc>>,
 }
 
 /// One `spec done` summary given after the spec was committed (finding 124).
@@ -250,6 +289,8 @@ impl Spec {
             genesis_tree: None,
             post_commit_notes: Vec::new(),
             created_by: None,
+            auto: None,
+            continues: None,
         }
     }
 

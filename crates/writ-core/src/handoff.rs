@@ -220,6 +220,14 @@ pub fn handoff(repo: &Repository, since: Option<Since>, survival: bool) -> WritR
 
 const UNKNOWN: &str = "unknown";
 
+/// The instant `--since` resolves to (None: everything). Shared with the
+/// receipt, so `handoff --format pr` and `--format markdown` read the same
+/// window.
+pub fn window_after(repo: &Repository, since: Option<Since>) -> WritResult<Option<DateTime<Utc>>> {
+    let specs = repo.list_specs()?;
+    Ok(resolve_window(repo, &specs, since)?.after)
+}
+
 fn resolve_window(repo: &Repository, specs: &[Spec], since: Option<Since>) -> WritResult<Window> {
     let last_finish = || specs.iter().filter_map(|s| s.committed_at).max();
     Ok(match since {
@@ -346,7 +354,27 @@ pub fn resolve_path(
         .max_by_key(|s| s.committed_at)
         .and_then(|s| s.commit_hash.clone());
 
-    // An override on the path is the resolution, in its own words.
+    if let Some((resolution, detail)) = override_resolution(repo, path, seals) {
+        return (resolution, detail, commit);
+    }
+
+    let current = current_content(repo, path, all_committed);
+    let where_ = if all_committed {
+        "the commit"
+    } else {
+        "the working tree"
+    };
+    let (resolution, detail) = resolve_against(repo, path, seals, &current, where_);
+    (resolution, detail, commit)
+}
+
+/// An override on the path is the resolution, in its own recorded words
+/// (an accepted one before a rewrite of the agent's own lines).
+pub fn override_resolution(
+    repo: &Repository,
+    path: &str,
+    seals: &[&Seal],
+) -> Option<(String, String)> {
     let overrides: Vec<(&Seal, &OverrideContext)> = seals
         .iter()
         .flat_map(|s| {
@@ -356,21 +384,39 @@ pub fn resolve_path(
                 .map(move |o| (*s, o))
         })
         .collect();
-    if let Some((s, o)) = overrides
+    overrides
         .iter()
         .find(|(_, o)| o.resolution() != "rewrote_own")
         .or_else(|| overrides.first())
-    {
-        return (
-            o.resolution().to_string(),
-            o.describe(&s.agent.id, &s.id),
-            commit,
-        );
-    }
+        // Ruling 177: a move into another path of the same seal says so.
+        .map(|(s, o)| crate::convergence::survival::describe_override(repo, s, o))
+}
 
+/// How the specs that sealed `path` resolved against `current`, the
+/// content a merge produced (`where_` names it: "the commit", "the working
+/// tree"). Overrides are not considered here; [`resolve_path`] checks them
+/// first. Shared by handoff, why and the receipt (which passes the content
+/// a finish commits).
+pub fn resolve_against(
+    repo: &Repository,
+    path: &str,
+    seals: &[&Seal],
+    current: &str,
+    where_: &str,
+) -> (String, String) {
+    let ids: Vec<String> = {
+        let mut v: Vec<String> = Vec::new();
+        for s in seals {
+            if let Some(id) = &s.spec_id {
+                if !v.contains(id) {
+                    v.push(id.clone());
+                }
+            }
+        }
+        v
+    };
     // Each spec's own added lines (added by its seals, still in its last
     // version of the path): are they in the current content?
-    let current = current_content(repo, path, all_committed);
     let present: HashSet<&str> = current.lines().collect();
     // A missing line is superseded when a later seal of the path (any
     // spec in the set) dropped it; otherwise no seal removed it: missing.
@@ -431,11 +477,6 @@ pub fn resolve_path(
             *bucket.entry(id.clone()).or_insert(0) += 1;
         }
     }
-    let where_ = if all_committed {
-        "the commit"
-    } else {
-        "the working tree"
-    };
     let list = |m: &BTreeMap<String, usize>| {
         m.iter()
             .map(|(id, n)| format!("{n} line(s) of {id}"))
@@ -449,7 +490,6 @@ pub fn resolve_path(
                 "missing: {} not in {where_} and no seal removed them; run `writ doctor --survival`",
                 list(&missing)
             ),
-            commit,
         );
     }
     if superseded.is_empty() {
@@ -459,7 +499,6 @@ pub fn resolve_path(
                 "kept: every line {} sealed is in {where_}",
                 crate::seal::join_names(&ids).unwrap_or_default()
             ),
-            commit,
         );
     }
     (
@@ -468,7 +507,6 @@ pub fn resolve_path(
             "superseded: {} replaced by a later seal of the file; the rest kept",
             list(&superseded)
         ),
-        commit,
     )
 }
 

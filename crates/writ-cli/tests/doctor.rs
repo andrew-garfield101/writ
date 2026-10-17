@@ -578,7 +578,7 @@ fn version_skew_stale_managed_block_fixed_by_init() {
     let md = fs::read_to_string(s.0.join("CLAUDE.md")).unwrap();
     fs::write(
         s.0.join("CLAUDE.md"),
-        md.replace("FIRST ACTION", "FIRST STEP"),
+        md.replace("writ context", "writ context --format brief"),
     )
     .unwrap();
 

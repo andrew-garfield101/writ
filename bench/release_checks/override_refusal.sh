@@ -21,7 +21,22 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 W="$(rc_bin "${1:-$ROOT/target/release/writ}")"
 echo "binary: $W ($("$W" --version))"
 rc_setup .override_refusal_scratch writ-override-refusal "${2:-}"
-w() { env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$W" "$@"; }
+# Ruling 183 (0.4.3): a hand seal that drops another spec's sealed lines is refused at seal
+# time. This script's fixture builds that divergence on purpose to test what finish, doctor
+# and handoff do with it, so the fixture seals with `[seal] foreign_line_check = false` (the
+# test-fixture setting) and every diagnostic runs with the key removed again: fx_key on|off.
+fx_key() { [ -f .writ/config.toml ] || return 0
+  python3 - "$1" <<'FXPY'
+import re, sys
+p = ".writ/config.toml"; s = open(p).read()
+s = re.sub(r"\n?\[seal\]\nforeign_line_check = false\n", "\n", s)
+if sys.argv[1] == "on":
+    s = s.rstrip("\n") + "\n\n[seal]\nforeign_line_check = false\n"
+open(p, "w").write(s)
+FXPY
+}
+w_raw() { env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$W" "$@"; }
+w() { local a; for a in "$@"; do case "$a" in doctor|finish|handoff|why|context) fx_key off; w_raw "$@"; local rc=$?; fx_key on; return $rc ;; seal|spec|log|show|init|status|diff) break ;; esac; done; w_raw "$@"; }
 g() { git -c user.name=t -c user.email=t@localhost "$@"; }
 mark() {  # mark "<n>:<suffix>" ...: 40 numbered lines, the given ones suffixed
   python3 -c "
@@ -32,7 +47,7 @@ open('shared.txt', 'w').write(''.join(f'line {i}' + (' ' + m[i] if i in m else '
 newest() { w log --all --format json --limit 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["id"])'; }
 setup() {  # setup <dir> <with_b>: committed shared.txt; sa (agent-a) seals "line 2 A"
   rc_git_project "$1"
-  w init -y > /dev/null 2>&1; git add -A; g commit -qm init
+  w init -y > /dev/null 2>&1; fx_key on; git add -A; g commit -qm init
   # The base version is sealed and committed through writ, as in a real project.
   w spec add --id setup --title setup --agent human --claim > /dev/null
   mark; w seal -s base --agent human --spec setup --paths shared.txt > /dev/null 2>&1
@@ -81,7 +96,7 @@ chk "nobody: override seals; context has path and line, no other agent" \
 # git base: the same "nobody" case on a file whose base version came from a git
 # commit, not a writ seal (the usual case: files that predate writ init).
 rc_git_project "$D/gitbase"
-w init -y > /dev/null 2>&1; git add -A; g commit -qm init
+w init -y > /dev/null 2>&1; fx_key on; git add -A; g commit -qm init
 mark; git add -A; g commit -qm shared
 w spec add --id sa --title a --agent agent-a --claim > /dev/null
 mark 2:A; w seal -s "a adds line 2 A" --agent agent-a --spec sa --paths shared.txt > /dev/null 2>&1

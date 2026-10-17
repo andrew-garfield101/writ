@@ -71,7 +71,25 @@ pub struct SpecDoneOutcome {
     /// `CLAIM: ...` when an agent other than the claim holder closed the
     /// spec (finding 52). Also recorded as a security event.
     pub claim_warning: Option<String>,
+    /// Ruling 181 (2): the survival check of the closing identity's own
+    /// specs: (lines checked, specs, milliseconds). None when it had no
+    /// sealed spec to check.
+    pub survival: Option<(usize, usize, u64)>,
 }
+
+/// Ruling 183: false only when `.writ/config.toml` sets the fixture switch
+/// `[seal] foreign_line_check = false`.
+pub fn foreign_line_check_configured(writ_dir: &Path) -> bool {
+    fs::read_to_string(writ_dir.join("config.toml"))
+        .ok()
+        .and_then(|t| toml::from_str::<crate::config::ProjectConfig>(&t).ok())
+        .and_then(|c| c.seal?.foreign_line_check)
+        .unwrap_or(true)
+}
+
+/// Ruling 181 (2): the longest `spec done` waits for its survival check
+/// (the full survival tier target on this repository is 5 s).
+pub const SPEC_DONE_SURVIVAL_BUDGET_MS: u64 = 5_000;
 
 /// Who a status view names for a spec (S.4a): the claim holder, else the
 /// agent of its newest seal, else its non-human creator, else `unclaimed`.
@@ -111,10 +129,27 @@ pub struct Repository {
     /// Paths for which the next seals may remove own lines
     /// (`--allow-removals <path>`, finding 56). Scoped to those files.
     allow_removal_paths: HashSet<String>,
+    /// Longest wait for the repository lock ([`Self::open_bounded`]).
+    lock_timeout: Duration,
+    /// Finding 173: override records written by the auto seal hook say so
+    /// (never "after being told").
+    override_by_hook: bool,
+    /// Rulings 181/183: the seal-time foreign-line check and the spec done
+    /// survival check. Off in the core API (engine tests build concurrent
+    /// versions directly); every agent-facing surface turns it on with
+    /// [`Self::enable_survival_checks`].
+    survival_checks: bool,
+    /// Ruling 183: the fixture switch turned the checks off; every seal
+    /// records it.
+    survival_checks_off_by_config: bool,
 }
 
 /// `event_type` of a seal-time refusal record (finding 76).
 pub const EVENT_SEAL_REFUSED: &str = "seal_refused";
+
+/// Finding 158: advisory memo of writ content hash to git blob id, so the
+/// stuck-file check compares ids instead of reading and hashing HEAD blobs.
+pub const GIT_OID_CACHE_FILE: &str = "git_oid_cache.json";
 
 /// Which seal-time check refused. Serialized as the `reason` field of
 /// [`SealRefusedEvent`].
@@ -332,6 +367,15 @@ impl Repository {
     /// Searches for `.writ/` in the given directory. Loads compression
     /// settings from GcConfig if available, otherwise uses defaults.
     pub fn open(root: &Path) -> WritResult<Self> {
+        Self::open_bounded(root, Self::LOCK_TIMEOUT)
+    }
+
+    /// [`Self::open`] with a bound on every wait for the repository lock
+    /// (at open and at each later locked operation). Sprint 6 ruling 149:
+    /// the auto seal hook waits at most a short bound and, on
+    /// `WritError::LockTimeout`, retries the path later instead of blocking
+    /// the agent.
+    pub fn open_bounded(root: &Path, lock_timeout: Duration) -> WritResult<Self> {
         let writ_dir = root.join(WRIT_DIR);
 
         if !writ_dir.exists() {
@@ -339,10 +383,22 @@ impl Repository {
         }
 
         // --- Schema version check & auto-migration ---
+        // Finding 158: a repository at the current schema, stamped by this
+        // writ version within the hour, needs neither: read without the
+        // lock (the file is replaced atomically) and skip the stamp. Every
+        // open used to take the repository lock and fsync version.toml,
+        // three times per seal, queueing every open behind every seal.
+        let current = crate::migrate::RepoVersion::load(&writ_dir)?;
+        let fresh = current.as_ref().is_some_and(|v| {
+            v.schema_version == crate::migrate::CURRENT_SCHEMA_VERSION
+                && v.last_opened_by == env!("CARGO_PKG_VERSION")
+                && v.last_opened_at
+                    .is_some_and(|t| chrono::Utc::now() - t < chrono::Duration::hours(1))
+        });
         // Acquire lock during migration + version stamp to prevent races when
         // multiple processes/threads open the same repo concurrently.
-        {
-            let _lock = RepoLock::acquire(&writ_dir, Self::LOCK_TIMEOUT)?;
+        if !fresh {
+            let _lock = RepoLock::acquire(&writ_dir, lock_timeout)?;
 
             let current_schema = crate::migrate::CURRENT_SCHEMA_VERSION;
             let repo_version = crate::migrate::RepoVersion::load(&writ_dir)?;
@@ -360,6 +416,14 @@ impl Repository {
             v.last_opened_at = Some(chrono::Utc::now());
             v.save(&writ_dir)?;
         }
+
+        // Finding 158: `[store] full_fsync` restores F_FULLFSYNC on Apple.
+        crate::fsutil::set_full_fsync(
+            crate::config::ProjectConfig::load(&writ_dir)
+                .ok()
+                .and_then(|c| c.store)
+                .is_some_and(|s| s.full_fsync),
+        );
 
         // Load storage config for ObjectStore compression settings.
         let storage_config = crate::gc::GcConfig::load(&writ_dir)
@@ -398,6 +462,10 @@ impl Repository {
             active_workspace: "main".to_string(),
             allow_own_line_removal: false,
             allow_removal_paths: HashSet::new(),
+            lock_timeout,
+            override_by_hook: false,
+            survival_checks: false,
+            survival_checks_off_by_config: false,
         })
     }
 
@@ -470,6 +538,22 @@ impl Repository {
     /// earlier seals of the same spec added. The CLI sets it for `--force`.
     pub fn set_allow_own_line_removal(&mut self, allow: bool) {
         self.allow_own_line_removal = allow;
+    }
+
+    /// Rulings 181/183: turn on the seal-time foreign-line check and the
+    /// spec done survival check, unless the fixture switch
+    /// `[seal] foreign_line_check = false` is in `.writ/config.toml`. Every
+    /// agent-facing surface calls this (CLI seal and spec done, the auto
+    /// seal hook, Python, MCP).
+    pub fn enable_survival_checks(&mut self) {
+        self.survival_checks = foreign_line_check_configured(&self.writ_dir);
+        self.survival_checks_off_by_config = !self.survival_checks;
+    }
+
+    /// Finding 173: mark override records as written by the auto seal hook
+    /// (its own fresh edit; no agent was told).
+    pub fn set_override_by_hook(&mut self, by_hook: bool) {
+        self.override_by_hook = by_hook;
     }
 
     /// Allow own-line removals only in these repo-relative files (the CLI's
@@ -688,7 +772,7 @@ impl Repository {
 
     /// Acquire an exclusive lock on the repository.
     fn lock(&self) -> WritResult<RepoLock> {
-        RepoLock::acquire(&self.writ_dir, Self::LOCK_TIMEOUT)
+        RepoLock::acquire(&self.writ_dir, self.lock_timeout)
     }
 
     /// Get the working directory state.
@@ -1249,6 +1333,35 @@ impl Repository {
         // recorded on the seal as override context; any other loss refuses,
         // naming who else worked on the file.
         let mut override_context = Vec::new();
+        // Ruling 181 (finding 145 closed): every seal, hand or hook, is
+        // checked against other open specs' sealed lines. A loss on a path
+        // named with --allow-removals is recorded as accepting the other
+        // agent's version (the refusal was the telling); any other refuses.
+        if let (Some(sid), true) = (spec_id.as_deref(), self.survival_checks) {
+            let mut refused = Vec::new();
+            for (spec, by, loss) in self.foreign_losses_in(sid, &agent.id, selected, &index)? {
+                let (_, added_by) = self.loss_context(&spec, &agent.id, &loss)?;
+                if self.allow_removal_paths.contains(&loss.path) {
+                    override_context.push(crate::seal::OverrideContext {
+                        path: loss.path.clone(),
+                        other_agents: vec![by.clone()],
+                        accepted_lines: loss.lines.clone(),
+                        lines: loss.lines,
+                        added_by,
+                        accepted_from: Some(vec![by]),
+                        by_hook: false,
+                    });
+                } else {
+                    let n = loss.line_count();
+                    refused.push((spec, by, added_by.last().cloned(), loss.path, n));
+                }
+            }
+            if !refused.is_empty() {
+                let err = WritError::ForeignLinesRemoved { losses: refused };
+                self.note_seal_refusal(Some(sid), &agent.id, &changed_paths, &err);
+                return Err(err);
+            }
+        }
         if let (Some(sid), false) = (spec_id.as_deref(), self.allow_own_line_removal) {
             let (allowed, refused): (Vec<_>, Vec<_>) = self
                 .own_line_losses(sid, selected, &index)?
@@ -1286,6 +1399,7 @@ impl Repository {
                     added_by,
                     accepted_from: Some(accepted_from),
                     accepted_lines,
+                    by_hook: self.override_by_hook,
                 });
             }
         }
@@ -1380,6 +1494,7 @@ impl Repository {
         // Finding 76: a forced seal and its allowances are visible in the
         // record, so the hurdle metric can be read from the store.
         seal.forced = self.allow_own_line_removal;
+        seal.foreign_line_check_off = self.survival_checks_off_by_config;
         let mut allowed: Vec<String> = self.allow_removal_paths.iter().cloned().collect();
         allowed.sort();
         seal.allow_removals = allowed;
@@ -1585,6 +1700,131 @@ impl Repository {
             }
         }
         Ok(losses)
+    }
+
+    /// Sprint 6 auto seal (Amis): what the pending change to `path` would
+    /// lose of OTHER open specs' sealed lines, by the same own-line rules a
+    /// spec's own seal is checked with (finding 102, allowances included).
+    /// Specs claimed by `agent` and committed specs are skipped. Read-only.
+    /// Each entry: the other spec, the agent that sealed the lost lines
+    /// (else its holder), the loss. Hand seals do not run this check; the
+    /// auto seal hook does, so an agent that overwrote another's sealed work
+    /// is told before its rewrite is recorded.
+    pub fn foreign_line_losses(
+        &self,
+        own_spec: &str,
+        agent: &str,
+        path: &str,
+    ) -> WritResult<
+        Vec<(
+            String,
+            String,
+            Option<String>,
+            convergence::survival::SurvivalLoss,
+        )>,
+    > {
+        let index = self.load_index()?;
+        let rules = self.ignore_rules();
+        let working_state = state::compute_state(&self.root, &index, &rules);
+        let Some(file_state) = working_state.changes.iter().find(|f| f.path == path) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for (spec, by, loss) in self.foreign_losses_in(own_spec, agent, &[file_state], &index)? {
+            let (_, added_by) = self.loss_context(&spec, agent, &loss)?;
+            out.push((spec, by, added_by.last().cloned(), loss));
+        }
+        Ok(out)
+    }
+
+    /// [`Self::foreign_line_losses`] over the files of one seal (moves
+    /// between them are not losses, finding 53 / ruling 177).
+    fn foreign_losses_in(
+        &self,
+        own_spec: &str,
+        agent: &str,
+        selected: &[&state::FileState],
+        index: &Index,
+    ) -> WritResult<Vec<(String, String, convergence::survival::SurvivalLoss)>> {
+        let mut out = Vec::new();
+        for spec in self.list_specs()? {
+            if spec.id == own_spec
+                || spec.sealed_by.is_empty()
+                || spec.claimed_by.as_deref() == Some(agent)
+                || spec.commit_state != crate::spec::CommitState::Uncommitted
+                || matches!(
+                    spec.lifecycle_state,
+                    crate::spec::LifecycleState::Cancelled | crate::spec::LifecycleState::Archived
+                )
+            {
+                continue;
+            }
+            for loss in self.own_line_losses(&spec.id, selected, index)? {
+                let (_, added_by) = self.loss_context(&spec.id, agent, &loss)?;
+                let by = added_by
+                    .last()
+                    .and_then(|id| self.load_seal(id).ok())
+                    .map(|s| s.agent.id)
+                    .filter(|a| a != agent)
+                    .or_else(|| spec.claimed_by.clone())
+                    .unwrap_or_else(|| "another agent".to_string());
+                out.push((spec.id.clone(), by, loss));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Finding 174: remove an open auto spec that has no seals (SessionEnd).
+    /// Anything else is left alone; returns true when removed.
+    pub fn remove_empty_auto_spec(&self, spec_id: &str) -> WritResult<bool> {
+        let spec = self.load_spec(spec_id)?;
+        if spec.auto.is_none()
+            || !spec.sealed_by.is_empty()
+            || spec.status == crate::spec::SpecStatus::Complete
+        {
+            return Ok(false);
+        }
+        fs::remove_file(
+            self.writ_dir
+                .join("specs")
+                .join(format!("{}.json", spec.id)),
+        )?;
+        Ok(true)
+    }
+
+    /// Sprint 6: SessionEnd closes an auto spec. Status complete, no summary
+    /// text (the receipt says "no summary from the agent"), the seal count
+    /// and span recorded on `spec.auto`. A spec already complete is left
+    /// alone (the agent closed it with its own words). Returns true when
+    /// the spec was closed here.
+    pub fn close_auto_spec(&self, spec_id: &str) -> WritResult<bool> {
+        let mut spec = self.load_spec(spec_id)?;
+        if spec.status == crate::spec::SpecStatus::Complete || spec.auto.is_none() {
+            return Ok(false);
+        }
+        let mut times: Vec<DateTime<Utc>> = spec
+            .sealed_by
+            .iter()
+            .filter_map(|id| self.load_seal(id).ok())
+            .map(|s| s.timestamp)
+            .collect();
+        times.sort();
+        let now = chrono::Utc::now();
+        if let Some(auto) = spec.auto.as_mut() {
+            auto.closed_by_session_end = Some(crate::spec::AutoClose {
+                at: now,
+                seals: spec.sealed_by.len(),
+                first_seal_at: times.first().copied(),
+                last_seal_at: times.last().copied(),
+            });
+        }
+        spec.status = crate::spec::SpecStatus::Complete;
+        spec.completion_summary = None;
+        spec.completed_at = Some(now);
+        spec.updated_at = now;
+        self.save_spec(&spec)?;
+        let _ = self.try_completion_convergence(spec_id);
+        Ok(true)
     }
 
     /// The version of `path` a spec started from when its first seal of the
@@ -1887,7 +2127,9 @@ impl Repository {
         err: &WritError,
     ) {
         let reason = match err {
-            WritError::OwnLinesRemoved { .. } => SealRefusal::SurvivalCheck,
+            WritError::OwnLinesRemoved { .. } | WritError::ForeignLinesRemoved { .. } => {
+                SealRefusal::SurvivalCheck
+            }
             WritError::SealClaimConflict { .. } => SealRefusal::ClaimConflict,
             WritError::SpecAlreadyCommitted { .. } => SealRefusal::SpecCommitted,
             WritError::ScopeViolation(_) => SealRefusal::ScopeViolation,
@@ -1962,22 +2204,23 @@ impl Repository {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let paths: Vec<String> = candidates.iter().map(|c| c.0.clone()).collect();
-        let head = match self.git_head_blobs(&paths) {
-            Ok(h) => h,
+        let wanted: Vec<(String, String)> = candidates
+            .iter()
+            .map(|c| (c.0.clone(), c.3.clone()))
+            .collect();
+        let (same, absent) = match self.git_head_same(&wanted) {
+            Ok(r) => r,
             // No git to compare against: nothing can be shown stuck.
             Err(_) => return Ok(Vec::new()),
         };
         // Finding 80: a git-ignored path absent from HEAD can never be
         // committed by finish, so it is not stuck (a force-added one is).
-        let ignored = self.git_ignored(&paths);
+        let absent_paths: Vec<String> = absent.iter().cloned().collect();
+        let ignored = self.git_ignored(&absent_paths);
         let mut out: Vec<seal_scope::StuckFile> = candidates
             .into_iter()
-            .filter(|(path, _, _, _)| !(ignored.contains(path) && !head.contains_key(path)))
-            .filter(|(path, _, _, hash)| {
-                head.get(path)
-                    .is_none_or(|bytes| crate::hash::hash_bytes(bytes) != *hash)
-            })
+            .filter(|(path, _, _, _)| !(ignored.contains(path) && absent.contains(path)))
+            .filter(|(path, _, _, _)| !same.contains(path))
             .map(|(path, spec, seal_id, _)| seal_scope::StuckFile {
                 path,
                 spec_id: spec.id.clone(),
@@ -2032,6 +2275,68 @@ impl Repository {
             out.insert(path.clone(), blob.content().to_vec());
         }
         Ok(out)
+    }
+
+    /// Finding 158: which `(path, writ hash)` pairs git HEAD holds with that
+    /// exact content, and which paths HEAD lacks. Compares git's entry id
+    /// against a memo of writ hash to git blob id (`.writ/git_oid_cache.json`,
+    /// advisory: both ids are content addresses, so an entry never goes
+    /// stale); only a pair the memo does not know reads and hashes the blob.
+    #[cfg(feature = "bridge")]
+    pub fn git_head_same(
+        &self,
+        wanted: &[(String, String)],
+    ) -> WritResult<(HashSet<String>, HashSet<String>)> {
+        let git_repo = git2::Repository::discover(&self.root).map_err(|_| WritError::NoGitRepo)?;
+        let mut same = HashSet::new();
+        let mut absent = HashSet::new();
+        let Ok(head) = git_repo.head() else {
+            absent.extend(wanted.iter().map(|(p, _)| p.clone()));
+            return Ok((same, absent));
+        };
+        let tree = head.peel_to_tree()?;
+        let memo_path = self.writ_dir.join(GIT_OID_CACHE_FILE);
+        let mut memo: HashMap<String, String> = std::fs::read(&memo_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+        let mut learned = false;
+        for (path, hash) in wanted {
+            let Ok(entry) = tree.get_path(Path::new(path)) else {
+                absent.insert(path.clone());
+                continue;
+            };
+            if entry.kind() != Some(git2::ObjectType::Blob) {
+                absent.insert(path.clone());
+                continue;
+            }
+            let oid = entry.id().to_string();
+            if memo.get(hash) == Some(&oid) {
+                same.insert(path.clone());
+                continue;
+            }
+            let blob = git_repo.find_blob(entry.id())?;
+            if crate::hash::hash_bytes(blob.content()) == *hash {
+                memo.insert(hash.clone(), oid);
+                learned = true;
+                same.insert(path.clone());
+            }
+        }
+        if learned {
+            if let Ok(bytes) = serde_json::to_vec(&memo) {
+                let _ = crate::fsutil::write_advisory(&memo_path, &bytes);
+            }
+        }
+        Ok((same, absent))
+    }
+
+    /// See the `bridge` build.
+    #[cfg(not(feature = "bridge"))]
+    pub fn git_head_same(
+        &self,
+        _wanted: &[(String, String)],
+    ) -> WritResult<(HashSet<String>, HashSet<String>)> {
+        Err(WritError::NoGitRepo)
     }
 
     /// The subset of `paths` git ignores (finding 80). Empty without git.
@@ -2162,12 +2467,13 @@ impl Repository {
     /// Post-seal work that runs outside the repo lock: storage pressure and
     /// optional on-seal convergence.
     fn after_seal(&self, lock: RepoLock, mut seal: Seal) -> WritResult<Seal> {
-        // GC.3.3c: Lightweight storage pressure check (best-effort, never blocks seal).
-        self.check_storage_pressure(&seal);
-
         // Release the repo lock BEFORE convergence: convergence takes its own
         // lock via converge_all(), so holding it here would deadlock.
         drop(lock);
+
+        // GC.3.3c: Lightweight storage pressure check (best-effort, never
+        // blocks seal). Read only, so outside the lock (finding 158).
+        self.check_storage_pressure(&seal);
 
         // V3: on-seal convergence is off by default; it fires from
         // mark_spec_done(). Opt in with `auto_converge_on_seal = true`.
@@ -2730,9 +3036,21 @@ impl Repository {
             let entry = entry?;
             let path = entry.path();
             if path.extension().is_some_and(|ext| ext == "json") {
-                let data = fs::read_to_string(&path)?;
-                let spec: Spec = serde_json::from_str(&data)?;
-                specs.push(spec);
+                // Finding 179: a spec removed between listing and reading
+                // is absent, not an error.
+                let data = match fs::read_to_string(&path) {
+                    Ok(d) => d,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(e.into()),
+                };
+                // Finding 179: a spec file that does not parse (half
+                // written, corrupt) is absent here; `writ doctor` reports
+                // it as an unparseable record (repair::unparseable_records),
+                // so it is never silent.
+                match serde_json::from_str::<Spec>(&data) {
+                    Ok(spec) => specs.push(spec),
+                    Err(_) => continue,
+                }
             }
         }
 
@@ -4023,12 +4341,24 @@ impl Repository {
             let mut spec_ids: Vec<String> = Vec::new();
             for entry in fs::read_dir(&heads_dir)? {
                 let entry = entry?;
-                spec_ids.push(entry.file_name().to_string_lossy().to_string());
+                let name = entry.file_name().to_string_lossy().to_string();
+                // Finding 179: a head mid atomic write is `<id>.tmp`; it is
+                // not a spec.
+                if name.ends_with(".tmp") {
+                    continue;
+                }
+                spec_ids.push(name);
             }
             spec_ids.sort();
 
             for spec_id in spec_ids {
-                let branch_seals = self.spec_log(&spec_id)?;
+                // Finding 179: a spec gone between listing and reading is
+                // absent, not an error.
+                let branch_seals = match self.spec_log(&spec_id) {
+                    Ok(s) => s,
+                    Err(WritError::SpecNotFound(_)) => continue,
+                    Err(e) => return Err(e),
+                };
                 for seal in branch_seals {
                     if seen.insert(seal.id.clone()) {
                         all_seals.push(seal);
@@ -5646,17 +5976,132 @@ impl Repository {
             })?;
         }
         let seal_summary = summary.as_deref().unwrap_or("Spec completed");
+        let closer = agent.id.clone();
         let final_seal = if no_seal {
             FinalSeal::Skipped
         } else {
             self.final_seal_for_done(agent, seal_summary, &spec_id, paths)?
+        };
+        // Ruling 181 (2): never done over red. Always a fresh run (never a
+        // cached green, finding 136), of this identity's own specs.
+        let survival = if self.survival_checks {
+            self.spec_done_survival(&closer, &spec_id)?
+        } else {
+            None
         };
         let spec = self.mark_spec_done(&spec_id, summary)?;
         Ok(SpecDoneOutcome {
             spec,
             final_seal,
             claim_warning,
+            survival,
         })
+    }
+
+    /// Ruling 181 (2): added-line survival, against the files on disk, of
+    /// every uncommitted spec `agent` holds or created that has seals, plus
+    /// `closing`. Run fresh on a helper thread and waited for at most
+    /// [`SPEC_DONE_SURVIVAL_BUDGET_MS`]: past it the result is
+    /// `SpecDoneSurvivalNotRun`. Any lost line (or undone sealed deletion)
+    /// is `SpecDoneLinesLost`. Read only.
+    fn spec_done_survival(
+        &self,
+        agent: &str,
+        closing: &str,
+    ) -> WritResult<Option<(usize, usize, u64)>> {
+        let ids: Vec<String> = self
+            .list_specs()?
+            .into_iter()
+            .filter(|s| {
+                (s.id == closing
+                    || s.claimed_by.as_deref() == Some(agent)
+                    || s.created_by.as_deref() == Some(agent))
+                    && !s.sealed_by.is_empty()
+                    && s.commit_state == crate::spec::CommitState::Uncommitted
+            })
+            .map(|s| s.id)
+            .collect();
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let started = std::time::Instant::now();
+        let root = self.root.clone();
+        let n = ids.len();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = Repository::open(&root).and_then(|r| {
+                convergence::survival::audit(&r, &ids, convergence::survival::Against::WorkingTree)
+            });
+            let _ = tx.send(r);
+        });
+        let budget = Duration::from_millis(SPEC_DONE_SURVIVAL_BUDGET_MS);
+        let report = match rx.recv_timeout(budget) {
+            Ok(r) => r?,
+            Err(_) => {
+                return Err(WritError::SpecDoneSurvivalNotRun {
+                    budget_ms: SPEC_DONE_SURVIVAL_BUDGET_MS,
+                })
+            }
+        };
+        let ms = started.elapsed().as_millis() as u64;
+        if !report.is_green() {
+            let history = self.log_all().unwrap_or_default();
+            let mut shown: Vec<String> = report
+                .lost_lines()
+                .take(3)
+                .map(|(spec, path, l)| {
+                    let mut d = convergence::survival::describe_lost(path, l);
+                    // r181 (4): a removal another spec sealed names its agent.
+                    if let Some((by, id)) = self.removed_by_other(&history, spec, path, &l.text) {
+                        d.push_str(&format!(
+                            ", removed by agent {by} in seal {}",
+                            &id[..id.len().min(12)]
+                        ));
+                    }
+                    d
+                })
+                .collect();
+            shown.extend(
+                report
+                    .deleted_but_present()
+                    .take(3)
+                    .map(|(_, f)| format!("{} was deleted by your seal and is back", f.path)),
+            );
+            let lost = report.lost + report.deleted_but_present().count();
+            return Err(WritError::SpecDoneLinesLost { lost, shown, ms });
+        }
+        Ok(Some((report.checked, n, ms)))
+    }
+
+    /// The newest seal of a spec other than `spec` that recorded `path`
+    /// without `line` while its previous version had it: (agent, seal id).
+    fn removed_by_other(
+        &self,
+        history: &[Seal],
+        spec: &str,
+        path: &str,
+        line: &str,
+    ) -> Option<(String, String)> {
+        let text = |h: &Option<String>| -> Option<String> {
+            h.as_ref()
+                .and_then(|h| self.objects.retrieve(h).ok())
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        let mut seals: Vec<&Seal> = history
+            .iter()
+            .filter(|s| s.spec_id.as_deref() != Some(spec))
+            .collect();
+        seals.sort_by_key(|s| std::cmp::Reverse(s.timestamp));
+        for s in seals {
+            for c in s.changes.iter().filter(|c| c.path == path) {
+                let had = text(&c.old_hash).is_some_and(|t| t.lines().any(|l| l == line));
+                let has = text(&c.new_hash).is_some_and(|t| t.lines().any(|l| l == line));
+                if had && !has {
+                    return Some((s.agent.id.clone(), s.id.clone()));
+                }
+            }
+        }
+        None
     }
 
     /// The final seal of `spec done` (S.1, finding 50), shared by the CLI,
@@ -8013,8 +8458,26 @@ impl Repository {
         let lock = self.lock()?;
         let index = self.load_index()?;
         let rules = self.ignore_rules();
-        let mut working_state = state::compute_state(&self.root, &index, &rules);
-        self.add_stuck_files(&mut working_state, &index);
+        // Finding 158: named files are checked one by one, not by walking
+        // the tree; a named path with no pending change may be stuck
+        // (finding 74), which needs the stuck-file check.
+        let mut working_state = match (named.is_empty(), {
+            if named.is_empty() {
+                None
+            } else {
+                state::compute_state_for_paths(&self.root, &index, &rules, named)
+            }
+        }) {
+            (false, Some(ws)) => ws,
+            _ => state::compute_state(&self.root, &index, &rules),
+        };
+        if named.is_empty()
+            || named
+                .iter()
+                .any(|p| !working_state.changes.iter().any(|f| &f.path == p))
+        {
+            self.add_stuck_files(&mut working_state, &index);
+        }
         // Finding 111: a path named with --paths that an earlier seal holds
         // and that is gone from disk is a deletion to record, even when the
         // ignore rules now hide it from the scan (else nothing could ever
@@ -8071,7 +8534,8 @@ impl Repository {
 
         // Quick size estimate: sum of file sizes in .writ/ via StorageReport::scan.
         // This is fast for typical repos (< 10k files in .writ/).
-        let report = match crate::gc::StorageReport::scan(&self.writ_dir, config.budget_bytes) {
+        let report = match crate::gc::StorageReport::scan_sizes(&self.writ_dir, config.budget_bytes)
+        {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -9512,7 +9976,7 @@ impl Repository {
         Ok(())
     }
 
-    fn save_spec(&self, spec: &Spec) -> WritResult<()> {
+    pub(crate) fn save_spec(&self, spec: &Spec) -> WritResult<()> {
         let path = self
             .writ_dir
             .join("specs")
@@ -10696,6 +11160,8 @@ impl Repository {
             claimed_host: claim_src.claimed_host.clone(),
             release_forced: existing.release_forced || incoming.release_forced,
             created_by: existing.created_by.clone().or(incoming.created_by.clone()),
+            auto: existing.auto.clone().or(incoming.auto.clone()),
+            continues: existing.continues.clone().or(incoming.continues.clone()),
             genesis_tree: existing
                 .genesis_tree
                 .clone()
@@ -16229,6 +16695,8 @@ mod verify_all_chains_tests {
             release_forced: false,
             genesis_tree: None,
             post_commit_notes: Vec::new(),
+            auto: None,
+            continues: None,
             created_by: None,
         };
         repo.add_spec(&spec).unwrap();
@@ -16301,6 +16769,8 @@ mod verify_all_chains_tests {
                 release_forced: false,
                 genesis_tree: None,
                 post_commit_notes: Vec::new(),
+                auto: None,
+                continues: None,
                 created_by: None,
             };
             repo.add_spec(&spec).unwrap();
@@ -18845,6 +19315,8 @@ mod remote_tests {
             release_forced: false,
             genesis_tree: None,
             post_commit_notes: Vec::new(),
+            auto: None,
+            continues: None,
             created_by: None,
         };
 
@@ -37615,6 +38087,7 @@ mod own_line_override_tests {
             added_by: vec![added.id.clone()],
             accepted_from: Some(vec!["b".to_string()]),
             accepted_lines: vec!["line 2 A".to_string()],
+            by_hook: false,
         };
         assert_eq!(s.override_context, vec![expect.clone()]);
         assert_eq!(expect.resolution(), "accepted_after_told");
@@ -37738,6 +38211,7 @@ mod dry_convergence_tests {
                 if rel.starts_with("security")
                     || rel.ends_with("doctor_cache.json")
                     || rel.ends_with("survival_cache.json")
+                    || rel.ends_with(GIT_OID_CACHE_FILE)
                 {
                     continue;
                 }
@@ -37809,5 +38283,32 @@ mod dry_convergence_tests {
         let real = repo.finalize_convergence().unwrap();
         assert_eq!(real.shadow_results, dry.report.shadow_results);
         assert_eq!(repo.object_content(hash).unwrap(), merged);
+    }
+}
+
+#[cfg(test)]
+mod finding_179_tests {
+    use super::*;
+
+    /// Finding 179: a head file mid atomic write (`heads/<id>.tmp`) and a
+    /// stray spec temp file are not specs; log_all and list_specs succeed.
+    #[test]
+    fn log_all_skips_temp_heads_and_list_specs_skips_temp_specs() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let heads = repo.workspace_dir().join("heads");
+        fs::create_dir_all(&heads).unwrap();
+        fs::write(heads.join("auto-1a2b3c4d.tmp"), "deadbeef").unwrap();
+        fs::write(repo.writ_dir().join("specs").join("auto-1a2b3c4d.tmp"), "{").unwrap();
+        fs::write(
+            repo.writ_dir().join("specs").join("broken.json"),
+            "{ not json",
+        )
+        .unwrap();
+        assert!(repo.log_all().is_ok(), "{:?}", repo.log_all().err());
+        assert!(repo.list_specs().unwrap().is_empty());
+        // A head whose spec is gone is skipped too.
+        fs::write(heads.join("gone-spec"), "deadbeef").unwrap();
+        assert!(repo.log_all().is_ok(), "{:?}", repo.log_all().err());
     }
 }

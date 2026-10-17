@@ -352,6 +352,22 @@ impl StorageReport {
 
     /// Build a storage report by walking the `.writ/` directory.
     pub fn scan(writ_dir: &Path, budget_bytes: u64) -> WritResult<Self> {
+        let mut report = Self::scan_sizes(writ_dir, budget_bytes)?;
+        // Compression statistics from the object store (reads and
+        // decompresses every object: for `writ gc` reports, never per seal).
+        let objects_dir = writ_dir.join("objects");
+        if objects_dir.exists() {
+            let store = crate::object::ObjectStore::new(&objects_dir);
+            report.compression = store.compression_stats().ok();
+        }
+        Ok(report)
+    }
+
+    /// [`Self::scan`] without compression statistics: file sizes only (one
+    /// metadata walk of `.writ/`). The per-seal storage pressure check uses
+    /// this; decompressing every object there was most of a seal's time
+    /// (finding 158).
+    pub fn scan_sizes(writ_dir: &Path, budget_bytes: u64) -> WritResult<Self> {
         let mut report = StorageReport {
             total_bytes: 0,
             seal_bytes: 0,
@@ -422,13 +438,6 @@ impl StorageReport {
                 report.other_bytes = report.other_bytes.saturating_sub(size);
                 report.working_state_bytes += size;
             }
-        }
-
-        // Compression statistics from the object store.
-        let objects_dir = writ_dir.join("objects");
-        if objects_dir.exists() {
-            let store = crate::object::ObjectStore::new(&objects_dir);
-            report.compression = store.compression_stats().ok();
         }
 
         Ok(report)
@@ -1329,6 +1338,13 @@ impl LiveObjects {
     }
 
     /// Add a spec's genesis tree (expanded), if it has one.
+    /// Treat `trees` as already expanded: their entries are known to the
+    /// caller (doctor's store cache, finding 158), so `add_tree` records
+    /// the tree's own hash and does not read it again.
+    pub fn assume_expanded<I: IntoIterator<Item = String>>(&mut self, trees: I) {
+        self.expanded_trees.extend(trees);
+    }
+
     pub fn add_spec(&mut self, spec: &crate::spec::Spec) {
         if let Some(ref tree) = spec.genesis_tree {
             self.add_tree(tree, &format!("genesis tree of spec {}", spec.id));
@@ -2179,6 +2195,8 @@ mod tests {
             release_forced: false,
             genesis_tree: None,
             post_commit_notes: Vec::new(),
+            auto: None,
+            continues: None,
             created_by: None,
         }
     }
@@ -2901,6 +2919,7 @@ mod tests {
             workspace: "main".to_string(),
             convergence: None,
             forced: false,
+            foreign_line_check_off: false,
             allow_removals: Vec::new(),
             override_context: Vec::new(),
         }
@@ -3696,6 +3715,8 @@ mod tests {
             release_forced: false,
             genesis_tree: None,
             post_commit_notes: Vec::new(),
+            auto: None,
+            continues: None,
             created_by: None,
         }
     }

@@ -16,13 +16,28 @@ FX="$ROOT/crates/writ-cli/tests/fixtures/f115"
 W="$(rc_bin "${1:-$ROOT/target/release/writ}")"
 echo "binary: $W ($("$W" --version))"
 rc_setup .merge_descendant_scratch writ-merge-descendant "${2:-}"
-w() { env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$W" "$@"; }
+# Ruling 183 (0.4.3): a hand seal that drops another spec's sealed lines is refused at seal
+# time. This script's fixture builds that divergence on purpose to test what finish, doctor
+# and handoff do with it, so the fixture seals with `[seal] foreign_line_check = false` (the
+# test-fixture setting) and every diagnostic runs with the key removed again: fx_key on|off.
+fx_key() { [ -f .writ/config.toml ] || return 0
+  python3 - "$1" <<'FXPY'
+import re, sys
+p = ".writ/config.toml"; s = open(p).read()
+s = re.sub(r"\n?\[seal\]\nforeign_line_check = false\n", "\n", s)
+if sys.argv[1] == "on":
+    s = s.rstrip("\n") + "\n\n[seal]\nforeign_line_check = false\n"
+open(p, "w").write(s)
+FXPY
+}
+w_raw() { env -i HOME="$HOME" PATH=/usr/bin:/bin:/usr/sbin:/sbin "$W" "$@"; }
+w() { local a; for a in "$@"; do case "$a" in doctor|finish|handoff|why|context) fx_key off; w_raw "$@"; local rc=$?; fx_key on; return $rc ;; seal|spec|log|show|init|status|diff) break ;; esac; done; w_raw "$@"; }
 g() { git -c user.name=t -c user.email=t@localhost "$@"; }
 
 # fixture <dir> <second version>: the sprint 4 shape, both specs done.
 fixture() {
     rc_git_project "$1"
-    w init -y > /dev/null 2>&1; git add -A; g commit -qm init
+    w init -y > /dev/null 2>&1; fx_key on; git add -A; g commit -qm init
     cp "$FX/base.py.txt" t.py; git add t.py; g commit -qm base
     w spec add --id harness --title harness --agent bri --claim > /dev/null
     w spec add --id stale-release --title stale-release --agent amis --claim > /dev/null

@@ -514,7 +514,11 @@ fn handoff_next_action_equals_doctor_on_every_state() {
         // two reads, then put it back for the seals that follow.
         let cfg = p.path(".writ/config.toml");
         let orig = fs::read_to_string(&cfg).unwrap();
-        fs::write(&cfg, orig.replace("\n[seal]\nforeign_line_check = false\n", "")).unwrap();
+        fs::write(
+            &cfg,
+            orig.replace("\n[seal]\nforeign_line_check = false\n", ""),
+        )
+        .unwrap();
         let h = p.json("human", &["handoff", "--since", since, "--format", "json"]);
         let d = p.json("human", &["doctor", "--format", "json"]);
         fs::write(&cfg, &orig).unwrap();

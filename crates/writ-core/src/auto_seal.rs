@@ -484,8 +484,10 @@ fn drain_mine(
             continue;
         }
         let mtime = fs::metadata(&abs).ok().and_then(|m| {
-            use std::os::unix::fs::MetadataExt;
-            Some(m.mtime() as i128 * NS_PER_SEC + m.mtime_nsec() as i128)
+            m.modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos() as i128)
         });
         let others: Vec<String> = match mtime {
             Some(t) => {

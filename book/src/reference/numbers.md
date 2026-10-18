@@ -71,8 +71,9 @@ The question: how often does writ get in an agent's way? A hurdle is a forced se
 |---|---|---:|---:|---:|---|
 | 0.4.1 | `stale-release`, `survival-tier`, `ci-and-hooks`, `harness-0-4-1` | 20 | 41 | 4.9 | 2026-10-14 |
 | 0.4.2 | `act-on-it`, `merge-descendant`, `session-end-and-ci`, `harness-0-4-2` | 12 | 38 | 3.2 | 2026-10-14 |
+| 0.4.3 | `auto-seal`, `harness-0-4-3`, `receipt-and-scale`, `release-0-4-3`, `close-0-4-3-agents`, `fix-0-4-3-build` | 28 | 88 | 3.2 | 2026-10-18 |
 
-0.4.2 over 0.4.1: 0.65 times the rate. The 0.4.2 release note said 0.67 times (20 over 39, 12 over 35) because the seal totals were counted before each release's own release seals; the hurdle counts are the same. From 0.4.3 the count is saved to a file when the release is cut.
+0.4.2 over 0.4.1: 0.65 times the rate. The 0.4.2 release note said 0.67 times (20 over 39, 12 over 35) because the seal totals were counted before each release's own release seals; the hurdle counts are the same. 0.4.3 over 0.4.2: the same rate. 24 of its 28 hurdles are allowed removals in the test harness and auto seal specs, where fixtures were rewritten on purpose; 16 refusal events in the sprint name no spec of the set and are not counted. From 0.4.3 the count is saved to a file when the release is cut: `0.4.3-hurdles/hurdles_records_5d30ff7_20261018T071256Z.txt`.
 
 ## Unsealed window
 
@@ -114,21 +115,23 @@ Credit moved: files sealed by an agent that the hooks had not named as the maker
 
 ## Fleet numbers
 
-Many agents editing in one directory at the same time, driven through the installed edit hook by `bench/fleet/sim.py`, the way Claude Code calls it. Measured on 2026-10-14 on a 0.4.3 development build (binary sha256 `c63f55be96f4`), against 0.4.2 with the same script. The 0.4.3 release build is a later binary; its numbers replace these when its run files are saved. Reproduce with `bench/release_checks/fleet_numbers.sh`, which reruns each published shape and compares.
+Many agents editing in one directory at the same time, driven through the installed edit hook by `bench/fleet/sim.py`, the way Claude Code calls it. Measured on 2026-10-15 on the 0.4.3 release candidate (binary sha256 `5da679fd4fab`, the tree of the 0.4.3 tag before its Windows build fix), and on 2026-10-14 on an earlier development build (`c63f55be96f4`, before the store lock stopped polling), against 0.4.2 with the same script. Reproduce with `bench/release_checks/fleet_numbers.sh`, which reruns each published shape and compares.
 
 What these numbers cover. They are from the edit tool path (Edit, Write, NotebookEdit), where the hook is told which file the agent edited. Edits made by shell commands (the Bash hook pair) are not measured here, and "no edit sealed under the wrong agent" from these runs does not carry over to them.
 
-At one agent the seal follows the edit by 38 ms. At 50 agents in one directory it lands when the turn ends: median 5.0 to 5.3 s, worst 11 s, every edit sealed by the end. At 50 agents the slowest hook took about 1 s to return to the agent. Edit to seal is an upper bound: the time from the edit to the first seal that holds it.
+On the release candidate, at one agent the seal follows the edit by 13 ms. At 50 agents in one directory: median 985 ms, nine in ten under 3.0 s, worst 6.5 s, every edit sealed by the end; the slowest hook took 682 ms to return to the agent. The development build before the lock change read 38 ms at one agent and a median of 5.0 to 5.3 s at 50, its rows kept below. Edit to seal is an upper bound: the time from the edit to the first seal that holds it.
 
 | Agents x edits | Repository | Hook return p50 / max | Edit to seal p50 / max | Edits sealed by the end | Sealed under another agent | Evidence |
 |---|---|---|---|---|---|---|
-| 1 x 50, one after another | clone of the writ repository, 279 files | 90 ms / 152 ms | 38 ms / 77 ms | 50 of 50 | 0 | `0.4.3-fleet-sim/1x50-this-repo.json` |
+| 1 x 50, one after another, release candidate (load average 10 on 10 cores) | clone of the writ repository, 279 files | 21 ms / 49 ms | 13 ms / 42 ms | 50 of 50 | 0 | `0.4.3-fleet-sim/1x50-this-repo-freeze4.json` |
+| 50 x 20, all at once, release candidate (load average 7.3 rising to 10.2) | generated, 1,105 files | 383 ms / 682 ms | 985 ms / 6.5 s | 1,000 of 1,000 | 0 | `0.4.3-fleet-sim/50x20-freeze4.json` |
+| 1 x 50, one after another, development build | clone of the writ repository, 279 files | 90 ms / 152 ms | 38 ms / 77 ms | 50 of 50 | 0 | `0.4.3-fleet-sim/1x50-this-repo.json` |
 | 50 x 20, all at once (load average 3.8 on 10 cores) | generated, 1,105 files | 295 ms / 937 ms | 5.3 s / 11.0 s | 1,000 of 1,000 | 0 | `0.4.3-fleet-sim/50x20-run1-with-load.json` |
 | 50 x 20, all at once, again (load average 3.5) | generated, 1,105 files | 291 ms / 1,081 ms | 5.0 s / 11.0 s | 1,000 of 1,000 | 0 | `0.4.3-fleet-sim/50x20-run2-with-load.json` |
 | 0.4.2, 50 x 20, a seal command per edit | generated, 1,105 files | 7.0 s / 21.7 s | not measured | 9 files left unsealed | 0 | `0.4.3-fleet-sim/before-0.4.2-naive-50x20-run1.json` |
 | 0.4.2, 50 x 20, again | generated, 1,105 files | 7.1 s / 20.1 s | not measured | 17 files left unsealed | 0 | `0.4.3-fleet-sim/before-0.4.2-naive-50x20-run2.json` |
 
-0.4.2 has no auto seal; its rows use a hook that runs `writ seal --paths` after each edit, the closest a user could get. At 50 agents in 0.4.3 most edits are sealed when each agent's turn ends rather than on the edit itself (in the second run: 19 seals on the edit, 11 put off because another agent held the store lock, 42 at the end of the turn), which is why the window there is the turn, not the hook.
+0.4.2 has no auto seal; its rows use a hook that runs `writ seal --paths` after each edit, the closest a user could get. At 50 agents in 0.4.3 most edits are sealed when each agent's turn ends rather than on the edit itself (release candidate: 273 hook calls sealed on the edit, 206 put off because another agent held the store lock, 26 seals at the end of the turn; development build, second run: 19, 11 and 42), which is why the window there is the turn, not the hook.
 
 These are not a pass or fail against the 0.4.3 aim of edit to seal under 1 s: that aim was set for the two-agent live runs above, not for 50 agents.
 

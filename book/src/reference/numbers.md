@@ -91,19 +91,17 @@ The edit tools (Edit, Write, NotebookEdit) have no live run figure yet; their fl
 
 When two agents run shell commands at the same time and a file changes while both are running, writ cannot always tell whose change it is. It then seals the file for nobody and asks each of those agents in one line to claim it, because sealing a change under the wrong agent is worse than not sealing it.
 
-| Run | Identities in the run\* | Agents asked | Hook sealed | Asked | Evidence |
-|---|---|---|---|---|---|
-| c409 | 6 | 4 | 14 | 17 | `0.4.3-fleet-live-c409/summary.json` (`ambiguity`), from `hooks.log` |
-| A | 2 | 2 | 3 | 28 | `0.4.3-live-runA-freeze4/summary.json` (`ambiguity`), release candidate `5da679fd4fab` |
-| B | 3 | 2 | 2 | 54 | `0.4.3-live-runB-freeze4-rerun/summary.json` (`ambiguity`), release candidate `5da679fd4fab` |
+| Run | Identities in the run\* | Agents asked | Hook sealed | Not attributed (records) | Ask lines shown | Evidence |
+|---|---|---|---|---|---|---|
+| c409 | 6 | 4 | 14 | 17 | 4 | `0.4.3-fleet-live-c409/summary.json` (`ambiguity`), from `hooks.log` |
+| A | 2 | 2 | 3 | 28 | 5 | `0.4.3-live-runA-freeze4/summary.json` (`ambiguity`), release candidate `5da679fd4fab` |
+| B | 3 | 2 | 2 | 54 | 10 | `0.4.3-live-runB-freeze4-rerun/summary.json` (`ambiguity`), release candidate `5da679fd4fab` |
 
 \* Identities in the run: c409's six are two mains and four subagents; run B's third identity is the injected stale session, which never edited.
 
-With two agents running test suites in the same directory, most writes land while both agents have a command open, so writ asks rather than guesses. In these runs the agents sealed when asked and nothing was lost.
+"Not attributed" counts hook log records, including the end of turn sweep, which prints nothing; "ask lines shown" counts the lines an agent actually received (finding 187, counted 2026-10-18 from the hook logs and transcripts, `0.4.4-ask-count/results.md`). In these runs the agents sealed when asked and nothing was lost.
 
-For 0.4.4, the ask count is the number to drive down.
-
-Most of the ambiguity comes from commands that run for a long time: a test run such as pytest keeps an agent's command open for minutes, and every file another agent changes in that time overlaps it.
+Where the records come from (finding 186, measured 2026-10-18 on these three runs): Claude Code sends the PostToolUse event only after a shell command succeeds; a failed command gets a separate PostToolUseFailure event, which 0.4.3's hooks do not register. So a command that exits non zero, such as `cat` on a missing file, leaves that agent's window open until its turn ends, and every file the other agent changes in that time has two candidates. All 99 records across the three runs have such a window among their candidates. 0.4.4 registers the failure event and closes stale windows; on the same three runs that leaves 6 records of 99 ambiguous, with 0 wrong attributions (`0.4.4-ask-count/results.md`, the "rules 0+1+2" column; the change ships when the two agent runs on the 0.4.4 build confirm it).
 
 Credit moved: files sealed by an agent that the hooks had not named as the maker or a candidate. On the run above, 6: the four files of finding 169 and two sealed by a main agent whose candidates were its own subagent and the other main agent (`0.4.3-fleet-live-c409/report.md`). The exit runs on the build with the fix report this count beside the ambiguity row.
 

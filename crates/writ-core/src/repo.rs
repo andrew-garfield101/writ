@@ -134,6 +134,8 @@ pub struct Repository {
     /// Finding 173: override records written by the auto seal hook say so
     /// (never "after being told").
     override_by_hook: bool,
+    /// Ruling 189: recorded on the next seals as [`Seal::attributed_by`].
+    attributed_by: Option<String>,
     /// Rulings 181/183: the seal-time foreign-line check and the spec done
     /// survival check. Off in the core API (engine tests build concurrent
     /// versions directly); every agent-facing surface turns it on with
@@ -464,6 +466,7 @@ impl Repository {
             allow_removal_paths: HashSet::new(),
             lock_timeout,
             override_by_hook: false,
+            attributed_by: None,
             survival_checks: false,
             survival_checks_off_by_config: false,
         })
@@ -554,6 +557,12 @@ impl Repository {
     /// (its own fresh edit; no agent was told).
     pub fn set_override_by_hook(&mut self, by_hook: bool) {
         self.override_by_hook = by_hook;
+    }
+
+    /// Ruling 189: record how the auto seal hook attributed the next seals'
+    /// paths (`command_text`); None (the default) records nothing.
+    pub fn set_attributed_by(&mut self, by: Option<&str>) {
+        self.attributed_by = by.map(str::to_string);
     }
 
     /// Allow own-line removals only in these repo-relative files (the CLI's
@@ -1499,6 +1508,7 @@ impl Repository {
         allowed.sort();
         seal.allow_removals = allowed;
         seal.override_context = override_context;
+        seal.attributed_by = self.attributed_by.clone();
 
         let ks = KeyStore::open(&self.writ_dir);
         let signing_key = ks.load_agent_signing_key(&seal.agent.id).ok();

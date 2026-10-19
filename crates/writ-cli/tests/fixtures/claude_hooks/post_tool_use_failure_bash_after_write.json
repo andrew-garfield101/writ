@@ -1,0 +1,20 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000007",
+  "transcript_path": "~/.claude/projects/-repo/00000000-0000-4000-8000-000000000007.jsonl",
+  "cwd": "/repo",
+  "prompt_id": "00000000-0000-4000-8000-000000000008",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUseFailure",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "printf 'x\\n' > wrote.txt && false",
+    "description": "Write a file then run a failing command"
+  },
+  "tool_use_id": "toolu_01LSGQFfrBAtWVmxKU4WZpqT",
+  "error": "Exit code 1",
+  "is_interrupt": false,
+  "duration_ms": 15
+}

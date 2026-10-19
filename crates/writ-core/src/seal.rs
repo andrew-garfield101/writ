@@ -145,7 +145,19 @@ pub struct Seal {
     /// Absent when empty (no override was used).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub override_context: Vec<OverrideContext>,
+    /// Ruling 189: how the auto seal hook decided these paths were the
+    /// sealer's when its Bash window was not the only candidate:
+    /// `command_text` (exactly one candidate's command named the path).
+    /// Absent for a seal decided by a single window, or any other seal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributed_by: Option<String>,
 }
+
+/// [`Seal::attributed_by`] for a path the command text decided (ruling 189).
+pub const ATTRIBUTED_BY_COMMAND_TEXT: &str = "command_text";
+
+/// The words every surface uses for such a seal (receipt, handoff, why).
+pub const ATTRIBUTED_FROM_COMMAND: &str = "attributed from the command";
 
 /// One path's override record on a seal (finding 102).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,6 +339,7 @@ impl Seal {
             foreign_line_check_off: false,
             allow_removals: Vec::new(),
             override_context: Vec::new(),
+            attributed_by: None,
         };
 
         // Compute the seal's ID from its content

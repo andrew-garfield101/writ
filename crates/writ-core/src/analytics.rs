@@ -259,6 +259,7 @@ mod tests {
             foreign_line_check_off: false,
             allow_removals: Vec::new(),
             override_context: Vec::new(),
+            attributed_by: None,
         }
     }
 

@@ -8,6 +8,11 @@
 # Checks 28-29 (0.4.2): a project initialized before the SessionEnd hook gains
 # exactly one on rerun, the user's own SessionEnd hook is kept, and the hook
 # runs PATH's `writ session-end`.
+# Checks 15, 30-31 (0.4.4, finding 184): an existing writ block in AGENTS.md is
+# refreshed in place even with codex = false (before 0.4.4 the rerun left it
+# stale), user text around it kept; a stale block reads version_skew on
+# AGENTS.md until the rerun; an AGENTS.md with no writ markers under codex =
+# false is still left byte for byte alone.
 #
 # Usage: bench/release_checks/init_rerun.sh [WRIT_BIN] [SCRATCH_DIR]
 #   WRIT_BIN     writ binary under test (default: <repo>/target/release/writ)
@@ -110,7 +115,8 @@ d["hooks"]["SessionEnd"] = [{"hooks": [{"type": "command", "command": "echo USER
 st.write_text(json.dumps(d, indent=2))
 PY
 cp .claude/settings.json settings.tampered.json 2>/dev/null || true
-cp AGENTS.md AGENTS.tampered.md  # codex = false is seeded above: the rerun must not touch it
+cp AGENTS.md AGENTS.tampered.md
+skew_before="$("$W" doctor --format json 2>/dev/null | python3 -c 'import json,sys; print(" ".join(p for f in json.load(sys.stdin).get("findings", []) if f.get("check") == "version_skew" for p in f.get("paths") or []))' 2>/dev/null || true)"
 "$W" init -y > init2.log 2>&1; echo "init2 rc=$?"
 snap after
 
@@ -130,8 +136,10 @@ chk "slash commands refreshed" "! grep -rq STALE-CMD .claude/commands"
 chk "SessionStart hook refreshed" "! grep -q STALE-HOOK .claude/settings.json"
 chk "settings instructions refreshed" "! grep -q STALE-INSTRUCTIONS .claude/settings.json"
 chk "AGENT_INSTRUCTIONS.md refreshed" "[ ! -f .writ/AGENT_INSTRUCTIONS.md ] || ! grep -q STALE-AGENT .writ/AGENT_INSTRUCTIONS.md"
-chk "AGENTS.md byte for byte unchanged (codex = false opt-out honoured)" "[ -f AGENTS.tampered.md ] && cmp -s AGENTS.tampered.md AGENTS.md"
-chk "AGENTS.md user text preserved" "[ ! -f AGENTS.md ] || grep -q USER-BELOW-MARKERS AGENTS.md"
+block() { python3 -c 'import sys; s=open(sys.argv[1]).read(); B="<!-- BEGIN WRIT CONFIGURATION"; E="<!-- END WRIT CONFIGURATION -->"; print(s[s.index(B):s.index(E)+len(E)] if B in s and E in s else "")' "$1"; }
+chk "AGENTS.md writ block refreshed in place under codex = false, equal to CLAUDE.md's, once (finding 184)" \
+  "! grep -q STALE-MANAGED-TEXT AGENTS.md && [ \$(grep -c 'BEGIN WRIT CONFIGURATION' AGENTS.md) -eq 1 ] && [ -n \"\$(block AGENTS.md)\" ] && [ \"\$(block AGENTS.md)\" = \"\$(block CLAUDE.md)\" ]"
+chk "AGENTS.md user text above and below the block preserved" "grep -q USER-ABOVE-MARKERS AGENTS.md && grep -q USER-BELOW-MARKERS AGENTS.md"
 chk "user permission preserved" "grep -q 'Bash(ls \\*)' .claude/settings.json"
 chk "user settings key preserved" "grep -q USER-SETTING .claude/settings.json"
 chk "SessionStart hook present in settings" "grep -q SessionStart .claude/settings.json"
@@ -166,6 +174,14 @@ chk "SessionEnd hook runs PATH's writ ('session-end' in 0.4.2, the 'hook' dispat
 mkdir -p real-bin; ln -sf "$W" real-bin/writ
 real_rc=0; real_out="$(echo '{"hook_event_name":"SessionEnd","session_id":"t-rerun","reason":"other"}' | PATH="$PWD/real-bin:/usr/bin:/bin" sh -c "${end_hook:-:}" 2>&1)" || real_rc=$?
 chk "SessionEnd hook with the real writ: exit 0, prints nothing" "[ $real_rc -eq 0 ] && [ -z \"\$real_out\" ]"
+# 0.4.4, finding 184: the stale block was version_skew on AGENTS.md before the rerun, and is not after.
+skew_after="$("$W" doctor --format json 2>/dev/null | python3 -c 'import json,sys; print(" ".join(p for f in json.load(sys.stdin).get("findings", []) if f.get("check") == "version_skew" for p in f.get("paths") or []))' 2>/dev/null || true)"
+chk "stale AGENTS.md block: version_skew on AGENTS.md before the rerun, none after (finding 184)" \
+  "printf '%s\n' \$skew_before | grep -qx AGENTS.md && ! printf '%s\n' \$skew_after | grep -qx AGENTS.md"
+# codex = false and an AGENTS.md that is only the user's (no writ markers): left alone.
+printf '# only mine\nUSER-ONLY-AGENTS\n' > AGENTS.md; cp AGENTS.md AGENTS.mine.md
+"$W" init -y > init3.log 2>&1 || true
+chk "AGENTS.md with no writ markers under codex = false: byte for byte unchanged by the rerun" "cmp -s AGENTS.mine.md AGENTS.md"
 echo "--- config.toml diff (before rerun vs after)"; diff config.before.toml .writ/config.toml || true
 echo "--- init2 output"; cat init2.log
 exit $fail

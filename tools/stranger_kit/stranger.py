@@ -846,13 +846,48 @@ def worst_window(recs: list[dict]) -> dict | None:
             "seal": w.get("seal"), "cause": cause}
 
 
-def ambiguity_rate(recs: list[dict]) -> dict:
+# The 0.4.3+ ambiguity line (ruling 160 wording) as an agent receives it.
+ASK_MARK = "writ could not tell whose change it is"
+
+
+def ambiguity_rate(recs: list[dict], agents: dict | None = None) -> dict:
+    """Finding 187: records writ could not attribute (hooks.log) are not asks.
+
+    `records_not_attributed` counts hooks.log ambiguous records, Stop sweep
+    records included (they print nothing). `ask_lines_shown` counts, per
+    agent, the ambiguity lines that agent actually received (transcript
+    hook context, repeats counted). `ambiguous_records` is kept, equal to
+    `records_not_attributed`, so 0.4.3 evidence and readers still parse.
+    `records_told` counts records whose 0.4.4 `told` flag is true (None when
+    the log predates the flag).
+    """
     amb = [r for r in recs if r.get("outcome") == "ambiguous"]
     files = {p for r in amb for p in (r.get("paths") or [r.get("path")]) if p}
     sealed = [r for r in recs if r.get("outcome") == "sealed"]
-    return {"ambiguous_records": len(amb), "ambiguous_files": len(files),
-            "sealed_records": len(sealed),
-            "identities": len({r.get("agent") for r in recs if r.get("agent")})}
+    flagged = [r for r in amb if isinstance(r.get("told"), bool)]
+    out = {"ambiguous_records": len(amb), "records_not_attributed": len(amb),
+           "ambiguous_files": len(files), "sealed_records": len(sealed),
+           "identities": len({r.get("agent") for r in recs if r.get("agent")}),
+           "records_told": sum(r["told"] for r in flagged) if flagged else None}
+    if agents is not None:
+        out["ask_lines_shown"] = ask_lines_shown(agents)
+        out["ask_lines_shown_total"] = sum(out["ask_lines_shown"].values())
+    return out
+
+
+def ask_lines_shown(agents: dict) -> dict[str, int]:
+    """Ambiguity lines each agent received, from its `hook_context_seen`
+    plus its subagents' (their own transcripts; c409 had 2 there)."""
+    def n(seen: list[dict]) -> int:
+        return sum(h.get("times", 1) for h in seen if ASK_MARK in h.get("line", ""))
+    return {a: n(i.get("hook_context_seen", []))
+            + sum(n(sa.get("hook_context_seen", [])) for sa in i.get("subagents", []))
+            for a, i in agents.items()}
+
+
+def ask_counts(summary: dict, recs: list[dict]) -> dict:
+    """Both 187 numbers for a saved run: its summary.json and hooks.log."""
+    return ambiguity_rate(recs, summary.get("agents") or {})
 
 
 def credit_moved(recs: list[dict], seals: list) -> list[str]:
@@ -977,7 +1012,7 @@ def score(out: Path) -> dict:
         "seals_by_identity_and_source": seal_sources(seals),
         "window_mtime": hook_window(_records(out)),
         "window_worst": worst_window(_records(out)),
-        "ambiguity": ambiguity_rate(_records(out)),
+        "ambiguity": ambiguity_rate(_records(out), agents),
         "credit_moved": credit_moved(_records(out), seals),
         "receipt": (out / "receipt.txt").read_text() if (out / "receipt.txt").exists() else None,
         "tools_total": dict(sum((collections.Counter(i["tools_total_main_and_subagents"])
@@ -1016,9 +1051,10 @@ def report(s: dict, kit: dict) -> str:
           (f"- Worst window record: {s['window_worst']['ms']} ms, {s['window_worst']['path']} by "
            f"{s['window_worst']['agent']}, hook {s['window_worst']['hook']}, seal {s['window_worst']['seal']}: "
            f"{s['window_worst']['cause']}" if s.get("window_worst") else "- Worst window record: none"),
-          f"- Ambiguity (ruling 160): {amb['ambiguous_records']} ambiguous records over "
-          f"{amb['ambiguous_files']} files against {amb['sealed_records']} sealed records, "
-          f"{amb['identities']} identities",
+          f"- Ambiguity (ruling 160, 187): {amb['records_not_attributed']} records writ could not "
+          f"attribute over {amb['ambiguous_files']} files against {amb['sealed_records']} sealed records, "
+          f"{amb['identities']} identities; ask lines shown {amb.get('ask_lines_shown_total')} "
+          f"{amb.get('ask_lines_shown')}",
           f"- Credit moved (169): {len(s['credit_moved'])}"
           + ("".join(f"\n  - {c}" for c in s['credit_moved'])),
           f"- Zero-touch safe finish: strict {s['zero_touch_strict']}, lenient {s['zero_touch_lenient']}",

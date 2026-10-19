@@ -313,7 +313,8 @@ fn remove_claude_instructions(root: &Path) -> WritResult<Option<String>> {
 const WRIT_HOOK_MARKER: &str = "writ context";
 
 /// Files whose writ-managed text is older than this binary's template
-/// (`writ doctor` version_skew): the CLAUDE.md marked block, and the
+/// (`writ doctor` version_skew): the CLAUDE.md and AGENTS.md marked blocks
+/// (finding 184), and the
 /// SessionStart hook in `.claude/settings.json` (or a writ hook still on a
 /// legacy event). Only text writ already manages is checked; a project that
 /// never opted in reports nothing. `writ init -y` refreshes both.
@@ -324,6 +325,14 @@ pub fn stale_managed_text(root: &Path) -> Vec<String> {
             let fresh = wrap_with_markers(&writ_claude_md_section());
             if replace_marked_section(&content, &fresh) != content {
                 stale.push("CLAUDE.md".to_string());
+            }
+        }
+    }
+    if let Ok(content) = fs::read_to_string(root.join("AGENTS.md")) {
+        if content.contains(MARKER_BEGIN) {
+            let fresh = wrap_with_markers(&writ_agents_md_section());
+            if replace_marked_section(&content, &fresh) != content {
+                stale.push("AGENTS.md".to_string());
             }
         }
     }
@@ -525,6 +534,10 @@ fn expected_hooks(fallback: &str) -> Vec<(&'static str, Option<&'static str>, St
         (WRIT_HOOK_EVENT, None, session_start_command(fallback)),
         ("PreToolUse", Some("Bash"), auto.clone()),
         ("PostToolUse", Some(matcher), auto.clone()),
+        // Finding 186: Claude Code sends PostToolUse only after a call that
+        // succeeded; a failed call (a Bash exit 1) gets PostToolUseFailure.
+        // Without it the call's window never closes.
+        ("PostToolUseFailure", Some(matcher), auto.clone()),
         ("UserPromptSubmit", None, auto.clone()),
         ("Stop", None, auto.clone()),
         ("SubagentStop", None, auto.clone()),
@@ -536,6 +549,7 @@ fn expected_hooks(fallback: &str) -> Vec<(&'static str, Option<&'static str>, St
 const WRIT_AUTO_EVENTS: &[&str] = &[
     "PreToolUse",
     "PostToolUse",
+    "PostToolUseFailure",
     "UserPromptSubmit",
     "Stop",
     "SubagentStop",
@@ -891,6 +905,30 @@ pub fn hook_codex(root: &Path) -> WritResult<HookResult> {
         files_created: created,
         files_updated: updated,
     })
+}
+
+/// Finding 184: refresh the writ block of an existing AGENTS.md (the text
+/// between the writ markers becomes today's template; everything outside
+/// is kept byte for byte), whether or not Codex is enabled in this
+/// project's config: the block is writ-managed text either way. A file
+/// without the markers, or no file, is left alone (`hook_codex` adds the
+/// block when Codex is enabled). Returns `Some("AGENTS.md")` when the file
+/// changed.
+pub fn refresh_agents_md_block(root: &Path) -> WritResult<Option<String>> {
+    let agents_md = root.join("AGENTS.md");
+    let Ok(content) = fs::read_to_string(&agents_md) else {
+        return Ok(None);
+    };
+    if !content.contains(MARKER_BEGIN) {
+        return Ok(None);
+    }
+    let fresh = wrap_with_markers(&writ_agents_md_section());
+    let new_content = replace_marked_section(&content, &fresh);
+    if new_content == content {
+        return Ok(None);
+    }
+    atomic_write(&agents_md, new_content.as_bytes())?;
+    Ok(Some("AGENTS.md".to_string()))
 }
 
 /// Install hooks for all detected frameworks.
@@ -2879,8 +2917,8 @@ mod tests {
         let hooks = parsed["hooks"].as_object().unwrap();
         assert_eq!(
             hooks.len(),
-            7,
-            "SessionStart plus the six auto seal events: {hooks:?}"
+            8,
+            "SessionStart plus the seven auto seal events (PostToolUseFailure, finding 186): {hooks:?}"
         );
         let ends = writ_commands(&parsed, "SessionEnd");
         assert_eq!(ends.len(), 1, "{hooks:?}");
@@ -3603,6 +3641,38 @@ mod hook_path_resolution_tests {
         let mut wrong_matcher = settings_with(&start);
         wrong_matcher["hooks"]["PostToolUse"][0]["matcher"] = serde_json::json!("Edit");
         assert!(settings_hook_stale(&wrong_matcher));
+    }
+
+    /// Finding 186: a 0.4.3 project (every hook but PostToolUseFailure) is
+    /// stale until `writ init -y` adds it; uninit removes it.
+    #[test]
+    fn f186_project_without_post_tool_use_failure_is_stale_and_uninit_removes_it() {
+        let start = session_start_command("writ");
+        let mut v043 = settings_with(&start);
+        assert!(!settings_hook_stale(&v043));
+        assert_eq!(
+            v043["hooks"]["PostToolUseFailure"][0]["matcher"],
+            crate::auto_seal::POST_TOOL_MATCHER
+        );
+        v043["hooks"]
+            .as_object_mut()
+            .unwrap()
+            .remove("PostToolUseFailure");
+        assert!(settings_hook_stale(&v043));
+
+        let dir = std::env::temp_dir().join(format!("writ-f186-uninit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".claude")).unwrap();
+        let full = settings_with(&start);
+        fs::write(
+            dir.join(".claude/settings.json"),
+            serde_json::to_string(&full).unwrap(),
+        )
+        .unwrap();
+        remove_claude_hook(&dir).unwrap();
+        let after = fs::read_to_string(dir.join(".claude/settings.json")).unwrap();
+        assert!(!after.contains("PostToolUseFailure"), "{after}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

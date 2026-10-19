@@ -1,0 +1,25 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000007",
+  "transcript_path": "~/.claude/projects/-repo/00000000-0000-4000-8000-000000000007.jsonl",
+  "cwd": "/repo",
+  "prompt_id": "00000000-0000-4000-8000-000000000008",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "echo ok",
+    "description": "Echo ok"
+  },
+  "tool_response": {
+    "stdout": "ok",
+    "stderr": "",
+    "interrupted": false,
+    "isImage": false,
+    "noOutputExpected": false
+  },
+  "tool_use_id": "toolu_01MtoCMeowJ9mCHS4u7m89nb",
+  "duration_ms": 14
+}

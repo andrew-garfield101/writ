@@ -165,6 +165,30 @@ Set during initialization with `writ init --profile <name>`. Controls storage bu
 | `production` | 100 GB | 90 days | Level 3 | Production systems |
 | `enterprise` | Unlimited | 365 days | Level 6 | Enterprise deployments |
 
+## Claude Code Hooks
+
+`writ init -y` writes these hooks into `.claude/settings.json`, beside any hooks of your own, and `writ uninit` removes only writ's. Every writ hook exits 0, so a hook never fails the agent's tool call; problems go to `.writ/hooks.log`.
+
+| Event | Matcher | What writ does |
+|-------|---------|----------------|
+| SessionStart | all | Prints the short instructions and the brief |
+| PreToolUse | Bash | Opens a window for the command: records the tree before it runs, and closes any earlier window of the same agent that never got an end event |
+| PostToolUse | Edit, Write, MultiEdit, NotebookEdit, Bash | Seals the path the tool changed, under the agent's spec |
+| PostToolUseFailure | Edit, Write, MultiEdit, NotebookEdit, Bash | The same as PostToolUse. Claude Code sends this event instead of PostToolUse when the tool call fails, and a command can write files before it fails |
+| UserPromptSubmit | all | Keeps the prompt's first sentence as the title of an auto spec |
+| Stop | all | Seals any edited file the edit hooks missed |
+| SubagentStop | all | The same for a subagent, and ends a named subagent's instance |
+| SessionEnd | all | Closes the session's auto specs and records the session end |
+
+A project set up before PostToolUseFailure was added reads `version_skew` in `writ doctor` until you run `writ init -y` again.
+
+When the store lock is busy, a hook waits at most 200 ms, then leaves the path for the agent's next hook or its Stop:
+
+```toml
+[hooks]
+lock_wait_ms = 200
+```
+
 ## Test Fixture Settings
 
 These settings exist for writ's own test fixtures. Do not set them in a project where agents work.

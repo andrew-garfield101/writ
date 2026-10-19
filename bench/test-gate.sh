@@ -43,6 +43,12 @@ else
     echo "GATE_SKIP_BUILD=1: using existing release binary and Python extension" >"$build_log"
 fi
 
+# Finding 185 (retro rule 1): an unformatted tree fails CI, so it fails here first.
+fmt_rc=0; "$CARGO" fmt --all -- --check >"$(dirname "$OUT")/test-gate-fmt.log" 2>&1 || fmt_rc=$?
+# Finding 185 (retro rule 1): CI has no Windows job; only Release builds Windows,
+# after the tag. Type check the tree for x86_64-pc-windows-msvc here (Rust code
+# only, C deps stubbed; see bench/windows_check.sh). rc 2 = cannot run here.
+win_rc=0; "$ROOT/bench/windows_check.sh" "$(dirname "$OUT")/test-gate-windows.log" || win_rc=$?
 # --no-fail-fast: without it cargo stops at the first failing test binary and
 # the counts silently undercount every binary after it.
 "$CARGO" test -p writ-core -p writ-cli -p writ-mcp --no-fail-fast >"$rust_log" 2>&1
@@ -144,7 +150,7 @@ brief_out="$(dirname "$OUT")/test-gate-brief.txt"
 python -m pytest crates/writ-py/tests bench/test_verify_check.py bench/fleet tools/stranger_kit -q -p no:cacheprovider -rxXf >"$py_log" 2>&1
 py_rc=$?
 
-BUILD_RC=$build_rc BUILD_LOG="$build_log" \
+FMT_RC=$fmt_rc WIN_RC=$win_rc BUILD_RC=$build_rc BUILD_LOG="$build_log" \
 TIMING_LOG="$timing_log" TIMING_RC=$timing_rc TIMING_LOAD="$timing_load" TIMING_TESTS="${TIMING_TESTS[*]}" \
 RUST_LOG="$rust_log" PY_LOG="$py_log" RUST_RC=$rust_rc PY_RC=$py_rc \
 VERIFY_JSON="$verify_json" VERIFY_RC=$verify_rc \
@@ -190,6 +196,12 @@ ignored_tests = set(re.findall(r"^test (\S+) \.\.\. ignored", rust, re.M))
 unexpected_ignores = sorted(ignored_tests - EXPECTED_IGNORED)
 stale_ignores = sorted(EXPECTED_IGNORED - ignored_tests)
 problems = []
+if int(os.environ["FMT_RC"]) != 0:
+    problems.append("fmt: cargo fmt --all -- --check failed (finding 185), see test-gate-fmt.log")
+if int(os.environ["WIN_RC"]) == 1:
+    problems.append("windows: cargo check --target x86_64-pc-windows-msvc failed (finding 185), see test-gate-windows.log")
+elif int(os.environ["WIN_RC"]) != 0:
+    problems.append("windows: cross-check could not run on this machine (no rustup or target), see test-gate-windows.log")
 if int(os.environ["BUILD_RC"]) != 0:
     problems.append(f"build: release binary or Python extension failed (rc {os.environ['BUILD_RC']}), see {os.environ['BUILD_LOG']}")
 if int(os.environ["RUST_RC"]) != 0 or r["failed"]:
@@ -347,6 +359,8 @@ FLAKY_WATCH = {
 }
 result = {
     "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+    "fmt_rc": int(os.environ["FMT_RC"]),
+    "windows_check_rc": int(os.environ["WIN_RC"]),
     "build_rc": int(os.environ["BUILD_RC"]),
     "rust": r, "python": p, "timing": timing, "verify": verify, "doctor": doctor, "hook_latency": hook, "bare_ignores": bare,
     "rust_failures": result_failures,

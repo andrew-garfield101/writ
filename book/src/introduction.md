@@ -37,6 +37,10 @@ Writ sits alongside git, not instead of it. A human checks out a branch, runs `w
 └──────────┘                └─────────────────┘                └──────────────┘
 ```
 
+## What Writ Is Not
+
+Writ is not agent memory and not a search index. It does not store what an agent knows or help it find code. It is a record of what each agent did: every seal names the agent and the spec, is hash chained to the seal before it, and is signed with the agent's own key when that agent is registered with `writ agent register`. The record sits under git, and `writ finish` writes it into the commit.
+
 ## When You Need It
 
 If you have one agent doing straightforward work on isolated files, git is probably fine. Writ's value is proportional to complexity.
@@ -47,7 +51,7 @@ The inflection point comes when:
 - You need structured awareness of who is doing what and which files are contested
 - Merging agent work requires understanding code structure, not just line positions
 - Context cost matters: agents spend real tokens reconstructing state that writ delivers in one call
-- You need cryptographic proof of what happened, who did it, and that nothing was tampered with
+- You need a record of what happened and who did it that cannot be altered without it showing
 
 The single agent with git world is today. The fleet of fifty agents world is next quarter. Writ is built for that transition.
 

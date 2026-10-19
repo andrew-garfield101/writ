@@ -1,7 +1,8 @@
 //! Auto seal through Claude Code hooks (sprint 6, 0.4.3).
 //!
-//! `writ init` registers one hidden command, `writ hook`, on PostToolUse
-//! (the edit tools), UserPromptSubmit, Stop, SubagentStop and SessionEnd.
+//! `writ init` registers one hidden command, `writ hook`, on PreToolUse
+//! (Bash), PostToolUse and PostToolUseFailure (the edit tools and Bash),
+//! UserPromptSubmit, Stop, SubagentStop and SessionEnd.
 //! Claude Code hands it the event as JSON on stdin; [`run`] dispatches on
 //! `hook_event_name`.
 //!
@@ -54,6 +55,14 @@ pub const POST_TOOL_MATCHER: &str = "Edit|Write|MultiEdit|NotebookEdit|Bash";
 
 /// Log of every hook firing, under `.writ`.
 pub const HOOKS_LOG: &str = "hooks.log";
+
+/// The event after a tool call that succeeded.
+const POST_EVENT: &str = "PostToolUse";
+
+/// Finding 186: the event after a tool call that failed (a Bash exit 1).
+/// Same input fields as PostToolUse; dispatched the same way, since a
+/// command can write files and then fail.
+pub const POST_FAILURE_EVENT: &str = "PostToolUseFailure";
 
 /// Per-identity state under `.writ` (touched paths, refusals told).
 const STATE_DIR: &str = "agents/claudecode";
@@ -149,7 +158,7 @@ pub fn run(cwd: &Path, stdin: &str) -> HookOutcome {
     let Some(writ_dir) = find_writ_dir(cwd) else {
         return HookOutcome::default();
     };
-    let log = HookLog::new(&writ_dir, started);
+    let mut log = HookLog::new(&writ_dir, started);
     let input: HookInput = match serde_json::from_str(stdin.trim()) {
         Ok(v) => v,
         Err(e) => {
@@ -159,11 +168,17 @@ pub fn run(cwd: &Path, stdin: &str) -> HookOutcome {
         }
     };
     let event = input.hook_event_name.clone().unwrap_or_default();
+    log.failure = event == POST_FAILURE_EVENT;
     let result = match event.as_str() {
         "PreToolUse" => bash_pre(&writ_dir, &input, &log).map(|_| None),
-        "PostToolUse" => post_tool_use(&writ_dir, &input, &log),
+        POST_EVENT | POST_FAILURE_EVENT => post_tool_use(&writ_dir, &input, &log),
         "UserPromptSubmit" => stash_prompt(&writ_dir, &input, &log).map(|_| None),
-        "Stop" | "SubagentStop" => sweep(&writ_dir, &input, &log).map(|_| None),
+        "Stop" => sweep(&writ_dir, &input, &log).map(|_| None),
+        "SubagentStop" => {
+            let r = sweep(&writ_dir, &input, &log).map(|_| None);
+            release_named_subagent(&writ_dir, &input);
+            r
+        }
         "SessionEnd" => session_end(&writ_dir, &input, stdin, &log).map(|_| None),
         other => {
             log.write(json!({"event": other, "outcome": "skipped",
@@ -197,6 +212,9 @@ fn find_writ_dir(cwd: &Path) -> Option<PathBuf> {
 struct HookLog {
     path: PathBuf,
     started: Instant,
+    /// Finding 186: this firing is a PostToolUseFailure; its records say so
+    /// (the PostToolUse code path writes them).
+    failure: bool,
 }
 
 impl HookLog {
@@ -204,11 +222,15 @@ impl HookLog {
         Self {
             path: writ_dir.join(HOOKS_LOG),
             started,
+            failure: false,
         }
     }
 
     fn write(&self, mut entry: Value) {
         if let Some(m) = entry.as_object_mut() {
+            if self.failure && m.get("event").and_then(Value::as_str) == Some(POST_EVENT) {
+                m.insert("event".into(), json!(POST_FAILURE_EVENT));
+            }
             m.insert(
                 "ts".into(),
                 json!(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
@@ -240,7 +262,8 @@ impl HookLog {
 /// commands resolve to in this environment (findings 131, 135); with no
 /// agent signal at all, the host session id stands in (`claude-code-xxxx`,
 /// the form `CLAUDE_CODE_SESSION_ID` gives). A subagent's is
-/// `<parent>-<first 8 of agent_id>`.
+/// `<parent>-<first 8 of agent_id>`, except a named custom subagent's
+/// (ruling 192, [`named_subagent`]): its type name.
 pub fn identity(writ_dir: &Path, default_agent: Option<&str>, input: &HookInput) -> HookIdentity {
     let mut main = crate::agent::resolve_agent_id_in(None, default_agent, true, Some(writ_dir));
     if !main.is_agent() {
@@ -253,7 +276,8 @@ pub fn identity(writ_dir: &Path, default_agent: Option<&str>, input: &HookInput)
     let session = input.session_id.clone().filter(|s| !s.is_empty());
     match subagent_suffix(input) {
         Some(sfx) => HookIdentity {
-            id: format!("{}-{sfx}", main.id),
+            id: named_subagent(writ_dir, input, &sfx)
+                .unwrap_or_else(|| format!("{}-{sfx}", main.id)),
             parent: Some(main.id),
             session,
         },
@@ -275,6 +299,161 @@ fn subagent_suffix(input: &HookInput) -> Option<String> {
         .take(8)
         .collect();
     (!clean.is_empty()).then_some(clean)
+}
+
+/// Claude Code's built-in subagent types: never a named identity, even when
+/// a file of the same name exists (ruling 192).
+const BUILTIN_AGENT_TYPES: &[&str] = &[
+    "general-purpose",
+    "Explore",
+    "Plan",
+    "statusline-setup",
+    "output-style-setup",
+    "claude-code-guide",
+];
+
+/// Live named subagent instances, one file per type, under `.writ`.
+const LIVE_DIR: &str = "agents/claudecode/live";
+
+/// One live instance of a named subagent type.
+#[derive(Debug, serde::Serialize, Deserialize)]
+struct LiveInstance {
+    /// The identity it was given (the type name, or `<type>-<agent8>`).
+    name: String,
+    #[serde(default)]
+    session: Option<String>,
+    /// Its latest hook.
+    last: chrono::DateTime<chrono::Utc>,
+}
+
+/// The custom agent type named by the hook's `agent_type`, when it is a
+/// file under `.claude/agents/` and not a built-in type.
+fn custom_agent_type(writ_dir: &Path, input: &HookInput) -> Option<String> {
+    let ty = input.agent_type.as_deref()?.trim();
+    let safe = !ty.is_empty()
+        && ty.len() <= 64
+        && ty
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && ty != "human";
+    if !safe || BUILTIN_AGENT_TYPES.contains(&ty) {
+        return None;
+    }
+    let root = writ_dir.parent()?;
+    root.join(".claude")
+        .join("agents")
+        .join(format!("{ty}.md"))
+        .is_file()
+        .then(|| ty.to_string())
+}
+
+/// Ruling 192: a named custom subagent's identity is its type name, so its
+/// seals carry the name (not a hash) and the spec it claimed under that
+/// name is honoured. `<type>-<agent8>` only while another live instance of
+/// the same type already holds the plain name. An instance is live from
+/// its first hook to its SubagentStop (or [`WINDOW_STALE_SECS`] without a
+/// hook); the name an instance got is kept for its life. None for any
+/// other subagent (the 0.4.3 parent-derived identity, finding 131).
+fn named_subagent(writ_dir: &Path, input: &HookInput, sfx: &str) -> Option<String> {
+    let ty = custom_agent_type(writ_dir, input)?;
+    let agent_id = input.agent_id.as_deref()?.trim().to_string();
+    let path = writ_dir.join(LIVE_DIR).join(format!("{ty}.json"));
+    let _lock = LiveLock::acquire(&path);
+    let mut live = load_live(&path);
+    let now = chrono::Utc::now();
+    live.retain(|_, i| (now - i.last).num_seconds() < WINDOW_STALE_SECS);
+    let name = match live.get(&agent_id) {
+        Some(i) => i.name.clone(),
+        None if live.values().any(|i| i.name == ty) => format!("{ty}-{sfx}"),
+        None => ty.clone(),
+    };
+    live.insert(
+        agent_id,
+        LiveInstance {
+            name: name.clone(),
+            session: input.session_id.clone(),
+            last: now,
+        },
+    );
+    save_live(&path, &live);
+    Some(name)
+}
+
+/// SubagentStop: the instance is no longer live.
+fn release_named_subagent(writ_dir: &Path, input: &HookInput) {
+    let (Some(ty), Some(agent_id)) = (
+        custom_agent_type(writ_dir, input),
+        input.agent_id.as_deref(),
+    ) else {
+        return;
+    };
+    let path = writ_dir.join(LIVE_DIR).join(format!("{ty}.json"));
+    let _lock = LiveLock::acquire(&path);
+    let mut live = load_live(&path);
+    if live.remove(agent_id.trim()).is_some() {
+        save_live(&path, &live);
+    }
+}
+
+fn load_live(path: &Path) -> BTreeMap<String, LiveInstance> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_live(path: &Path, live: &BTreeMap<String, LiveInstance>) {
+    if let Some(d) = path.parent() {
+        let _ = fs::create_dir_all(d);
+    }
+    if let Ok(json) = serde_json::to_string(live) {
+        let _ = crate::fsutil::atomic_write(path, json.as_bytes());
+    }
+}
+
+/// A short exclusive lock on one type's live file, so two instances that
+/// start together cannot both take the plain name. Best effort: after
+/// about 100 ms (or a lock older than 2 s, a crashed hook) the hook goes
+/// on without it rather than delay the agent's tool call.
+struct LiveLock(Option<PathBuf>);
+
+impl LiveLock {
+    fn acquire(path: &Path) -> Self {
+        let lock = path.with_extension("lock");
+        if let Some(d) = lock.parent() {
+            let _ = fs::create_dir_all(d);
+        }
+        for _ in 0..20 {
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+            {
+                Ok(_) => return Self(Some(lock)),
+                Err(_) => {
+                    let old = fs::metadata(&lock)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|d| d.as_secs() >= 2);
+                    if old {
+                        let _ = fs::remove_file(&lock);
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                }
+            }
+        }
+        Self(None)
+    }
+}
+
+impl Drop for LiveLock {
+    fn drop(&mut self) {
+        if let Some(p) = &self.0 {
+            let _ = fs::remove_file(p);
+        }
+    }
 }
 
 fn agent_identity(id: &str) -> AgentIdentity {
@@ -332,54 +511,78 @@ fn post_tool_use(writ_dir: &Path, input: &HookInput, log: &HookLog) -> WritResul
         return Ok(None);
     }
     let who = identity_for(writ_dir, input);
-    let tell = seal_for(writ_dir, input, &who, &tool, &[rel], log)?;
-    Ok(tell.map(|msg| additional_context(&msg)))
+    let tell = seal_for(writ_dir, input, &who, &tool, &[rel], &[], log)?;
+    Ok(tell.map(|msg| additional_context(input, &msg)))
 }
 
 /// Seal `paths` (this identity's own edit) under its spec, after draining
-/// what it left pending (ruling 149). Returns the one line for the agent.
+/// what it left pending (ruling 149). `by_text` are further paths of the
+/// same call that only the command text decided were this identity's
+/// (ruling 189); they go into their own seal, recorded as
+/// `attributed_by: command_text`, so every seal says how writ decided.
+/// Returns the one line for the agent.
 fn seal_for(
     writ_dir: &Path,
     input: &HookInput,
     who: &HookIdentity,
     tool: &str,
     paths: &[String],
+    by_text: &[String],
     log: &HookLog,
 ) -> WritResult<Option<String>> {
+    let all: Vec<String> = paths.iter().chain(by_text).cloned().collect();
+    let Some(first) = all.first() else {
+        return Ok(None);
+    };
     let root = writ_dir.parent().unwrap_or(writ_dir).to_path_buf();
     let mut touched = Touched::load(writ_dir, who);
     let repo = match open_checked(&root, hook_lock_wait(writ_dir)) {
         Ok(r) => r,
         Err(WritError::LockTimeout) => {
-            lock_timeout(&mut touched, paths, tool, who, log);
+            lock_timeout(&mut touched, &all, tool, who, log);
             return Ok(None);
         }
         Err(e) => return Err(e),
     };
-    let spec = spec_for(&repo, who, input, &paths[0])?;
+    let spec = spec_for(&repo, who, input, first)?;
     // Ruling 149 (2): seal what this identity left pending first (a lock
     // timeout, a refusal whose content has since changed, a Bash edit of a
     // touched file), then the new paths.
     let due: Vec<String> = touched
         .due(repo.root())
         .into_iter()
-        .filter(|p| !paths.contains(p))
+        .filter(|p| !all.contains(p))
         .collect();
     let drain = drain_mine(writ_dir, &root, who, due, &mut touched, log);
-    let mut tell = None;
-    if !drain.is_empty() {
-        let r = seal_paths_auto(&repo, who, &spec, "retry", &drain, &mut touched, log)?;
-        if r.lock_timed_out {
-            lock_timeout(&mut touched, paths, tool, who, log);
-            return Ok(None);
+    // Retry first, then the call's own paths, then its command-text paths;
+    // each batch is one seal. On a lock timeout the batches not yet sealed
+    // are marked pending (a timed-out batch marks its own).
+    let batches: [(&str, &[String], Option<&str>); 3] = [
+        ("retry", &drain, None),
+        (tool, paths, None),
+        (tool, by_text, Some(crate::seal::ATTRIBUTED_BY_COMMAND_TEXT)),
+    ];
+    let mut tells: [Option<String>; 3] = Default::default();
+    for (i, (label, batch, by)) in batches.iter().enumerate() {
+        if batch.is_empty() {
+            continue;
         }
-        tell = r.tell;
+        let r = seal_paths_auto(&repo, who, &spec, label, batch, *by, &mut touched, log)?;
+        if r.lock_timed_out {
+            let rest: Vec<String> = batches[i + 1..]
+                .iter()
+                .flat_map(|(_, b, _)| b.iter().cloned())
+                .collect();
+            lock_timeout(&mut touched, &rest, tool, who, log);
+            tells[i] = r.tell;
+            break;
+        }
+        tells[i] = r.tell;
     }
-    let r = seal_paths_auto(&repo, who, &spec, tool, paths, &mut touched, log)?;
-    let tell = match (tell, r.tell) {
-        (Some(a), Some(b)) => Some(format!("{b}; also: {a}")),
-        (a, b) => b.or(a),
-    };
+    // This call's lines first, a retry's after them (as before).
+    let [retry, own, text] = tells;
+    let lines: Vec<String> = [own, text, retry].into_iter().flatten().collect();
+    let tell = (!lines.is_empty()).then(|| lines.join("; also: "));
     let moves = move_notices(&repo, who, log);
     Ok(match (tell, moves) {
         (t, None) => t,
@@ -589,13 +792,33 @@ fn relative_path(root: &Path, cwd: Option<&str>, path: &str) -> Option<String> {
     (!s.is_empty() && !s.starts_with(".writ/") && s != ".writ").then_some(s)
 }
 
-/// The hook's stdout for a message to the agent (finding 141).
-fn additional_context(msg: &str) -> String {
+/// The hook's stdout for a message to the agent (finding 141), answering
+/// the event that fired (PostToolUse or PostToolUseFailure).
+fn additional_context(input: &HookInput, msg: &str) -> String {
+    let event = match input.hook_event_name.as_deref() {
+        Some(POST_FAILURE_EVENT) => POST_FAILURE_EVENT,
+        _ => POST_EVENT,
+    };
     json!({"hookSpecificOutput": {
-        "hookEventName": "PostToolUse",
+        "hookEventName": event,
         "additionalContext": msg,
     }})
     .to_string()
+}
+
+/// Seal labels of a late window close (an identity's next PreToolUse or
+/// UserPromptSubmit closed a window whose Post never came).
+const LATE_PRE: &str = "PreToolUse";
+const LATE_PROMPT: &str = "UserPromptSubmit";
+
+/// A label for a seal that did not come from the hook seeing this
+/// identity's own tool call just now (a retry, a Stop or SessionEnd drain,
+/// a late window close): finding 173, never the 144 own-rewrite path.
+fn is_drain(tool: &str) -> bool {
+    matches!(
+        tool,
+        "retry" | "Stop" | "SessionEnd" | LATE_PRE | LATE_PROMPT
+    )
 }
 
 /// Result of an auto seal attempt.
@@ -611,19 +834,33 @@ struct SealAttempt {
 /// other specs' sealed lines (refused paths are told once and stay on the
 /// touched list), the rest go into one seal. Summary `auto: <tool> <path>`
 /// for one path, `auto: <tool> <n> paths: ...` for several.
+#[allow(clippy::too_many_arguments)]
 fn seal_paths_auto(
     repo: &Repository,
     who: &HookIdentity,
     spec: &str,
     tool: &str,
     paths: &[String],
+    attributed_by: Option<&str>,
     touched: &mut Touched,
     log: &HookLog,
 ) -> WritResult<SealAttempt> {
     let writ_dir = repo.writ_dir();
     let event = match tool {
-        "Stop" | "SessionEnd" => tool,
-        _ => "PostToolUse",
+        "Stop" | "SessionEnd" | LATE_PRE | LATE_PROMPT => tool,
+        _ => POST_EVENT,
+    };
+    // Ruling 189: a command-text batch is sealed through its own handle so
+    // the seal records how writ decided.
+    let tagged;
+    let repo = match attributed_by {
+        Some(by) => {
+            let mut r = open_checked(repo.root(), hook_lock_wait(writ_dir))?;
+            r.set_attributed_by(Some(by));
+            tagged = r;
+            &tagged
+        }
+        None => repo,
     };
 
     let entry = |rel: &str, extra: Value| -> Value {
@@ -709,12 +946,13 @@ fn seal_paths_auto(
     // Finding 173: only a fresh edit (the hook that saw this agent's own
     // tool call) may take the 144 path. A drain (retry, Stop, SessionEnd)
     // never passes allow_removals: its content may be another agent's.
-    let fresh = !matches!(tool, "retry" | "Stop" | "SessionEnd");
+    let fresh = !is_drain(tool);
     if let Err(WritError::OwnLinesRemoved { other_agents, .. }) = &result {
         if fresh && other_agents.is_empty() {
             let mut own = open_checked(repo.root(), hook_lock_wait(writ_dir))?;
             own.set_allow_removal_paths(ok.iter().cloned());
             own.set_override_by_hook(true);
+            own.set_attributed_by(attributed_by);
             result = seal(&own);
         }
     }
@@ -723,11 +961,15 @@ fn seal_paths_auto(
             for rel in &ok {
                 let lag = mtime_to_now_ms(&repo.root().join(rel));
                 touched.mark_sealed(rel, content_hash(&repo.root().join(rel)));
-                log.write(entry(
+                let mut e = entry(
                     rel,
                     json!({"outcome": "sealed", "seal": &seal.id[..12],
                     "edit_to_seal_ms": lag}),
-                ));
+                );
+                if let (Some(by), Some(m)) = (attributed_by, e.as_object_mut()) {
+                    m.insert("attributed_by".into(), json!(by));
+                }
+                log.write(e);
             }
         }
         Err(WritError::NothingToSeal) => {
@@ -898,6 +1140,7 @@ fn bash_pre(writ_dir: &Path, input: &HookInput, log: &HookLog) -> WritResult<()>
     };
     let root = writ_dir.parent().unwrap_or(writ_dir).to_path_buf();
     let who = identity_for(writ_dir, input);
+    close_late(writ_dir, input, &who, LATE_PRE, Some(&id), log)?;
     let t = Instant::now();
     let w = BashWindow {
         agent: who.id.clone(),
@@ -968,8 +1211,13 @@ fn own_windows(writ_dir: &Path, agent: &str) -> Vec<(PathBuf, BashWindow)> {
 }
 
 /// Close a window: record its end, drop its tree signature.
-fn close_window(path: &Path, mut w: BashWindow) {
-    w.end = Some(chrono::Utc::now());
+fn close_window(path: &Path, w: BashWindow) {
+    close_window_at(path, w, chrono::Utc::now());
+}
+
+/// Close a window as of `at`.
+fn close_window_at(path: &Path, mut w: BashWindow, at: chrono::DateTime<chrono::Utc>) {
+    w.end = Some(at);
     w.sig = crate::state::TreeSignature::default();
     if let Ok(json) = serde_json::to_string(&w) {
         let _ = crate::fsutil::atomic_write(path, json.as_bytes());
@@ -998,7 +1246,8 @@ const NS_PER_SEC: i128 = 1_000_000_000;
 /// owns the path; several make it ambiguous. With no candidate (mtime
 /// preserved by `cp -p`, a checkout) or no mtime, this call owns it only
 /// if no other identity's interval overlapped the call at all. Command
-/// text is never used.
+/// text is not used here; an ambiguous result goes to
+/// [`command_text_owner`] (ruling 189).
 fn attribute(
     mtime_ns: Option<i128>,
     mine: &BashWindow,
@@ -1040,6 +1289,66 @@ fn attribute(
         _ => Owner::Ambiguous(who),
     };
     (owner, coarse)
+}
+
+/// True when `cmd` names `needle` as a whole word: not preceded by a
+/// letter, digit, `_` or `-`, not followed by a letter, digit or `_` (so
+/// `app.py` does not match `myapp.py` or `app.pyc`). Anywhere in the text,
+/// heredoc bodies included.
+fn names_word(cmd: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    cmd.match_indices(needle).any(|(a, m)| {
+        let pre = cmd[..a].chars().next_back();
+        let post = cmd[a + m.len()..].chars().next();
+        !pre.is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-')
+            && !post.is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
+/// True when a command's text names the repository-relative path `rel`:
+/// the path itself or its basename (finding 188, Bri's measurement).
+fn names_path(cmd: &str, rel: &str) -> bool {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    names_word(cmd, rel) || (base != rel && names_word(cmd, base))
+}
+
+/// Ruling 189, rule 1 under reading W: the one candidate whose command
+/// text names `rel`, looking at every window of each candidate (open or
+/// closed, the reporter's own included) that overlaps the change range,
+/// from the reporting window's start to now. None when no candidate or
+/// several name it, or when any such window has no command text (never
+/// guess). No reader classification of any kind (rule 2 was measured
+/// wrong and does not exist).
+fn command_text_owner(
+    rel: &str,
+    candidates: &[String],
+    reporter: &BashWindow,
+    windows: &[BashWindow],
+    now_ns: i128,
+) -> Option<String> {
+    let (lo, hi) = (reporter.start_ns(), now_ns);
+    let mut naming: Vec<&String> = Vec::new();
+    for c in candidates {
+        let mut texts: Vec<&str> = Vec::new();
+        for w in std::iter::once(reporter).chain(windows.iter()) {
+            let dup = w.tool_use_id == reporter.tool_use_id && !std::ptr::eq(w, reporter);
+            if &w.agent == c && !dup && w.start_ns() <= hi && lo <= w.end_ns(now_ns) {
+                texts.push(w.command.as_str());
+            }
+        }
+        if texts.iter().any(|t| t.trim().is_empty()) {
+            return None;
+        }
+        if texts.iter().any(|t| names_path(t, rel)) {
+            naming.push(c);
+        }
+    }
+    match naming.as_slice() {
+        [one] => Some((*one).clone()),
+        _ => None,
+    }
 }
 
 /// The one line for the ambiguous paths of one call (ruling 160 wording;
@@ -1091,14 +1400,32 @@ fn save_ambiguous(writ_dir: &Path, a: &AmbiguousFile) {
     }
 }
 
+/// What one Bash window's diff came to (ruling 160, ruling 189).
+#[derive(Default)]
+struct BashVerdict {
+    /// This identity's paths, decided by its window alone.
+    mine: Vec<String>,
+    /// This identity's paths, decided by the command text (rule 1).
+    by_text: Vec<String>,
+    /// Ambiguous paths to tell this identity about.
+    tell: Vec<(String, Vec<String>)>,
+}
+
 /// Paths this window changed that are this identity's, and the lines to
-/// tell it (ambiguous paths). Removes nothing.
+/// tell it (ambiguous paths). Removes nothing. `event` labels the records
+/// (`PostToolUse`, or the event that closed the window late, `Stop`
+/// included); `shown` is false where nothing reaches the agent (a Stop
+/// sweep, a late close), and every ambiguous record carries `told`, so the
+/// records writ could not attribute are counted apart from the ask lines
+/// an agent saw (finding 187).
 fn bash_attribution(
     writ_dir: &Path,
     root: &Path,
     w: &BashWindow,
+    event: &str,
+    shown: bool,
     log: &HookLog,
-) -> (Vec<String>, Vec<(String, Vec<String>)>) {
+) -> BashVerdict {
     let t = Instant::now();
     let now = tree_sig(root);
     let snapshot_ms = t.elapsed().as_millis() as u64;
@@ -1107,17 +1434,22 @@ fn bash_attribution(
     let others = other_windows(writ_dir, &w.agent);
     let mut amb = load_ambiguous(writ_dir);
     let mut amb_changed = false;
-    let (mut mine, mut tell) = (Vec::new(), Vec::new());
+    let mut v = BashVerdict::default();
+    // Every window the command text rule may read: the others' and this
+    // identity's own (open or closed).
+    let mut text_windows: Vec<BashWindow> = Vec::new();
+    let mut text_loaded = false;
     for rel in changed {
         let hash = content_hash(&root.join(&rel));
         // Declined earlier as ambiguous, content unchanged: still nobody's.
         if let Some((h, who)) = amb.paths.get(&rel).cloned() {
             if h == hash {
-                log.write(json!({"event": "PostToolUse", "tool": "Bash", "path": rel,
-                    "agent": w.agent, "outcome": "ambiguous", "agents": who,
+                let told = Told::load(writ_dir, &w.agent).first_time(&rel, "ambiguous") && shown;
+                log.write(json!({"event": event, "tool": "Bash", "path": rel,
+                    "agent": w.agent, "outcome": "ambiguous", "agents": who, "told": told,
                     "detail": "declined earlier; content unchanged"}));
-                if Told::load(writ_dir, &w.agent).first_time(&rel, "ambiguous") {
-                    tell.push((rel.clone(), who.clone()));
+                if told {
+                    v.tell.push((rel.clone(), who.clone()));
                 }
                 continue;
             }
@@ -1126,19 +1458,44 @@ fn bash_attribution(
         }
         let mtime = now.files.get(&rel).map(|f| f.1);
         let (owner, coarse) = attribute(mtime, w, now_ns, &others);
+        let owner = match owner {
+            Owner::Ambiguous(who) => {
+                if !text_loaded {
+                    text_windows = other_windows(writ_dir, &w.agent);
+                    text_windows.extend(own_all_windows(writ_dir, &w.agent));
+                    text_loaded = true;
+                }
+                match command_text_owner(&rel, &who, w, &text_windows, now_ns) {
+                    Some(c) => {
+                        log.write(json!({"event": event, "tool": "Bash", "path": rel,
+                            "agent": w.agent, "outcome": "attributed_from_command",
+                            "owner": c, "agents": who,
+                            "attributed_by": crate::seal::ATTRIBUTED_BY_COMMAND_TEXT,
+                            "detail": "exactly one candidate's command names the path"}));
+                        if c == w.agent {
+                            v.by_text.push(rel);
+                        }
+                        continue;
+                    }
+                    None => Owner::Ambiguous(who),
+                }
+            }
+            o => o,
+        };
         match owner {
-            Owner::Mine => mine.push(rel),
-            Owner::Theirs => log.write(json!({"event": "PostToolUse", "tool": "Bash",
+            Owner::Mine => v.mine.push(rel),
+            Owner::Theirs => log.write(json!({"event": event, "tool": "Bash",
                 "path": rel, "agent": w.agent, "outcome": "skipped", "coarse_mtime": coarse,
                 "detail": "another agent's write (only its interval contains the mtime)"})),
             Owner::Ambiguous(who) => {
-                log.write(json!({"event": "PostToolUse", "tool": "Bash", "path": rel,
+                let told = Told::load(writ_dir, &w.agent).first_time(&rel, "ambiguous") && shown;
+                log.write(json!({"event": event, "tool": "Bash", "path": rel,
                     "agent": w.agent, "outcome": "ambiguous", "agents": who,
-                    "coarse_mtime": coarse}));
+                    "coarse_mtime": coarse, "told": told}));
                 amb.paths.insert(rel.clone(), (hash, who.clone()));
                 amb_changed = true;
-                if Told::load(writ_dir, &w.agent).first_time(&rel, "ambiguous") {
-                    tell.push((rel.clone(), who));
+                if told {
+                    v.tell.push((rel.clone(), who));
                 }
             }
         }
@@ -1146,12 +1503,52 @@ fn bash_attribution(
     if amb_changed {
         save_ambiguous(writ_dir, &amb);
     }
-    log.write(
-        json!({"event": "PostToolUse", "tool": "Bash", "agent": w.agent,
-        "outcome": "attributed", "paths": mine, "snapshot_ms": snapshot_ms,
-        "pre_to_attributed_ms": (chrono::Utc::now() - w.at).num_milliseconds()}),
-    );
-    (mine, tell)
+    log.write(json!({"event": event, "tool": "Bash", "agent": w.agent,
+        "outcome": "attributed", "paths": v.mine, "by_text": v.by_text,
+        "snapshot_ms": snapshot_ms,
+        "pre_to_attributed_ms": (chrono::Utc::now() - w.at).num_milliseconds()}));
+    v
+}
+
+/// Close this identity's open Bash windows whose Post never came, as of
+/// now, before a new event of the same identity (PreToolUse,
+/// UserPromptSubmit, Stop). Each window's changes are attributed and
+/// sealed first, exactly as the Stop sweep always did (ruling 155 (3));
+/// nothing is printed (finding 187: these records are `told: false`), and
+/// each close is logged `window_closed_late` with its age.
+///
+/// Safe because one identity's tool calls run one after another: in all
+/// three 0.4.3 evidence runs (A, B, c409) every call within one assistant
+/// message finished before the next began, so an identity's new event
+/// means its earlier calls are over. A host that ran one identity's calls
+/// in parallel would see the earlier call closed early; its later Post
+/// then finds the window closed and attributes nothing (see `bash_post`),
+/// and anything it wrote after the close is left for doctor's left_out
+/// check, never sealed to the wrong agent. `skip` is the call now starting.
+fn close_late(
+    writ_dir: &Path,
+    input: &HookInput,
+    who: &HookIdentity,
+    event: &str,
+    skip: Option<&str>,
+    log: &HookLog,
+) -> WritResult<()> {
+    let root = writ_dir.parent().unwrap_or(writ_dir).to_path_buf();
+    for (path, w) in own_windows(writ_dir, &who.id) {
+        if Some(w.tool_use_id.as_str()) == skip {
+            continue;
+        }
+        let at = chrono::Utc::now();
+        let v = bash_attribution(writ_dir, &root, &w, event, false, log);
+        log.write(json!({"event": event, "tool": "Bash", "agent": who.id,
+            "outcome": "window_closed_late", "tool_use_id": w.tool_use_id,
+            "age_ms": (at - w.at).num_milliseconds()}));
+        close_window_at(&path, w, at);
+        if !v.mine.is_empty() || !v.by_text.is_empty() {
+            seal_for(writ_dir, input, who, event, &v.mine, &v.by_text, log)?;
+        }
+    }
+    Ok(())
 }
 
 /// PostToolUse on Bash: seal exactly the paths this call changed that are
@@ -1178,19 +1575,28 @@ fn bash_post(writ_dir: &Path, input: &HookInput, log: &HookLog) -> WritResult<Op
         );
         return Ok(None);
     };
-    let (mine, amb) = bash_attribution(writ_dir, &root, &w, log);
+    if let Some(end) = w.end {
+        // Closed late by this identity's next event (or its Stop): its
+        // signature is gone, and its changes up to then were attributed.
+        log.write(json!({"event": POST_EVENT, "tool": "Bash", "agent": who.id,
+            "outcome": "skipped", "closed_at": end.to_rfc3339(),
+            "detail": "window already closed by a later event of this agent"}));
+        return Ok(None);
+    }
+    let v = bash_attribution(writ_dir, &root, &w, POST_EVENT, true, log);
+    let (mine, by_text, amb) = (v.mine, v.by_text, v.tell);
     let started = w.at;
     close_window(&path, w);
     let mut tell: Vec<String> = Vec::new();
-    if !mine.is_empty() {
-        if let Some(line) = seal_for(writ_dir, input, &who, "Bash", &mine, log)? {
+    if !mine.is_empty() || !by_text.is_empty() {
+        if let Some(line) = seal_for(writ_dir, input, &who, "Bash", &mine, &by_text, log)? {
             tell.push(line);
         }
         // Ruling 160 (2): the unsealed window over a Bash edit is an upper
         // bound, from the Pre snapshot to the seal written ("at most").
         log.write(
             json!({"event": "PostToolUse", "tool": "Bash", "agent": who.id,
-            "outcome": "bash_window", "paths": mine,
+            "outcome": "bash_window", "paths": mine, "by_text": by_text,
             "edit_to_seal_ms_at_most": (chrono::Utc::now() - started).num_milliseconds()}),
         );
     }
@@ -1198,7 +1604,7 @@ fn bash_post(writ_dir: &Path, input: &HookInput, log: &HookLog) -> WritResult<Op
         let agent = who.parent.is_some().then_some(who.id.as_str());
         tell.push(ambiguous_line(&amb, agent));
     }
-    Ok((!tell.is_empty()).then(|| additional_context(&tell.join("; also: "))))
+    Ok((!tell.is_empty()).then(|| additional_context(input, &tell.join("; also: "))))
 }
 
 // ---------------------------------------------------------------------------
@@ -1521,6 +1927,9 @@ fn prompt_path(writ_dir: &Path, session: &str) -> PathBuf {
 /// a `<task-notification>`, finding 133), at most 80 characters. Prints
 /// nothing: UserPromptSubmit stdout is injected into the agent's context.
 fn stash_prompt(writ_dir: &Path, input: &HookInput, log: &HookLog) -> WritResult<()> {
+    // A new prompt: this identity's earlier calls are over.
+    let who = identity_for(writ_dir, input);
+    close_late(writ_dir, input, &who, LATE_PROMPT, None, log)?;
     let (Some(session), Some(prompt)) = (input.session_id.as_deref(), input.prompt.as_deref())
     else {
         return Ok(());
@@ -1557,7 +1966,7 @@ pub fn prompt_title(line: &str) -> String {
                 && line[i + c.len_utf8()..]
                     .chars()
                     .next()
-                    .map_or(true, char::is_whitespace)
+                    .is_none_or(char::is_whitespace)
         })
         .map(|(i, c)| &line[..i + c.len_utf8()])
         .unwrap_or(line)
@@ -1759,13 +2168,7 @@ fn sweep(writ_dir: &Path, input: &HookInput, log: &HookLog) -> WritResult<()> {
     let who = identity_for(writ_dir, input);
     // Ruling 155 (3): Bash calls whose Post never came. Same attribution as
     // the Post; nothing printed.
-    for (path, w) in own_windows(writ_dir, &who.id) {
-        let (mine, _tell) = bash_attribution(writ_dir, &root, &w, log);
-        close_window(&path, w);
-        if !mine.is_empty() {
-            seal_for(writ_dir, input, &who, "Stop", &mine, log)?;
-        }
-    }
+    close_late(writ_dir, input, &who, "Stop", None, log)?;
     let mut touched = Touched::load(writ_dir, &who);
     let due = touched.due(&root);
     let due = drain_mine(writ_dir, &root, &who, due, &mut touched, log);
@@ -1782,7 +2185,7 @@ fn sweep(writ_dir: &Path, input: &HookInput, log: &HookLog) -> WritResult<()> {
         Err(e) => return Err(e),
     };
     let spec = spec_for(&repo, &who, input, &due[0])?;
-    seal_paths_auto(&repo, &who, &spec, "Stop", &due, &mut touched, log)?;
+    seal_paths_auto(&repo, &who, &spec, "Stop", &due, None, &mut touched, log)?;
     Ok(())
 }
 
@@ -1844,7 +2247,16 @@ fn session_end(writ_dir: &Path, input: &HookInput, raw: &str, log: &HookLog) -> 
         }
         match spec_for(&repo, &who, input, &due[0]) {
             Ok(spec) => {
-                seal_paths_auto(&repo, &who, &spec, "SessionEnd", &due, &mut touched, log)?;
+                seal_paths_auto(
+                    &repo,
+                    &who,
+                    &spec,
+                    "SessionEnd",
+                    &due,
+                    None,
+                    &mut touched,
+                    log,
+                )?;
             }
             Err(e) => log.write(json!({"event": "SessionEnd", "agent": who.id,
                 "outcome": "error", "detail": e.to_string()})),
@@ -2026,6 +2438,89 @@ mod tests {
     }
 
     const S: i128 = NS_PER_SEC;
+
+    #[test]
+    fn r192_custom_agent_type_needs_a_file_and_never_a_builtin_or_unsafe_name() {
+        let base = std::env::temp_dir().join(format!("writ-r192-{}", std::process::id()));
+        let writ_dir = base.join(".writ");
+        fs::create_dir_all(&writ_dir).unwrap();
+        fs::create_dir_all(base.join(".claude/agents")).unwrap();
+        for n in ["bri", "Explore", "human"] {
+            fs::write(base.join(format!(".claude/agents/{n}.md")), "x").unwrap();
+        }
+        let ty = |t: &str| {
+            custom_agent_type(
+                &writ_dir,
+                &input(json!({"agent_id": "a1", "agent_type": t})),
+            )
+        };
+        assert_eq!(ty("bri").as_deref(), Some("bri"));
+        assert_eq!(ty("Explore"), None);
+        assert_eq!(ty("human"), None);
+        assert_eq!(ty("haris"), None);
+        assert_eq!(ty("../bri"), None);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn f188_names_path_takes_the_path_or_basename_as_a_whole_word() {
+        assert!(names_path("printf x >> pkg/rel.txt", "pkg/rel.txt"));
+        assert!(names_path("cd pkg && printf x >> mod.py", "pkg/mod.py"));
+        assert!(names_path(
+            "sh <<'EOF'\ncat > notes/h.txt\nEOF",
+            "notes/h.txt"
+        ));
+        assert!(names_path("cat ./app.py", "app.py"));
+        assert!(!names_path("cat myapp.py", "app.py"));
+        assert!(!names_path("cat app.pyc", "app.py"));
+        assert!(!names_path("cat my-app.py", "app.py"));
+        assert!(!names_path("ls >/dev/null", "app.py"));
+        assert!(!names_path("anything", ""));
+    }
+
+    fn cmd_window(
+        agent: &str,
+        id: &str,
+        cmd: &str,
+        start_s: i64,
+        end_s: Option<i64>,
+    ) -> BashWindow {
+        let mut w = window(agent, start_s, end_s);
+        w.tool_use_id = id.into();
+        w.command = cmd.into();
+        w
+    }
+
+    #[test]
+    fn f188_rule_1_reading_w_over_every_overlapping_window() {
+        let now = 200 * S;
+        let cands = vec!["a".to_string(), "b".to_string()];
+        let rep = cmd_window("a", "a1", "ls", 100, None);
+        // Only b's earlier (closed, overlapping) window names the path: b.
+        let b_old = cmd_window("b", "b1", "cat > x.py <<'EOF'\nEOF", 90, Some(120));
+        let b_now = cmd_window("b", "b2", "pytest -q", 130, None);
+        let ws = vec![b_old, b_now, cmd_window("a", "a1", "ls", 100, None)];
+        assert_eq!(
+            command_text_owner("x.py", &cands, &rep, &ws, now).as_deref(),
+            Some("b")
+        );
+        // A window that closed before the change range does not count.
+        let b_gone = cmd_window("b", "b0", "echo > x.py", 10, Some(20));
+        assert_eq!(
+            command_text_owner("x.py", &cands, &rep, &[b_gone], now),
+            None
+        );
+        // Both name it: nobody.
+        let rep2 = cmd_window("a", "a2", "echo >> x.py", 100, None);
+        let b2 = cmd_window("b", "b3", "grep y x.py", 120, None);
+        assert_eq!(command_text_owner("x.py", &cands, &rep2, &[b2], now), None);
+        // A candidate window with no command text: never guess.
+        let b_blank = cmd_window("b", "b4", "  ", 120, None);
+        assert_eq!(
+            command_text_owner("x.py", &cands, &rep2, &[b_blank], now),
+            None
+        );
+    }
 
     #[test]
     fn ruling_158_one_candidate_owns_several_are_ambiguous() {

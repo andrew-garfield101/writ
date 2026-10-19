@@ -590,6 +590,86 @@ fn version_skew_stale_managed_block_fixed_by_init() {
     assert!(findings_for(&s.0, "amis-test", "version_skew").is_empty());
 }
 
+const WRIT_BEGIN: &str = "<!-- BEGIN WRIT CONFIGURATION — managed by writ init -->";
+const WRIT_END: &str = "<!-- END WRIT CONFIGURATION -->";
+
+/// The text between (and including) the writ markers.
+fn writ_block(text: &str) -> &str {
+    let a = text.find(WRIT_BEGIN).expect("no begin marker");
+    let b = text.find(WRIT_END).expect("no end marker") + WRIT_END.len();
+    &text[a..b]
+}
+
+/// Finding 184: `writ init -y` on a project whose config has Codex off
+/// (as an earlier writ left it) refreshes an existing AGENTS.md writ block
+/// to today's template and keeps the user's text above and below byte for
+/// byte; the stale block is version_skew until then.
+#[test]
+fn f184_init_rerun_refreshes_a_stale_agents_md_block_and_keeps_user_text() {
+    let s = Scratch::new("f184-agents");
+    git(&s.0, &["init", "-q"]);
+    let out = writ(&s.0, &["init", "-y", "--frameworks", "claude"]);
+    assert!(out.status.success(), "{out:?}");
+    let current = writ_block(&fs::read_to_string(s.0.join("CLAUDE.md")).unwrap()).to_string();
+    let above = "# Agents\n\nUser text above, kept exactly.  \n\n";
+    let below = "\n\n## Mine\nUser text below.\n";
+    let old = format!(
+        "{WRIT_BEGIN}\n## Version Control — Writ (MANDATORY)\nRun writ seal after every change.\n{WRIT_END}"
+    );
+    fs::write(s.0.join("AGENTS.md"), format!("{above}{old}{below}")).unwrap();
+    let found = findings_for(&s.0, "amis-test", "version_skew");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0]["paths"][0], "AGENTS.md", "{found:?}");
+
+    run_fix_as(&s.0, "amis-test", "writ init -y");
+
+    let after = fs::read_to_string(s.0.join("AGENTS.md")).unwrap();
+    assert_eq!(writ_block(&after), current, "{after}");
+    assert!(after.starts_with(above), "{after:?}");
+    assert!(after.ends_with(below), "{after:?}");
+    assert_eq!(after, format!("{above}{current}{below}"));
+    assert!(!after.contains("MANDATORY"), "{after}");
+    assert!(findings_for(&s.0, "amis-test", "version_skew").is_empty());
+
+    // A file that is only the old block is replaced by the current one.
+    fs::write(s.0.join("AGENTS.md"), &old).unwrap();
+    run_fix_as(&s.0, "amis-test", "writ init -y");
+    assert_eq!(
+        writ_block(&fs::read_to_string(s.0.join("AGENTS.md")).unwrap()),
+        current
+    );
+
+    // Codex off and no markers: the user's file is left alone.
+    fs::write(s.0.join("AGENTS.md"), "# only mine\n").unwrap();
+    run_fix_as(&s.0, "amis-test", "writ init -y");
+    assert_eq!(
+        fs::read_to_string(s.0.join("AGENTS.md")).unwrap(),
+        "# only mine\n"
+    );
+}
+
+/// Finding 184 with Codex on: a file with no markers gets the block
+/// appended (as before), a stale block is refreshed in place.
+#[test]
+fn f184_init_rerun_with_codex_appends_or_refreshes_the_agents_md_block() {
+    let s = Scratch::new("f184-codex");
+    git(&s.0, &["init", "-q"]);
+    fs::write(s.0.join("AGENTS.md"), "# Agents\nmine\n").unwrap();
+    let out = writ(&s.0, &["init", "-y", "--frameworks", "claude,codex"]);
+    assert!(out.status.success(), "{out:?}");
+    let current = writ_block(&fs::read_to_string(s.0.join("CLAUDE.md")).unwrap()).to_string();
+    let text = fs::read_to_string(s.0.join("AGENTS.md")).unwrap();
+    assert!(text.starts_with("# Agents\nmine\n"), "{text}");
+    assert_eq!(writ_block(&text), current);
+    fs::write(
+        s.0.join("AGENTS.md"),
+        text.replace(&current, &format!("{WRIT_BEGIN}\nold\n{WRIT_END}")),
+    )
+    .unwrap();
+    run_fix_as(&s.0, "amis-test", "writ init -y");
+    assert_eq!(fs::read_to_string(s.0.join("AGENTS.md")).unwrap(), text);
+}
+
 /// version_skew (PATH): two distinct writ binaries on PATH; the fix
 /// removes the shadowed one.
 #[test]

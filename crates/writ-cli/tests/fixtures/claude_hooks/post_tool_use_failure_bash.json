@@ -1,0 +1,20 @@
+{
+  "session_id": "00000000-0000-4000-8000-000000000007",
+  "transcript_path": "~/.claude/projects/-repo/00000000-0000-4000-8000-000000000007.jsonl",
+  "cwd": "/repo",
+  "prompt_id": "00000000-0000-4000-8000-000000000008",
+  "permission_mode": "bypassPermissions",
+  "effort": {
+    "level": "medium"
+  },
+  "hook_event_name": "PostToolUseFailure",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "cat missing_file",
+    "description": "Attempt to cat a missing file"
+  },
+  "tool_use_id": "toolu_01LSzKgQa2JBgqdGc4PtwpeD",
+  "error": "Exit code 1\ncat: missing_file: No such file or directory",
+  "is_interrupt": false,
+  "duration_ms": 443
+}

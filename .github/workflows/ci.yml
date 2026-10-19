@@ -286,6 +286,35 @@ jobs:
   #         path: bench/context/results/
   #         if-no-files-found: warn
 
+  # Finding 196 (sprint 7, ruling 196): before this job no CI run compiled writ
+  # for Windows; only the Release workflow did, after the tag, which is how the
+  # 0.4.3 tag failed on std::os::unix (finding 185). A real MSVC check (C deps
+  # included), not a test run, to keep CI time down. It is a job of this
+  # workflow with no continue-on-error, so a failure here fails the CI status.
+  # Runner: windows-latest, the image release.yml builds the Windows CLI and
+  # wheel on, so CI checks the same toolchain and SDK the release uses.
+  windows-check:
+    name: Windows Check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        run: rustup toolchain install --no-self-update && rustc --version
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-check-${{ hashFiles('**/Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: ${{ runner.os }}-check-
+
+      - name: cargo check (writ-cli, writ-core, all targets)
+        run: cargo check -p writ-cli -p writ-core --all-targets
+
   python-tests:
     name: Python Tests
     runs-on: ${{ matrix.os }}

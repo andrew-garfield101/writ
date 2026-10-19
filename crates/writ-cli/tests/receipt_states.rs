@@ -568,3 +568,138 @@ fn rc_auto_spec_without_spec_done_reads_no_summary_n_auto_seals_over_span() {
         "seal summaries presented as words: {l}"
     );
 }
+
+/// Run every writ hook command registered on `event` with `stdin`, as
+/// `agent`; each must exit 0.
+fn fire(p: &Project, agent: &str, event: &str, stdin: &Value) {
+    let settings: Value =
+        serde_json::from_str(&fs::read_to_string(p.path(".claude/settings.json")).unwrap())
+            .unwrap();
+    let cmds: Vec<String> = settings["hooks"][event]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|e| e["hooks"].as_array().cloned().unwrap_or_default())
+        .filter_map(|h| h["command"].as_str().map(str::to_string))
+        .filter(|c| c.contains("writ"))
+        .collect();
+    assert!(!cmds.is_empty(), "no writ {event} hook");
+    for c in &cmds {
+        use std::io::Write as _;
+        let mut ch = p
+            .cmd("sh", agent)
+            .arg("-c")
+            .arg(c)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        ch.stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.to_string().as_bytes())
+            .unwrap();
+        assert_eq!(ch.wait_with_output().unwrap().status.code(), Some(0));
+    }
+}
+
+fn bash_stdin(p: &Project, event: &str, session: &str, cmd: &str, id: &str) -> Value {
+    serde_json::json!({
+        "session_id": session, "hook_event_name": event, "tool_name": "Bash",
+        "cwd": p.root.display().to_string(),
+        "tool_input": {"command": cmd}, "tool_use_id": id,
+    })
+}
+
+/// Ruling 189: a seal the hook attributed from the command text says so on
+/// the receipt's shared-file line, in handoff and in `writ why`; a seal by a
+/// single window (or by hand) keeps today's wording.
+#[test]
+fn rc_189_command_text_seal_reads_attributed_from_the_command() {
+    let p = Project::new("cmdtext");
+    let since = p.newest_seal();
+    p.spec("sa", ALPHA);
+    p.spec("sb", BRAVO);
+    let tick = || std::thread::sleep(std::time::Duration::from_millis(30));
+    // alpha's command names shared.txt; bravo's open call names nothing.
+    let ca = "printf 'alpha\\n' >> shared.txt";
+    let cb = "ls >/dev/null";
+    fire(
+        &p,
+        ALPHA,
+        "PreToolUse",
+        &bash_stdin(&p, "PreToolUse", "sess-a", ca, "t_a"),
+    );
+    tick();
+    fire(
+        &p,
+        BRAVO,
+        "PreToolUse",
+        &bash_stdin(&p, "PreToolUse", "sess-b", cb, "t_b"),
+    );
+    tick();
+    let out = p.cmd("sh", "human").arg("-c").arg(ca).output().unwrap();
+    assert!(out.status.success());
+    tick();
+    fire(
+        &p,
+        ALPHA,
+        "PostToolUse",
+        &bash_stdin(&p, "PostToolUse", "sess-a", ca, "t_a"),
+    );
+    tick();
+    fire(
+        &p,
+        BRAVO,
+        "PostToolUse",
+        &bash_stdin(&p, "PostToolUse", "sess-b", cb, "t_b"),
+    );
+    let s = p.json(
+        "human",
+        &["log", "--all", "--format", "json", "--limit", "1"],
+    );
+    assert_eq!(s[0]["agent"]["id"], ALPHA, "{s:#}");
+    assert_eq!(s[0]["attributed_by"], "command_text", "{s:#}");
+    // bravo then edits the same file by hand.
+    let cur = fs::read_to_string(p.path("shared.txt")).unwrap();
+    p.write("shared.txt", &format!("{cur}bravo\n"));
+    assert!(p.seal(BRAVO, "sb", "shared.txt", &[]).status.success());
+
+    let r = text(&p.ok(
+        "human",
+        &["handoff", "--since", &since, "--format", "receipt"],
+    ));
+    let l = file_line(&r, "shared.txt");
+    assert!(
+        l.contains("sa by alpha, attributed from the command"),
+        "receipt line: {l}"
+    );
+    assert_eq!(l.matches("attributed from the command").count(), 1, "{l}");
+    let pr = text(&p.ok("human", &["handoff", "--since", &since, "--format", "pr"]));
+    assert!(
+        file_line(&pr, "shared.txt").contains("sa by alpha, attributed from the command"),
+        "{pr}"
+    );
+    let h = text(&p.ok("human", &["handoff", "--since", &since]));
+    assert!(
+        line_with(&h, "`shared.txt` sealed by").contains("sa (attributed from the command), sb"),
+        "{h}"
+    );
+    let why = text(&p.ok("human", &["why", "shared.txt"]));
+    let lines: Vec<&str> = why.lines().filter(|l| l.contains(" seal ")).collect();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.contains("attributed from the command"))
+            .count(),
+        1,
+        "{why}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("by alpha") && l.contains("attributed from the command")),
+        "{why}"
+    );
+}

@@ -464,3 +464,52 @@ def test_worst_window_names_path_hook_and_cause():
     w = stranger.worst_window(recs)
     assert (w["ms"], w["path"], w["hook"], w["seal"]) == (17951, "app.py", "retry", "s2")
     assert "drained" in w["cause"] and "ambiguous by e" in w["cause"]
+
+
+# Finding 187: records writ could not attribute are not asks.
+RUNA_F4 = EVIDENCE / "0.4.3-live-runA-freeze4"
+needs_runa_f4 = pytest.mark.skipif(not (RUNA_F4 / "summary.json").exists(),
+                                   reason="0.4.3 run A freeze 4 evidence not present")
+
+
+@needs_runa_f4
+def test_run_a_freeze4_has_28_records_not_attributed_and_5_ask_lines_shown():
+    summary = json.loads((RUNA_F4 / "summary.json").read_text())
+    recs = stranger._records(RUNA_F4)
+    a = stranger.ask_counts(summary, recs)
+    assert a["records_not_attributed"] == 28
+    assert a["ambiguous_records"] == 28  # 0.4.3 field name, kept for old evidence
+    assert a["ask_lines_shown"] == {"agent-1": 2, "agent-2": 3}
+    assert a["ask_lines_shown_total"] == 5
+    assert a["records_told"] is None  # 0.4.3 hooks.log has no told flag
+
+
+def test_ask_lines_count_only_ambiguity_lines_and_repeats():
+    agents = {
+        "agent-1": {"hook_context_seen": [
+            {"line": f"a.py changed while 2 agents ran commands (x, y); {stranger.ASK_MARK}; ...",
+             "times": 2},
+            {"line": "a.py: writ did not seal it: removes lines sealed by y", "times": 1},
+        ]},
+        "agent-2": {"hook_context_seen": []},
+    }
+    recs = [
+        {"event": "PostToolUse", "path": "a.py", "agent": "agent-1", "outcome": "ambiguous", "told": True},
+        {"event": "Stop", "path": "a.py", "agent": "agent-2", "outcome": "ambiguous", "told": False},
+    ]
+    a = stranger.ambiguity_rate(recs, agents)
+    assert (a["records_not_attributed"], a["records_told"]) == (2, 1)
+    assert a["ask_lines_shown"] == {"agent-1": 2, "agent-2": 0}
+    assert a["ask_lines_shown_total"] == 2
+
+
+C409 = EVIDENCE / "0.4.3-fleet-live-c409"
+
+
+@pytest.mark.skipif(not (C409 / "summary.json").exists(), reason="c409 evidence not present")
+def test_c409_ask_lines_include_the_subagents_own_transcripts():
+    summary = json.loads((C409 / "summary.json").read_text())
+    a = stranger.ask_counts(summary, stranger._records(C409))
+    assert a["records_not_attributed"] == 17
+    assert a["ask_lines_shown"] == {"agent-1": 3, "agent-2": 1}
+    assert a["ask_lines_shown_total"] == 4

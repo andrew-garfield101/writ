@@ -87,6 +87,17 @@ writ seal -s "implemented login" --agent backend-dev --spec auth
 
 `writ context` shows per agent activity: which files each agent has modified, their latest work, and how many seals they've created. For a fleet of agents working concurrently, this is the difference between "which of my 12 agents touched this file" being a five minute archaeology project versus a single structured lookup.
 
+### Identity Under Claude Code
+
+With the hooks `writ init -y` installs, an agent never passes `--agent` for the seals the hooks make. Writ takes the identity from what Claude Code sends each hook:
+
+- **A main session** seals as `claude-code-<id>`, derived from its session.
+- **A subagent whose type you defined** in a file under `.claude/agents/` seals under that type's name. A `reviewer` subagent, from `.claude/agents/reviewer.md`, seals as `reviewer`. If a spec is claimed under that name, the seals go to that spec, and the receipt names `reviewer`.
+- **A second instance of the same type**, started while the first is still live, seals as `<type>-<first 8 of its agent id>`, for example `reviewer-a9e8d7c6`. Each instance keeps the name it was given for its life. An instance is live from its first hook until its SubagentStop, or until 30 minutes pass with no hook from it; after that a new instance gets the plain name again.
+- **A subagent of a built in type** (general-purpose, Explore, Plan, statusline-setup, output-style-setup, claude-code-guide), or of a type with no file under `.claude/agents/`, seals as `<parent>-<first 8 of its agent id>`, and its auto spec names the parent.
+
+Limits: names are shared across the whole repository, not kept per session, so a `reviewer` in a second session at the same time gets the suffix. Two instances of one type that start in the same instant can end up with the same name, because writ skips its naming lock after about 100 ms rather than delay a tool call. A writ command a subagent types by hand in its shell runs as the parent, because Claude Code gives the subagent's shell the parent's environment; pass `--agent <name>` there.
+
 ### Scope Enforcement
 
 Agents can be constrained to specific files or directories:

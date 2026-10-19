@@ -2038,7 +2038,13 @@ fn r160_old_mtime_with_another_interval_open_seals_to_nobody() {
     p.spec("sa", ALPHA);
     p.spec("sb", BRAVO);
     let src = old_copy(&p, "old.txt", &numbered(20, &[(9, "restored")]));
-    let cmd = format!("cp -p {} a.txt", src.display());
+    // Through a script: the text names no path, so rule 1 cannot decide.
+    fs::write(
+        p.home.join("restore.sh"),
+        format!("cp -p {} a.txt\n", src.display()),
+    )
+    .unwrap();
+    let cmd = "sh \"$HOME/restore.sh\"".to_string();
     let cb = "ls >/dev/null";
     let before = p.seal_count();
     let mut runs = bash_pre(&p, BRAVO, "sess-b", cb, "toolu_b");
@@ -2129,11 +2135,14 @@ fn paste(p: &Project, agent: Option<&str>, session: &str, fix: &str) -> Output {
 /// both hooks print the ambiguity line. Returns (alpha's runs, bravo's runs).
 fn ambiguity(p: &Project, paths: &[&str], tag: &str) -> (Vec<HookRun>, Vec<HookRun>) {
     let ca = "cat a.txt >/dev/null";
-    let cb = paths
+    // bravo writes through a script so neither command text names a path:
+    // rule 1 (ruling 189) cannot decide and the 0.4.3 fallback is exercised.
+    let script = paths
         .iter()
-        .map(|f| format!("printf 'bravo {tag}\\n' >> {f}"))
-        .collect::<Vec<_>>()
-        .join(" && ");
+        .map(|f| format!("printf 'bravo {tag}\\n' >> {f}\n"))
+        .collect::<String>();
+    fs::write(p.home.join(format!("w_{tag}.sh")), script).unwrap();
+    let cb = format!("sh \"$HOME/w_{tag}.sh\"");
     let ida = format!("toolu_a_{tag}");
     let idb = format!("toolu_b_{tag}");
     let mut a = bash_hook(p, Some(ALPHA), "sess-a", "PreToolUse", ca, &ida, None);
@@ -2278,7 +2287,9 @@ fn f168_fix_pasted_by_a_subagent_seals_under_the_subagent() {
     // The subagent's read-only call is open while bravo writes shared.txt.
     let sub = "a1b2c3d4e5f6a7b8c";
     let cs = "cat a.txt >/dev/null";
-    let cb = "printf 'bravo\\n' >> shared.txt";
+    // Through a script: no command text names the path (rule 1 cannot decide).
+    fs::write(p.home.join("w.sh"), "printf 'bravo\\n' >> shared.txt\n").unwrap();
+    let cb = "sh \"$HOME/w.sh\"";
     let mut s = bash_hook(&p, None, "sess-p", "PreToolUse", cs, "toolu_s", Some(sub));
     tick();
     let mut b = bash_hook(&p, Some(BRAVO), "sess-b", "PreToolUse", cb, "toolu_b", None);
@@ -2499,7 +2510,55 @@ fn f168_fix_pasted_with_no_spec_ever_opens_an_auto_spec_and_seals() {
 /// after being told, never the hook's).
 #[test]
 fn f173_drain_never_seals_another_writers_ambiguous_rewrite_and_never_overrides() {
-    let p = Project::new("f173");
+    // Fallback (no command names the path, rule 1 cannot decide): ambiguous.
+    let (p, runs_a, _runs_b) = f173_rewrite("f173", false);
+    // (b) alpha was told, by a hook line naming the path and bravo.
+    let told: Vec<String> = runs_a.iter().filter_map(HookRun::to_agent).collect();
+    assert!(
+        told.iter()
+            .any(|l| l.contains("shared.txt") && l.contains(BRAVO)),
+        "alpha was never told about bravo's rewrite: {told:?}"
+    );
+    f173_after(&p);
+}
+
+/// Rule 1 (ruling 189): bravo's heredoc names shared.txt, so bravo owns the
+/// rewrite; it drops alpha's sealed line, so bravo's own seal is refused
+/// with the 141 line naming alpha; alpha is not asked; alpha's drain still
+/// never seals it and no hook seal overrides.
+#[test]
+fn f173_rule1_writer_named_in_command_is_refused_and_alphas_drain_never_seals() {
+    let (p, runs_a, runs_b) = f173_rewrite("f173-r1", true);
+    let told_b: Vec<String> = runs_b.iter().filter_map(HookRun::to_agent).collect();
+    assert_eq!(
+        told_b.len(),
+        1,
+        "bravo: want one refusal line, got {told_b:?}"
+    );
+    assert!(
+        told_b[0].contains("shared.txt") && told_b[0].contains(ALPHA),
+        "bravo's refusal does not name the path and alpha: {}",
+        told_b[0]
+    );
+    assert!(
+        !told_b[0].contains(AMBIGUOUS),
+        "rule 1 attributed it, yet bravo got the ambiguity line: {}",
+        told_b[0]
+    );
+    let told_a: Vec<String> = runs_a.iter().filter_map(HookRun::to_agent).collect();
+    assert!(
+        told_a.is_empty(),
+        "alpha asked about a path rule 1 gave bravo: {told_a:?}"
+    );
+    f173_after(&p);
+}
+
+/// alpha seals its line in shared.txt, then bravo rewrites the file from a
+/// stale copy that drops it while alpha's call is open. `named`: bravo's
+/// command names the path (heredoc), else it writes through a script.
+/// Returns the project, alpha's and bravo's hook runs.
+fn f173_rewrite(tag: &str, named: bool) -> (Project, Vec<HookRun>, Vec<HookRun>) {
+    let p = Project::new(tag);
     p.spec("sa", ALPHA);
     p.spec("sb", BRAVO);
     // alpha's Edit seals its line.
@@ -2513,17 +2572,35 @@ fn f173_drain_never_seals_another_writers_ambiguous_rewrite_and_never_overrides(
     // stale copy, dropping alpha's line, while alpha's interval is open.
     let ca = "sleep 0";
     let stale = numbered(40, &[(30, "B")]);
-    let cb = format!("cat > shared.txt <<'EOF'\n{stale}EOF");
-    let mut runs = bash_pre(&p, ALPHA, "sess-a", ca, "toolu_a");
+    let cb = if named {
+        format!("cat > shared.txt <<'EOF'\n{stale}EOF")
+    } else {
+        fs::write(p.home.join("stale.txt"), &stale).unwrap();
+        fs::write(
+            p.home.join("restore.sh"),
+            "cat \"$HOME/stale.txt\" > \"$1\"\n",
+        )
+        .unwrap();
+        // The target arrives through a variable: the text names no path.
+        "T=shared; sh \"$HOME/restore.sh\" \"$T.txt\"".to_string()
+    };
+    let mut a = bash_pre(&p, ALPHA, "sess-a", ca, "toolu_a");
     tick();
-    runs.extend(bash_pre(&p, BRAVO, "sess-b", &cb, "toolu_b"));
+    let mut b = bash_pre(&p, BRAVO, "sess-b", &cb, "toolu_b");
     tick();
     run_sh(&p, &cb);
     tick();
-    runs.extend(bash_post(&p, BRAVO, "sess-b", &cb, "toolu_b"));
+    b.extend(bash_post(&p, BRAVO, "sess-b", &cb, "toolu_b"));
     tick();
-    runs.extend(bash_post(&p, ALPHA, "sess-a", ca, "toolu_a"));
-    all_exit_zero(&runs, "ambiguous rewrite");
+    a.extend(bash_post(&p, ALPHA, "sess-a", ca, "toolu_a"));
+    all_exit_zero(&a, "rewrite alpha");
+    all_exit_zero(&b, "rewrite bravo");
+    (p, a, b)
+}
+
+/// alpha's next hooks never seal bravo's rewrite; no hook seal overrides;
+/// the file stays unsealed and the handoff says nothing false.
+fn f173_after(p: &Project) {
     let before = p.seal_count();
     // alpha's next hooks: an Edit elsewhere, then Stop.
     p.write("a.txt", &numbered(20, &[(1, "A")]));
@@ -2540,10 +2617,10 @@ fn f173_drain_never_seals_another_writers_ambiguous_rewrite_and_never_overrides(
         ),
         "alpha stop",
     );
-    for s in seals_since(&p, before) {
+    for s in seals_since(p, before) {
         assert!(
             !(s["agent"]["id"] == ALPHA && paths_of(&s).contains("shared.txt")),
-            "alpha's drain sealed bravo's ambiguous rewrite: {s}"
+            "alpha's drain sealed bravo's rewrite: {s}"
         );
     }
     for s in p.seals() {
@@ -2569,13 +2646,6 @@ fn f173_drain_never_seals_another_writers_ambiguous_rewrite_and_never_overrides(
             }
         }
     }
-    // (b) alpha was told, by a hook line naming the path and bravo.
-    let told: Vec<String> = runs.iter().filter_map(HookRun::to_agent).collect();
-    assert!(
-        told.iter()
-            .any(|l| l.contains("shared.txt") && l.contains(BRAVO)),
-        "alpha was never told about bravo's rewrite: {told:?}"
-    );
     // The file is still unsealed, and the receipt-to-be says nothing false.
     let st = text(&p.ok("human", &["diff", "--stat"]));
     assert!(st.contains("shared.txt"), "{st}");
@@ -3360,5 +3430,520 @@ fn r183_refusal_texts_never_mention_the_config_key() {
         ] {
             assert!(!s.contains(w), "{who} refusal mentions {w:?}: {s}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sprint 7 (0.4.4), ruling 189 on findings 186, 187, 188. Assertions before
+// the code (retro rule 1); ignored until Amis lands each; the two
+// f188 guards pass on 0.4.3 and run now, so rule 1 cannot break them unseen.
+// 186: a failed Bash call gets PostToolUseFailure, never PostToolUse (Claude
+//   Code 2.1.290, fixture post_tool_use_failure_bash.json: `error`,
+//   `is_interrupt`, `duration_ms`, no `tool_response`). writ init registers
+//   PostToolUseFailure for the same matchers and dispatches it like
+//   PostToolUse (the command may have written before it failed). An
+//   identity's stale open windows close at its next PreToolUse (calls of one
+//   identity run one after another), for hosts that send no failure event.
+// 187: Stop sweep records print nothing; every ambiguous hooks.log record
+//   carries `told` (bool, as refused records do) so the collector counts
+//   records not attributed apart from ask lines shown.
+// 188 rule 1 (reading W): when exactly one candidate's command text names the
+//   path (relative path, basename, or inside a heredoc body), that candidate
+//   owns it; the seal and its hooks.log record carry
+//   `attributed_by: "command_text"`. Two candidates naming it: ambiguous, the
+//   0.4.3 line unchanged, left_out addressed to both (169). Rule 2 (a
+//   candidate whose command names no path is a reader) does not exist.
+// ---------------------------------------------------------------------------
+
+const PTUF_FIXTURE: &str = include_str!("fixtures/claude_hooks/post_tool_use_failure_bash.json");
+
+/// PostToolUseFailure stdin in the captured 2.1.290 shape, for `cmd`.
+fn bash_failure_stdin(p: &Project, session: &str, cmd: &str, id: &str) -> Value {
+    let mut v: Value = serde_json::from_str(PTUF_FIXTURE).unwrap();
+    assert!(
+        v.get("tool_response").is_none(),
+        "fixture shape changed: {v}"
+    );
+    v["session_id"] = json!(session);
+    v["transcript_path"] = json!(format!("/tmp/claude-fixture/{session}.jsonl"));
+    v["cwd"] = json!(p.root.display().to_string());
+    v["permission_mode"] = json!("default");
+    v["tool_input"] = json!({"command": cmd, "description": "run"});
+    v["tool_use_id"] = json!(id);
+    v["error"] = json!("Exit code 1");
+    v
+}
+
+fn bash_failure(p: &Project, agent: &str, session: &str, cmd: &str, id: &str) -> Vec<HookRun> {
+    let stdin = bash_failure_stdin(p, session, cmd, id);
+    p.fire("PostToolUseFailure", Some("Bash"), Some(agent), &stdin)
+}
+
+/// Run a fixture command that must fail (exit non-zero), as the agent's did.
+fn run_sh_failing(p: &Project, cmd: &str) {
+    let out = p
+        .cmd("sh", Some("human"))
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .unwrap();
+    assert!(
+        !out.status.success(),
+        "fixture command `{cmd}` was meant to fail"
+    );
+}
+
+/// hooks.log records (one JSON object per line).
+fn hook_records(p: &Project) -> Vec<Value> {
+    p.hooks_log()
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .collect()
+}
+
+/// A write by alpha's command while bravo's call is open; returns every run.
+/// `ca` writes (`run_sh`), `cb` is only announced (Pre/Post), never run.
+fn overlapped(p: &Project, ca: &str, cb: &str, tag: &str) -> (Vec<HookRun>, Vec<HookRun>) {
+    let (ida, idb) = (format!("toolu_a_{tag}"), format!("toolu_b_{tag}"));
+    let mut a = bash_pre(p, ALPHA, "sess-a", ca, &ida);
+    tick();
+    let mut b = bash_pre(p, BRAVO, "sess-b", cb, &idb);
+    tick();
+    run_sh(p, ca);
+    tick();
+    a.extend(bash_post(p, ALPHA, "sess-a", ca, &ida));
+    tick();
+    b.extend(bash_post(p, BRAVO, "sess-b", cb, &idb));
+    all_exit_zero(&a, "overlapped alpha");
+    all_exit_zero(&b, "overlapped bravo");
+    (a, b)
+}
+
+#[test]
+fn f186_failed_bash_call_closes_its_window() {
+    let p = Project::new("f186-close");
+    for tool in ["Bash", "Edit", "Write", "NotebookEdit"] {
+        assert!(
+            !p.hook_commands("PostToolUseFailure", Some(tool)).is_empty(),
+            "init registers no PostToolUseFailure hook covering {tool}:\n{}",
+            p.settings()
+        );
+    }
+    p.spec("sa", ALPHA);
+    p.spec("sb", BRAVO);
+    let ca = "cat missing_file";
+    let before = p.seal_count();
+    let mut runs = bash_pre(&p, ALPHA, "sess-a", ca, "toolu_a");
+    run_sh_failing(&p, ca);
+    tick();
+    runs.extend(bash_failure(&p, ALPHA, "sess-a", ca, "toolu_a"));
+    tick();
+    let cb = "printf 'bravo\\n' >> shared.txt";
+    let call_b = bash_call(&p, BRAVO, "sess-b", cb, "toolu_b");
+    all_exit_zero(&runs, "alpha");
+    nothing_to_agent(&runs, "alpha");
+    all_exit_zero(&call_b, "bravo");
+    nothing_to_agent(&call_b, "bravo: no ambiguity line once alpha's call failed");
+    let new = seals_since(&p, before);
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["agent"]["id"], BRAVO, "{}", new[0]);
+    assert_eq!(new[0]["spec_id"], "sb");
+    assert_eq!(paths_of(&new[0]), set(&["shared.txt"]));
+    assert!(
+        !hook_records(&p)
+            .iter()
+            .any(|r| r["outcome"] == "ambiguous" && r["path"] == "shared.txt"),
+        "shared.txt recorded ambiguous:\n{}",
+        p.hooks_log()
+    );
+}
+
+#[test]
+fn f186_posttoolusefailure_still_attributes_writes_made_before_the_failure() {
+    let p = Project::new("f186-wrote");
+    p.spec("sa", ALPHA);
+    let ca = "printf 'alpha\\n' >> c.txt && false";
+    let before = p.seal_count();
+    let mut runs = bash_pre(&p, ALPHA, "sess-a", ca, "toolu_a");
+    run_sh_failing(&p, ca);
+    tick();
+    runs.extend(bash_failure(&p, ALPHA, "sess-a", ca, "toolu_a"));
+    all_exit_zero(&runs, "alpha");
+    nothing_to_agent(&runs, "alpha");
+    let new = seals_since(&p, before);
+    assert_eq!(new.len(), 1, "failure hook sealed nothing: {new:?}");
+    assert_eq!(new[0]["agent"]["id"], ALPHA);
+    assert_eq!(new[0]["spec_id"], "sa");
+    assert_eq!(paths_of(&new[0]), set(&["c.txt"]));
+    // The window is closed: the Stop that follows has nothing left to sweep.
+    let stop = p.event(
+        Some(ALPHA),
+        "sess-a",
+        "Stop",
+        json!({"stop_hook_active": false}),
+    );
+    all_exit_zero(&stop, "stop");
+    assert_eq!(p.seal_count(), before + 1, "Stop sealed again");
+}
+
+#[test]
+fn f186_stale_window_closed_at_next_pretooluse() {
+    let p = Project::new("f186-stale");
+    p.spec("sa", ALPHA);
+    p.spec("sb", BRAVO);
+    // An old host: the failed call gets no event at all.
+    let a1 = "cat NO_SUCH_FILE.md 2>/dev/null";
+    all_exit_zero(&bash_pre(&p, ALPHA, "sess-a", a1, "toolu_a1"), "a1 pre");
+    run_sh_failing(&p, a1);
+    tick();
+    // alpha's next call: its Pre closes the a1 window at this call's start.
+    let a2 = "ls >/dev/null";
+    let call_a = bash_call(&p, ALPHA, "sess-a", a2, "toolu_a2");
+    all_exit_zero(&call_a, "a2");
+    nothing_to_agent(&call_a, "a2");
+    tick();
+    let before = p.seal_count();
+    let cb = "printf 'bravo\\n' >> shared.txt";
+    let call_b = bash_call(&p, BRAVO, "sess-b", cb, "toolu_b");
+    all_exit_zero(&call_b, "bravo");
+    nothing_to_agent(
+        &call_b,
+        "bravo: alpha's stale window must not make it ambiguous",
+    );
+    let new = seals_since(&p, before);
+    assert_eq!(new.len(), 1, "{new:?}");
+    assert_eq!(new[0]["agent"]["id"], BRAVO, "{}", new[0]);
+    assert_eq!(paths_of(&new[0]), set(&["shared.txt"]));
+}
+
+#[test]
+fn f188_command_text_attributes_when_exactly_one_candidate_names_the_path() {
+    // (form, alpha's command, the path it writes)
+    let forms = [
+        (
+            "relative",
+            "printf 'alpha\\n' >> pkg/rel.txt",
+            "pkg/rel.txt",
+        ),
+        (
+            "basename",
+            "cd pkg && printf 'alpha\\n' >> mod.py",
+            "pkg/mod.py",
+        ),
+        (
+            "heredoc",
+            "sh <<'EOF'\nprintf 'alpha\\n' >> notes/h.txt\nEOF",
+            "notes/h.txt",
+        ),
+    ];
+    for (form, ca, path) in forms {
+        let p = Project::new(&format!("f188-one-{form}"));
+        p.write("pkg/keep.txt", "k\n");
+        p.write("notes/keep.txt", "k\n");
+        p.spec("sa", ALPHA);
+        p.spec("sb", BRAVO);
+        let before = p.seal_count();
+        let (a, b) = overlapped(&p, ca, "ls >/dev/null", form);
+        nothing_to_agent(&a, &format!("{form}: alpha"));
+        nothing_to_agent(&b, &format!("{form}: bravo"));
+        let new = seals_since(&p, before);
+        assert_eq!(new.len(), 1, "{form}: {new:?}");
+        assert_eq!(new[0]["agent"]["id"], ALPHA, "{form}: {}", new[0]);
+        assert_eq!(new[0]["spec_id"], "sa", "{form}");
+        assert_eq!(paths_of(&new[0]), set(&[path]), "{form}");
+        assert_eq!(
+            new[0]["attributed_by"], "command_text",
+            "{form}: the seal does not record how writ decided: {}",
+            new[0]
+        );
+        let recs = hook_records(&p);
+        assert!(
+            recs.iter().any(|r| r["path"] == path
+                && r["agent"] == ALPHA
+                && r["attributed_by"] == "command_text"),
+            "{form}: hooks.log has no attributed_by=command_text record for {path}:\n{}",
+            p.hooks_log()
+        );
+        assert!(
+            !recs
+                .iter()
+                .any(|r| r["outcome"] == "ambiguous" && r["path"] == path),
+            "{form}: {path} also recorded ambiguous:\n{}",
+            p.hooks_log()
+        );
+    }
+}
+
+#[test]
+fn f188_two_candidates_naming_the_path_stay_ambiguous() {
+    let p = Project::new("f188-two");
+    p.spec("sa", ALPHA);
+    p.spec("sb", BRAVO);
+    let before = p.seal_count();
+    let (a, b) = overlapped(
+        &p,
+        "printf 'alpha\\n' >> shared.txt",
+        "grep -c line shared.txt >/dev/null",
+        "two",
+    );
+    assert_eq!(p.seal_count(), before, "an ambiguous write was sealed");
+    assert_ambiguous_line(&a, "shared.txt", 2, "alpha");
+    assert_ambiguous_line(&b, "shared.txt", 2, "bravo");
+    assert!(
+        !p.hooks_log().contains("command_text"),
+        "attributed_by recorded on an ambiguous path:\n{}",
+        p.hooks_log()
+    );
+    p.ok(
+        ALPHA,
+        &["spec", "done", "sa", "--agent", ALPHA, "--no-seal"],
+    );
+    p.ok(
+        BRAVO,
+        &["spec", "done", "sb", "--agent", BRAVO, "--no-seal"],
+    );
+    let d = p.json("charlie", &["doctor", "--format", "json"]);
+    let f = d["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["check"] == "left_out" && f.to_string().contains("shared.txt"))
+        .cloned()
+        .unwrap_or_else(|| panic!("no left_out finding for shared.txt:\n{d:#}"));
+    assert_eq!(f["anyone_may_fix"], false, "{f:#}");
+    let msg = f["message"].as_str().unwrap();
+    assert!(msg.contains(ALPHA) && msg.contains(BRAVO), "{msg}");
+}
+
+#[test]
+fn f188_no_reader_rule() {
+    let p = Project::new("f188-noreader");
+    p.spec("sa", ALPHA);
+    p.spec("sb", BRAVO);
+    // alpha's command writes shared.txt through a script: its text names no path.
+    fs::write(p.home.join("gen.sh"), "printf 'alpha\\n' >> shared.txt\n").unwrap();
+    let before = p.seal_count();
+    let (a, b) = overlapped(&p, "sh \"$HOME/gen.sh\"", "pytest -q", "noreader");
+    assert_eq!(
+        p.seal_count(),
+        before,
+        "sealed although neither command names the path (a reader rule?)"
+    );
+    assert_ambiguous_line(&a, "shared.txt", 2, "alpha");
+    assert_ambiguous_line(&b, "shared.txt", 2, "bravo");
+    assert!(!p.hooks_log().contains("command_text"), "{}", p.hooks_log());
+}
+
+#[test]
+fn f187_sweep_records_are_not_asks() {
+    let p = Project::new("f187-sweep");
+    p.spec("sa", ALPHA);
+    p.spec("sb", BRAVO);
+    fs::write(p.home.join("gen.sh"), "printf 'bravo\\n' >> shared.txt\n").unwrap();
+    // alpha's call is open (its Post never comes) while bravo's script writes.
+    let mut all = bash_pre(&p, ALPHA, "sess-a", "ls >/dev/null", "toolu_a");
+    tick();
+    let cb = "sh \"$HOME/gen.sh\"";
+    all.extend(bash_pre(&p, BRAVO, "sess-b", cb, "toolu_b"));
+    tick();
+    run_sh(&p, cb);
+    tick();
+    let post_b = bash_post(&p, BRAVO, "sess-b", cb, "toolu_b");
+    tick();
+    let stop_a = p.event(
+        Some(ALPHA),
+        "sess-a",
+        "Stop",
+        json!({"stop_hook_active": false}),
+    );
+    all_exit_zero(&all, "pre");
+    all_exit_zero(&stop_a, "stop");
+    nothing_to_agent(&stop_a, "alpha's Stop sweep");
+    assert_ambiguous_line(&post_b, "shared.txt", 2, "bravo");
+    let shown: usize = post_b
+        .iter()
+        .chain(stop_a.iter())
+        .filter_map(HookRun::to_agent)
+        .count();
+    let amb: Vec<Value> = hook_records(&p)
+        .into_iter()
+        .filter(|r| r["outcome"] == "ambiguous" && r["path"] == "shared.txt")
+        .collect();
+    assert_eq!(
+        amb.len(),
+        2,
+        "one record from bravo's Post, one from alpha's Stop:\n{amb:#?}"
+    );
+    for r in &amb {
+        assert!(r["told"].is_boolean(), "ambiguous record without told: {r}");
+    }
+    let sweep: Vec<&Value> = amb.iter().filter(|r| r["agent"] == ALPHA).collect();
+    assert_eq!(sweep.len(), 1, "{amb:#?}");
+    assert_eq!(
+        sweep[0]["event"], "Stop",
+        "sweep record logged as {}",
+        sweep[0]
+    );
+    assert_eq!(sweep[0]["told"], false, "{}", sweep[0]);
+    let told = amb.iter().filter(|r| r["told"] == true).count();
+    assert_eq!(
+        told, shown,
+        "told records != lines the agents received:\n{amb:#?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ruling 192 (finding 191, sprint 7 item 10): a named custom subagent. When
+// hook stdin's `agent_type` names a custom agent (a file under
+// .claude/agents/, not a built-in type such as general-purpose or Explore),
+// the hook identity is that name; `-<agent8>` is appended only while a
+// second live instance of the same type exists (SubagentStart to
+// SubagentStop); that identity's claimed spec is honoured as a main agent's
+// is. Built-in types keep the 0.4.3 `<parent>-<agent8>` identity (131).
+// Stdin is the 0.4.3 subagent capture shape (agent_id, agent_type).
+// ---------------------------------------------------------------------------
+
+fn custom_agent(p: &Project, name: &str) {
+    p.write(
+        &format!(".claude/agents/{name}.md"),
+        &format!("---\nname: {name}\ndescription: test agent\n---\nYou are {name}.\n"),
+    );
+}
+
+/// SubagentStart, if writ registers it (Amis's choice: liveness may instead
+/// run from a subagent's first hook to its SubagentStop).
+fn sub_start(p: &Project, session: &str, id: &str, ty: &str) {
+    if p.hook_commands("SubagentStart", None).is_empty() {
+        return;
+    }
+    let runs = p.event(
+        None,
+        session,
+        "SubagentStart",
+        json!({SUBAGENT_ID_FIELD: id, SUBAGENT_TYPE_FIELD: ty}),
+    );
+    all_exit_zero(&runs, "SubagentStart");
+}
+
+fn sub_stop(p: &Project, session: &str, id: &str, ty: &str) {
+    let runs = p.event(
+        None,
+        session,
+        "SubagentStop",
+        json!({SUBAGENT_ID_FIELD: id, SUBAGENT_TYPE_FIELD: ty, "stop_hook_active": false}),
+    );
+    all_exit_zero(&runs, "SubagentStop");
+}
+
+/// The parent's own identity, as its first edit records it.
+fn parent_identity(p: &Project, session: &str) -> String {
+    p.write("README.md", "# fixture\nparent\n");
+    all_exit_zero(&p.edit(None, session, "Edit", "README.md"), "parent");
+    p.newest_seal()["agent"]["id"].as_str().unwrap().to_string()
+}
+
+const SUB_X: &str = "a1b2c3d4e5f6a7b8c";
+const SUB_Y: &str = "a9e8d7c6b5a4f3e2d";
+
+#[test]
+fn f191_named_custom_subagent_seals_under_its_type_name() {
+    let p = Project::new("f191-name");
+    custom_agent(&p, "bri");
+    sub_start(&p, "sess-p", SUB_X, "bri");
+    p.write("b.txt", &numbered(20, &[(1, "bri")]));
+    all_exit_zero(&sub_edit(&p, "sess-p", (SUB_X, "bri"), "b.txt"), "bri");
+    let s = p.newest_seal();
+    assert_eq!(s["agent"]["id"], "bri", "{s}");
+    assert_eq!(paths_of(&s), set(&["b.txt"]));
+    // Its Bash writes too (the case in finding 191).
+    let cmd = "printf 'bri\\n' >> c.txt";
+    let mut pre = bash_stdin(&p, "sess-p", "PreToolUse", cmd, "toolu_x2");
+    pre[SUBAGENT_ID_FIELD] = json!(SUB_X);
+    pre[SUBAGENT_TYPE_FIELD] = json!("bri");
+    let mut runs = p.fire("PreToolUse", Some("Bash"), None, &pre);
+    run_sh(&p, cmd);
+    let mut post = bash_stdin(&p, "sess-p", "PostToolUse", cmd, "toolu_x2");
+    post[SUBAGENT_ID_FIELD] = json!(SUB_X);
+    post[SUBAGENT_TYPE_FIELD] = json!("bri");
+    runs.extend(p.fire("PostToolUse", Some("Bash"), None, &post));
+    all_exit_zero(&runs, "bri bash");
+    let s = p.newest_seal();
+    assert_eq!(s["agent"]["id"], "bri", "{s}");
+    assert_eq!(paths_of(&s), set(&["c.txt"]));
+}
+
+#[test]
+fn f191_second_live_instance_of_a_type_gets_the_suffix() {
+    let p = Project::new("f191-two");
+    custom_agent(&p, "bri");
+    sub_start(&p, "sess-p", SUB_X, "bri");
+    sub_start(&p, "sess-p", SUB_Y, "bri");
+    p.write("b.txt", &numbered(20, &[(1, "x")]));
+    all_exit_zero(&sub_edit(&p, "sess-p", (SUB_X, "bri"), "b.txt"), "x");
+    let sx = p.newest_seal();
+    p.write("shared.txt", &numbered(40, &[(1, "y")]));
+    all_exit_zero(&sub_edit(&p, "sess-p", (SUB_Y, "bri"), "shared.txt"), "y");
+    let sy = p.newest_seal();
+    assert_eq!(
+        sx["agent"]["id"], "bri",
+        "the first live instance keeps the name: {sx}"
+    );
+    assert_eq!(
+        sy["agent"]["id"], "bri-a9e8d7c6",
+        "the second live instance: {sy}"
+    );
+    // Both stopped: a later lone instance is plain `bri` again.
+    sub_stop(&p, "sess-p", SUB_X, "bri");
+    sub_stop(&p, "sess-p", SUB_Y, "bri");
+    let lone = "a0a1a2a3a4a5a6a7a";
+    sub_start(&p, "sess-p", lone, "bri");
+    p.write("a.txt", &numbered(20, &[(1, "lone")]));
+    all_exit_zero(&sub_edit(&p, "sess-p", (lone, "bri"), "a.txt"), "lone");
+    assert_eq!(p.newest_seal()["agent"]["id"], "bri");
+}
+
+#[test]
+fn f191_named_subagent_seals_under_its_claimed_spec() {
+    let p = Project::new("f191-spec");
+    custom_agent(&p, "bri");
+    p.spec("harness", "bri");
+    let specs_before = p.auto_specs().len();
+    sub_start(&p, "sess-p", SUB_X, "bri");
+    p.write("b.txt", &numbered(20, &[(1, "bri")]));
+    all_exit_zero(&sub_edit(&p, "sess-p", (SUB_X, "bri"), "b.txt"), "bri");
+    let s = p.newest_seal();
+    assert_eq!(s["agent"]["id"], "bri", "{s}");
+    assert_eq!(s["spec_id"], "harness", "claimed spec not honoured: {s}");
+    assert_eq!(
+        p.auto_specs().len(),
+        specs_before,
+        "an auto spec was opened"
+    );
+}
+
+#[test]
+fn f191_builtin_type_keeps_the_parent_derived_identity() {
+    let p = Project::new("f191-builtin");
+    // A custom file exists for another name; built-in and unknown types ignore it.
+    custom_agent(&p, "bri");
+    let parent = parent_identity(&p, "sess-p");
+    for (i, (id, ty)) in [
+        (SUB_X, "general-purpose"),
+        (SUB_Y, "Explore"),
+        ("a0a1a2a3a4a5a6a7a", "not-a-file-agent"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sub_start(&p, "sess-p", id, ty);
+        let rel = format!("f{i}.txt");
+        p.write(&rel, &format!("{ty}\n"));
+        all_exit_zero(&sub_edit(&p, "sess-p", (id, ty), &rel), ty);
+        let s = p.newest_seal();
+        assert_eq!(
+            s["agent"]["id"],
+            format!("{parent}-{}", &id[..8]),
+            "{ty}: {s}"
+        );
     }
 }

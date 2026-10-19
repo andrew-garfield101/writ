@@ -89,6 +89,20 @@ pub struct HandoffMerge {
     /// The finish commit that produced the current content, when committed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit: Option<String>,
+    /// Ruling 189: the specs in `specs` whose seal of this path the auto
+    /// seal hook attributed from the command text.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attributed_from_command: Vec<String>,
+}
+
+/// Ruling 189: true when any of `spec`'s seals in `seals` touched `path`
+/// and was attributed from the command text (not a single window).
+pub fn spec_attributed_from_command(seals: &[&Seal], spec: &str, path: &str) -> bool {
+    seals.iter().any(|s| {
+        s.spec_id.as_deref() == Some(spec)
+            && s.attributed_by.as_deref() == Some(crate::seal::ATTRIBUTED_BY_COMMAND_TEXT)
+            && s.changes.iter().any(|c| c.path == path)
+    })
 }
 
 /// Pending work and whose it is.
@@ -539,12 +553,18 @@ fn merges(
             continue;
         }
         let (resolution, detail, commit) = resolve_path(repo, &path, &seals, specs);
+        let attributed_from_command = order
+            .iter()
+            .filter(|id| spec_attributed_from_command(&seals, id, &path))
+            .cloned()
+            .collect();
         out.push(HandoffMerge {
             path,
             specs: order,
             resolution,
             detail,
             commit,
+            attributed_from_command,
         });
     }
     Ok(out)
@@ -647,10 +667,21 @@ pub fn to_markdown(h: &Handoff) -> String {
             .as_deref()
             .map(|c| format!(" (commit {})", &c[..c.len().min(12)]))
             .unwrap_or_default();
+        let by: Vec<String> = m
+            .specs
+            .iter()
+            .map(|id| {
+                if m.attributed_from_command.contains(id) {
+                    format!("{id} ({})", crate::seal::ATTRIBUTED_FROM_COMMAND)
+                } else {
+                    id.clone()
+                }
+            })
+            .collect();
         s.push_str(&format!(
             "- `{}` sealed by {}: **{}**{commit}. {}\n",
             m.path,
-            m.specs.join(", "),
+            by.join(", "),
             m.resolution,
             m.detail
         ));

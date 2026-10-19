@@ -310,7 +310,12 @@ def told(res):
 
 def ambiguity(root, paths, tag):
     ca = "cat a.txt >/dev/null"
-    cb = " && ".join(f"printf 'bravo {tag}\\n' >> {f}" for f in paths)
+    # bravo writes through a script whose command text names no path, so 0.4.4's
+    # command text rule (finding 188) cannot decide and the 0.4.3 fallback is what
+    # these checks exercise, as Bri's Rust tests do since sprint 7.
+    gen = HOME / f"gen_{tag}.sh"
+    gen.write_text("".join(f"printf 'bravo {tag}\\n' >> {f}\n" for f in paths))
+    cb = f"sh {gen}"
     a = bash(root, "alpha", "sess-a", "PreToolUse", ca, f"toolu_a_{tag}"); tick()
     b = bash(root, "bravo", "sess-b", "PreToolUse", cb, f"toolu_b_{tag}"); tick()
     sh_run(root, cb); tick()

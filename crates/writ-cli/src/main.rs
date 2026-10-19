@@ -2433,6 +2433,9 @@ fn cmd_init(
             if let Err(e) = writ_core::hooks::hook_codex(cwd) {
                 hook_warnings.push(format!("Codex hook: {}", e));
             }
+        } else if let Err(e) = writ_core::hooks::refresh_agents_md_block(cwd) {
+            // Finding 184: an existing writ block is refreshed regardless.
+            hook_warnings.push(format!("AGENTS.md: {}", e));
         }
         if plan.enable_generic {
             if let Err(e) = writ_core::hooks::hook_generic(cwd) {

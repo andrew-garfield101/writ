@@ -49,6 +49,10 @@ pub struct WhyEntry {
     /// The committed spec this one continues (`X-followup` continues `X`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continues: Option<String>,
+    /// Ruling 189: `command_text` when the auto seal hook attributed this
+    /// seal's paths from the command text; absent for a single window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attributed_by: Option<String>,
 }
 
 /// The merge that produced the current content.
@@ -151,6 +155,7 @@ pub fn why(repo: &Repository, path: &str) -> WritResult<Why> {
                 .as_deref()
                 .and_then(|id| crate::doctor::continues(id, &specs))
                 .map(|x| x.id.clone()),
+            attributed_by: s.attributed_by.clone(),
         });
     }
     let spec_seals: Vec<&Seal> = seals.iter().filter(|s| s.spec_id.is_some()).collect();
@@ -194,8 +199,14 @@ pub fn to_markdown(w: &Why) -> String {
             .as_deref()
             .map(|c| format!(" (spec {c} continued as spec {spec} after finish)"))
             .unwrap_or_default();
+        let how = match e.attributed_by.as_deref() {
+            Some(crate::seal::ATTRIBUTED_BY_COMMAND_TEXT) => {
+                format!(", {}", crate::seal::ATTRIBUTED_FROM_COMMAND)
+            }
+            _ => String::new(),
+        };
         s.push_str(&format!(
-            "- {} seal {} by {} on `{spec}`{cont}: {}\n",
+            "- {} seal {} by {} on `{spec}`{cont}: {}{how}\n",
             e.timestamp.format("%Y-%m-%d %H:%M"),
             &e.seal[..e.seal.len().min(12)],
             e.agent,

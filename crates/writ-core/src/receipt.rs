@@ -311,7 +311,15 @@ pub fn build(
                     .filter(|s| s.spec_id.as_deref() == Some(id))
                     .map(|s| s.agent.id.as_str())
                     .collect();
-                format!("{id} by {}", who.into_iter().collect::<Vec<_>>().join(", "))
+                let how = if crate::handoff::spec_attributed_from_command(seals, id, path) {
+                    format!(", {}", crate::seal::ATTRIBUTED_FROM_COMMAND)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "{id} by {}{how}",
+                    who.into_iter().collect::<Vec<_>>().join(", ")
+                )
             })
             .collect();
         let (resolution, detail) = match crate::handoff::override_resolution(repo, path, seals) {

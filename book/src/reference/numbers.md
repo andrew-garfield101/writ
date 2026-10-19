@@ -26,6 +26,9 @@ The question: at the end of a run, does `writ doctor` say the repository is safe
 | 2026-10-14 | 0.4.3 development build `86a5d9c7d67d` | two agents, each splitting its task across two subagents; no writ instructions, sealing automatic; the receipt named the wrong author for four files (finding 169, fixed in `07209051b2d9`) | 2/2 | `0.4.3-fleet-live-c409/summary.json`, `report.md` |
 | 2026-10-16 | 0.4.3 release candidate `5da679fd4fab` (Amis `3b14d8a540c3`) | exit run A: two agents, no writ instructions, sealing automatic; a hand seal over the other agent's sealed lines was refused and the agent merged them back from the seal | 2/2 | `0.4.3-live-runA-freeze4/summary.json`, `report.md` |
 | 2026-10-17 | 0.4.3 release candidate `5da679fd4fab` | exit run B: two agents and a claim left by an exited session, released by one agent with `--stale`; a hand seal over the other agent's sealed line was refused and the agent merged it | 2/2 | `0.4.3-live-runB-freeze4-rerun/summary.json`, `report.md` (earlier attempts on this build ended on the agents' session limit and are kept as voids) |
+| 2026-10-19 | 0.4.4 release candidate `6a9d7c2aad2d` | exit run A: two agents, no writ instructions; three seals refused for dropping the other agent's sealed lines, each merged | 2/2 | `0.4.4-live-runA-freeze6/summary.json`, `report.md` |
+| 2026-10-19 | 0.4.4 release candidate `6a9d7c2aad2d` | exit run B: two agents and a claim left by an exited session, released by an agent without `--force` | 2/2 | `0.4.4-live-runB-freeze6/summary.json`, `report.md` |
+| 2026-10-19 | 0.4.4 release candidate `6a9d7c2aad2d` | two agents splitting their tasks across named subagents (`store-builder`, `web-builder`); the receipt names them, and `web-builder-ab037dfe` for the second live instance | 2/2 | `0.4.4-fleet-live-freeze6/summary.json`, `receipt.txt` |
 
 What the misses were. On 0.4.0 the fix for the injected stale claim needed `--force`, which an agent should not run on its own. On 0.4.1 both agents read the fix two or three times and left it alone because the claim was not theirs; "lenient" counts a finish that was safe once the human ran the printed fix. 0.4.2 changed the finding to say any agent may run it.
 
@@ -51,6 +54,9 @@ The question: did the commit `writ finish` made keep every line any agent sealed
 | 2026-10-14 | 0.4.3 run with subagents (13 files, 7 specs); the receipt named the wrong author for four files (finding 169, fixed in `07209051b2d9`) | 2,694 | 65 | 0 | `0.4.3-fleet-live-c409/audit.txt` |
 | 2026-10-16 | 0.4.3 release candidate, exit run A (13 files, 3 specs; finish's survival line: 1,079 sealed lines, none lost) | 1,896 | 4 | 0 | `0.4.3-live-runA-freeze4/audit.txt` |
 | 2026-10-17 | 0.4.3 release candidate, exit run B (17 files, 2 specs; finish's survival line: 1,152 sealed lines, none lost) | 1,741 | 3 | 0 | `0.4.3-live-runB-freeze4-rerun/audit.txt` |
+| 2026-10-19 | 0.4.4 release candidate, exit run A (2 specs; finish's survival line: 1,045 sealed lines, none lost) | 1,625 | 0 | 0 | `0.4.4-live-runA-freeze6/audit.txt` |
+| 2026-10-19 | 0.4.4 release candidate, exit run B (2 specs; finish's survival line: 1,119 sealed lines, none lost) | 1,870 | 27 | 0 | `0.4.4-live-runB-freeze6/audit.txt` |
+| 2026-10-19 | 0.4.4 release candidate, run with named subagents (5 specs; finish's survival line: 1,485 sealed lines, none lost) | 2,275 | 3 | 0 | `0.4.4-fleet-live-freeze6/audit.txt` |
 
 ## Survival check time
 
@@ -84,8 +90,12 @@ The time from an agent's edit to the seal that records it, read from each run's 
 | 2026-10-14 | 0.4.3 run with subagents (build `86a5d9c7d67d`); the receipt named the wrong author for four files (finding 169, fixed in `07209051b2d9`) | shell commands (Bash); the run used no edit tool | 366 ms / 1.2 s | 14 seals of 9 files, none with a coarse timestamp | `0.4.3-fleet-live-c409/summary.json` (`window_mtime`), from `hooks.log` |
 | 2026-10-16 | 0.4.3 release candidate, exit run A | shell commands (Bash) and Write | 258 ms / 260 ms | 3 seals, none with a coarse timestamp | `0.4.3-live-runA-freeze4/summary.json` (`window_mtime`) |
 | 2026-10-17 | 0.4.3 release candidate, exit run B | shell commands (Bash) | 439 ms / 439 ms | 2 seals, none with a coarse timestamp | `0.4.3-live-runB-freeze4-rerun/summary.json` (`window_mtime`) |
+| 2026-10-18 | 0.4.4 development build `8538885aee46`, exit run A | shell commands (Bash) | 560 ms / 3,055 ms | 28 seals, none with a coarse timestamp | `0.4.4-live-runA-freeze5/summary.json` (`window_mtime`) |
+| 2026-10-19 | 0.4.4 release candidate `6a9d7c2aad2d`, exit run A | shell commands (Bash) | 416 ms / 2,993 ms | 25 seals, none with a coarse timestamp | `0.4.4-live-runA-freeze6/summary.json` (`window_mtime`) |
+| 2026-10-19 | 0.4.4 release candidate `6a9d7c2aad2d`, exit run B | shell commands (Bash) | 272 ms / 428 ms | 23 seals, none with a coarse timestamp | `0.4.4-live-runB-freeze6/summary.json` (`window_mtime`) |
+| 2026-10-19 | 0.4.4 release candidate `6a9d7c2aad2d`, run with named subagents | shell commands (Bash) 12, Write 2 | 300 ms / 345 ms | 14 seals, none with a coarse timestamp | `0.4.4-fleet-live-freeze6/summary.json` (`window_mtime`) |
 
-The edit tools (Edit, Write, NotebookEdit) have no live run figure yet; their fleet figures are below.
+The 0.4.4 runs seal many more writes than 0.4.3's, including writes early in long commands such as a test run, whose seal waits for the command to return; that is where the worst cases above come from. The edit tools have one live figure so far (two Write seals in the run with named subagents); their fleet figures are below.
 
 ## Ambiguous changes
 
@@ -96,6 +106,10 @@ When two agents run shell commands at the same time and a file changes while bot
 | c409 | 6 | 4 | 14 | 17 | 4 | `0.4.3-fleet-live-c409/summary.json` (`ambiguity`), from `hooks.log` |
 | A | 2 | 2 | 3 | 28 | 5 | `0.4.3-live-runA-freeze4/summary.json` (`ambiguity`), release candidate `5da679fd4fab` |
 | B | 3 | 2 | 2 | 54 | 10 | `0.4.3-live-runB-freeze4-rerun/summary.json` (`ambiguity`), release candidate `5da679fd4fab` |
+| A on 0.4.4 | 2 | 0 | 28 | 0 | 0 | `0.4.4-live-runA-freeze5/summary.json` (`ambiguity`) and `ask_counts.json`, 2026-10-18, development build `8538885aee46` with the PostToolUseFailure hook and command text attribution; PostToolUseFailure fired 7 times, 32 windows opened and 32 closed |
+| A on 0.4.4 | 2 | 0 | 25 | 0 | 0 | `0.4.4-live-runA-freeze6/summary.json` (`ambiguity`) and `ask_counts.json`, 2026-10-19, release candidate `6a9d7c2aad2d`; 31 windows, all closed |
+| B on 0.4.4 | 3 | 0 | 23 | 0 | 0 | `0.4.4-live-runB-freeze6/summary.json` (`ambiguity`) and `ask_counts.json`, release candidate `6a9d7c2aad2d`; 33 windows, all closed |
+| named subagents on 0.4.4 | 6 | 0 | 14 | 0 | 0 | `0.4.4-fleet-live-freeze6/summary.json` (`ambiguity`) and `ask_counts.json`, release candidate `6a9d7c2aad2d`; 58 windows, all closed; one seal attributed from the command text |
 
 \* Identities in the run: c409's six are two mains and four subagents; run B's third identity is the injected stale session, which never edited.
 
@@ -103,7 +117,7 @@ When two agents run shell commands at the same time and a file changes while bot
 
 Where the records come from (finding 186, measured 2026-10-18 on these three runs): Claude Code sends the PostToolUse event only after a shell command succeeds; a failed command gets a separate PostToolUseFailure event, which 0.4.3's hooks do not register. So a command that exits non zero, such as `cat` on a missing file, leaves that agent's window open until its turn ends, and every file the other agent changes in that time has two candidates. All 99 records across the three runs have such a window among their candidates. 0.4.4 registers the failure event and closes stale windows; on the same three runs that leaves 6 records of 99 ambiguous, with 0 wrong attributions (`0.4.4-ask-count/results.md`, the "rules 0+1+2" column; the change ships when the two agent runs on the 0.4.4 build confirm it).
 
-Credit moved: files sealed by an agent that the hooks had not named as the maker or a candidate. On the run above, 6: the four files of finding 169 and two sealed by a main agent whose candidates were its own subagent and the other main agent (`0.4.3-fleet-live-c409/report.md`). The exit runs on the build with the fix report this count beside the ambiguity row.
+Credit moved: files sealed by an agent that the hooks had not named as the maker or a candidate. On the run above, 6: the four files of finding 169 and two sealed by a main agent whose candidates were its own subagent and the other main agent (`0.4.3-fleet-live-c409/report.md`). On the three 0.4.4 release candidate runs, 0 in each, and 0 wrong attributions, checked by hand against each identity's own transcript (`README.md` and `summary.json` `credit_moved` in `0.4.4-live-runA-freeze6/`, `0.4.4-live-runB-freeze6/` and `0.4.4-fleet-live-freeze6/`).
 
 ## Hook cost
 

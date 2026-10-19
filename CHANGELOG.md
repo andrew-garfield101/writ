@@ -5,6 +5,32 @@ All notable changes to writ will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.4] — 2026-10-19
+
+### Added
+
+- A Claude Code subagent whose type is a file under `.claude/agents/` (`reviewer` from `.claude/agents/reviewer.md`) seals under that type's name, and under the spec claimed by that name, so the receipt says `reviewer` rather than a hash. A second instance of the same type, started while the first is live, gets `<type>-<first 8 of its agent id>`; each instance keeps its name for its life (first hook to SubagentStop, or 30 minutes with no hook). Built in types (general-purpose, Explore, Plan, statusline-setup, output-style-setup, claude-code-guide) and types with no file keep the 0.4.3 identity, `<parent>-<agent8>`. No new hook is registered for this. Names are shared across the repository; two instances of one type that start in the same instant can share the name, because the naming lock gives up after about 100 ms rather than delay the tool call. (finding 191, rulings 192 and 195; 2e9a48bfe72f)
+- `attributed_by: command_text` on a seal and its `.writ/hooks.log` record when writ decided whose change a file was from the command text: two agents' commands were open as the file changed and exactly one of those commands names the path or its file name as a whole word. The receipt's shared file line reads "sa by alpha, attributed from the command", `writ handoff` "sa (attributed from the command)", and `writ why` adds it to that seal's line. When both commands name the path, or neither does, writ asks exactly as in 0.4.3. (findings 176 and 188, ruling 189; ac8599b18195)
+
+### Changed
+
+- `writ init` registers PostToolUseFailure with the same matcher and command as PostToolUse (Edit, Write, MultiEdit, NotebookEdit, Bash), and `writ uninit` removes it. Claude Code sends PostToolUseFailure instead of PostToolUse when a tool call fails; the hook handles it like PostToolUse, because a command can write files before it fails. (finding 186; ac8599b18195)
+- An agent's earlier hook windows close at its next PreToolUse, UserPromptSubmit or Stop, after their changes are attributed and sealed, as the Stop sweep always did. A PostToolUse that arrives for a window already closed attributes nothing. Before, a window left open by a failed command made that agent a candidate for every file the other agent changed until its turn ended. (finding 186; ac8599b18195)
+- Every ambiguous record in `.writ/hooks.log` carries `told`: true when the agent was shown the ask line, false for the end of turn sweep and late close records, which print nothing. The stranger kit's collector reports both numbers: records not attributed and ask lines shown. (finding 187; 9f4479a3313e)
+
+### Fixed
+
+- A failed shell command never closed its hook window. Claude Code sends PostToolUse only after a call succeeds, and 0.4.3 did not register the failure event, so a `cat` of a missing file left that agent's window open for minutes. On the three runs measured for this release, every one of 99 unattributed records had such a window among its candidates. (finding 186; ac8599b18195)
+- The 0.4.3 release note and the numbers page said writ "asked" for what is a count of records writ could not attribute. 51 of the 99 came from the end of turn sweep, which prints nothing; the agents saw 5, 10 and 4 ask lines. Both now give the two numbers separately. (finding 187)
+- Writ asked about writes whose command named the file while the other agent's open command did not. Those are now attributed from the command text (above). (finding 188; ac8599b18195)
+- A named Claude Code subagent's edits, including its shell writes, were sealed by the hook under the parent derived identity on an auto spec, so the spec that subagent had claimed by name held none of its work and the receipt credited a hash. (finding 191; 2e9a48bfe72f)
+- A named agent's own hand seal of files the hook had recorded as ambiguous was refused, because the ambiguity named its hook identity rather than its name; the only command that worked sealed under the derived identity. The hook now uses the same name as the hand seal. (findings 193 and 194; 2e9a48bfe72f)
+- `writ init -y` did not refresh an existing writ block in AGENTS.md when Codex was off, so after an upgrade AGENTS.md kept the old instructions. An existing block is now refreshed in place either way, the text around it kept; a stale block reads `version_skew` on AGENTS.md until the rerun; an AGENTS.md with no writ markers is still left alone when Codex is off. (finding 184; 8e8e9495414e)
+
+### Upgrade
+
+- Run `writ init -y` once in each project after upgrading. It adds the PostToolUseFailure hook and refreshes the AGENTS.md block. Until you do, `writ doctor` reports `version_skew` on `.claude/settings.json`, and on AGENTS.md when its block is stale.
+
 ## [0.4.3] — 2026-10-17
 
 ### Found and fixed before release

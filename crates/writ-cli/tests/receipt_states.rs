@@ -703,3 +703,26 @@ fn rc_189_command_text_seal_reads_attributed_from_the_command() {
         "{why}"
     );
 }
+
+/// Finding 199: the survival line ends with the seals in the receipt and
+/// how many carry a signature; with keys made on each identity's first
+/// seal, every one does.
+#[test]
+fn rc_199_survival_line_counts_seals_and_signed() {
+    let p = Project::new("signed");
+    let since = p.newest_seal();
+    p.spec("sa", ALPHA);
+    p.write("a.txt", "alpha\n");
+    assert!(p.seal(ALPHA, "sa", "a.txt", &[]).status.success());
+    p.write("b.txt", "alpha\n");
+    assert!(p.seal(ALPHA, "sa", "b.txt", &[]).status.success());
+    let r = text(&p.ok(
+        "human",
+        &["handoff", "--since", &since, "--format", "receipt"],
+    ));
+    let l = r
+        .lines()
+        .find(|l| l.contains("Survival:"))
+        .unwrap_or_else(|| panic!("no survival line: {r}"));
+    assert!(l.ends_with("; 2 seals, 2 signed"), "survival line: {l}");
+}

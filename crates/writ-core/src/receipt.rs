@@ -52,6 +52,18 @@ pub struct SurvivalLine {
     /// False when no finish recorded it (a commit made before 0.4.3).
     #[serde(default = "yes")]
     pub recorded: bool,
+    /// Finding 199: the committed specs' seals and how many of them carry
+    /// a signature. Counted from the seals when the receipt is built, so a
+    /// rebuilt receipt counts them too; None only on a bare line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seals: Option<SignedCount>,
+}
+
+/// Seals and signed seals behind a receipt (finding 199).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedCount {
+    pub seals: usize,
+    pub signed: usize,
 }
 
 fn yes() -> bool {
@@ -67,6 +79,7 @@ impl SurvivalLine {
             lost: report.lost + report.deleted_but_present().count(),
             forced,
             recorded: true,
+            seals: None,
         }
     }
 
@@ -78,6 +91,7 @@ impl SurvivalLine {
             lost: 0,
             forced: false,
             recorded: true,
+            seals: None,
         }
     }
 
@@ -88,11 +102,21 @@ impl SurvivalLine {
             lost: 0,
             forced: false,
             recorded: false,
+            seals: None,
         }
     }
 
-    /// The one line, as both forms print it.
+    /// The one line, as both forms print it: the survival result, then
+    /// the seals and how many are signed (finding 199).
     pub fn text(&self) -> String {
+        let base = self.survival_text();
+        match self.seals {
+            Some(c) if c.seals > 0 => format!("{base}; {} seals, {} signed", c.seals, c.signed),
+            _ => base,
+        }
+    }
+
+    fn survival_text(&self) -> String {
         if !self.recorded {
             return "Survival: not recorded for this commit (finished before writ 0.4.3)".into();
         }
@@ -249,7 +273,7 @@ pub fn build(
     after: Option<DateTime<Utc>>,
     until: DateTime<Utc>,
     content: &Content,
-    survival: SurvivalLine,
+    mut survival: SurvivalLine,
     commit: Option<String>,
 ) -> WritResult<Receipt> {
     let all_specs = repo.list_specs()?;
@@ -267,6 +291,12 @@ pub fn build(
         seals.sort_by(|a, b| a.timestamp.cmp(&b.timestamp).then(a.id.cmp(&b.id)));
         own.insert(id.to_string(), seals);
     }
+
+    let all_own = own.values().flatten();
+    survival.seals = Some(SignedCount {
+        seals: all_own.clone().count(),
+        signed: all_own.filter(|s| s.signature.is_some()).count(),
+    });
 
     let mut specs = Vec::new();
     for id in &wanted {
@@ -396,7 +426,8 @@ pub fn build(
     overrides.sort();
     let overrides = overrides.into_iter().map(|(_, d)| d).collect();
 
-    let refusals = refusals_in(repo.writ_dir(), &wanted, after, until)?;
+    let committed_paths: BTreeSet<&str> = by_path.keys().copied().collect();
+    let refusals = refusals_in(repo.writ_dir(), &wanted, &committed_paths, after, until)?;
     let check_off_seals = own
         .values()
         .flatten()
@@ -461,10 +492,14 @@ fn receipt_spec(spec: &Spec, seals: &[Seal]) -> ReceiptSpec {
 }
 
 /// The refusal records in `(after, until]`, oldest first: every
-/// `finish_refused`, and each `seal_refused` naming a spec in `wanted`.
+/// `finish_refused`, and each `seal_refused` naming a spec in `wanted` or
+/// a path the committed specs sealed (finding 203: an identity whose only
+/// seal was refused has no committed spec, but the file it was refused on
+/// is in the commit).
 fn refusals_in(
     writ_dir: &Path,
     wanted: &BTreeSet<&str>,
+    committed_paths: &BTreeSet<&str>,
     after: Option<DateTime<Utc>>,
     until: DateTime<Utc>,
 ) -> WritResult<Vec<ReceiptRefusal>> {
@@ -496,7 +531,8 @@ fn refusals_in(
         let kind = match e.event_type.as_str() {
             crate::doctor::EVENT_FINISH_REFUSED => "finish",
             crate::repo::EVENT_SEAL_REFUSED
-                if e.specs.iter().any(|s| wanted.contains(s.as_str())) =>
+                if e.specs.iter().any(|s| wanted.contains(s.as_str()))
+                    || e.files.iter().any(|f| committed_paths.contains(f.as_str())) =>
             {
                 "seal"
             }
@@ -1149,6 +1185,7 @@ mod tests {
                 lost: 0,
                 forced: false,
                 recorded: true,
+                seals: None,
             },
             check_off_seals: 0,
         }

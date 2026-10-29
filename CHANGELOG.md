@@ -5,6 +5,35 @@ All notable changes to writ will be documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.5] — 2026-10-19
+
+### Added
+
+- Seals are signed by default. The first time writ seals for an identity, by the auto seal hook or by hand, it makes an Ed25519 key for that identity where `writ agent register` stores keys (`.writ/keys/<id>.pub`, and `.writ/keys/<id>.enc` encrypted), under the repository lock, and signs that seal and every later one with it. A seal is never refused for signing: if no key can be made it is written unsigned with an `UNSIGNED:` warning. `writ agent register` adopts a key writ already made for that name. A key writ made proves continuity of one identity in this store, not which person or model it is; `writ agent list` ends with the identities that sign with such a key and says so, and `writ agent show` works for them. (finding 199; 70ed9d281858, fa155640a0a9 to 92a6c16b0668, 2e6b0fdbd752, b01d89eee756, ac188162770a)
+- `writ verify` reports `seals_signed` and `seals_unsigned` (JSON, on the chain, on `head_chain` and on each `spec_chains` entry with `--all-chains`) and a text line "N signed (signature checked against the agent's key), N unsigned". Unsigned seals, such as those made before 0.4.5, are counted, never failures. (finding 199; ac188162770a)
+- The receipt's survival line ends with "N seals, N signed" for the range. (finding 199; 3b4aeef069c8, 2882c73f7d89)
+- A foreign line refusal made by the auto seal hook is recorded in `.writ/security/events.jsonl` as a `seal_refused` event, like a refused hand seal: `agent_id` (the hook identity, `<type>-<agent8>` for a second live instance of a subagent type), `specs` (the refused identity's spec), `files`, `lines` (the dropped line count), `other_agents`, `reason` `survival_check`, once per distinct refusal. The receipt's "Refusals in range" lists it, so an identity whose only seal the hook refused now appears in the receipt. (findings 203 and 204; 01ceea54c15e)
+
+- `.writ/hooks.log` carries a start record and an end record for every hook run, and the stranger kit's collector counts hooks killed before they finished: a start with no matching end before the next start from the same process. Logs written before 0.4.5, which have no end records, read "cannot tell". Start and end records are left out of hook timing. (finding 213; c39d353fdc2e)
+
+### Changed
+
+- A writ command typed in a Claude Code subagent's shell, which carries the parent's environment, runs as the identity whose open hook window in that session runs it: the window's recorded command text holds `writ` and each argument in order. With one match the command runs as that identity; with none, or more than one, it runs as the parent, whose own open window counts as a match. It says so on stderr ("writ: ran as reviewer (the open hook window of reviewer runs this command; ...)"), and for the parent only when another identity in the session has a window or is a live named subagent. Applies only when the identity comes from the session alone (no `--agent`, `WRIT_AGENT_ID` or `default_agent`). (finding 202, ruling 202; ee535f9e8824)
+- An auto spec's title skips prompts that begin with `<task-notification>`, `<agent-message`, `<cross-session-message` or `[SYSTEM NOTIFICATION`; `.writ/hooks.log` records them as `not_a_prompt` and the last real prompt keeps the title. The finish subject for a spec is the first sentence of its `spec done -s` summary, cut at 59 characters, when that summary differs from the title; the multi spec subject uses the first spec's phrase. (findings 190 and 208; ee535f9e8824)
+- The receipt lists a refusal when its event names a spec in the finish or a path those specs sealed; the line shape is unchanged: `seal refused <time> for <agent> (survival_check): specs <ids>; files <paths>`. (finding 203; 01ceea54c15e)
+- Python `Repository.verify_chain()` and `verify_seal()` check each seal against its own agent's key and return `signed` and `unsigned` counts. `verify_chain(use_convergence_key=True)` still checks every seal against the convergence engine's key, so on a 0.4.5 store, where agent seals are signed with the agent's own key, it reports agent seals as signature failures; use it only for seals the engine made. (ruling 211; 799f73fe083d)
+
+### Fixed
+
+- `writ finish` asked an agent to claim a file it had just merged: its write landed while two agents' commands were open. `writ finish`, `writ restore`, `writ converge` and `writ converge-all` now note each path in `.writ/own_writes/<pid>-<start>.json` before writing it and record when they end; the hook skips a listed path whose modification time falls inside that span and logs `writ_own_write`. Markers are pruned after 30 minutes. (finding 206; ee535f9e8824)
+- An agent message delivered as a prompt titled an auto spec, and the finish commit subject then read `writ: <agent-message from=...>`. (findings 190 and 208; ee535f9e8824)
+
+### Known issue in every earlier release
+
+- **Signatures were recorded for registered agents but never checked; the hash chain was.** `writ verify` passed no key, so `verify --seal` printed `signature_valid: null` and a seal whose signature had been altered verified as valid. Each signature is now checked against the key of the identity that made the seal; a bad one prints `FAIL <seal12>: signature verification failed`, reads `INVALID` and exits 1. Content and chain hashes were always checked. (finding 209; ac188162770a)
+- **A hook killed by Claude Code's 10 second timeout left no record.** Sealing a very large file with a long history of seals on its spec can take longer than the timeout; Claude Code then stops the hook, so its refusal line never reached the agent and `.writ/hooks.log` had no outcome. From 0.4.5 the start and end records make such a hook countable (above). The slow check itself is not changed in this release. (finding 213; c39d353fdc2e)
+- **The stranger kit's `finish_audit.py` read 0 lines on a finish commit amended with `git commit --amend`,** because the receipt is keyed to the original hash. It now recognises an amend of a finish commit (same parent and tree), says so, and audits that commit's specs. (finding 207; ee535f9e8824)
+
 ## [0.4.4] — 2026-10-19
 
 ### Added

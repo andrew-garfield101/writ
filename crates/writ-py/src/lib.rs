@@ -1058,9 +1058,11 @@ impl PyRepository {
 
     /// Verify the cryptographic integrity of the seal chain from HEAD.
     ///
-    /// Returns a dict with: total_seals, verified, unsecured, failures, valid.
-    /// If `use_convergence_key` is True, uses the repo's convergence verifying
-    /// key for signature verification. Otherwise signatures are not checked.
+    /// Returns a dict with: total_seals, verified, unsecured, signed,
+    /// unsigned, failures, valid. With no key, each signature is checked
+    /// against its own agent's key in the store (finding 199).
+    /// If `use_convergence_key` is True, every signature is checked against
+    /// the convergence engine's key instead.
     #[pyo3(signature = (use_convergence_key=false))]
     fn verify_chain(&self, py: Python, use_convergence_key: bool) -> PyResult<PyObject> {
         let vk = if use_convergence_key {
@@ -1084,10 +1086,12 @@ impl PyRepository {
         use_convergence_key: bool,
     ) -> PyResult<PyObject> {
         let seal = self.inner.get_seal(seal_id).map_err(writ_err)?;
+        // Finding 199: without the convergence flag, the seal's own
+        // agent's key, so a signature is checked, not skipped.
         let vk = if use_convergence_key {
             self.inner.convergence_verifying_key()
         } else {
-            None
+            self.inner.agent_verifying_key(&seal.agent.id)
         };
         let result = self.inner.verify_seal(&seal, vk.as_ref());
         to_pydict(py, &result)

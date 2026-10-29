@@ -160,7 +160,7 @@ Users start at Level 0. Most stay there. If they hit Level 1, convergence handle
 
 ## Writ Watch
 
-`writ watch` is a live monitoring tool that shows seal events as they happen. It gives you a real time view of agent activity without needing to poll `writ status`.
+`writ watch` shows seal events as they happen and, by default, converges overlapping changes as soon as two specs have sealed the same file. It gives you a real time view of agent activity without needing to poll `writ status`. Run it with `--no-auto-converge` to watch and report only.
 
 ### Starting the Watcher
 
@@ -183,7 +183,7 @@ $ writ watch
   Press q to quit.
 ```
 
-Run this in a dedicated terminal tab for passive visibility into agent activity. Overlapping files are flagged so you can track where convergence will be needed.
+Run this in a dedicated terminal tab for visibility into agent activity. Overlapping files are flagged, and each convergence watch runs is reported with its result.
 
 ### How Convergence Works
 
@@ -200,6 +200,7 @@ You do not need to run convergence manually in the normal workflow. Agents work,
 # .writ/config.toml
 [watch]
 interval = 5              # polling interval in seconds (default: 5)
+auto_converge = true      # converge overlapping seals (default: true)
 ```
 
 CLI overrides:

@@ -33,17 +33,18 @@ A commit knows: who (an email), when (a timestamp), and what (a diff). That's it
   "files_changed": 3,
   "content_hash": "blake3:...",
   "parent_seal_hash": "blake3:...",
-  "chain_hash": "blake3:..."
+  "chain_hash": "blake3:...",
+  "signature": "..."
 }
 ```
 
 A seal knows everything a commit knows, plus:
 
-- **Who** made it (agent identity with trust level and role, not just an email)
+- **Who** made it (an agent identity with its own signing key, not just an email)
 - **What task** it serves (linked spec with status and file scope)
 - **What status** the task is in (in progress, complete, blocked)
 - **Whether it was tested** (pass/fail counts, lint status)
-- **Cryptographic integrity** (BLAKE3 hash chain linking to the previous seal)
+- **Cryptographic integrity** (BLAKE3 hash chain linking to the previous seal, and from 0.4.5 an Ed25519 signature by the identity that made it)
 
 This is the intelligence layer. Git stores diffs. Writ stores structured knowledge about what happened, who did it, and why.
 
@@ -55,7 +56,7 @@ This is the intelligence layer. Git stores diffs. Writ stores structured knowled
 | **Task linkage** | Branch name (convention) | First class spec reference |
 | **Status** | None | `in-progress`, `complete`, `blocked` |
 | **Test results** | None (CI runs after the fact) | `tests_passed`, `tests_failed`, `linted` |
-| **Integrity** | SHA-1 hash | BLAKE3 content hash + chain hash + Ed25519 signature |
+| **Integrity** | SHA-1 hash | BLAKE3 content hash + chain hash + Ed25519 signature (signed by default from 0.4.5) |
 | **Scope awareness** | None | Can enforce file scope constraints per agent |
 | **Machine readable** | Needs parsing | Structured JSON from the start |
 
@@ -113,7 +114,7 @@ writ show a7c2e8f4b31a --diff
 Every seal contains three hashes:
 
 1. **Content hash:** BLAKE3 hash of the seal's own data (files, metadata). Proves the seal hasn't been modified.
-2. **Parent seal hash:** BLAKE3 hash of the previous seal. Links seals into a chain.
+2. **Parent seal hash:** the previous seal's chain hash. Links seals into a chain.
 3. **Chain hash:** BLAKE3 hash combining the content hash and parent seal hash. Provides tamper evidence across the entire history.
 
 Verify the chain at any time:
@@ -123,6 +124,12 @@ writ verify
 ```
 
 If any seal has been tampered with, verification fails and reports exactly where the chain broke.
+
+## Signatures
+
+From 0.4.5 every seal is signed by default. The first seal an identity makes, through the auto seal hook or by hand, creates an Ed25519 key for it under `.writ/keys/`, and every later seal by that identity is signed with it. `writ verify` checks each signature against that identity's key and reports how many seals are signed and how many are not; seals from before 0.4.5 are counted as unsigned, not as failures. The commit receipt's survival line carries the same count, for example "4 seals, 4 signed".
+
+A key writ made proves continuity, not a person: the signed seals came from one continuing identity in this store and were not altered afterwards. It is as private as your `.writ` directory, which git never sees. The [security model](security-model.md#ed25519-signatures) has the detail.
 
 ## Next Steps
 

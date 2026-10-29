@@ -88,6 +88,45 @@ impl KeyStore {
         Ok(())
     }
 
+    /// Make a keypair for `agent_id` when it has none (finding 199).
+    ///
+    /// Called on an identity's first seal, hook or hand, so every seal by
+    /// that identity is signed from then on. The key lives in this store
+    /// (`.writ/keys/`, never a tracked file). A key writ made on a first
+    /// seal proves continuity of one identity, not a person: every seal
+    /// signed with it was made by whoever held this store's key for that
+    /// name, nothing more. Returns true when a key was made now.
+    ///
+    /// Callers hold the repository lock, so two seals of one identity
+    /// never make two keys. A half-written pair (public key without its
+    /// private half) is left alone: the seal goes unsigned, never signed
+    /// with a key its public half does not match.
+    pub fn ensure_agent_key(&self, agent_id: &str) -> WritResult<bool> {
+        Self::validate_agent_id(agent_id)?;
+        if self.has_agent(agent_id) || self.enc_key_path(agent_id).exists() {
+            return Ok(false);
+        }
+        fs::create_dir_all(&self.keys_dir)?;
+        self.ensure_master_key()?;
+        let (signing, verifying) = crypto::generate_keypair();
+        // Private half first, public half last: `has_agent` (the public
+        // file) is only true once both are on disk.
+        let master_key = self.load_master_key()?;
+        let ciphertext = self.encrypt(&master_key, &signing.to_bytes())?;
+        let enc_hex: String = ciphertext.iter().map(|b| format!("{b:02x}")).collect();
+        let enc_path = self.enc_key_path(agent_id);
+        crate::fsutil::atomic_write(&enc_path, enc_hex.as_bytes())?;
+        Self::restrict_permissions(&enc_path)?;
+        let pub_hex = crypto::verifying_key_to_hex(&verifying);
+        crate::fsutil::atomic_write(&self.pub_key_path(agent_id), pub_hex.as_bytes())?;
+        Ok(true)
+    }
+
+    /// The directory keys live in (`.writ/keys`).
+    pub fn keys_dir(&self) -> &Path {
+        &self.keys_dir
+    }
+
     /// Load an agent's signing (private) key.
     pub fn load_agent_signing_key(&self, agent_id: &str) -> WritResult<ed25519_dalek::SigningKey> {
         let enc_hex = fs::read_to_string(self.enc_key_path(agent_id))

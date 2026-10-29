@@ -185,6 +185,17 @@ pub struct SealRefusedEvent {
     pub reason: SealRefusal,
     pub specs: Vec<String>,
     pub files: Vec<String>,
+    /// Finding 203: lines the refused seal would have dropped (0 when the
+    /// refusal is not about lines).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub lines: usize,
+    /// Finding 203: the agents whose sealed lines the refusal protected.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_agents: Vec<String>,
+}
+
+fn is_zero(n: &usize) -> bool {
+    *n == 0
 }
 
 /// Snapshot of git working tree state, used by install().
@@ -1487,6 +1498,7 @@ impl Repository {
             None => None,
         };
 
+        let signing_key = self.seal_signing_key(&agent.id, &mut seal_warnings);
         let mut seal = Seal::new(
             parent,
             tree_hash,
@@ -1510,8 +1522,6 @@ impl Repository {
         seal.override_context = override_context;
         seal.attributed_by = self.attributed_by.clone();
 
-        let ks = KeyStore::open(&self.writ_dir);
-        let signing_key = ks.load_agent_signing_key(&seal.agent.id).ok();
         seal.secure(signing_key.as_ref());
 
         self.save_seal(&seal)?;
@@ -1522,6 +1532,34 @@ impl Repository {
             self.record_seal_on_spec(sid, &seal)?;
         }
         Ok(seal)
+    }
+
+    /// The key a seal by `agent_id` is signed with (finding 199).
+    ///
+    /// An identity with no key gets one on its first seal, hook or hand
+    /// ([`KeyStore::ensure_agent_key`]), so every seal is signed. A key
+    /// made this way proves continuity of one identity, not a person.
+    /// Signing never refuses a seal: when no key can be made or loaded the
+    /// seal is written unsigned and says why in its warnings.
+    fn seal_signing_key(
+        &self,
+        agent_id: &str,
+        warnings: &mut Vec<String>,
+    ) -> Option<ed25519_dalek::SigningKey> {
+        let ks = KeyStore::open(&self.writ_dir);
+        if let Err(e) = ks.ensure_agent_key(agent_id) {
+            warnings.push(format!(
+                "UNSIGNED: writ could not make a key for '{agent_id}': {e}"
+            ));
+            return None;
+        }
+        match ks.load_agent_signing_key(agent_id) {
+            Ok(k) => Some(k),
+            Err(e) => {
+                warnings.push(format!("UNSIGNED: no signing key for '{agent_id}': {e}"));
+                None
+            }
+        }
     }
 
     /// Own-line survival (finding 42): lines that `spec_id`'s earlier seals
@@ -2129,6 +2167,19 @@ impl Repository {
     /// `seal_refused` event in `.writ/security/events.jsonl` with the spec,
     /// agent, paths and reason, so the hurdle metric can be read from the
     /// store. "Nothing to seal" is not a refusal. Best-effort.
+    /// Record a refused seal as a `seal_refused` event, the same record a
+    /// hand seal's refusal writes; the hook calls this for the foreign-line
+    /// refusals it makes before any seal (finding 203).
+    pub fn record_seal_refusal(
+        &self,
+        spec_id: Option<&str>,
+        agent_id: &str,
+        paths: &[String],
+        err: &WritError,
+    ) {
+        self.note_seal_refusal(spec_id, agent_id, paths, err);
+    }
+
     fn note_seal_refusal(
         &self,
         spec_id: Option<&str>,
@@ -2146,6 +2197,23 @@ impl Repository {
             WritError::AgentInactive(_) => SealRefusal::AgentInactive,
             _ => return,
         };
+        let (lines, mut other_agents) = match err {
+            WritError::ForeignLinesRemoved { losses } => (
+                losses.iter().map(|l| l.4).sum(),
+                losses.iter().map(|l| l.1.clone()).collect::<Vec<_>>(),
+            ),
+            WritError::OwnLinesRemoved {
+                losses,
+                other_agents,
+                ..
+            } => (
+                losses.iter().map(|l| l.line_count()).sum(),
+                other_agents.clone(),
+            ),
+            _ => (0, Vec::new()),
+        };
+        other_agents.sort();
+        other_agents.dedup();
         let logger = crate::security::SecurityEventLogger::new(&self.writ_dir);
         let _ = logger.emit_record(&SealRefusedEvent {
             timestamp: Utc::now(),
@@ -2156,6 +2224,8 @@ impl Repository {
             reason,
             specs: spec_id.map(|s| vec![s.to_string()]).unwrap_or_default(),
             files: paths.to_vec(),
+            lines,
+            other_agents,
         });
     }
 
@@ -2742,6 +2812,18 @@ impl Repository {
         self.verify_chain_from(start, verifying_key)
     }
 
+    /// [`Self::verify_chain`] for `context` (findings 211, 212): a
+    /// signature verified once is remembered in `.writ/sig_cache.json`,
+    /// keyed by the seal id, its content hash, its signature and the key,
+    /// so each seal is verified once per store state. Hashes are always
+    /// recomputed. `writ verify` never uses the cache.
+    pub fn verify_chain_cached(&self) -> WritResult<ChainVerification> {
+        let mut cache = SignatureCache::load(&self.writ_dir);
+        let result = self.verify_chain_from_with(self.read_head()?, None, Some(&mut cache));
+        cache.save(&self.writ_dir);
+        result
+    }
+
     /// Verify the HEAD chain plus every spec's branch chain.
     ///
     /// Returns an `AllChainsVerification` with the HEAD result and per-spec
@@ -2834,8 +2916,17 @@ impl Repository {
         start: Option<String>,
         verifying_key: Option<&ed25519_dalek::VerifyingKey>,
     ) -> WritResult<ChainVerification> {
+        self.verify_chain_from_with(start, verifying_key, None)
+    }
+
+    fn verify_chain_from_with(
+        &self,
+        start: Option<String>,
+        verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+        sig_cache: Option<&mut SignatureCache>,
+    ) -> WritResult<ChainVerification> {
         let (seals, chain_break) = self.walk_chain_graceful(start);
-        let mut result = self.verify_seal_chain(&seals, verifying_key)?;
+        let mut result = self.verify_seal_chain(&seals, verifying_key, sig_cache)?;
 
         if let Some((missing_id, err_msg)) = chain_break {
             let error = format!("chain broken: seal not found: {missing_id} ({err_msg})");
@@ -2861,19 +2952,69 @@ impl Repository {
         &self,
         seals: &[crate::seal::Seal],
         verifying_key: Option<&ed25519_dalek::VerifyingKey>,
+        mut sig_cache: Option<&mut SignatureCache>,
     ) -> WritResult<ChainVerification> {
         let mut verified = 0;
         let mut unsecured = 0;
+        let mut signed = 0;
         let mut failures = Vec::new();
+        // Finding 199/209: with no key given, each seal's signature is
+        // checked against its own agent's key in this store.
+        let ks = KeyStore::open(&self.writ_dir);
+        let mut keys: HashMap<String, Option<ed25519_dalek::VerifyingKey>> = HashMap::new();
 
         for (i, seal) in seals.iter().enumerate() {
+            if seal.signature.is_some() {
+                signed += 1;
+            }
             if !seal.is_secured() {
                 unsecured += 1;
                 continue;
             }
 
-            let result = self.verify_seal(seal, verifying_key);
+            let own_key;
+            let key = match verifying_key {
+                Some(k) => Some(k),
+                None => {
+                    own_key = *keys
+                        .entry(seal.agent.id.clone())
+                        .or_insert_with(|| ks.load_agent_verifying_key(&seal.agent.id).ok());
+                    own_key.as_ref()
+                }
+            };
+            let result = match (sig_cache.as_deref_mut(), key) {
+                (Some(cache), Some(k)) => {
+                    let ck = SignatureCache::key(seal, k);
+                    let unsigned_copy;
+                    let probe = if ck.as_ref().is_some_and(|c| cache.known.contains(c)) {
+                        // Verified before with this exact signature, content
+                        // hash and key: only the hashes are rechecked.
+                        unsigned_copy = None;
+                        let mut r = self.verify_seal(seal, None);
+                        r.signature_valid = Some(true);
+                        r
+                    } else {
+                        unsigned_copy = ck;
+                        self.verify_seal(seal, key)
+                    };
+                    if let (Some(c), Some(true)) = (unsigned_copy, probe.signature_valid) {
+                        cache.known.insert(c);
+                        cache.dirty = true;
+                    }
+                    probe
+                }
+                _ => self.verify_seal(seal, key),
+            };
 
+            // A hash mismatch is reported as one (below); a bad signature
+            // on an intact seal is its own failure.
+            if result.content_hash_valid
+                && result.chain_hash_valid
+                && result.signature_valid == Some(false)
+            {
+                failures.push(result);
+                continue;
+            }
             if result.content_hash_valid && result.chain_hash_valid {
                 // For non-genesis seals, verify parent_seal_hash matches
                 // the previous seal's chain_hash (seals are newest-first)
@@ -2915,6 +3056,8 @@ impl Repository {
             total_seals: seals.len(),
             verified,
             unsecured,
+            signed,
+            unsigned: seals.len() - signed,
             failures,
             valid,
         })
@@ -4569,7 +4712,7 @@ impl Repository {
     /// Build a lightweight chain integrity summary for context output.
     /// Returns None if no seals have crypto fields (all pre-Sprint A).
     fn build_chain_integrity(&self) -> Option<ChainIntegritySummary> {
-        let result = self.verify_chain(None).ok()?;
+        let result = self.verify_chain_cached().ok()?;
         // Only include if there are any secured seals
         if result.verified == 0 && result.failures.is_empty() {
             return None;
@@ -5817,6 +5960,7 @@ impl Repository {
             };
 
             if needs_write {
+                crate::own_writes::note(&self.writ_dir, rel_path); // finding 206
                 fs::write(&full_path, &content)?;
                 if exists_on_disk {
                     modified.push(rel_path.clone());
@@ -5830,6 +5974,7 @@ impl Repository {
             if !target_index.entries.contains_key(tracked_path) {
                 let full_path = self.validate_path(tracked_path)?;
                 if full_path.exists() {
+                    crate::own_writes::note(&self.writ_dir, tracked_path); // finding 206
                     fs::remove_file(&full_path)?;
                     deleted.push(tracked_path.clone());
                 }
@@ -6696,6 +6841,7 @@ impl Repository {
             if let Some(parent) = file_path.parent() {
                 fs::create_dir_all(parent)?;
             }
+            crate::own_writes::note(&self.writ_dir, &merged.path); // finding 206
             fs::write(&file_path, &merged.content)?;
         }
 
@@ -6705,6 +6851,7 @@ impl Repository {
                 if let Some(parent) = file_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                crate::own_writes::note(&self.writ_dir, path); // finding 206
                 fs::write(&file_path, content)?;
             }
         }
@@ -6715,6 +6862,7 @@ impl Repository {
                 if let Some(parent) = file_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                crate::own_writes::note(&self.writ_dir, path); // finding 206
                 fs::write(&file_path, content)?;
             }
         }
@@ -6724,6 +6872,7 @@ impl Repository {
             if let Some(parent) = file_path.parent() {
                 fs::create_dir_all(parent)?;
             }
+            crate::own_writes::note(&self.writ_dir, &resolution.path); // finding 206
             fs::write(&file_path, &resolution.content)?;
         }
 
@@ -7118,6 +7267,7 @@ impl Repository {
                 if let Some(parent) = file_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                crate::own_writes::note(&self.writ_dir, path); // finding 206
                 fs::write(&file_path, content)?;
             }
 
@@ -8074,6 +8224,7 @@ impl Repository {
                 if let Some(parent) = file_path.parent() {
                     fs::create_dir_all(parent)?;
                 }
+                crate::own_writes::note(&self.writ_dir, path); // finding 206
                 fs::write(&file_path, content)?;
             }
 
@@ -9521,6 +9672,7 @@ impl Repository {
             if let Some(parent) = full_path.parent() {
                 fs::create_dir_all(parent)?;
             }
+            crate::own_writes::note(&self.writ_dir, path); // finding 206
             fs::write(&full_path, content.as_bytes())?;
         }
 
@@ -9574,6 +9726,15 @@ impl Repository {
         ks.load_agent_signing_key("convergence").ok()
     }
 
+    /// The verifying key of `agent_id` in this store, if it has one: a key
+    /// from `writ agent register` or one writ made on the identity's first
+    /// seal (finding 199).
+    pub fn agent_verifying_key(&self, agent_id: &str) -> Option<ed25519_dalek::VerifyingKey> {
+        KeyStore::open(&self.writ_dir)
+            .load_agent_verifying_key(agent_id)
+            .ok()
+    }
+
     /// Load the convergence engine's Ed25519 verifying (public) key.
     ///
     /// Returns `None` if the key doesn't exist (pre-Sprint A repos).
@@ -9600,10 +9761,17 @@ impl Repository {
             return Err(WritError::AgentAlreadyExists(agent_id.to_string()));
         }
 
-        // Generate keypair and store in keystore
-        let (signing_key, verifying_key) = crate::crypto::generate_keypair();
+        // Finding 199: an identity that already sealed has the key writ
+        // made on its first seal; registering adopts it, so its earlier
+        // seals still verify. Otherwise a new keypair.
         let ks = KeyStore::open(&self.writ_dir);
-        ks.store_agent_key(agent_id, &signing_key, &verifying_key)?;
+        let verifying_key = if ks.has_agent(agent_id) {
+            ks.load_agent_verifying_key(agent_id)?
+        } else {
+            let (signing_key, verifying_key) = crate::crypto::generate_keypair();
+            ks.store_agent_key(agent_id, &signing_key, &verifying_key)?;
+            verifying_key
+        };
 
         let agent = RegisteredAgent {
             agent_id: agent_id.to_string(),
@@ -12859,12 +13027,66 @@ pub struct SealVerification {
     pub error: Option<String>,
 }
 
+/// Signatures already verified (findings 211, 212), for `context` only.
+/// An entry is BLAKE3 of the seal id, content hash, signature and public
+/// key: Ed25519 verification is a function of exactly those, so a cached
+/// entry stands for the same result; any change to them misses the cache.
+#[derive(Default)]
+struct SignatureCache {
+    known: HashSet<String>,
+    dirty: bool,
+}
+
+impl SignatureCache {
+    const FILE: &'static str = "sig_cache.json";
+
+    fn load(writ_dir: &Path) -> Self {
+        let known = fs::read_to_string(writ_dir.join(Self::FILE))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        SignatureCache {
+            known,
+            dirty: false,
+        }
+    }
+
+    fn key(seal: &Seal, key: &ed25519_dalek::VerifyingKey) -> Option<String> {
+        let sig = seal.signature.as_deref()?;
+        let content = seal.content_hash.as_deref()?;
+        Some(crate::crypto::blake3_hex(
+            format!(
+                "{}\n{content}\n{sig}\n{}",
+                seal.id,
+                crate::crypto::verifying_key_to_hex(key)
+            )
+            .as_bytes(),
+        ))
+    }
+
+    /// Best effort: a cache that cannot be written is rebuilt next time.
+    fn save(&self, writ_dir: &Path) {
+        if !self.dirty {
+            return;
+        }
+        if let Ok(json) = serde_json::to_vec(&self.known) {
+            let _ = atomic_write(&writ_dir.join(Self::FILE), &json);
+        }
+    }
+}
+
 /// Result of verifying the full chain from HEAD.
 #[derive(Debug, Clone, Serialize)]
 pub struct ChainVerification {
     pub total_seals: usize,
     pub verified: usize,
     pub unsecured: usize,
+    /// Seals carrying a signature (finding 199). Each was checked against
+    /// its agent's key when this store holds it; a bad one is a failure.
+    pub signed: usize,
+    /// Seals with no signature: made before 0.4.5, or by an identity writ
+    /// could not make a key for. Reported by count, never a failure.
+    pub unsigned: usize,
     pub failures: Vec<SealVerification>,
     pub valid: bool,
 }
@@ -16370,6 +16592,44 @@ mod chain_tests {
     }
 
     #[test]
+    fn f212_cached_context_verification_still_catches_a_changed_signature() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        fs::write(dir.path().join("file.txt"), "signed content").unwrap();
+        let seal = repo
+            .seal(
+                chain_agent(),
+                "signed seal".to_string(),
+                None,
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        // First call verifies and remembers; the second reads the cache.
+        let first = repo.verify_chain_cached().unwrap();
+        assert!(first.valid && first.signed == 1);
+        assert!(dir.path().join(".writ/sig_cache.json").exists());
+        assert!(repo.verify_chain_cached().unwrap().valid);
+        // A flipped signature digit is a different cache key: verified
+        // again, and it fails.
+        let path = dir
+            .path()
+            .join(".writ/seals")
+            .join(format!("{}.json", seal.id));
+        let json = fs::read_to_string(&path).unwrap();
+        let sig = seal.signature.clone().unwrap();
+        let flipped = format!(
+            "{}{}",
+            if sig.starts_with('0') { '1' } else { '0' },
+            &sig[1..]
+        );
+        fs::write(&path, json.replace(&sig, &flipped)).unwrap();
+        assert!(!repo.verify_chain_cached().unwrap().valid);
+        assert!(!repo.verify_chain(None).unwrap().valid);
+    }
+
+    #[test]
     fn test_chain_with_signed_seals_verifies() {
         let dir = tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
@@ -16378,11 +16638,12 @@ mod chain_tests {
 
         fs::write(dir.path().join("file.txt"), "signed content").unwrap();
 
-        // Create through normal seal path (gets secured without signing key)
+        // Finding 199: the normal seal path signs with a key writ made for
+        // the identity on its first seal.
         let _seal = repo
             .seal(
                 chain_agent(),
-                "unsigned seal".to_string(),
+                "signed seal".to_string(),
                 None,
                 TaskStatus::InProgress,
                 Verification::default(),
@@ -16390,15 +16651,15 @@ mod chain_tests {
             )
             .unwrap();
 
-        // Verify without signing key first
+        // No key given: checked against the agent's own key in the store.
         let result = repo.verify_chain(None).unwrap();
         assert!(result.valid);
-
-        // Verify with key — signature_valid should be None (not signed)
-        let result = repo.verify_chain(Some(&verifying_key)).unwrap();
-        assert!(result.valid);
-        // Seal is verified but not signed
         assert_eq!(result.verified, 1);
+        assert_eq!((result.signed, result.unsigned), (1, 0));
+
+        // An unrelated key does not verify the signature.
+        let result = repo.verify_chain(Some(&verifying_key)).unwrap();
+        assert!(!result.valid, "a key that did not sign it must fail");
     }
 
     #[test]

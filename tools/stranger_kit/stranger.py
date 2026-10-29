@@ -742,6 +742,42 @@ def _is_obj(line: str) -> bool:
         return False
 
 
+def hook_firings(recs: list[dict]) -> dict:
+    """Ruling 213: every hook firing (0.4.5 on) opens with a `start` record
+    and closes with an `end` record, both carrying the process `pid`.
+    Walking the log in order, a firing runs from its start to the next start
+    with the same pid (pids are reused over a long log). A firing with no
+    `end` is a hook killed before it finished, whatever it logged first (the
+    finding 213 shape logged `attributed`, then hit the 10 s timeout). A log
+    with starts but no end record at all (a build between the two records)
+    cannot tell: `killed` is None. Logs before 0.4.5 have no starts: 0."""
+    firings: list[list[dict]] = []
+    open_by_pid: dict = {}
+    for r in recs:
+        pid = r.get("pid")
+        if pid is None:
+            continue
+        if r.get("outcome") == "start":
+            open_by_pid[pid] = [r]
+            firings.append(open_by_pid[pid])
+        elif pid in open_by_pid:
+            open_by_pid[pid].append(r)
+    ends = sum(r.get("outcome") == "end" for r in recs)
+
+    def brief(f: list[dict]) -> str:
+        r = f[0]
+        who = r.get("agent_type") or r.get("agent_id") or r.get("session") or "?"
+        last = f[-1].get("outcome")
+        return (f"{r.get('event')} {r.get('tool') or ''} {who} {r.get('ts')} pid {r.get('pid')}"
+                f" (last: {last})")
+
+    if firings and not ends:
+        return {"starts": len(firings), "ends": 0, "killed": None, "killed_firings": []}
+    killed = [f for f in firings if not any(x.get("outcome") == "end" for x in f[1:])]
+    return {"starts": len(firings), "ends": ends, "killed": len(killed),
+            "killed_firings": [brief(f) for f in killed]}
+
+
 def hooks_log_summary(text: str) -> dict:
     """`.writ/hooks.log`: JSON lines from 0.4.3 ({event, tool, path, agent,
     spec, outcome, edit_to_seal_ms, ms, ...}); any other line is counted as
@@ -764,10 +800,14 @@ def hooks_log_summary(text: str) -> dict:
            "refused": sum(str(r.get("outcome", "")).startswith("refus") for r in recs)
            + sum("refus" in l.lower() for l in bad)}
     if recs:
+        out.update(hook_firings(recs))
         out["by_event"] = dict(collections.Counter(r.get("event") for r in recs))
         out["by_outcome"] = dict(collections.Counter(r.get("outcome") for r in recs))
         out["agents"] = sorted({r.get("agent") for r in recs if r.get("agent")})
-        hm = [float(r["ms"]) for r in recs if isinstance(r.get("ms"), (int, float))]
+        # A start record's ms is the time to its own write, not a hook's run;
+        # an end record repeats the firing's time: count each firing once.
+        hm = [float(r["ms"]) for r in recs
+              if isinstance(r.get("ms"), (int, float)) and r.get("outcome") not in ("start", "end")]
         es = [float(r["edit_to_seal_ms"]) for r in recs
               if isinstance(r.get("edit_to_seal_ms"), (int, float))]
         out["hook_ms"] = {"p50": pct(hm, 0.5), "max": max(hm) if hm else None}

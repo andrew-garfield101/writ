@@ -43,9 +43,28 @@ seals = [json.load(open(f)) for f in glob.glob(f"{W}/seals/*.json")]
 seals.sort(key=lambda s: s["timestamp"])
 specs = {json.load(open(f))["id"]: json.load(open(f)) for f in glob.glob(f"{W}/specs/*.json")}
 
+def rev(spec):
+    r = subprocess.run(["git", "-C", REPO, "rev-parse", spec], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+def amended_from(full):
+    """Finding 207: the finish commit an amend replaced: the one finish
+    record (.writ/receipts/<commit>.json) whose commit has the same parent
+    and tree as `full`. None when no record, or more than one, matches."""
+    key = (rev(full + "^"), rev(full + "^{tree}"))
+    found = []
+    for f in glob.glob(f"{W}/receipts/*.json"):
+        c = json.load(open(f)).get("commit") or ""
+        if c and c != full and (rev(c + "^"), rev(c + "^{tree}")) == key:
+            found.append(c)
+    return found[0] if len(found) == 1 else None
+
 for c in sys.argv[1:]:
-    full = subprocess.run(["git", "-C", REPO, "rev-parse", c], capture_output=True, text=True).stdout.strip()
+    full = rev(c) or ""
     spec_ids = sorted(s for s, d in specs.items() if (d.get("commit_hash") or "") == full)
+    if not spec_ids and (orig := amended_from(full)):
+        print(f"{c} is an amend of finish commit {orig[:12]} (same parent and tree)")
+        spec_ids = sorted(s for s, d in specs.items() if (d.get("commit_hash") or "") == orig)
     committed = set(subprocess.run(["git", "-C", REPO, "show", "--name-only", "--format=", full], capture_output=True, text=True).stdout.split())
     by_file = collections.defaultdict(dict)  # file -> spec -> last seal change
     for s in seals:

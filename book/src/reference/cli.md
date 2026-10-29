@@ -150,29 +150,31 @@ When unclaimed specs exist (created via `writ plan` or `writ spec add` but not y
 
 ### `writ watch`
 
-Live seal event monitoring. Shows agent activity in real time without needing to poll `writ status`.
+Watches for new seals and converges overlapping changes as they happen. Shows agent activity in real time without polling `writ status`.
 
 ```bash
 writ watch [OPTIONS]
 
 Options:
-  --interval <SECONDS>       Polling interval [default: 5]
-  --daemon                   Run as background process
-  --stop                     Stop running daemon
+  --interval <SECONDS>       Polling interval (default 5, or from config)
+  --no-auto-converge         Watch and report only; do not merge
+  --daemon                   Run as a background process
+  --stop                     Stop a running daemon
   --status                   Show daemon status and recent activity
 ```
 
-By default, runs in the foreground showing real time output. Press `q` to quit. Seal events display as they happen, with overlapping files flagged for visibility.
+By default it runs in the foreground; press `q` to quit. Each new seal is shown as it lands, with files that overlap another spec flagged. When two specs have sealed the same file, watch converges them, as `writ converge-all` would, and reports each convergence and its result; `--no-auto-converge` or `auto_converge = false` turns that off. Every interval it also runs `writ doctor`, reruns the survival tier when the store or a file it audits has changed, and reports when the findings change.
 
-Daemon mode (`--daemon`) runs the watcher as a background process with output logged to `.writ/watch.log` and PID stored in `.writ/watch.pid`.
+Convergence also runs without watch: at `writ spec done` for overlapping completed work, and at `writ finish` as the backstop. Watch is optional.
 
-Note: convergence runs automatically at `writ spec done` and as a backstop at `writ finish`. Watch is a monitoring tool, not a convergence trigger.
+Daemon mode (`--daemon`) runs the watcher in the background, logging to `.writ/watch.log` with its PID in `.writ/watch.pid`.
 
 Configuration via `.writ/config.toml`:
 
 ```toml
 [watch]
 interval = 5              # polling interval in seconds
+auto_converge = true      # converge overlapping seals (default true)
 log_file = ".writ/watch.log"
 ```
 
@@ -307,6 +309,31 @@ When workspaces exist with changes, `writ finish` automatically:
 4. If convergence is clean, proceeds to git commit
 5. After commit, prompts for workspace directory cleanup (default: yes)
 
+### `writ handoff`
+
+What happened since a point, for the next person or agent. Read only.
+
+```bash
+writ handoff [OPTIONS]
+
+Options:
+  --since <POINT>    A seal id, a time (RFC 3339 or YYYY-MM-DD), or last-finish (default)
+  --format <FORMAT>  markdown (default), brief, json, pr (the full receipt for a PR
+                     description), receipt (the commit body form)
+  --survival         Also run doctor's survival tier
+  --commit <REV>     The receipt of a finish commit, rebuilt from its records
+```
+
+The receipt is what `writ finish` writes into the commit body: one line per spec with its agent, seal count and the agent's own words from `spec done -s`; every file more than one spec sealed and how it was resolved; overrides accepted; refusals in range; and the survival line, which from 0.4.5 ends with how many seals in the range are signed ("12 seals, 12 signed"). Refusals in range lists every refused seal by identity, time and files. From 0.4.5 that includes refusals made by the auto seal hook, so an agent whose only seal was refused still appears; before 0.4.5 a hook refusal was only in `.writ/hooks.log`.
+
+### `writ why`
+
+Why a file is the way it is: the specs that sealed it in order, what each added and removed, any override, and the merge that produced the current content. Read only.
+
+```bash
+writ why <PATH> [--format markdown|json]
+```
+
 ## Convergence Commands
 
 ### `writ converge`
@@ -403,6 +430,23 @@ Options:
 ```
 
 If the agent has exactly one active spec, the ID can be omitted: `writ spec done`.
+
+The summary is the agent's own words in the commit receipt, and from 0.4.5 `writ finish` uses its first sentence (up to 59 characters) as the commit subject when it differs from the spec's title. Typed in a Claude Code subagent's shell, which carries the parent's environment, any writ command runs as the subagent whose open command in that session runs it (0.4.5); when no open command or more than one matches, it runs as the parent. It prints which identity it ran as on stderr, for the parent only when another identity in the session is running or has a command open. This applies only when the identity comes from the Claude Code session alone, not from `--agent`, `WRIT_AGENT_ID` or `default_agent`.
+
+### `writ spec release`
+
+Release a claim on a spec.
+
+```bash
+writ spec release <ID> [OPTIONS]
+
+Options:
+  --agent <AGENT>  The agent releasing (resolved like every command if omitted)
+  --stale          Release another agent's claim only if its holder is provably gone
+                   (same host, its process exited); refuses otherwise and says why
+  --force          Release a claim another agent holds; a human's decision,
+                   recorded as forced on the spec and in the security log
+```
 
 ### `writ spec complete`
 
@@ -507,8 +551,12 @@ writ verify [OPTIONS]              # Full chain verification (default)
 writ verify --seal <ID> [OPTIONS] # Single seal verification
 
 Options:
+  --chain            Verify the full hash chain from genesis to HEAD
+  --all-chains       Verify the HEAD chain plus every spec's chain
   --format <FORMAT>  Output: json, human
 ```
+
+Checks every seal's content hash and chain link and, from 0.4.5, every signature against the key of the identity that made the seal. The result counts signed and unsigned seals (`seals_signed`, `seals_unsigned` in JSON). Unsigned seals, such as those made before 0.4.5, are counted and never fail; a signature that does not match its identity's key fails, names the seal, and exits 1. `--seal` reports `signature_valid` for one seal: `true`, `false`, or `null` when the seal is unsigned or the store holds no key for its identity. See [Security Model](../concepts/security-model.md#ed25519-signatures) for what a signature proves.
 
 ### `writ security events`
 
@@ -529,11 +577,32 @@ Options:
 Register an agent identity.
 
 ```bash
-writ agent register --id <ID> [OPTIONS]
+writ agent register <NAME> [OPTIONS]
 
 Options:
-  --role <ROLE>            Agent role
-  --trust-level <LEVEL>    full, standard, restricted, untrusted
+  --trust-level <LEVEL>      full, standard, restricted, untrusted (default: standard)
+  --scope <GLOB>             Scope constraint, repeatable
+  --registered-by <WHO>      Who registered the agent (default: human)
+```
+
+From 0.4.5 an identity that has already sealed has a key writ made on its first seal; registering that name adopts the key, so its earlier signed seals still verify.
+
+### `writ agent list` and `writ agent show`
+
+```bash
+writ agent list            # registered agents
+writ agent show <NAME>     # one identity: trust level, scope, public key, status
+```
+
+From 0.4.5 `writ agent list` ends with how many identities sign with a key writ made on their first seal, which ones, and what such a key proves: continuity of one identity, not a person. `writ agent show` works for those identities too.
+
+### `writ agent suspend`, `reactivate`, `revoke`, `scope`
+
+```bash
+writ agent suspend <NAME>      # temporarily refuse its seals
+writ agent reactivate <NAME>   # lift a suspension
+writ agent revoke <NAME>       # permanent; removes its keys, keeps its history
+writ agent scope <NAME> ...    # manage its scope constraints
 ```
 
 ## Git Bridge

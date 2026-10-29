@@ -15,6 +15,7 @@
 - [Convergence](concepts/convergence.md)
 - [Output Formats](concepts/output-formats.md)
 - [Security Model](concepts/security-model.md)
+- [Lifecycle and Storage](concepts/lifecycle-and-storage.md)
 
 # Guides
 
@@ -35,6 +36,7 @@
 - [Configuration](reference/configuration.md)
 - [Version Compatibility](reference/version-compat.md)
 - [Error Codes](reference/error-codes.md)
+- [Architecture](reference/architecture.md)
 - [What We Measure](reference/numbers.md)
 
 # Posts

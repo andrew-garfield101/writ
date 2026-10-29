@@ -49,6 +49,16 @@ fmt_rc=0; "$CARGO" fmt --all -- --check >"$(dirname "$OUT")/test-gate-fmt.log" 2
 # after the tag. Type check the tree for x86_64-pc-windows-msvc here (Rust code
 # only, C deps stubbed; see bench/windows_check.sh). rc 2 = cannot run here.
 win_rc=0; "$ROOT/bench/windows_check.sh" "$(dirname "$OUT")/test-gate-windows.log" || win_rc=$?
+# Retro rule 1 (sprint 7, finding 208): the version sites agree with each other
+# and with the CHANGELOG's top heading. Always run and reported; a failure is a
+# gate problem only under GATE_RELEASE=1 (mid sprint the CHANGELOG heading leads
+# the bump). GATE_TAG=vX.Y.Z also checks the committed HEAD against that tag
+# name, the same check bench/release_checks/tag_version.sh runs before a push.
+tag_log="$(dirname "$OUT")/test-gate-tag-version.log"
+tag_rc=0; "$ROOT/bench/release_checks/tag_version.sh" --tree >"$tag_log" 2>&1 || tag_rc=$?
+if [[ -n "${GATE_TAG:-}" ]]; then
+    "$ROOT/bench/release_checks/tag_version.sh" "$GATE_TAG" HEAD >>"$tag_log" 2>&1 || tag_rc=$?
+fi
 # --no-fail-fast: without it cargo stops at the first failing test binary and
 # the counts silently undercount every binary after it.
 "$CARGO" test -p writ-core -p writ-cli -p writ-mcp --no-fail-fast >"$rust_log" 2>&1
@@ -150,7 +160,7 @@ brief_out="$(dirname "$OUT")/test-gate-brief.txt"
 python -m pytest crates/writ-py/tests bench/test_verify_check.py bench/fleet tools/stranger_kit -q -p no:cacheprovider -rxXf >"$py_log" 2>&1
 py_rc=$?
 
-FMT_RC=$fmt_rc WIN_RC=$win_rc BUILD_RC=$build_rc BUILD_LOG="$build_log" \
+FMT_RC=$fmt_rc WIN_RC=$win_rc TAG_RC=$tag_rc TAG_LOG="$tag_log" BUILD_RC=$build_rc BUILD_LOG="$build_log" \
 TIMING_LOG="$timing_log" TIMING_RC=$timing_rc TIMING_LOAD="$timing_load" TIMING_TESTS="${TIMING_TESTS[*]}" \
 RUST_LOG="$rust_log" PY_LOG="$py_log" RUST_RC=$rust_rc PY_RC=$py_rc \
 VERIFY_JSON="$verify_json" VERIFY_RC=$verify_rc \
@@ -184,6 +194,7 @@ timing["seconds"] = float(m[1]) if m else None
 EXPECTED_IGNORED = {
     "ignore::tests::repo_level::test_rejected_scope_violation_seal_leaves_object_count_unchanged",  # 17
     "f136_info_note_on_a_committed_spec_survives_the_bound_in_both_tiers",  # 136 info variant (Haris)
+    # Sprint 8 (0.4.5), assertions before the code (Bri, harness-0-4-5); remove each as it lands.
 }
 # Gate checks waiting on an implementation: reported, not failed, and a
 # problem once they pass (remove the entry then), like EXPECTED_IGNORED.
@@ -202,6 +213,11 @@ if int(os.environ["WIN_RC"]) == 1:
     problems.append("windows: cargo check --target x86_64-pc-windows-msvc failed (finding 185), see test-gate-windows.log")
 elif int(os.environ["WIN_RC"]) != 0:
     problems.append("windows: cross-check could not run on this machine (no rustup or target), see test-gate-windows.log")
+tag_version = {"rc": int(os.environ["TAG_RC"]), "tag": os.environ.get("GATE_TAG") or None,
+               "failed": re.findall(r"^FAIL (.*)$", open(os.environ["TAG_LOG"]).read(), re.M)}
+if tag_version["rc"] != 0 and os.environ.get("GATE_RELEASE") == "1":
+    problems.append(f"tag version: version sites disagree (finding 208, retro rule 1): "
+                    f"{tag_version['failed']}, see test-gate-tag-version.log")
 if int(os.environ["BUILD_RC"]) != 0:
     problems.append(f"build: release binary or Python extension failed (rc {os.environ['BUILD_RC']}), see {os.environ['BUILD_LOG']}")
 if int(os.environ["RUST_RC"]) != 0 or r["failed"]:
@@ -361,6 +377,7 @@ result = {
     "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
     "fmt_rc": int(os.environ["FMT_RC"]),
     "windows_check_rc": int(os.environ["WIN_RC"]),
+    "tag_version": tag_version,
     "build_rc": int(os.environ["BUILD_RC"]),
     "rust": r, "python": p, "timing": timing, "verify": verify, "doctor": doctor, "hook_latency": hook, "bare_ignores": bare,
     "rust_failures": result_failures,

@@ -1710,6 +1710,8 @@ fn main() {
             accept_removals,
             receipt,
         } => {
+            // Finding 206: the hook does not ask about writ's own writes.
+            let _own = writ_core::own_writes::begin("finish");
             if let Err(e) = accept_captured_removals(&cwd, &accept_removals) {
                 eprintln!("{} {e}", "error:".red().bold());
                 process::exit(1);
@@ -1749,6 +1751,7 @@ fn main() {
             force,
             format,
         } => {
+            let _own = writ_core::own_writes::begin("restore");
             let format = resolve_format(format.as_deref(), &cwd, "human");
             cmd_restore(&cwd, &seal_id, force, &format)
         }
@@ -1758,6 +1761,7 @@ fn main() {
             format,
             apply,
         } => {
+            let _own = writ_core::own_writes::begin("converge");
             let format = resolve_format(format.as_deref(), &cwd, "json");
             cmd_converge(&cwd, &left_spec, &right_spec, &format, apply)
         }
@@ -1768,6 +1772,7 @@ fn main() {
             strategy,
             auto_resolve,
         } => {
+            let _own = writ_core::own_writes::begin("converge-all");
             let format = resolve_format(format.as_deref(), &cwd, "json");
             let strategy = resolve_strategy(strategy.as_deref(), &cwd);
             cmd_converge_all(&cwd, &format, apply, dry_run, &strategy, auto_resolve)
@@ -2135,6 +2140,19 @@ fn make_formatter(name: &str, cwd: &Path) -> Option<Box<dyn format::OutputFormat
     format::formatter_for_project(name, project_name.as_deref())
 }
 
+/// Finding 190: a spec's phrase in the finish subject. The first sentence
+/// of the agent's closing summary when `spec done -s` gave one (a summary
+/// that is not the title standing in, finding 68), else the title.
+fn subject_phrase(spec: &writ_core::spec::Spec) -> String {
+    spec.completion_summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != spec.title.trim())
+        .and_then(|t| t.lines().map(str::trim).find(|l| !l.is_empty()))
+        .map(writ_core::auto_seal::prompt_title)
+        .unwrap_or_else(|| spec.title.clone())
+}
+
 /// Resolve the acting agent's ID through the one core resolver (S.3).
 ///
 /// Priority: explicit --agent > WRIT_AGENT_ID > settings.default_agent >
@@ -2145,13 +2163,49 @@ fn resolve_agent(explicit: Option<&str>, cwd: &Path) -> String {
     let default_agent = repo
         .as_ref()
         .and_then(|r| r.settings().default_agent.clone());
-    writ_core::agent::resolve_agent_id_in(
+    let resolved = writ_core::agent::resolve_agent_id_in(
         explicit,
         default_agent.as_deref(),
         true,
         repo.as_ref().map(|r| r.writ_dir()),
-    )
-    .id
+    );
+    match repo {
+        Some(ref r) => session_command_identity(r, resolved),
+        None => resolved.id,
+    }
+}
+
+/// Finding 202: an identity that came from Claude Code's session variable
+/// (no --agent, no WRIT_AGENT_ID, no default) is the parent's, even in a
+/// subagent's shell. Resolve it by the open hook window that runs this
+/// command ([`writ_core::auto_seal::command_identity`]) and say which
+/// identity the command ran as, once per process.
+fn session_command_identity(
+    repo: &Repository,
+    resolved: writ_core::agent::ResolvedIdentity,
+) -> String {
+    use writ_core::agent::IdentitySource;
+    static DONE: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+    let IdentitySource::Framework(ref var) = resolved.source else {
+        return resolved.id;
+    };
+    let Some(session) = std::env::var(var).ok().filter(|s| !s.is_empty()) else {
+        return resolved.id;
+    };
+    let (parent, id) = DONE.get_or_init(|| {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let r =
+            writ_core::auto_seal::command_identity(repo.writ_dir(), &resolved.id, &session, &args);
+        if let Some(note) = r.note {
+            eprintln!("{note}");
+        }
+        (resolved.id.clone(), r.id)
+    });
+    if *parent == resolved.id {
+        id.clone()
+    } else {
+        resolved.id
+    }
 }
 
 /// The agent identity from the environment alone (WRIT_AGENT_ID or a
@@ -5358,8 +5412,8 @@ fn cmd_finish(
 
     // Generate commit message from committable specs (not all specs).
     let commit_message = {
-        let titles: Vec<&str> = committable.iter().map(|s| s.title.as_str()).collect();
-        let first_title = titles.first().copied().unwrap_or("writ changes");
+        let titles: Vec<String> = committable.iter().map(|s| subject_phrase(s)).collect();
+        let first_title = titles.first().map(String::as_str).unwrap_or("writ changes");
         if committable.len() == 1 {
             format!("writ: {}", first_title)
         } else {
@@ -8454,17 +8508,23 @@ fn cmd_verify_seal(
         return Ok(true);
     }
 
-    let result = repo.verify_seal(&seal, None);
+    let agent_key = repo.agent_verifying_key(&seal.agent.id);
+    let result = repo.verify_seal(&seal, agent_key.as_ref());
 
     // Determine signature status text
     let sig_status = match (seal.signature.is_some(), result.signature_valid) {
         (true, Some(true)) => ("OK", "verified".to_string()),
         (true, Some(false)) => ("FAIL", "signature verification failed".to_string()),
-        (true, None) => ("N/A", "present (unverified — no key provided)".to_string()),
+        (true, None) => (
+            "N/A",
+            "present (unverified: no key for this agent in this store)".to_string(),
+        ),
         (false, _) => ("N/A", "not present".to_string()),
     };
 
-    let all_ok = result.content_hash_valid && result.chain_hash_valid;
+    let all_ok = result.content_hash_valid
+        && result.chain_hash_valid
+        && result.signature_valid != Some(false);
 
     match format {
         "json" => {
@@ -8553,6 +8613,8 @@ fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<bool, Box<dyn std
                 "seals_checked": result.total_seals,
                 "seals_verified": result.verified,
                 "seals_unsecured": result.unsecured,
+                "seals_signed": result.signed,
+                "seals_unsigned": result.unsigned,
                 "failures": result.failures.iter().map(|f| {
                     serde_json::json!({
                         "seal": &f.seal_id[..12.min(f.seal_id.len())],
@@ -8572,6 +8634,7 @@ fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<bool, Box<dyn std
                 result.verified.to_string().green(),
                 result.unsecured.to_string().dimmed()
             );
+            println!("  {}", signed_line(&result));
             if !result.valid {
                 for f in &result.failures {
                     let short_id = &f.seal_id[..12.min(f.seal_id.len())];
@@ -8597,6 +8660,15 @@ fn cmd_verify_chain(repo: &Repository, format: &str) -> Result<bool, Box<dyn std
     }
 
     Ok(result.valid)
+}
+
+/// Finding 199: signed and unsigned seals by count. Unsigned seals (made
+/// before 0.4.5) are reported, never an error; a bad signature is a FAIL.
+fn signed_line(result: &writ_core::repo::ChainVerification) -> String {
+    format!(
+        "{} signed (signature checked against the agent's key), {} unsigned",
+        result.signed, result.unsigned
+    )
 }
 
 /// `missing_objects` as JSON: `[{"hash": .., "path": ..}]`.
@@ -8643,6 +8715,8 @@ fn cmd_verify_all_chains(
                     "seals_checked": result.head_chain.total_seals,
                     "seals_verified": result.head_chain.verified,
                     "seals_unsecured": result.head_chain.unsecured,
+                    "seals_signed": result.head_chain.signed,
+                    "seals_unsigned": result.head_chain.unsigned,
                     "failures": result.head_chain.failures.iter().map(|f| {
                         serde_json::json!({
                             "seal": &f.seal_id[..12.min(f.seal_id.len())],
@@ -8657,6 +8731,8 @@ fn cmd_verify_all_chains(
                         "seals_checked": sc.chain.total_seals,
                         "seals_verified": sc.chain.verified,
                         "seals_unsecured": sc.chain.unsecured,
+                        "seals_signed": sc.chain.signed,
+                        "seals_unsigned": sc.chain.unsigned,
                         "failures": sc.chain.failures.iter().map(|f| {
                             serde_json::json!({
                                 "seal": &f.seal_id[..12.min(f.seal_id.len())],
@@ -8678,6 +8754,7 @@ fn cmd_verify_all_chains(
                 result.head_chain.verified,
                 result.head_chain.unsecured
             );
+            println!("  {}", signed_line(&result.head_chain));
             for f in &result.head_chain.failures {
                 let short_id = &f.seal_id[..12.min(f.seal_id.len())];
                 println!(
@@ -8703,6 +8780,7 @@ fn cmd_verify_all_chains(
                         "  {} seals checked, {} verified, {} pre-security",
                         sc.chain.total_seals, sc.chain.verified, sc.chain.unsecured
                     );
+                    println!("  {}", signed_line(&sc.chain));
                     for f in &sc.chain.failures {
                         let short_id = &f.seal_id[..12.min(f.seal_id.len())];
                         println!(
@@ -8787,14 +8865,50 @@ fn cmd_agent_register(
     Ok(())
 }
 
+/// Finding 199: what a key writ made on an identity's first seal proves.
+const FIRST_SEAL_KEY_NOTE: &str = "a key writ made on an identity's first seal proves continuity \
+of one identity (every seal signed with it came from whoever held this store's key for that \
+name), not who the person or agent is";
+
+/// Identities with a key in this store but no registration: keys writ
+/// made on their first seal (finding 199).
+fn first_seal_keys(
+    repo: &Repository,
+    registered: &[writ_core::agent::RegisteredAgent],
+) -> Vec<String> {
+    writ_core::keystore::KeyStore::open(repo.writ_dir())
+        .list_agents()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|id| id != "convergence" && !registered.iter().any(|a| &a.agent_id == id))
+        .collect()
+}
+
+fn print_first_seal_keys(keys: &[String]) {
+    if keys.is_empty() {
+        return;
+    }
+    println!(
+        "\n{} identit{} sign with a key writ made on its first seal: {}",
+        keys.len(),
+        if keys.len() == 1 { "y" } else { "ies" },
+        keys.join(", ")
+    );
+    println!("  {FIRST_SEAL_KEY_NOTE}");
+}
+
 fn cmd_agent_list(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
     let agents = repo.list_agents()?;
+    let first_seal = first_seal_keys(&repo, &agents);
 
     if agents.is_empty() {
         match format {
             "json" => println!("[]"),
-            _ => println!("no registered agents"),
+            _ => {
+                println!("no registered agents");
+                print_first_seal_keys(&first_seal);
+            }
         }
         return Ok(());
     }
@@ -8820,6 +8934,7 @@ fn cmd_agent_list(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Er
                     scope
                 );
             }
+            print_first_seal_keys(&first_seal);
         }
     }
 
@@ -8828,7 +8943,36 @@ fn cmd_agent_list(cwd: &Path, format: &str) -> Result<(), Box<dyn std::error::Er
 
 fn cmd_agent_show(cwd: &Path, name: &str, format: &str) -> Result<(), Box<dyn std::error::Error>> {
     let repo = Repository::open_from_dir(cwd)?;
-    let agent = repo.load_agent(name)?;
+    let agent = match repo.load_agent(name) {
+        Ok(a) => a,
+        Err(e) => {
+            // Finding 199: an identity with only a first-seal key.
+            let ks = writ_core::keystore::KeyStore::open(repo.writ_dir());
+            let Ok(key) = ks.load_agent_verifying_key(name) else {
+                return Err(e.into());
+            };
+            let public_key = writ_core::crypto::verifying_key_to_hex(&key);
+            match format {
+                "json" => println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "agent_id": name,
+                        "registered": false,
+                        "public_key": public_key,
+                        "key_origin": "first_seal",
+                        "proves": FIRST_SEAL_KEY_NOTE,
+                    }))?
+                ),
+                _ => {
+                    println!("agent: {name} (not registered)");
+                    println!("  public_key:    {public_key}");
+                    println!("  key:           made by writ on this identity's first seal");
+                    println!("  {FIRST_SEAL_KEY_NOTE}");
+                }
+            }
+            return Ok(());
+        }
+    };
 
     match format {
         "json" => {

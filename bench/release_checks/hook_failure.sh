@@ -136,7 +136,7 @@ mine = commands(p, "PostToolUseFailure")
 users = [h.get("command") for e in settings(p).get("hooks", {}).get("PostToolUseFailure", []) or [] for h in e.get("hooks", [])]
 chk("12 uninit removes writ's PostToolUseFailure hook and keeps the user's own",
     r.returncode == 0 and not mine and "echo user-failure-hook" in users, f"rc={r.returncode} writ={mine} users={users}")
-done(12)
+done(15)
 PY
 rc=$?
 echo "hook_failure: exit $rc"

@@ -26,19 +26,24 @@ HOME.mkdir(exist_ok=True)
 if not (BIN / "writ").exists():
     (BIN / "writ").symlink_to(WRIT)
 _fail = 0
+_ran = 0
+_passed = 0
 
 
 def chk(name: str, ok: bool, detail: str = "") -> None:
     """Print one PASS or FAIL line; remember a failure for done()."""
-    global _fail
+    global _fail, _ran, _passed
     print(("PASS " if ok else "FAIL ") + name + ("" if ok or not detail else f"  [{detail}]"))
+    _ran += 1
+    _passed += bool(ok)
     if not ok:
         _fail = 1
 
 
 def done(total: int) -> None:
-    """Exit 0 only when every check passed."""
-    sys.exit(_fail)
+    """Print passed/total and exit 0 only when every planned check ran and passed."""
+    print(f"{_passed}/{total}" + ("" if _ran == total else f"  ({_ran} ran)"))
+    sys.exit(1 if _fail or _ran != total else 0)
 
 
 def env(session: str | None = None, agent: str | None = None) -> dict[str, str]:

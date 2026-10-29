@@ -424,3 +424,24 @@ class TestSecurityErrorContract:
         # Empty repo: 0 seals, still valid (vacuously)
         assert result["total_seals"] == 0
         assert result["valid"] is True
+
+
+# ── Finding 199: signing by default ───────────────────────────────────
+
+
+class TestSigningByDefaultContract:
+    """Every seal is signed with a key made on the identity's first seal."""
+
+    def test_verify_chain_counts_signed_and_unsigned(self, sealed_repo):
+        repo, path = sealed_repo
+        result = repo.verify_chain()
+        assert isinstance(result["signed"], int)
+        assert isinstance(result["unsigned"], int)
+        assert result["signed"] + result["unsigned"] == result["total_seals"]
+
+    def test_verify_seal_checks_the_agents_own_signature(self, sealed_repo):
+        repo, path = sealed_repo
+        seal_id = repo.log()[0]["id"]
+        result = repo.verify_seal(seal_id)
+        assert result["signature_present"] is True
+        assert result["signature_valid"] is True

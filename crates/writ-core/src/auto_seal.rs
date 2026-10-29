@@ -96,6 +96,22 @@ pub const SESSION_END_LOCK_WAIT: std::time::Duration = std::time::Duration::from
 /// (finding 133).
 const TASK_NOTIFICATION: &str = "<task-notification>";
 
+/// Prompts that are not the user's words: a notice the host injects, or a
+/// message from another agent stashed as a prompt (findings 133, 190, 208).
+/// Never an auto spec title; the session's last real prompt stays.
+const NOT_A_PROMPT: [&str; 4] = [
+    TASK_NOTIFICATION,
+    "<agent-message",
+    "<cross-session-message",
+    "[SYSTEM NOTIFICATION",
+];
+
+/// True when `prompt` is one of [`NOT_A_PROMPT`].
+fn is_notice(prompt: &str) -> bool {
+    let p = prompt.trim_start();
+    NOT_A_PROMPT.iter().any(|n| p.starts_with(n))
+}
+
 /// The fields of Claude Code's hook stdin writ reads (live shape, 2.1.290).
 #[derive(Debug, Default, Deserialize)]
 pub struct HookInput {
@@ -168,6 +184,13 @@ pub fn run(cwd: &Path, stdin: &str) -> HookOutcome {
         }
     };
     let event = input.hook_event_name.clone().unwrap_or_default();
+    // Ruling 213: a start record before any work, so a hook Claude Code
+    // kills at its timeout leaves a start with no outcome (same pid).
+    // The identity is the host's, unresolved: resolving it is work.
+    log.write(json!({"event": event, "outcome": "start",
+        "session": input.session_id, "agent_id": input.agent_id,
+        "agent_type": input.agent_type, "tool": input.tool_name,
+        "tool_use_id": input.tool_use_id}));
     log.failure = event == POST_FAILURE_EVENT;
     let result = match event.as_str() {
         "PreToolUse" => bash_pre(&writ_dir, &input, &log).map(|_| None),
@@ -186,13 +209,18 @@ pub fn run(cwd: &Path, stdin: &str) -> HookOutcome {
             Ok(None)
         }
     };
-    match result {
+    let out = match result {
         Ok(stdout) => HookOutcome { stdout },
         Err(e) => {
             log.write(json!({"event": event, "outcome": "error", "detail": e.to_string()}));
             HookOutcome::default()
         }
-    }
+    };
+    // Ruling 213: every firing closes its start with an `end` record (same
+    // pid), so a start with no end means Claude Code killed the hook, even
+    // one that had already logged its attribution.
+    log.write(json!({"event": event, "outcome": "end"}));
+    out
 }
 
 fn find_writ_dir(cwd: &Path) -> Option<PathBuf> {
@@ -239,6 +267,8 @@ impl HookLog {
                 "ms".into(),
                 json!(self.started.elapsed().as_millis() as u64),
             );
+            // Ruling 213: pairs a start record with this firing's outcomes.
+            m.insert("pid".into(), json!(std::process::id()));
         }
         // Best-effort by design: the log is the error channel of last resort.
         // Finding 154: one write() per record on an O_APPEND descriptor, so
@@ -904,6 +934,12 @@ fn seal_paths_auto(
             .collect::<Vec<_>>()
             .join(";");
         let tell = Told::load(writ_dir, &who.id).first_time(rel, &signature);
+        // Finding 203: the refusal goes into the record a hand seal's
+        // refusal writes, once per distinct refusal (the told signature),
+        // so the receipt's "Refusals in range" lists it.
+        if tell {
+            repo.record_seal_refusal(Some(spec), &who.id, std::slice::from_ref(rel), &err);
+        }
         log.write(entry(
             rel,
             json!({"outcome": "refused", "told": tell, "detail": msg}),
@@ -1224,6 +1260,113 @@ fn close_window_at(path: &Path, mut w: BashWindow, at: chrono::DateTime<chrono::
     }
 }
 
+// ---------------------------------------------------------------------------
+// Hand typed commands in a subagent's shell (finding 202)
+// ---------------------------------------------------------------------------
+
+/// Which identity a hand typed writ command ran as, when the shell's
+/// environment gave the parent's (finding 202).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandIdentity {
+    pub id: String,
+    /// The one line the command prints, when another identity of this
+    /// session was in the picture; None when nothing else was.
+    pub note: Option<String>,
+}
+
+/// Finding 202, the 188 rule applied to commands: a subagent's shell has
+/// the parent's environment, so its hand typed `writ` command resolves to
+/// `parent`. The hook records each open Bash window's command text; the
+/// command resolves to the identity whose open window in this `session`
+/// contains this invocation (`writ`, then each of `args` in order).
+/// Exactly one such window wins. None, or more than one (the parent's own
+/// open window counts), and the command runs as `parent`: writ never
+/// guesses. The note names the identity whenever another identity of the
+/// session has a window or is a live named subagent.
+pub fn command_identity(
+    writ_dir: &Path,
+    parent: &str,
+    session: &str,
+    args: &[String],
+) -> CommandIdentity {
+    let now = chrono::Utc::now();
+    let windows: Vec<BashWindow> = fs::read_dir(writ_dir.join(BASH_DIR))
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| serde_json::from_str(&fs::read_to_string(e.path()).ok()?).ok())
+                .filter(|w: &BashWindow| {
+                    w.session.as_deref() == Some(session)
+                        && (now - w.end.unwrap_or(w.at)).num_seconds() < WINDOW_STALE_SECS
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut matching: Vec<&str> = windows
+        .iter()
+        .filter(|w| w.end.is_none() && runs_invocation(&w.command, args))
+        .map(|w| w.agent.as_str())
+        .collect();
+    matching.sort();
+    matching.dedup();
+    let others = windows.iter().any(|w| w.agent != parent) || live_in_session(writ_dir, session);
+    match matching.as_slice() {
+        [one] if *one != parent => CommandIdentity {
+            id: one.to_string(),
+            note: Some(format!(
+                "writ: ran as {one} (the open hook window of {one} runs this command; this shell's environment gives {parent})"
+            )),
+        },
+        [] | [_] => CommandIdentity {
+            id: parent.to_string(),
+            note: others.then(|| {
+                format!("writ: ran as {parent} (no other identity's open hook window runs this command)")
+            }),
+        },
+        many => CommandIdentity {
+            id: parent.to_string(),
+            note: Some(format!(
+                "writ: ran as {parent} ({} open hook windows run this command: {}; writ does not guess)",
+                many.len(),
+                many.join(", ")
+            )),
+        },
+    }
+}
+
+/// True when `command` holds `writ` followed by every one of `args`, in
+/// order. An argument the shell changed (quoting inside it, a variable)
+/// does not appear verbatim and so never matches: the parent stands.
+fn runs_invocation(command: &str, args: &[String]) -> bool {
+    command.match_indices("writ").any(|(i, _)| {
+        let mut rest = &command[i + 4..];
+        if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            return false;
+        }
+        args.iter().all(|a| match rest.find(a.as_str()) {
+            Some(j) => {
+                rest = &rest[j + a.len()..];
+                true
+            }
+            None => false,
+        })
+    })
+}
+
+/// A live named subagent instance in `session` (ruling 192's registry).
+fn live_in_session(writ_dir: &Path, session: &str) -> bool {
+    let now = chrono::Utc::now();
+    fs::read_dir(writ_dir.join(LIVE_DIR))
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                load_live(&e.path()).values().any(|i| {
+                    i.session.as_deref() == Some(session)
+                        && (now - i.last).num_seconds() < WINDOW_STALE_SECS
+                })
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Whose change a path is (ruling 160).
 #[derive(Debug, PartialEq, Eq)]
 enum Owner {
@@ -1439,7 +1582,18 @@ fn bash_attribution(
     // identity's own (open or closed).
     let mut text_windows: Vec<BashWindow> = Vec::new();
     let mut text_loaded = false;
+    // Finding 206: paths writ itself wrote (finish, restore, converge)
+    // inside this window are nobody's change: not asked, not sealed.
+    let own_writes = crate::own_writes::load(writ_dir, WINDOW_STALE_SECS);
+    let wall = chrono::Utc::now();
     for rel in changed {
+        let mtime = now.files.get(&rel).map(|f| f.1);
+        if let Some(o) = own_writes.iter().find(|o| o.covers(&rel, mtime, wall)) {
+            log.write(json!({"event": event, "tool": "Bash", "path": rel,
+                "agent": w.agent, "outcome": "writ_own_write", "command": o.command,
+                "detail": "written by writ itself inside this window; not attributed"}));
+            continue;
+        }
         let hash = content_hash(&root.join(&rel));
         // Declined earlier as ambiguous, content unchanged: still nobody's.
         if let Some((h, who)) = amb.paths.get(&rel).cloned() {
@@ -1456,7 +1610,6 @@ fn bash_attribution(
             amb.paths.remove(&rel);
             amb_changed = true;
         }
-        let mtime = now.files.get(&rel).map(|f| f.1);
         let (owner, coarse) = attribute(mtime, w, now_ns, &others);
         let owner = match owner {
             Owner::Ambiguous(who) => {
@@ -1924,7 +2077,7 @@ fn prompt_path(writ_dir: &Path, session: &str) -> PathBuf {
 }
 
 /// Keep the first non-empty line of the session's latest real prompt (not
-/// a `<task-notification>`, finding 133), at most 80 characters. Prints
+/// a notice or an agent message, findings 133 and 190), as a title. Prints
 /// nothing: UserPromptSubmit stdout is injected into the agent's context.
 fn stash_prompt(writ_dir: &Path, input: &HookInput, log: &HookLog) -> WritResult<()> {
     // A new prompt: this identity's earlier calls are over.
@@ -1934,7 +2087,8 @@ fn stash_prompt(writ_dir: &Path, input: &HookInput, log: &HookLog) -> WritResult
     else {
         return Ok(());
     };
-    if prompt.trim_start().starts_with(TASK_NOTIFICATION) {
+    if is_notice(prompt) {
+        log.write(json!({"event": "UserPromptSubmit", "outcome": "not_a_prompt"}));
         return Ok(());
     }
     let Some(first) = prompt.lines().map(str::trim).find(|l| !l.is_empty()) else {
@@ -2733,6 +2887,62 @@ mod tests {
         let w = root.join(".writ/x").display().to_string();
         assert_eq!(relative_path(&root, None, &w), None);
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn r213_every_firing_writes_a_start_record_first_with_its_pid() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".writ")).unwrap();
+        let stdin = r#"{"hook_event_name":"SomethingNew","session_id":"s1","tool_name":"Bash","tool_use_id":"t1"}"#;
+        run(dir.path(), stdin);
+        let log = fs::read_to_string(dir.path().join(".writ").join(HOOKS_LOG)).unwrap();
+        let recs: Vec<Value> = log
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(recs[0]["outcome"], "start", "{log}");
+        assert_eq!(recs[0]["event"], "SomethingNew");
+        assert_eq!(recs[0]["tool_use_id"], "t1");
+        let pid = std::process::id();
+        assert!(recs.iter().all(|r| r["pid"] == pid), "{log}");
+        assert_eq!(recs.len(), 3, "start, the outcome, end: {log}");
+        assert_eq!(recs[2]["outcome"], "end", "{log}");
+    }
+
+    #[test]
+    fn f190_notices_and_agent_messages_are_not_prompts() {
+        assert!(is_notice(
+            "<agent-message from=\"a1\">\nhi\n</agent-message>"
+        ));
+        assert!(is_notice("  [SYSTEM NOTIFICATION - NOT USER INPUT]\nx"));
+        assert!(is_notice("<task-notification>\n<task-id>x</task-id>"));
+        assert!(is_notice("<cross-session-message from=\"x\">hi"));
+        assert!(!is_notice("Fix the parser. Then add tests."));
+        assert!(!is_notice("Explain <agent-message> handling"));
+    }
+
+    #[test]
+    fn f202_invocation_matches_writ_then_each_argument_in_order() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let cmd = "cd /p && writ spec done -s \"checked b.txt, 75 tests\" 2>&1 | head -10";
+        assert!(runs_invocation(
+            cmd,
+            &a(&["spec", "done", "-s", "checked b.txt, 75 tests"])
+        ));
+        // Other words, other order, or a word that only starts with writ.
+        assert!(!runs_invocation(
+            cmd,
+            &a(&["spec", "done", "-s", "other words"])
+        ));
+        assert!(!runs_invocation(cmd, &a(&["done", "spec"])));
+        assert!(!runs_invocation(
+            "writer spec done -s x",
+            &a(&["spec", "done", "-s", "x"])
+        ));
+        assert!(runs_invocation(
+            "/opt/homebrew/bin/writ seal -s x",
+            &a(&["seal", "-s", "x"])
+        ));
     }
 
     #[test]

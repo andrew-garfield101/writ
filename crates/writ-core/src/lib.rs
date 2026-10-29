@@ -34,6 +34,7 @@ pub mod keystore;
 pub mod lock;
 pub mod migrate;
 pub mod object;
+pub mod own_writes;
 pub mod platform;
 pub mod proposal;
 pub mod receipt;

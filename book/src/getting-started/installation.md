@@ -20,19 +20,17 @@ Build the CLI from source. Requires the Rust toolchain.
 cargo install --path crates/writ-cli
 ```
 
-Or, once published to crates.io:
+Writ is not published to crates.io, so run this from a clone of the repository. The crates named `writ` and `writ-cli` on crates.io are other projects: `cargo install writ` does not install this tool.
+
+## Homebrew (macOS and Linux)
+
+Installs the CLI from the writ tap, with prebuilt binaries for Apple silicon and Intel Macs and for Linux on x86_64 and ARM64.
 
 ```bash
-cargo install writ
+brew install andrew-garfield101/writ/writ
 ```
 
-## macOS (Homebrew)
-
-Coming soon. Once the Homebrew tap is published:
-
-```bash
-brew install writ
-```
+Upgrade with `brew upgrade writ`. The tap is updated by the release pipeline after each version is published. Homebrew installs the CLI only; for `import writ` in Python, install from PyPI as well.
 
 ## From Source
 
@@ -59,7 +57,7 @@ maturin develop
 
 ```bash
 writ --version
-# writ 0.1.0
+# prints the installed version, for example: writ 0.4.5
 
 writ --help
 # Shows all available commands
@@ -90,7 +88,7 @@ pip uninstall writ-vcs -y
 # Cargo
 cargo uninstall writ
 
-# Homebrew (when available)
+# Homebrew
 brew uninstall writ
 
 # From source — remove the binary you added to PATH

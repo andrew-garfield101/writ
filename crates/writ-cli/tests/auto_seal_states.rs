@@ -3947,3 +3947,675 @@ fn f191_builtin_type_keeps_the_parent_derived_identity() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sprint 8 (0.4.5). Assertions before the code (retro rule 1); ignored until
+// Amis lands each (signing, 199, is in signing_states.rs).
+// 203: a foreign-line refusal made by the hook is a `seal_refused` event in
+//   .writ/security/events.jsonl with the identity (agent_id), the path
+//   (files), the lines and the other agent, once per distinct refusal; the
+//   receipt's "Refusals in range" lists it (Amis: spec committed, or files
+//   include a committed path), so an identity whose only seal was refused
+//   still appears in the receipt.
+// 204: with two live instances of a named type, the refusal names the
+//   suffixed identity (event, hook line and receipt).
+// 202: a writ command typed in a subagent's shell (the parent's environment)
+//   resolves to the identity whose open hook window's command text contains
+//   it; none or several matching: the parent; the command says which
+//   identity it ran as. Transcript shape from evidence/0.4.4-fleet-live-
+//   freeze6 (web-builder subagent: `cd <proj> && writ spec done -s "..."
+//   2>&1 | head -10`).
+// 206: paths written by `writ finish` / `writ restore` in their own window
+//   are writ's own writes: no ambiguity line and no auto seal for them.
+// 190: the auto spec title skips agent messages and system notices; the
+//   finish subject uses the closing summary when spec done had one.
+// 208 is the gate's tag check (Djo; Amis and Bri agreed gate-only), not here.
+// ---------------------------------------------------------------------------
+
+/// `seal_refused` records in .writ/security/events.jsonl.
+fn refused_events(p: &Project) -> Vec<Value> {
+    p.read(".writ/security/events.jsonl")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|e| e["event_type"] == "seal_refused")
+        .collect()
+}
+
+/// True when a field other than agent_id/details/event_type names `who`.
+fn names_other(e: &Value, who: &str) -> bool {
+    e.as_object().is_some_and(|m| {
+        m.iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "agent_id" | "details" | "event_type"))
+            .any(|(_, v)| match v {
+                Value::String(s) => s == who,
+                Value::Array(a) => a.iter().any(|x| x == who),
+                _ => false,
+            })
+    })
+}
+
+/// The 203 event contract for one refusal of `who` on `path` against `other`.
+fn assert_refusal_event(e: &Value, who: &str, path: &str, other: &str) {
+    assert_eq!(e["agent_id"], who, "identity: {e}");
+    assert!(
+        e["files"]
+            .as_array()
+            .is_some_and(|f| f.iter().any(|x| x == path)),
+        "path: {e}"
+    );
+    assert!(
+        e.get("lines").is_some_and(|l| !l.is_null()),
+        "no lines field: {e}"
+    );
+    assert!(
+        names_other(e, other),
+        "the other agent {other} is not in a field of its own: {e}"
+    );
+}
+
+/// bravo seals "line 30 B" through the hook; alpha's stale write drops it
+/// and alpha's hook seal is refused. `alpha_spec`: claim "sa" first.
+fn hook_refusal(tag: &str, alpha_spec: bool) -> (Project, String, Vec<HookRun>) {
+    let p = Project::new(tag);
+    let since = p.newest_seal()["id"].as_str().unwrap().to_string();
+    if alpha_spec {
+        p.spec("sa", ALPHA);
+    }
+    p.spec("sb", BRAVO);
+    p.write("shared.txt", &numbered(40, &[(30, "B")]));
+    all_exit_zero(
+        &p.edit(Some(BRAVO), "sess-b", "Edit", "shared.txt"),
+        "bravo",
+    );
+    assert_eq!(p.newest_seal()["agent"]["id"], BRAVO);
+    p.write("shared.txt", &numbered(40, &[(2, "A")]));
+    let runs = p.edit(Some(ALPHA), "sess-a", "Write", "shared.txt");
+    let told: Vec<String> = runs.iter().filter_map(HookRun::to_agent).collect();
+    assert_eq!(
+        told.len(),
+        1,
+        "fixture: alpha's hook seal is refused: {told:?}"
+    );
+    (p, since, runs)
+}
+
+/// bravo's spec done, shared.txt back to bravo's sealed version, finish.
+/// Returns the commit body (the receipt).
+fn finish_bravo(p: &Project) -> String {
+    p.write("shared.txt", &numbered(40, &[(30, "B")]));
+    p.ok(
+        BRAVO,
+        &["spec", "done", "sb", "--agent", BRAVO, "--no-seal"],
+    );
+    let fin = p.writ("human", &["finish", "-y"]);
+    assert!(fin.status.success(), "finish: {}", text(&fin));
+    p.git_ok(&["log", "-1", "--format=%B"])
+}
+
+fn refusals_section(receipt: &str) -> Vec<String> {
+    receipt
+        .lines()
+        .skip_while(|l| !l.contains("Refusals in range"))
+        .skip(1)
+        .take_while(|l| l.trim_start().starts_with('-'))
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn f203_hook_refusal_is_a_seal_refused_event_with_identity_path_lines_and_other_agent() {
+    let (p, _, _) = hook_refusal("f203-event", true);
+    let ev: Vec<Value> = refused_events(&p)
+        .into_iter()
+        .filter(|e| e["agent_id"] == ALPHA)
+        .collect();
+    assert_eq!(ev.len(), 1, "one seal_refused event for alpha: {ev:?}");
+    assert_refusal_event(&ev[0], ALPHA, "shared.txt", BRAVO);
+    assert!(
+        ev[0]["specs"]
+            .as_array()
+            .is_some_and(|s| s.iter().any(|x| x == "sa")),
+        "the refused identity's spec: {}",
+        ev[0]
+    );
+    // The same refusal again (same path, same state): no second record.
+    p.write("shared.txt", &numbered(40, &[(2, "A"), (3, "A")]));
+    all_exit_zero(
+        &p.edit(Some(ALPHA), "sess-a", "Edit", "shared.txt"),
+        "again",
+    );
+    let n = refused_events(&p)
+        .iter()
+        .filter(|e| e["agent_id"] == ALPHA)
+        .count();
+    assert_eq!(
+        n, 1,
+        "a repeated refusal is recorded once per distinct refusal"
+    );
+}
+
+#[test]
+fn f203_hook_refusal_appears_in_receipt_refusals_in_range() {
+    let (p, since, _) = hook_refusal("f203-receipt", true);
+    let body = finish_bravo(&p);
+    let lines = refusals_section(&body);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains(ALPHA) && l.contains("shared.txt")),
+        "no refusal line for alpha on shared.txt in the commit body:\n{body}"
+    );
+    // The handoff receipt for the same range agrees.
+    let r = receipt_text(&p, &since);
+    assert!(
+        refusals_section(&r)
+            .iter()
+            .any(|l| l.contains(ALPHA) && l.contains("shared.txt")),
+        "handoff receipt:\n{r}"
+    );
+}
+
+#[test]
+fn f203_identity_whose_only_seal_was_refused_appears_in_the_receipt() {
+    // alpha has no claimed spec: its auto spec has 0 seals and SessionEnd
+    // removes it (174); the refusal is the only record of alpha.
+    let (p, _, _) = hook_refusal("f203-only", false);
+    all_exit_zero(
+        &p.event(
+            Some(ALPHA),
+            "sess-a",
+            "SessionEnd",
+            json!({"reason": "exit"}),
+        ),
+        "alpha SessionEnd",
+    );
+    let body = finish_bravo(&p);
+    assert!(
+        body.contains(ALPHA),
+        "alpha (refused, no seal) is absent from the receipt:\n{body}"
+    );
+    assert!(
+        refusals_section(&body)
+            .iter()
+            .any(|l| l.contains(ALPHA) && l.contains("shared.txt")),
+        "no refusal line names alpha:\n{body}"
+    );
+}
+
+const WB: &str = "web-builder";
+
+/// Two live web-builder instances (SUB_X plain, SUB_Y suffixed). `first`
+/// seals line 30 of shared.txt; the other's stale write drops it and is
+/// refused. Returns the project and the refused instance's hook runs.
+fn two_instance_refusal(tag: &str, first: &str, second: &str) -> (Project, Vec<HookRun>) {
+    let p = Project::new(tag);
+    custom_agent(&p, WB);
+    sub_start(&p, "sess-p", SUB_X, WB);
+    sub_start(&p, "sess-p", SUB_Y, WB);
+    // Establish liveness of both by a first edit each (if writ has no
+    // SubagentStart, liveness runs from a subagent's first hook).
+    p.write("a.txt", &numbered(20, &[(1, "x")]));
+    all_exit_zero(&sub_edit(&p, "sess-p", (SUB_X, WB), "a.txt"), "x");
+    p.write("b.txt", &numbered(20, &[(1, "y")]));
+    all_exit_zero(&sub_edit(&p, "sess-p", (SUB_Y, WB), "b.txt"), "y");
+    p.write("shared.txt", &numbered(40, &[(30, "first")]));
+    all_exit_zero(&sub_edit(&p, "sess-p", (first, WB), "shared.txt"), "first");
+    p.write("shared.txt", &numbered(40, &[(2, "second")]));
+    let runs = sub_edit(&p, "sess-p", (second, WB), "shared.txt");
+    (p, runs)
+}
+
+#[test]
+fn f204_refusal_names_the_suffixed_identity_when_two_instances_are_live() {
+    let suffixed = format!("{WB}-{}", &SUB_Y[..8]);
+    // (a) The suffixed instance is refused: event and receipt name it.
+    let (p, runs) = two_instance_refusal("f204-a", SUB_X, SUB_Y);
+    let told: Vec<String> = runs.iter().filter_map(HookRun::to_agent).collect();
+    assert_eq!(told.len(), 1, "{told:?}");
+    let ev: Vec<Value> = refused_events(&p)
+        .into_iter()
+        .filter(|e| e["files"].to_string().contains("shared.txt"))
+        .collect();
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_refusal_event(&ev[0], &suffixed, "shared.txt", WB);
+    sub_stop(&p, "sess-p", SUB_X, WB);
+    sub_stop(&p, "sess-p", SUB_Y, WB);
+    p.write("shared.txt", &numbered(40, &[(30, "first")]));
+    // Close the first instance's spec (it sealed shared.txt) so the finish
+    // commits the path the refusal is about (the f203 committed-path rule).
+    let first_spec = p
+        .seals()
+        .into_iter()
+        .find(|s| s["agent"]["id"] == WB && paths_of(s).contains("shared.txt"))
+        .and_then(|s| s["spec_id"].as_str().map(str::to_string))
+        .expect("the first instance's shared.txt seal");
+    p.ok(
+        WB,
+        &["spec", "done", &first_spec, "--agent", WB, "--no-seal"],
+    );
+    let head = p.git_ok(&["rev-parse", "HEAD"]);
+    let fin = p.writ("human", &["finish", "-y"]);
+    assert!(fin.status.success(), "finish: {}", text(&fin));
+    assert_ne!(
+        p.git_ok(&["rev-parse", "HEAD"]),
+        head,
+        "fixture: the finish committed nothing:\n{}",
+        text(&fin)
+    );
+    let body = p.git_ok(&["log", "-1", "--format=%B"]);
+    assert!(
+        refusals_section(&body)
+            .iter()
+            .any(|l| l.contains(&suffixed) && l.contains("shared.txt")),
+        "the receipt's refusal line does not name {suffixed}:\n{body}"
+    );
+    // (b) The plain instance is refused over the suffixed one's lines: the
+    // line told to it names the suffixed owner.
+    let (_q, runs) = two_instance_refusal("f204-b", SUB_Y, SUB_X);
+    let told: Vec<String> = runs.iter().filter_map(HookRun::to_agent).collect();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(
+        told[0].contains(&suffixed),
+        "the refusal told to {WB} names its owner as {suffixed}: {}",
+        told[0]
+    );
+}
+
+const REVIEWER: &str = "reviewer";
+const CHECKER: &str = "checker";
+
+/// A named subagent's Bash Pre/Post (stdin agent_id/agent_type).
+fn sub_bash(p: &Project, event: &str, cmd: &str, id: &str, sub: (&str, &str)) -> Vec<HookRun> {
+    let mut stdin = bash_stdin(p, "sess-p", event, cmd, id);
+    stdin[SUBAGENT_ID_FIELD] = json!(sub.0);
+    stdin[SUBAGENT_TYPE_FIELD] = json!(sub.1);
+    let runs = p.fire(event, Some("Bash"), None, &stdin);
+    all_exit_zero(&runs, event);
+    runs
+}
+
+/// Run `cmd` as a subagent's Bash tool does: sh in the parent's Claude Code
+/// environment (no WRIT_AGENT_ID, the parent's session id).
+fn in_parent_shell(p: &Project, cmd: &str) -> Output {
+    p.cmd("sh", None)
+        .env("CLAUDE_CODE_SESSION_ID", "sess-p")
+        .arg("-c")
+        .arg(cmd)
+        .output()
+        .unwrap()
+}
+
+/// Parent and reviewer (and checker, when `two`) each hold an auto spec.
+/// Returns (project, parent identity, parent spec, reviewer spec, checker spec).
+fn subagent_specs(tag: &str, two: bool) -> (Project, String, String, String, Option<String>) {
+    let p = Project::new(tag);
+    custom_agent(&p, REVIEWER);
+    custom_agent(&p, CHECKER);
+    let parent = parent_identity(&p, "sess-p");
+    let parent_spec = p.newest_seal()["spec_id"].as_str().unwrap().to_string();
+    sub_start(&p, "sess-p", SUB_X, REVIEWER);
+    p.write("b.txt", &numbered(20, &[(1, "reviewed")]));
+    all_exit_zero(
+        &sub_edit(&p, "sess-p", (SUB_X, REVIEWER), "b.txt"),
+        "reviewer",
+    );
+    let rs = p.newest_seal();
+    assert_eq!(rs["agent"]["id"], REVIEWER, "fixture: {rs}");
+    let rev_spec = rs["spec_id"].as_str().unwrap().to_string();
+    let chk_spec = two.then(|| {
+        sub_start(&p, "sess-p", SUB_Y, CHECKER);
+        p.write("a.txt", &numbered(20, &[(1, "checked")]));
+        all_exit_zero(
+            &sub_edit(&p, "sess-p", (SUB_Y, CHECKER), "a.txt"),
+            "checker",
+        );
+        let cs = p.newest_seal();
+        assert_eq!(cs["agent"]["id"], CHECKER, "fixture: {cs}");
+        cs["spec_id"].as_str().unwrap().to_string()
+    });
+    (p, parent, parent_spec, rev_spec, chk_spec)
+}
+
+/// The command's output says which identity it ran as: a line carrying
+/// "as <who>" (e.g. "ran as reviewer"; an `--agent <who>` in a printed fix
+/// or an auto spec title "auto work by <who>" is not that statement).
+fn says_ran_as(said: &str, who: &str) -> bool {
+    let needle = format!("as {who}");
+    said.lines().any(|l| {
+        l.match_indices(&needle).any(|(i, _)| {
+            let before = l[..i].chars().last();
+            let after = l[i + needle.len()..].chars().next();
+            matches!(before, None | Some(' ' | '(' | '`' | '"'))
+                && !matches!(after, Some(c) if c.is_ascii_alphanumeric() || c == '-')
+        })
+    })
+}
+
+fn is_closed(p: &Project, spec: &str) -> bool {
+    p.spec_json(spec)["status"] == "complete"
+}
+
+/// The freeze 6 shape: `cd <proj> && writ spec done -s "..." 2>&1 | head -10`.
+fn done_cmd(p: &Project, words: &str) -> String {
+    format!(
+        "cd {} && writ spec done -s \"{words}\" 2>&1 | head -10",
+        p.root.display()
+    )
+}
+
+#[test]
+fn f202_subagent_hand_command_resolves_by_open_window_command_text() {
+    let (p, parent, parent_spec, rev_spec, _) = subagent_specs("f202-match", false);
+    let words = "reviewer words: checked b.txt, 75 tests";
+    let cmd = done_cmd(&p, words);
+    sub_bash(&p, "PreToolUse", &cmd, "toolu_rev_done", (SUB_X, REVIEWER));
+    let out = in_parent_shell(&p, &cmd);
+    sub_bash(&p, "PostToolUse", &cmd, "toolu_rev_done", (SUB_X, REVIEWER));
+    let said = text(&out);
+    assert!(
+        is_closed(&p, &rev_spec),
+        "reviewer's spec not closed:\n{said}"
+    );
+    assert!(
+        p.spec_json(&rev_spec).to_string().contains(words),
+        "reviewer's words not on its spec: {}",
+        p.spec_json(&rev_spec)
+    );
+    assert!(
+        !is_closed(&p, &parent_spec),
+        "the parent's ({parent}) spec was closed by the reviewer's command"
+    );
+    assert!(
+        says_ran_as(&said, REVIEWER),
+        "the command does not say it ran as {REVIEWER}:\n{said}"
+    );
+}
+
+#[test]
+fn f202_no_matching_window_resolves_to_parent_and_says_so() {
+    let (p, parent, parent_spec, rev_spec, _) = subagent_specs("f202-none", false);
+    // The reviewer's window for this command is not open (no Pre): the
+    // reviewer's earlier edit window must not capture it.
+    let cmd = done_cmd(&p, "parent words: wired the reviewer in");
+    let out = in_parent_shell(&p, &cmd);
+    let said = text(&out);
+    assert!(
+        is_closed(&p, &parent_spec),
+        "parent's spec not closed:\n{said}"
+    );
+    assert!(
+        !is_closed(&p, &rev_spec),
+        "reviewer's spec was closed:\n{said}"
+    );
+    assert!(
+        says_ran_as(&said, &parent),
+        "the command does not say it ran as {parent}:\n{said}"
+    );
+}
+
+#[test]
+fn f202_two_matching_windows_resolve_to_parent() {
+    let (p, parent, parent_spec, rev_spec, chk_spec) = subagent_specs("f202-two", true);
+    let chk_spec = chk_spec.unwrap();
+    let cmd = done_cmd(&p, "same words from two windows");
+    sub_bash(&p, "PreToolUse", &cmd, "toolu_rev", (SUB_X, REVIEWER));
+    sub_bash(&p, "PreToolUse", &cmd, "toolu_chk", (SUB_Y, CHECKER));
+    let out = in_parent_shell(&p, &cmd);
+    sub_bash(&p, "PostToolUse", &cmd, "toolu_rev", (SUB_X, REVIEWER));
+    sub_bash(&p, "PostToolUse", &cmd, "toolu_chk", (SUB_Y, CHECKER));
+    let said = text(&out);
+    assert!(
+        !is_closed(&p, &rev_spec),
+        "reviewer's spec closed on a tie:\n{said}"
+    );
+    assert!(
+        !is_closed(&p, &chk_spec),
+        "checker's spec closed on a tie:\n{said}"
+    );
+    assert!(
+        is_closed(&p, &parent_spec),
+        "parent's spec not closed:\n{said}"
+    );
+    assert!(
+        says_ran_as(&said, &parent),
+        "the command does not say it ran as {parent}:\n{said}"
+    );
+}
+
+/// alpha and bravo each hold a read-only Bash window open while `act` runs
+/// (a writ command by the human); then both Posts and Stops. Returns every
+/// hook run and the seal count before `act`.
+fn windows_around(p: &Project, act: &dyn Fn(&Project)) -> (Vec<HookRun>, BTreeSet<String>) {
+    // Commands that name no path, so command text (188) cannot decide.
+    let (ca, cb) = ("ls >/dev/null", "pwd >/dev/null");
+    let mut runs = bash_pre(p, ALPHA, "sess-a", ca, "toolu_206a");
+    runs.extend(bash_pre(p, BRAVO, "sess-b", cb, "toolu_206b"));
+    tick();
+    let before: BTreeSet<String> = p
+        .seals()
+        .iter()
+        .filter_map(|s| s["id"].as_str().map(str::to_string))
+        .collect();
+    act(p);
+    tick();
+    runs.extend(bash_post(p, ALPHA, "sess-a", ca, "toolu_206a"));
+    runs.extend(bash_post(p, BRAVO, "sess-b", cb, "toolu_206b"));
+    runs.extend(p.event(
+        Some(ALPHA),
+        "sess-a",
+        "Stop",
+        json!({"stop_hook_active": false}),
+    ));
+    runs.extend(p.event(
+        Some(BRAVO),
+        "sess-b",
+        "Stop",
+        json!({"stop_hook_active": false}),
+    ));
+    all_exit_zero(&runs, "206 windows");
+    (runs, before)
+}
+
+/// No hook line mentions `path`, no hook seal took it, no ambiguous record.
+fn assert_not_asked(p: &Project, runs: &[HookRun], before: &BTreeSet<String>, path: &str) {
+    for r in runs {
+        if let Some(line) = r.to_agent() {
+            assert!(!line.contains(path), "asked about writ's own write: {line}");
+        }
+    }
+    let auto_took: Vec<Value> = p
+        .seals()
+        .into_iter()
+        .filter(|s| s["id"].as_str().is_some_and(|i| !before.contains(i)))
+        .filter(|s| {
+            s["summary"].as_str().is_some_and(|x| x.starts_with("auto"))
+                && paths_of(s).contains(path)
+        })
+        .collect();
+    assert!(auto_took.is_empty(), "a hook sealed {path}: {auto_took:?}");
+    let amb: Vec<Value> = hook_records(p)
+        .into_iter()
+        .filter(|r| {
+            r.to_string().contains(path)
+                && r["outcome"].as_str().is_some_and(|o| o.contains("ambig"))
+        })
+        .collect();
+    assert!(amb.is_empty(), "ambiguous records for {path}: {amb:?}");
+}
+
+#[test]
+fn f206_finish_own_writes_are_not_asked_about() {
+    let p = Project::new("f206-finish");
+    set_check_off(&p);
+    p.spec("sa", ALPHA);
+    p.spec("sb", BRAVO);
+    p.write("shared.txt", &numbered(40, &[(2, "A")]));
+    assert!(seal_paths(&p, ALPHA, "sa", "shared.txt", &[])
+        .status
+        .success());
+    p.write("shared.txt", &numbered(40, &[(30, "B")]));
+    assert!(seal_paths(&p, BRAVO, "sb", "shared.txt", &[])
+        .status
+        .success());
+    p.ok(
+        ALPHA,
+        &["spec", "done", "sa", "--agent", ALPHA, "--no-seal"],
+    );
+    p.ok(
+        BRAVO,
+        &["spec", "done", "sb", "--agent", BRAVO, "--no-seal"],
+    );
+    let (runs, before) = windows_around(&p, &|p| {
+        let fin = p.writ("human", &["finish", "-y"]);
+        assert!(fin.status.success(), "finish: {}", text(&fin));
+    });
+    assert_eq!(
+        p.read("shared.txt"),
+        numbered(40, &[(2, "A"), (30, "B")]),
+        "fixture: finish materializes the merged file"
+    );
+    assert_not_asked(&p, &runs, &before, "shared.txt");
+}
+
+#[test]
+fn f206_restore_own_writes_are_not_asked_about() {
+    let p = Project::new("f206-restore");
+    p.spec("sa", ALPHA);
+    p.write("a.txt", &numbered(20, &[(1, "v1")]));
+    assert!(seal_paths(&p, ALPHA, "sa", "a.txt", &[]).status.success());
+    let v1 = p.newest_seal()["id"].as_str().unwrap()[..12].to_string();
+    p.write("a.txt", &numbered(20, &[(1, "v2")]));
+    assert!(seal_paths(&p, ALPHA, "sa", "a.txt", &[]).status.success());
+    let (runs, before) = windows_around(&p, &|p| {
+        let r = p.writ("human", &["restore", &v1, "--force"]);
+        assert!(r.status.success(), "restore: {}", text(&r));
+    });
+    assert_eq!(
+        p.read("a.txt"),
+        numbered(20, &[(1, "v1")]),
+        "fixture: restore wrote a.txt"
+    );
+    assert_not_asked(&p, &runs, &before, "a.txt");
+}
+
+#[test]
+fn f190_auto_spec_title_skips_agent_messages_and_system_notices() {
+    let notices = [
+        "<agent-message from=\"a2c00981dad0ab644\">\nAmis on signed-0-4-5: two questions before your assertions land.\n</agent-message>",
+        "[SYSTEM NOTIFICATION - NOT USER INPUT]\nThis is an automated background-task event, NOT a message from the user.",
+    ];
+    // (a) A real prompt, then notices: the title stays the real prompt's.
+    let p = Project::new("f190-after");
+    let prompt = |p: &Project, text: &str| {
+        let r = p.event(
+            Some(ALPHA),
+            "sess-a",
+            "UserPromptSubmit",
+            json!({"prompt": text}),
+        );
+        all_exit_zero(&r, "prompt");
+        nothing_to_agent(&r, "UserPromptSubmit");
+    };
+    prompt(&p, "Fix the parser. Then add tests.");
+    for n in notices {
+        prompt(&p, n);
+    }
+    p.write("a.txt", &numbered(20, &[(1, "A")]));
+    all_exit_zero(&p.edit(Some(ALPHA), "sess-a", "Edit", "a.txt"), "edit");
+    let spec = p.newest_seal()["spec_id"].as_str().unwrap().to_string();
+    let title = p.spec_json(&spec)["title"].as_str().unwrap().to_string();
+    assert_eq!(title.trim_end_matches('.'), "Fix the parser", "{title:?}");
+    // (b) Notices first, then the real prompt: the real one is the title.
+    let q = Project::new("f190-before");
+    for n in notices {
+        prompt(&q, n);
+    }
+    prompt(&q, "Add the login page. It needs a form.");
+    q.write("a.txt", &numbered(20, &[(1, "A")]));
+    all_exit_zero(&q.edit(Some(ALPHA), "sess-a", "Edit", "a.txt"), "edit");
+    let spec = q.newest_seal()["spec_id"].as_str().unwrap().to_string();
+    let title = q.spec_json(&spec)["title"].as_str().unwrap().to_string();
+    assert_eq!(
+        title.trim_end_matches('.'),
+        "Add the login page",
+        "{title:?}"
+    );
+    // (c) Only notices: the fallback, never a notice.
+    let r = Project::new("f190-only");
+    for n in notices {
+        prompt(&r, n);
+    }
+    r.write("a.txt", &numbered(20, &[(1, "A")]));
+    all_exit_zero(&r.edit(Some(ALPHA), "sess-a", "Edit", "a.txt"), "edit");
+    let spec = r.newest_seal()["spec_id"].as_str().unwrap().to_string();
+    let title = r.spec_json(&spec)["title"].as_str().unwrap().to_string();
+    assert!(
+        !title.contains("agent-message") && !title.contains("SYSTEM NOTIFICATION"),
+        "a notice became the title: {title:?}"
+    );
+}
+
+#[test]
+fn f190_finish_subject_uses_the_closing_summary_when_spec_done_had_one() {
+    let p = Project::new("f190-subject");
+    all_exit_zero(
+        &p.event(
+            Some(ALPHA),
+            "sess-a",
+            "UserPromptSubmit",
+            json!({"prompt": "Fix the parser. Then add tests."}),
+        ),
+        "prompt",
+    );
+    p.write("a.txt", &numbered(20, &[(1, "A")]));
+    all_exit_zero(&p.edit(Some(ALPHA), "sess-a", "Edit", "a.txt"), "edit");
+    let spec = p.newest_seal()["spec_id"].as_str().unwrap().to_string();
+    p.ok(
+        ALPHA,
+        &[
+            "spec",
+            "done",
+            &spec,
+            "-s",
+            "Rewrote the tokenizer loop. Added 12 tests.",
+            "--agent",
+            ALPHA,
+            "--no-seal",
+        ],
+    );
+    p.ok("human", &["finish", "-y"]);
+    let subject = p.git_ok(&["log", "-1", "--format=%s"]);
+    assert!(
+        subject.contains("Rewrote the tokenizer loop"),
+        "subject is not the closing summary's first sentence: {subject:?}"
+    );
+    assert!(
+        !subject.contains("Added 12 tests"),
+        "subject carries more than the first sentence: {subject:?}"
+    );
+    assert!(
+        !subject.contains("Fix the parser"),
+        "subject is still the prompt title: {subject:?}"
+    );
+    // Without a closing summary the subject follows the title (f170, live).
+    let q = Project::new("f190-subject-none");
+    all_exit_zero(
+        &q.event(
+            Some(ALPHA),
+            "sess-a",
+            "UserPromptSubmit",
+            json!({"prompt": "Fix the parser. Then add tests."}),
+        ),
+        "prompt",
+    );
+    q.write("a.txt", &numbered(20, &[(1, "A")]));
+    all_exit_zero(&q.edit(Some(ALPHA), "sess-a", "Edit", "a.txt"), "edit");
+    let spec = q.newest_seal()["spec_id"].as_str().unwrap().to_string();
+    q.ok(
+        ALPHA,
+        &["spec", "done", &spec, "--agent", ALPHA, "--no-seal"],
+    );
+    q.ok("human", &["finish", "-y"]);
+    let subject = q.git_ok(&["log", "-1", "--format=%s"]);
+    assert!(subject.contains("Fix the parser"), "{subject:?}");
+}

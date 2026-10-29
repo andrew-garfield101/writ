@@ -513,3 +513,67 @@ def test_c409_ask_lines_include_the_subagents_own_transcripts():
     assert a["records_not_attributed"] == 17
     assert a["ask_lines_shown"] == {"agent-1": 3, "agent-2": 1}
     assert a["ask_lines_shown_total"] == 4
+
+
+def _r213(pid, outcome, event="PostToolUse", tool="Bash", **kw):
+    r = {"event": event, "tool": tool, "outcome": outcome, "pid": pid,
+         "ts": f"2026-10-19T14:31:{pid % 60:02d}Z", "ms": 5}
+    r.update(kw)
+    return json.dumps(r)
+
+
+def test_r213_start_with_no_end_is_a_killed_hook():
+    """Ruling 213 (Amis's records): start opens a firing, end closes it; a
+    start with no end for its pid is a hook killed; pid reuse closes the
+    earlier firing."""
+    lines = [
+        _r213(101, "start", session="s-a", agent_id=None, agent_type=None),
+        _r213(101, "attributed"), _r213(101, "sealed"), _r213(101, "bash_window"),
+        _r213(101, "end"),
+        _r213(102, "start", agent_type="web-builder"),          # killed: nothing after
+        _r213(103, "start", event="PostToolUse", tool="Edit"),
+        _r213(103, "start", event="PostToolUse", tool="Edit"),  # pid reused: first one killed
+        _r213(103, "sealed", event="PostToolUse", tool="Edit"),
+        _r213(103, "end", event="PostToolUse", tool="Edit"),
+        _r213(104, "start", event="PreToolUse"), _r213(104, "snapshot", event="PreToolUse"),
+        _r213(104, "end", event="PreToolUse"),
+    ]
+    h = stranger.hooks_log_summary("\n".join(lines) + "\n")
+    assert (h["starts"], h["ends"]) == (5, 3)
+    assert h["killed"] == 2, h["killed_firings"]
+    assert any("web-builder" in k and "pid 102" in k for k in h["killed_firings"])
+    assert any("pid 103" in k for k in h["killed_firings"])
+    assert h["by_outcome"]["start"] == 5
+
+
+def test_r213_post_that_logged_attributed_then_was_killed_counts():
+    """The finding 213 incident: Post logged `attributed` for repo.rs, then
+    the 10 s timeout killed it before any end record."""
+    lines = [
+        _r213(201, "start"), _r213(201, "attributed", path="crates/writ-core/src/repo.rs"),
+        _r213(202, "start"), _r213(202, "attributed"), _r213(202, "end"),  # no bash_window: fine
+    ]
+    h = stranger.hooks_log_summary("\n".join(lines) + "\n")
+    assert h["killed"] == 1
+    assert "pid 201" in h["killed_firings"][0] and "last: attributed" in h["killed_firings"][0]
+
+
+def test_r213_hook_ms_counts_each_firing_once():
+    lines = [_r213(301, "start"), json.dumps({"event": "PostToolUse", "outcome": "sealed",
+                                              "pid": 301, "ms": 40}),
+             json.dumps({"event": "PostToolUse", "outcome": "end", "pid": 301, "ms": 41})]
+    h = stranger.hooks_log_summary("\n".join(lines) + "\n")
+    assert h["hook_ms"]["p50"] == 40.0 and h["killed"] == 0
+
+
+def test_r213_starts_without_any_end_record_cannot_tell():
+    lines = [_r213(401, "start"), _r213(401, "sealed")]
+    h = stranger.hooks_log_summary("\n".join(lines) + "\n")
+    assert h["killed"] is None and h["starts"] == 1
+
+
+def test_r213_logs_before_045_have_no_starts_and_nothing_killed():
+    lines = [json.dumps({"event": "PostToolUse", "tool": "Edit", "outcome": "sealed", "ms": 9})]
+    h = stranger.hooks_log_summary("\n".join(lines) + "\n")
+    assert (h["starts"], h["killed"]) == (0, 0)
+    assert h["hook_ms"]["p50"] == 9.0

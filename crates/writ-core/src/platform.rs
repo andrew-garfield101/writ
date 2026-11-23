@@ -248,6 +248,50 @@ mod unix_impl {
     }
 }
 
+/// Finding 215: whether a watch is running here, read only (a stale PID
+/// file is left for `writ watch` to clean). Doctor's watch line uses it.
+pub fn watch_running(writ_dir: &Path) -> bool {
+    read_pid_file(writ_dir)
+        .ok()
+        .flatten()
+        .is_some_and(is_process_alive)
+}
+
+/// Finding 215: a foreground `writ watch` records its pid in the same file
+/// the daemon uses, so doctor (and `writ watch --status`) can see it. The
+/// guard removes the file on exit only while it still holds this pid.
+#[derive(Debug)]
+pub struct WatchPidGuard {
+    writ_dir: std::path::PathBuf,
+    pid: u32,
+}
+
+impl WatchPidGuard {
+    /// Record this process unless another live watch already holds the
+    /// file (`None` then; that watch's record is left alone).
+    pub fn claim(writ_dir: &Path) -> WritResult<Option<Self>> {
+        let pid = std::process::id();
+        if let Ok(Some(other)) = read_pid_file(writ_dir) {
+            if other != pid && is_process_alive(other) {
+                return Ok(None);
+            }
+        }
+        write_pid_file(writ_dir, pid)?;
+        Ok(Some(Self {
+            writ_dir: writ_dir.to_path_buf(),
+            pid,
+        }))
+    }
+}
+
+impl Drop for WatchPidGuard {
+    fn drop(&mut self) {
+        if matches!(read_pid_file(&self.writ_dir), Ok(Some(p)) if p == self.pid) {
+            let _ = remove_pid_file(&self.writ_dir);
+        }
+    }
+}
+
 #[cfg(unix)]
 pub use unix_impl::{
     daemonize, detect_resource_limits as detect_resource_limits_impl, is_process_alive, send_signal,
@@ -546,6 +590,34 @@ mod tests {
         // Remove it.
         remove_pid_file(writ_dir).unwrap();
         assert!(read_pid_file(writ_dir).unwrap().is_none());
+    }
+
+    /// Finding 215: a foreground watch records its pid and removes it on
+    /// exit; a live other watch's record is never taken or removed.
+    #[cfg(unix)]
+    #[test]
+    fn f215_foreground_watch_pid_guard() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = dir.path();
+        assert!(!watch_running(w));
+        {
+            let g = WatchPidGuard::claim(w).unwrap();
+            assert!(g.is_some());
+            assert_eq!(read_pid_file(w).unwrap(), Some(std::process::id()));
+            assert!(watch_running(w));
+        }
+        assert!(read_pid_file(w).unwrap().is_none(), "removed on drop");
+        // A stale record is taken over.
+        write_pid_file(w, 99_999_999).unwrap();
+        assert!(!watch_running(w));
+        drop(WatchPidGuard::claim(w).unwrap().unwrap());
+        assert!(read_pid_file(w).unwrap().is_none());
+        // Another live watch (the test runner's parent, ours to signal)
+        // keeps its record.
+        let other = std::os::unix::process::parent_id();
+        write_pid_file(w, other).unwrap();
+        assert!(WatchPidGuard::claim(w).unwrap().is_none());
+        assert_eq!(read_pid_file(w).unwrap(), Some(other));
     }
 
     #[test]

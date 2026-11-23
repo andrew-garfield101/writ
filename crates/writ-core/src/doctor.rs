@@ -40,6 +40,9 @@ pub const CHECK_VERSION_SKEW: &str = "version_skew";
 /// Files genuinely uncommitted and unsealed that finish would leave out
 /// (finding 75).
 pub const CHECK_LEFT_OUT: &str = "left_out";
+/// Ruling 213 (0.4.6): a hook firing that wrote its `start` record and no
+/// `end` since the last finish: Claude Code killed it at its timeout.
+pub const CHECK_HOOK_KILLED: &str = "hook_killed";
 
 /// Ruling 183: the test-fixture switch `[seal] foreign_line_check = false`
 /// is set (a needs-human yellow; not in [`CHECK_IDS`], which lists the six
@@ -50,13 +53,14 @@ pub const CHECK_SEAL_CHECK_DISABLED: &str = "seal_check_disabled";
 pub const SEAL_CHECK_DISABLED_PHRASE: &str = "foreign-line check on seal is disabled in config";
 
 /// Every check id, in the order the fast tier runs them.
-pub const CHECK_IDS: [&str; 6] = [
+pub const CHECK_IDS: [&str; 7] = [
     CHECK_STORE_INTEGRITY,
     CHECK_STALE_CLAIM,
     CHECK_COMMITTED_SPEC_SEAL,
     CHECK_UNSEALED_AT_RISK,
     CHECK_VERSION_SKEW,
     CHECK_LEFT_OUT,
+    CHECK_HOOK_KILLED,
 ];
 
 /// The fast-tier part of the headline on a repository with no findings.
@@ -269,6 +273,10 @@ pub struct DoctorReport {
     /// `clean` or "safe to finish".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub survival_info: Vec<String>,
+    /// Fast tier info lines (finding 215): not findings, never affect
+    /// `clean`, the exit code or "safe to finish".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub info: Vec<String>,
     /// Check ids that ran, in order.
     pub checks_run: Vec<String>,
     pub findings: Vec<DoctorFinding>,
@@ -306,6 +314,7 @@ impl DoctorReport {
             survival_last_green: None,
             survival: crate::convergence::survival::SurvivalState::NotRun.note(),
             survival_info: Vec::new(),
+            info: Vec::new(),
             checks_run,
             clean: findings.is_empty(),
             findings,
@@ -577,12 +586,16 @@ pub fn run(repo: &Repository) -> WritResult<DoctorReport> {
     findings.extend(check_left_out(repo.root(), &specs, &ctx, &claimed, &actor));
     done(CHECK_LEFT_OUT, &mut checks_run, &mut lap);
 
+    findings.extend(check_hook_killed(repo.writ_dir(), &specs));
+    done(CHECK_HOOK_KILLED, &mut checks_run, &mut lap);
+
     mark_live_claims(repo.writ_dir(), &mut findings, &specs, &ctx, &actor);
     // Finding 169: ambiguous Bash writes are for their candidates only.
     crate::auto_seal::address_ambiguous(repo.writ_dir(), &mut findings);
 
     let mut report = DoctorReport::from_findings(findings, checks_run, started);
     report.check_ms = check_ms;
+    report.info.extend(watch_line(repo.writ_dir(), &specs));
     apply_survival_state(repo, &mut report);
     report.next_action = next_action(&report.findings, &specs);
     Ok(report)
@@ -1651,6 +1664,115 @@ fn git_head_blobs(root: &Path) -> Option<impl Fn(&str) -> Option<git2::Oid>> {
 }
 
 // ---------------------------------------------------------------------------
+// Info: watch is not running (finding 215)
+// ---------------------------------------------------------------------------
+
+/// Finding 215 (the tip `writ init` used to print): one info line when no
+/// watch runs here and more than one identity holds a claim on an open spec
+/// whose holder process is alive (the `stale_claim` verdict, so `ps` runs
+/// only when two holders could be judged). Never a finding: watch is
+/// optional, the hook seals and finish converges without it.
+fn watch_line(writ_dir: &Path, specs: &[crate::spec::Spec]) -> Option<String> {
+    let mut holders: Vec<&str> = specs
+        .iter()
+        .filter(|s| spec_is_open(s) && s.claimed_pid.is_some())
+        .filter_map(|s| s.claimed_by.as_deref())
+        .collect();
+    holders.sort_unstable();
+    holders.dedup();
+    if holders.len() < 2 || crate::platform::watch_running(writ_dir) {
+        return None;
+    }
+    let mut live: Vec<&str> = specs
+        .iter()
+        .filter(|s| spec_is_open(s) && s.claimed_pid.is_some())
+        .filter(|s| matches!(stale_verdict_here(writ_dir, s), StaleVerdict::Alive(_)))
+        .filter_map(|s| s.claimed_by.as_deref())
+        .collect();
+    live.sort_unstable();
+    live.dedup();
+    (live.len() > 1).then(|| {
+        format!(
+            "writ watch is not running while {} identities hold live claims here ({}); \
+             `writ watch` converges their overlapping seals as they land; `writ finish` \
+             converges without it",
+            live.len(),
+            live.join(", ")
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Check 7: a hook killed before it finished (ruling 213)
+// ---------------------------------------------------------------------------
+
+/// Killed firings since the last finish, one finding each (the kit's rule,
+/// see [`crate::hook_log`]). Ruling 213 (CC): the fix is the seal that never
+/// happened, `writ seal --paths <paths> --auto --agent <identity>` (the ask
+/// line shape), for that agent only: it seals the paths or refuses with the
+/// reason the agent never saw. A firing that named no path (a killed Stop
+/// sweep) has nothing to paste. The finding clears at the next finish.
+fn check_hook_killed(writ_dir: &Path, specs: &[crate::spec::Spec]) -> Vec<DoctorFinding> {
+    let after = crate::receipt::last_finish(specs);
+    let Some(killed) =
+        crate::hook_log::killed_firings_in(writ_dir, after, crate::platform::is_process_alive)
+    else {
+        return Vec::new();
+    };
+    killed.into_iter().map(killed_hook_finding).collect()
+}
+
+fn killed_hook_finding(k: crate::hook_log::KilledFiring) -> DoctorFinding {
+    let tool = k
+        .tool
+        .as_deref()
+        .map(|t| format!(" {t}"))
+        .unwrap_or_default();
+    let head = format!(
+        "hook killed before it finished: {}{tool} for {} at {}",
+        k.event, k.identity, k.ts
+    );
+    let tail = format!("(pid {}, last record '{}')", k.pid, k.last_outcome);
+    if k.paths.is_empty() || !k.identity_is_writ {
+        let why = if k.paths.is_empty() {
+            "it named no path"
+        } else {
+            "its records name no writ identity"
+        };
+        return DoctorFinding::new(
+            CHECK_HOOK_KILLED,
+            Severity::Yellow,
+            format!(
+                "{head} {tail}; {why}, so there is no seal to paste: \
+                 `writ status` shows any edit left pending; this clears at the next `writ finish`"
+            ),
+            "",
+            k.paths,
+        );
+    }
+    let fix = format!(
+        "writ seal --paths {} --auto --agent {}",
+        shell_quote(&k.paths.join(",")),
+        shell_quote(&k.identity)
+    );
+    let mut f = DoctorFinding::new(
+        CHECK_HOOK_KILLED,
+        Severity::Yellow,
+        format!(
+            "{head} on {} {tail}; the seal it was making never happened; the fix is for '{}' \
+             only: it seals the paths, or refuses with the reason '{}' never saw",
+            k.paths.join(", "),
+            k.identity,
+            k.identity
+        ),
+        fix,
+        k.paths,
+    );
+    f.anyone_may_fix = false;
+    f
+}
+
+// ---------------------------------------------------------------------------
 // Check 5: version skew
 // ---------------------------------------------------------------------------
 
@@ -2309,7 +2431,7 @@ mod tests {
         let mut ids = CHECK_IDS.to_vec();
         ids.sort();
         ids.dedup();
-        assert_eq!(ids.len(), 6);
+        assert_eq!(ids.len(), 7);
         assert_eq!(
             CHECK_IDS,
             [
@@ -2318,7 +2440,8 @@ mod tests {
                 "committed_spec_seal",
                 "unsealed_at_risk",
                 "version_skew",
-                "left_out"
+                "left_out",
+                "hook_killed"
             ]
         );
     }

@@ -21,6 +21,7 @@ CHECK_IDS = {
     "unsealed_at_risk",
     "version_skew",
     "left_out",
+    "hook_killed",
 }
 FINDING_KEYS = {
     "check",

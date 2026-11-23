@@ -36,6 +36,8 @@ pub fn cmd_watch_foreground(
     log_file: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let repo = writ_core::Repository::open_from_dir(cwd)?;
+    // Finding 215: doctor reads this pid to say whether watch is running.
+    let _pid_guard = platform::WatchPidGuard::claim(repo.writ_dir())?;
 
     // Build core watch config with all resolved values.
     let core_config = CoreWatchConfig {

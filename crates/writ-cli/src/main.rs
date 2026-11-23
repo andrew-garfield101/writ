@@ -2641,11 +2641,6 @@ fn cmd_init(
                         "→".green()
                     );
                 }
-                println!(
-                    "  {} Tip: run {} to monitor agent activity when multiple agents work in the same directory",
-                    "→".green(),
-                    "writ watch".bold()
-                );
             }
             if plan.enable_codex {
                 println!("{} Codex / OpenAI integration configured", "✓".green());
@@ -2980,10 +2975,6 @@ fn cmd_plan(
             println!(
                 "  Next: launch your agents. They discover specs via {}.",
                 "writ context".cyan()
-            );
-            println!(
-                "  Run {} to monitor agent activity in real time.",
-                "writ watch".cyan()
             );
         }
     }
@@ -10330,7 +10321,7 @@ fn append_watch_config_comment(config_path: &std::path::Path) {
     let watch_comment = r#"
 
 # Watch daemon configuration (uncomment to customize)
-# Run `writ watch` to monitor agent activity in real time.
+# `writ doctor` says when watch is not running and more than one agent holds a live claim.
 # [watch]
 # interval = 5              # seconds between polls (min: 1)
 # auto_converge = true       # auto-converge overlapping seals
@@ -10964,6 +10955,10 @@ fn print_doctor_human(report: &writ_core::doctor::DoctorReport) {
     for note in &report.survival_info {
         println!();
         println!("  [{}] survival: {note}", "info".cyan());
+    }
+    for note in &report.info {
+        println!();
+        println!("  [{}] watch: {note}", "info".cyan());
     }
     if !report.next_action.is_empty() {
         println!();

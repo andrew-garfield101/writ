@@ -27,6 +27,7 @@ pub mod gc;
 pub mod git_ops;
 pub mod handoff;
 pub mod hash;
+pub mod hook_log;
 pub mod hooks;
 pub mod ignore;
 pub mod index;

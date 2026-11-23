@@ -13,6 +13,7 @@ Tests will be extended when enhanced finish with per-spec/grouped
 strategies lands (W.6, W.8).
 """
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -57,6 +58,28 @@ def run_git(args: list, cwd: str, check: bool = True) -> subprocess.CompletedPro
         cwd=cwd,
         check=check,
     )
+
+
+def _finish_diagnostics(path: Path, finish_output: str) -> str:
+    """State to print when a finish assertion fails (finding 218).
+
+    218 failed once in CI with no output to tell which spec lost its work;
+    this names the finish output, every spec record (status, sealed_by) and
+    the writ index, so the next failure says where the file dropped out.
+    """
+    writ_dir = path / ".writ"
+    lines = ["--- finish output ---", finish_output, "--- specs ---"]
+    for spec_file in sorted((writ_dir / "specs").glob("*.json")):
+        lines.append(f"{spec_file.name}: {spec_file.read_text()}")
+    lines.append("--- writ index ---")
+    for index_file in sorted((writ_dir / "workspaces").glob("*/index.json")):
+        # The framework files `writ init` writes are left out: noise here.
+        entries = json.loads(index_file.read_text()).get("entries", {})
+        kept = {k: v for k, v in entries.items() if not k.startswith(".claude/")}
+        lines.append(f"{index_file}: {json.dumps(kept, indent=1)}")
+    lines.append("--- git log --stat ---")
+    lines.append(run_git(["log", "--stat", "-n", "3"], str(path), check=False).stdout)
+    return "\n".join(lines)
 
 
 @pytest.fixture
@@ -163,9 +186,10 @@ class TestParallelSpecsSingleCommit:
 
         log = run_git(["diff", "--name-only", "HEAD~1..HEAD"], str(path))
         files = log.stdout.strip().split("\n")
-        assert "models.py" in files
-        assert "routes.py" in files
-        assert "test_models.py" in files
+        diagnostics = _finish_diagnostics(path, result.stdout + result.stderr)
+        assert "models.py" in files, diagnostics
+        assert "routes.py" in files, diagnostics
+        assert "test_models.py" in files, diagnostics
 
 
 # ---------------------------------------------------------------------------

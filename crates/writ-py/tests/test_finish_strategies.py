@@ -8,6 +8,7 @@ Tests the enhanced finish flow via Python bindings:
 Bindings tested: finish, spec_done, get_spec, seal, context
 """
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -61,6 +62,28 @@ def git_writ_repo(tmp_path):
     return tmp_path
 
 
+def _finish_diagnostics(path: Path, finish_output: str) -> str:
+    """State to print when a finish assertion fails (finding 218).
+
+    218 failed once in CI with no output to tell which spec lost its work;
+    this names the finish output, every spec record (status, sealed_by) and
+    the writ index, so the next failure says where the file dropped out.
+    """
+    writ_dir = path / ".writ"
+    lines = ["--- finish output ---", finish_output, "--- specs ---"]
+    for spec_file in sorted((writ_dir / "specs").glob("*.json")):
+        lines.append(f"{spec_file.name}: {spec_file.read_text()}")
+    lines.append("--- writ index ---")
+    for index_file in sorted((writ_dir / "workspaces").glob("*/index.json")):
+        # The framework files `writ init` writes are left out: noise here.
+        entries = json.loads(index_file.read_text()).get("entries", {})
+        kept = {k: v for k, v in entries.items() if not k.startswith(".claude/")}
+        lines.append(f"{index_file}: {json.dumps(kept, indent=1)}")
+    lines.append("--- git log --stat ---")
+    lines.append(run_git(["log", "--stat", "-n", "3"], str(path), check=False).stdout)
+    return "\n".join(lines)
+
+
 def _setup_two_complete_specs(path, repo):
     """Helper: create 2 specs, seal work, mark done."""
     repo.add_spec(id="auth", title="Auth")
@@ -103,9 +126,10 @@ class TestPerSpecStrategy:
         _setup_two_complete_specs(path, repo)
 
         result = repo.finish(strategy="per-spec")
+        diagnostics = _finish_diagnostics(path, repr(result))
         assert result["strategy"] == "per-spec"
-        assert result["specs_finished"] == 2
-        assert len(result["commits"]) == 2
+        assert result["specs_finished"] == 2, diagnostics
+        assert len(result["commits"]) == 2, diagnostics
 
         # Each commit should reference its spec
         spec_ids = {c["specs"][0] for c in result["commits"]}

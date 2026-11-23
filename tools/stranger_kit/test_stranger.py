@@ -577,3 +577,65 @@ def test_r213_logs_before_045_have_no_starts_and_nothing_killed():
     h = stranger.hooks_log_summary("\n".join(lines) + "\n")
     assert (h["starts"], h["killed"]) == (0, 0)
     assert h["hook_ms"]["p50"] == 9.0
+
+
+# Kit double count (sprint 9 item 7). Claude Code 2.1.302+ writes each API
+# request body into the transcript as `api-request-blob` records (no
+# timestamp) that replay earlier tool calls; they are not events.
+def _blob(content, role="assistant"):
+    return {"type": "api-request-blob", "agentId": "a1b2c3d4e5f6a7b8c", "hash": "ab" * 32,
+            "sessionId": "s", "message": {"role": role, "content": content}}
+
+
+def test_request_blob_replay_is_not_a_second_edit(tmp_path):
+    t = _transcript(tmp_path, [_ev("assistant", [{"type": "tool_use", "id": "toolu_agent",
+                                                  "name": "Agent", "input": {}}],
+                                   "2026-10-19T18:44:00Z")])
+    d = tmp_path / "agent-1.subagents"
+    d.mkdir()
+    write = {"type": "tool_use", "id": "toolu_w", "name": "Write",
+             "input": {"file_path": "/r/auth.py", "content": "x"}}
+    bash = {"type": "tool_use", "id": "toolu_b", "name": "Bash", "input": {"command": "writ context"}}
+    (d / "agent-a1b2c3d4e5f6a7b8c.jsonl").write_text("\n".join(json.dumps(e) for e in [
+        {**_ev("assistant", [write, bash], "2026-10-19T18:44:05.138Z"), "agentId": "a1b2c3d4e5f6a7b8c"},
+        _blob([write, bash]),
+        _blob([{"type": "tool_result", "tool_use_id": "toolu_w", "content": "ok"}], role="user"),
+    ]) + "\n")
+    i = stranger.analyze_agent(t)
+    sa = i["subagents"][0]
+    assert [(e["tool"], e["at"]) for e in i["edits"]] == [("Write", "2026-10-19T18:44:05.138Z")]
+    assert sa["tools_subagent_own"] == {"Write": 1, "Bash": 1}
+    assert sa["hand_writ_commands"] == ["writ context"]
+    seals = [{"timestamp": "2026-10-19T18:44:05.200Z", "changes": [{"path": "auth.py"}]}]
+    w = stranger.unsealed_window(i["edits"], seals, "/r")
+    assert (w["edits"], w["sealed"], w["never_sealed"]) == (1, 1, 0)
+
+
+def test_edit_carried_by_two_records_with_one_id_counts_once():
+    call = {"type": "tool_use", "id": "toolu_e", "name": "Edit", "input": {"file_path": "/r/a.py"}}
+    evs = [_ev("assistant", [call], "2026-10-19T18:44:05Z"), _ev("assistant", [call], None)]
+    assert len(stranger.edits_of(evs)) == 1
+
+
+def test_events_drop_request_blobs_and_keep_everything_else(tmp_path):
+    t = _transcript(tmp_path, [_ev("assistant", [], "2026-10-19T18:44:05Z"), _blob([]),
+                               {"type": "attachment", "timestamp": "2026-10-19T18:44:06Z"}])
+    assert [e["type"] for e in stranger.events(t)] == ["assistant", "attachment"]
+
+
+FLEET_F7 = EVIDENCE / "0.4.5-fleet-live-freeze7"
+
+
+@pytest.mark.skipif(not (FLEET_F7 / "seals.json").exists(), reason="freeze 7 fleet evidence not present")
+def test_fleet_freeze7_web_builder_edits_are_4_and_all_sealed():
+    """Sprint 8 run C reported 4/8 edits sealed, 4 never; hooks.log shows the
+    four edit-tool calls of web-builder-a5aaa142 sealed within 65 ms."""
+    i = stranger.analyze_agent(FLEET_F7 / "agent-1.jsonl")
+    assert [(e["tool"], e["path"].rsplit("/proj/", 1)[1]) for e in i["edits"]] == [
+        ("Write", "auth.py"), ("Write", "tests/test_auth.py"),
+        ("Edit", "tests/test_auth.py"), ("Edit", "tests/test_auth.py")]
+    assert all(e["at"] for e in i["edits"])
+    kit = json.loads((FLEET_F7 / "kit.json").read_text())
+    seals = json.loads((FLEET_F7 / "seals.json").read_text())
+    w = stranger.unsealed_window(i["edits"], seals, kit["project"])
+    assert (w["edits"], w["sealed"], w["never_sealed"]) == (4, 4, 0)

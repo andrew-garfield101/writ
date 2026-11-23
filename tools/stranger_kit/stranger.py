@@ -375,15 +375,29 @@ def cmd_collect(project: Path, out: Path, no_finish: bool) -> None:
 # Transcript analysis (pure: reads OUT only)
 # ---------------------------------------------------------------------------
 
+# Claude Code 2.1.302 and later (not 2.1.290; every saved run since 0.4.3
+# run B on freeze 4) also writes the body of each API request into the
+# on-disk transcripts, chunked and content addressed, as `api-request-blob` records with no timestamp. They
+# replay messages already in the transcript, so each tool call, tool result
+# and hook line appears twice: once in its own record, once in a blob. Read
+# as events they double counted every subagent edit-tool call, and the copy
+# had no timestamp, so it was reported "never sealed" (sprint 8 run C, 4/8).
+REPLAY_RECORD_TYPES = ("api-request-blob",)
+
+
 def events(transcript: Path) -> list[dict]:
+    """The transcript's events, without request replays (REPLAY_RECORD_TYPES)."""
     out = []
     if not transcript.exists():
         return out
     for line in transcript.read_text(errors="replace").splitlines():
         try:
-            out.append(json.loads(line))
+            ev = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if isinstance(ev, dict) and ev.get("type") in REPLAY_RECORD_TYPES:
+            continue
+        out.append(ev)
     return out
 
 
@@ -471,10 +485,14 @@ def strings(obj) -> list[str]:
 def edits_of(evs: list[dict]) -> list[dict]:
     """Every edit-tool call, main or subagent (stream-json carries subagent
     events with parent_tool_use_id set), with its path and time."""
-    out = []
+    out, seen = [], set()
     for ev in evs:
         for b in (ev.get("message") or {}).get("content") or []:
             if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("name") in EDIT_TOOLS:
+                # One call, one edit, however many records carry it.
+                if b.get("id") is not None and b["id"] in seen:
+                    continue
+                seen.add(b.get("id"))
                 inp = b.get("input") or {}
                 path = inp.get("file_path") or inp.get("notebook_path")
                 if path:

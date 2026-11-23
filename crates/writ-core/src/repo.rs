@@ -1524,12 +1524,19 @@ impl Repository {
 
         seal.secure(signing_key.as_ref());
 
+        // Finding 218: read the spec record before the seal is durable; a
+        // record that cannot be read refuses the seal with nothing written.
+        let spec_rec = match spec_id.as_deref() {
+            Some(sid) => self.spec_for_seal(sid)?,
+            None => None,
+        };
+
         self.save_seal(&seal)?;
         atomic_write(&self.workspace_dir().join("HEAD"), seal.id.as_bytes())?;
         index.save(&self.workspace_dir().join("index.json"))?;
 
         if let Some(ref sid) = spec_id {
-            self.record_seal_on_spec(sid, &seal)?;
+            self.record_seal_on_spec(sid, spec_rec, &seal)?;
         }
         Ok(seal)
     }
@@ -2546,9 +2553,42 @@ impl Repository {
 
     /// Update the spec after a seal: head, `sealed_by`, activity, auto-claim
     /// on first seal, and status promotion.
-    fn record_seal_on_spec(&self, spec_id: &str, seal: &Seal) -> WritResult<()> {
+    /// Finding 218: the spec record a seal will be recorded on, read before
+    /// the seal is written. `None` only when no spec of that id exists (a
+    /// seal may name a spec id nobody added; it has a head, no record). Any
+    /// other failure (unreadable or unparseable file) refuses the seal.
+    fn spec_for_seal(&self, spec_id: &str) -> WritResult<Option<Spec>> {
+        #[cfg(test)]
+        if tests::f218_fail_load_spec_once() {
+            return Err(WritError::SpecUnreadable {
+                spec_id: spec_id.to_string(),
+                detail: "injected read failure (test)".into(),
+            });
+        }
+        match self.load_spec(spec_id) {
+            Ok(spec) => Ok(Some(spec)),
+            Err(WritError::SpecNotFound(_)) => Ok(None),
+            Err(e) => Err(WritError::SpecUnreadable {
+                spec_id: spec_id.to_string(),
+                detail: format!(
+                    "{}: {e}",
+                    self.writ_dir
+                        .join("specs")
+                        .join(format!("{spec_id}.json"))
+                        .display()
+                ),
+            }),
+        }
+    }
+
+    fn record_seal_on_spec(
+        &self,
+        spec_id: &str,
+        spec: Option<Spec>,
+        seal: &Seal,
+    ) -> WritResult<()> {
         self.write_spec_head(spec_id, &seal.id)?;
-        if let Ok(mut spec) = self.load_spec(spec_id) {
+        if let Some(mut spec) = spec {
             spec.sealed_by.push(seal.id.clone());
             let now = chrono::Utc::now();
             spec.updated_at = now;
@@ -13145,6 +13185,110 @@ mod tests {
     use crate::seal::AgentType;
     use crate::spec::{LifecycleState, SpecStatus};
     use tempfile::tempdir;
+
+    thread_local! {
+        static F218_FAIL_LOAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Finding 218 fault injection: true once after `f218_inject`.
+    pub(super) fn f218_fail_load_spec_once() -> bool {
+        F218_FAIL_LOAD.with(|c| c.replace(false))
+    }
+
+    fn f218_inject() {
+        F218_FAIL_LOAD.with(|c| c.set(true));
+    }
+
+    /// Finding 218 (Bri's CI shape): the spec record cannot be read while a
+    /// seal records itself on it. Before: the seal landed, the spec stayed
+    /// pending with no `sealed_by`, and finish left the file out. Now the
+    /// seal is refused with nothing written and the spec unchanged.
+    #[test]
+    fn f218_unreadable_spec_record_refuses_the_seal_and_writes_nothing() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new(
+            "models".into(),
+            "Data Models".into(),
+            String::new(),
+        ))
+        .unwrap();
+        let spec_file = repo.writ_dir().join("specs").join("models.json");
+        let before = fs::read(&spec_file).unwrap();
+        fs::write(dir.path().join("models.py"), "class User:\n    name: str\n").unwrap();
+        let agent = AgentIdentity {
+            id: "model-agent".into(),
+            agent_type: AgentType::Agent,
+        };
+
+        f218_inject();
+        let err = repo
+            .seal(
+                agent.clone(),
+                "added User model".into(),
+                Some("models".into()),
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, WritError::SpecUnreadable { spec_id, .. } if spec_id == "models"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("nothing was written"), "{err}");
+        assert_eq!(fs::read(&spec_file).unwrap(), before, "spec unchanged");
+        assert!(repo.log_all().unwrap().is_empty(), "no seal landed");
+        assert!(repo
+            .state()
+            .unwrap()
+            .changes
+            .iter()
+            .any(|c| c.path == "models.py"));
+
+        // The retry the message asks for lands the seal and its record.
+        let seal = repo
+            .seal(
+                agent,
+                "added User model".into(),
+                Some("models".into()),
+                TaskStatus::Complete,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        let spec = repo.load_spec("models").unwrap();
+        assert_eq!(spec.sealed_by, vec![seal.id]);
+    }
+
+    /// A spec file that exists but does not parse refuses the seal too
+    /// (no injection: the real error path).
+    #[test]
+    fn f218_corrupt_spec_record_refuses_the_seal() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("s".into(), "s".into(), String::new()))
+            .unwrap();
+        let spec_file = repo.writ_dir().join("specs").join("s.json");
+        fs::write(&spec_file, "{\"id\": \"s\", \"tit").unwrap();
+        fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        let err = repo
+            .seal(
+                test_agent(),
+                "x".into(),
+                Some("s".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("spec 's'") && text.contains("s.json"),
+            "{text}"
+        );
+        assert!(repo.log_all().unwrap().is_empty());
+    }
 
     #[test]
     fn test_verify_all_chains_lists_missing_tree_blob_with_path() {

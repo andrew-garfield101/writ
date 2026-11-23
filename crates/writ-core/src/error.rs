@@ -91,6 +91,10 @@ pub enum WritError {
     SealAlreadyExists(String),
     /// Spec has no seals — cannot converge.
     SpecHasNoSeals(String),
+    /// Finding 218: a seal names a spec whose record cannot be read, so
+    /// the seal is refused before anything is written (a seal never lands
+    /// without its spec record).
+    SpecUnreadable { spec_id: String, detail: String },
     /// Convergence has unresolved conflicts.
     UnresolvedConflicts(usize),
     /// Could not acquire the repository lock within the timeout.
@@ -360,6 +364,12 @@ impl fmt::Display for WritError {
             WritError::SealAlreadyExists(id) => {
                 write!(f, "seal '{id}' already exists (immutable)")
             }
+            WritError::SpecUnreadable { spec_id, detail } => write!(
+                f,
+                "seal refused: the record of spec '{spec_id}' could not be read ({detail}); \
+                 nothing was written, because a seal never lands without its spec record. \
+                 Run the same command again; if it fails again, run `writ doctor`"
+            ),
             WritError::SpecHasNoSeals(id) => write!(
                 f,
                 "spec '{id}' has no seals — seal some work first with `writ seal --spec {id}`"

@@ -98,7 +98,9 @@ chk "6 closing words verbatim for sa and sb; sc reads 'no summary from the agent
 chk "7 shared.txt resolved 'accepted after being told' naming alpha; two.txt kept" \
     'grep -F shared.txt "$D/body.txt" | grep -F "accepted after being told" | grep -qF alpha && grep -F two.txt "$D/body.txt" | grep -qF kept'
 chk "8 the refusal during the range is listed (shared.txt)" 'grep -iE "refus" "$D/body.txt" | grep -qF shared.txt'
-SURV="$(grep -oE '[0-9,]+ sealed line\(s\) of [0-9]+ spec\(s\) checked, none lost' "$D/finish.out" | head -1)"
+# Finding 221 (0.4.6): "N of M added line(s) of S spec(s) checked, none lost[; why the rest
+# were not counted]"; the 0.4.5 form "N sealed line(s) of ..." still matches.
+SURV="$(grep -oE '([0-9,]+ sealed line\(s\)|[0-9,]+ of [0-9,]+ added line\(s\)) of [0-9]+ spec\(s\) checked, none lost[^(]*' "$D/finish.out" | head -1 | sed 's/ *$//')"
 chk "9 survival line equals the finish's ('$SURV') and finish_audit says 0 lost" \
     '[ -n "$SURV" ] && grep -qF "$SURV" "$D/body.txt" && grep -q "LOST: 0" "$D/audit.txt"'
 chk "10 deterministic: two handoff receipts are identical" '[ -s "$D/h1.txt" ] && cmp -s "$D/h1.txt" "$D/h2.txt"'

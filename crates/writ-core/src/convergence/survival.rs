@@ -1448,6 +1448,10 @@ pub struct FileSurvival {
     /// already had before the spec): they say nothing about survival.
     #[serde(default)]
     pub skipped: usize,
+    /// Finding 221: the non-blank skipped lines by where they were first
+    /// sealed: a spec id, or "" for text the file held before the spec.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub earlier: std::collections::BTreeMap<String, usize>,
     pub lost: Vec<LostLine>,
     pub superseded: Vec<SupersededLine>,
     /// Own lines an own override replaced with another spec's content.
@@ -2127,8 +2131,7 @@ fn audit_with(
         .collect();
 
     // Phase 3, per spec and path: the audit.
-    let mut histories: HashMap<&str, HashMap<String, chrono::DateTime<chrono::Utc>>> =
-        HashMap::new();
+    let mut histories: HashMap<&str, LineHistory> = HashMap::new();
     let mut specs = Vec::with_capacity(preps.len());
     for prep in &preps {
         let Prep {
@@ -2179,6 +2182,7 @@ fn audit_with(
                     status,
                     checked: 0,
                     skipped: 0,
+                    earlier: Default::default(),
                     lost: Vec::new(),
                     superseded: Vec::new(),
                     captured: Vec::new(),
@@ -2236,22 +2240,30 @@ fn audit_with(
 /// When each line first appeared in any sealed version of a path (in a
 /// seal's recorded base or its result), from all its events. Built once
 /// per path per audit.
-fn line_history(events: &[PathEvent<'_>]) -> HashMap<String, chrono::DateTime<chrono::Utc>> {
-    let mut out: HashMap<String, chrono::DateTime<chrono::Utc>> = HashMap::new();
+/// Each line text's first appearance on the path: when, and (finding 221)
+/// the spec whose seal first held it in its sealed version (None when it
+/// first appears as a seal's recorded base, i.e. before writ sealed it).
+type LineHistory = HashMap<String, (chrono::DateTime<chrono::Utc>, Option<std::rc::Rc<str>>)>;
+
+fn line_history(events: &[PathEvent<'_>]) -> LineHistory {
+    let mut out: LineHistory = HashMap::new();
     let mut seen_texts: HashSet<*const u8> = HashSet::new();
     for e in events {
         let t = e.seal.timestamp;
-        for text in [e.old.as_deref(), Some(&*e.new)].into_iter().flatten() {
+        let spec: Option<std::rc::Rc<str>> = e.seal.spec_id.as_deref().map(std::rc::Rc::from);
+        let texts = [(e.old.as_deref(), None), (Some(&*e.new), spec)];
+        for (text, by) in texts {
+            let Some(text) = text else { continue };
             // Consecutive events share blobs; read each text once.
             if !seen_texts.insert(text.as_ptr()) {
                 continue;
             }
             for l in text.lines() {
                 match out.get_mut(l) {
-                    Some(first) if *first <= t => {}
-                    Some(first) => *first = t,
+                    Some((first, _)) if *first <= t => {}
+                    Some(slot) => *slot = (t, by.clone()),
                     None => {
-                        out.insert(l.to_string(), t);
+                        out.insert(l.to_string(), (t, by.clone()));
                     }
                 }
             }
@@ -2333,7 +2345,7 @@ fn audit_file(
     v: &OwnVersion,
     events: &[PathEvent<'_>],
     shared: &PathShared<'_>,
-    history: &HashMap<String, chrono::DateTime<chrono::Utc>>,
+    history: &LineHistory,
     target: Option<&str>,
     committed: &HashSet<String>,
     parents: &HashMap<&str, Option<&str>>,
@@ -2354,6 +2366,7 @@ fn audit_file(
         status: FileAuditStatus::Checked,
         checked: 0,
         skipped: 0,
+        earlier: Default::default(),
         lost: Vec::new(),
         superseded: Vec::new(),
         captured: Vec::new(),
@@ -2415,7 +2428,7 @@ fn audit_file(
             in_base.extend(
                 e.new
                     .lines()
-                    .filter(|l| history.get(*l).is_some_and(|first| *first < t)),
+                    .filter(|l| history.get(*l).is_some_and(|(first, _)| *first < t)),
             );
         }
     }
@@ -2489,6 +2502,20 @@ fn audit_file(
         .into_iter()
         .partition(|&i| distinctive(version_lines[i]));
     file.skipped += skipped.len();
+    // Finding 221: where each skipped line that is not blank was first
+    // sealed (a spec id; "" for text the file held before writ sealed it).
+    for &i in &skipped {
+        let l = version_lines[i];
+        if l.trim().is_empty() {
+            continue;
+        }
+        let by = history
+            .get(l)
+            .filter(|(first, _)| first_own.is_some_and(|t| *first < t))
+            .and_then(|(_, by)| by.as_deref())
+            .unwrap_or("");
+        *file.earlier.entry(by.to_string()).or_default() += 1;
+    }
     file.checked += kept.len();
     for i in content_gone(kept, &version_lines, &have) {
         let text = version_lines[i];
@@ -2526,7 +2553,7 @@ fn audit_file(
                         && !genesis.contains(x)
                         && history
                             .get(x)
-                            .is_none_or(|first| *first >= e.seal.timestamp)
+                            .is_none_or(|(first, _)| *first >= e.seal.timestamp)
                 })
             })
             .contains(l)

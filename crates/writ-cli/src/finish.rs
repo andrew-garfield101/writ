@@ -256,14 +256,15 @@ pub fn survival_gate(
         .map(|(spec, f)| format!("{} (deletion sealed by {spec})", f.path))
         .collect();
     if report.lost == 0 && undone.is_empty() {
+        // Finding 221: the same words the receipt records.
+        let line = SurvivalLine::from_report(&report, ids.len(), false);
         println!(
-            "  {} survival: {} sealed line(s) of {} spec(s) checked, none lost ({} ms)",
+            "  {} survival: {} ({} ms)",
             "✓".green(),
-            report.checked,
-            ids.len(),
+            line.finish_text(),
             started.elapsed().as_millis()
         );
-        return Ok(SurvivalLine::from_report(&report, ids.len(), false));
+        return Ok(line);
     }
     let mut lines: Vec<String> = report
         .lost_lines()

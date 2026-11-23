@@ -37,6 +37,14 @@ const WORDS_MAX_CHARS: usize = 160;
 /// Prefix of an auto seal's summary (`auto: <tool> <path>`).
 pub const AUTO_SEAL_PREFIX: &str = "auto:";
 
+fn was(n: usize) -> &'static str {
+    if n == 1 {
+        "was"
+    } else {
+        "were"
+    }
+}
+
 /// The survival result the finish computed for the specs it committed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SurvivalLine {
@@ -57,6 +65,16 @@ pub struct SurvivalLine {
     /// rebuilt receipt counts them too; None only on a bare line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seals: Option<SignedCount>,
+    /// Finding 221: every line the committed specs added (checked plus the
+    /// ones the anchor rule does not count). None on a line recorded before
+    /// 0.4.6, which keeps its old wording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<usize>,
+    /// Finding 221: added lines not counted because they were sealed
+    /// earlier, by the spec that first sealed them ("" for text the file
+    /// held before the spec), most first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub earlier: Vec<(String, usize)>,
 }
 
 /// Seals and signed seals behind a receipt (finding 199).
@@ -73,6 +91,14 @@ fn yes() -> bool {
 impl SurvivalLine {
     /// From the finish tier's report over `specs` specs.
     pub fn from_report(report: &AuditReport, specs: usize, forced: bool) -> Self {
+        let mut by: BTreeMap<String, usize> = BTreeMap::new();
+        for f in report.specs.iter().flat_map(|s| &s.files) {
+            for (k, n) in &f.earlier {
+                *by.entry(k.clone()).or_default() += n;
+            }
+        }
+        let mut earlier: Vec<(String, usize)> = by.into_iter().collect();
+        earlier.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         SurvivalLine {
             checked: report.checked,
             specs,
@@ -80,7 +106,71 @@ impl SurvivalLine {
             forced,
             recorded: true,
             seals: None,
+            added: Some(report.checked + report.skipped),
+            earlier,
         }
+    }
+
+    /// Finding 221: "N of M added line(s) of S spec(s) checked" and, when N
+    /// is less than M, where the rest were sealed; the old "N sealed
+    /// line(s)" form for a line recorded before 0.4.6.
+    fn checked_text(&self) -> String {
+        let Some(added) = self.added else {
+            return format!(
+                "{} sealed line(s) of {} spec(s) checked",
+                self.checked, self.specs
+            );
+        };
+        format!(
+            "{} of {added} added line(s) of {} spec(s) checked",
+            self.checked, self.specs
+        )
+    }
+
+    /// Finding 221: why the added lines not checked were not counted.
+    fn not_counted_text(&self) -> String {
+        let Some(added) = self.added else {
+            return String::new();
+        };
+        let mut parts: Vec<String> = Vec::new();
+        let named: Vec<&(String, usize)> =
+            self.earlier.iter().filter(|(k, _)| !k.is_empty()).collect();
+        for (spec, n) in named.iter().take(2) {
+            parts.push(format!("{n} {} sealed earlier under {spec}", was(*n)));
+        }
+        if named.len() > 2 {
+            let rest: usize = named[2..].iter().map(|(_, n)| n).sum();
+            parts.push(format!("{rest} under {} more spec(s)", named.len() - 2));
+        }
+        if let Some((_, n)) = self.earlier.iter().find(|(k, _)| k.is_empty()) {
+            parts.push(format!("{n} {} in the file before the spec", was(*n)));
+        }
+        let earlier: usize = self.earlier.iter().map(|(_, n)| n).sum();
+        let blank = added.saturating_sub(self.checked + earlier);
+        if blank > 0 {
+            parts.push(format!("{blank} blank"));
+        }
+        if parts.is_empty() {
+            return String::new();
+        }
+        format!("; {}", parts.join(", "))
+    }
+
+    /// The survival part as finish prints it (no "Survival: " prefix).
+    pub fn finish_text(&self) -> String {
+        if self.lost == 0 {
+            return format!(
+                "{}, none lost{}",
+                self.checked_text(),
+                self.not_counted_text()
+            );
+        }
+        format!(
+            "{}, {} lost{}",
+            self.checked_text(),
+            self.lost,
+            self.not_counted_text()
+        )
     }
 
     /// No spec in the finish had a seal: nothing to check.
@@ -92,6 +182,8 @@ impl SurvivalLine {
             forced: false,
             recorded: true,
             seals: None,
+            added: None,
+            earlier: Vec::new(),
         }
     }
 
@@ -103,6 +195,8 @@ impl SurvivalLine {
             forced: false,
             recorded: false,
             seals: None,
+            added: None,
+            earlier: Vec::new(),
         }
     }
 
@@ -123,23 +217,12 @@ impl SurvivalLine {
         if self.specs == 0 {
             return "Survival: no sealed lines to check".into();
         }
-        if self.lost == 0 {
-            return format!(
-                "Survival: {} sealed line(s) of {} spec(s) checked, none lost",
-                self.checked, self.specs
-            );
-        }
-        format!(
-            "Survival: {} sealed line(s) of {} spec(s) checked, {} lost{}",
-            self.checked,
-            self.specs,
-            self.lost,
-            if self.forced {
-                "; finished with --force"
-            } else {
-                ""
-            }
-        )
+        let forced = if self.lost > 0 && self.forced {
+            "; finished with --force"
+        } else {
+            ""
+        };
+        format!("Survival: {}{forced}", self.finish_text())
     }
 }
 
@@ -1186,6 +1269,8 @@ mod tests {
                 forced: false,
                 recorded: true,
                 seals: None,
+                added: None,
+                earlier: Vec::new(),
             },
             check_off_seals: 0,
         }
@@ -1237,6 +1322,59 @@ mod tests {
         assert!(no_summary_line(&mixed).starts_with("no summary from the agent; 5 seals, 2 auto,"));
     }
 
+    /// Finding 221: the wording for every way an added line goes uncounted,
+    /// and the 0.4.5 wording kept for a line recorded without `added`.
+    #[test]
+    fn f221_survival_line_says_what_it_did_not_count() {
+        let line = |added: Option<usize>, earlier: Vec<(&str, usize)>| SurvivalLine {
+            checked: 3,
+            specs: 1,
+            lost: 0,
+            forced: false,
+            recorded: true,
+            seals: None,
+            added,
+            earlier: earlier
+                .into_iter()
+                .map(|(k, n)| (k.to_string(), n))
+                .collect(),
+        };
+        assert_eq!(
+            line(Some(248), vec![("auto-74cd7ce5-a231e7df", 230)]).text(),
+            "Survival: 3 of 248 added line(s) of 1 spec(s) checked, none lost; \
+             230 were sealed earlier under auto-74cd7ce5-a231e7df, 15 blank"
+        );
+        assert_eq!(
+            line(
+                Some(20),
+                vec![("a", 5), ("b", 4), ("c", 3), ("d", 1), ("", 2)]
+            )
+            .text(),
+            "Survival: 3 of 20 added line(s) of 1 spec(s) checked, none lost; \
+             5 were sealed earlier under a, 4 were sealed earlier under b, \
+             4 under 2 more spec(s), 2 were in the file before the spec, 2 blank"
+        );
+        assert_eq!(
+            line(Some(5), vec![("", 1), ("a", 1)]).text(),
+            "Survival: 3 of 5 added line(s) of 1 spec(s) checked, none lost; \
+             1 was sealed earlier under a, 1 was in the file before the spec"
+        );
+        assert_eq!(
+            line(Some(3), vec![]).text(),
+            "Survival: 3 of 3 added line(s) of 1 spec(s) checked, none lost"
+        );
+        assert_eq!(
+            line(None, vec![]).text(),
+            "Survival: 3 sealed line(s) of 1 spec(s) checked, none lost"
+        );
+        // A record from 0.4.5 (no `added`) parses and keeps its wording.
+        let old: SurvivalLine = serde_json::from_str(
+            r#"{"checked":3,"specs":1,"lost":0,"forced":false,"recorded":true}"#,
+        )
+        .unwrap();
+        assert_eq!(old, line(None, vec![]));
+    }
+
     #[test]
     fn survival_line_says_force_and_unrecorded() {
         let mut l = SurvivalLine::from_report(
@@ -1255,7 +1393,7 @@ mod tests {
         );
         assert_eq!(
             l.text(),
-            "Survival: 10 sealed line(s) of 1 spec(s) checked, 2 lost; finished with --force"
+            "Survival: 10 of 10 added line(s) of 1 spec(s) checked, 2 lost; finished with --force"
         );
         l = SurvivalLine::not_recorded();
         assert!(l.text().contains("not recorded"));

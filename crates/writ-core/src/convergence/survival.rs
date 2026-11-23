@@ -606,33 +606,182 @@ impl<'a> SealStep<'a> {
         in_base: &HashSet<&str>,
         genesis: Option<&HashSet<&str>>,
     ) -> Vec<Self> {
+        note_step_build();
         let genesis = genesis.unwrap_or(in_base);
         steps
             .iter()
             .map(|(prev, new)| {
                 let before = counts(prev.lines());
-                let adds: HashSet<&'a str> = additions(prev, new)
-                    .into_iter()
-                    .map(|(_, l)| l)
-                    .filter(|l| {
-                        !l.trim().is_empty() && !before.contains_key(l) && !in_base.contains(l)
-                    })
-                    .collect();
-                let mut others: Vec<&'a str> = new
-                    .lines()
-                    .filter(|l| !l.trim().is_empty() && !genesis.contains(l) && !adds.contains(l))
-                    .collect();
-                others.sort_unstable();
-                others.dedup();
-                Self {
-                    adds,
-                    others,
-                    removed: informed_removals(prev, new)
-                        .into_keys()
-                        .filter(|l| !l.trim().is_empty())
-                        .collect(),
-                    kept: counts(new.lines()),
-                }
+                Self::one(new, &before, counts(new.lines()), in_base, genesis)
+            })
+            .collect()
+    }
+
+    /// [`Self::all`] with each step's line counts already known (finding
+    /// 214): `before[k]` counts `steps[k].0`, `kept[k]` counts `steps[k].1`.
+    /// The survival audit holds them per event, so they are not counted
+    /// again. Same result as [`Self::all`].
+    pub fn all_with_counts(
+        steps: &[(&'a str, &'a str)],
+        before: &[&HashMap<&'a str, usize>],
+        kept: &[&HashMap<&'a str, usize>],
+        in_base: &HashSet<&str>,
+        genesis: Option<&HashSet<&str>>,
+    ) -> Vec<Self> {
+        note_step_build();
+        let genesis = genesis.unwrap_or(in_base);
+        steps
+            .iter()
+            .zip(before.iter().zip(kept))
+            .map(|((_, new), (b, k))| Self::one(new, b, (*k).clone(), in_base, genesis))
+            .collect()
+    }
+
+    /// One step from its sealed text and the line counts of both sides.
+    fn one(
+        new: &'a str,
+        before: &HashMap<&'a str, usize>,
+        kept: HashMap<&'a str, usize>,
+        in_base: &HashSet<&str>,
+        genesis: &HashSet<&str>,
+    ) -> Self {
+        // The step's additions that `prev` never held. A line of `new` whose
+        // text is nowhere in `prev` is an insertion in every edit script, and
+        // an inserted line whose text `prev` held is filtered out anyway, so
+        // no diff is needed (finding 214: it was the step's largest cost).
+        let adds: HashSet<&'a str> = new
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !before.contains_key(l) && !in_base.contains(l))
+            .collect();
+        let mut others: Vec<&'a str> = new
+            .lines()
+            .filter(|l| !l.trim().is_empty() && !genesis.contains(l) && !adds.contains(l))
+            .collect();
+        others.sort_unstable();
+        others.dedup();
+        // informed_removals(prev, new), from the counts already made.
+        let removed = before
+            .iter()
+            .filter(|(l, n)| **n > kept.get(*l).copied().unwrap_or(0) && !l.trim().is_empty())
+            .map(|(l, _)| *l)
+            .collect();
+        Self {
+            adds,
+            others,
+            removed,
+            kept,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Finding 214: how many times this thread built a step list
+    /// ([`SealStep::all`], [`SealStep::all_with_counts`]); tests pin one
+    /// build per path per seal call.
+    pub(crate) static STEP_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[inline]
+fn note_step_build() {
+    #[cfg(test)]
+    STEP_BUILDS.with(|c| c.set(c.get() + 1));
+}
+
+/// [`saw_addition_in`] over one version, with each step's line independent
+/// answers made once (finding 214): how many of its additions the version
+/// keeps, and whether clause 2 or 3 holds. A line then costs one lookup
+/// per step that added it.
+struct StepsSeen<'s, 'a, 'h> {
+    steps: &'s [SealStep<'a>],
+    have: &'h HashMap<&'h str, usize>,
+    memo: Vec<std::cell::OnceCell<(usize, bool)>>,
+}
+
+impl<'s, 'a, 'h> StepsSeen<'s, 'a, 'h> {
+    fn new(steps: &'s [SealStep<'a>], have: &'h HashMap<&'h str, usize>) -> Self {
+        Self {
+            steps,
+            have,
+            memo: steps.iter().map(|_| std::cell::OnceCell::new()).collect(),
+        }
+    }
+
+    /// Same answer as `saw_addition_in(have, line, steps)`.
+    fn saw(&self, line: &str) -> bool {
+        let have = self.have;
+        let mut ours = false;
+        for (i, step) in self.steps.iter().enumerate() {
+            if !step.adds.contains(line) {
+                continue;
+            }
+            ours = true;
+            let (kept_adds, other_clause) = *self.memo[i].get_or_init(|| {
+                let kept_adds = step.adds.iter().filter(|l| have.contains_key(*l)).count();
+                let replaced = !step.removed.is_empty()
+                    && step.removed.iter().all(|l| {
+                        have.get(l).copied().unwrap_or(0) <= step.kept.get(l).copied().unwrap_or(0)
+                    });
+                let rest =
+                    !step.others.is_empty() && step.others.iter().all(|l| have.contains_key(l));
+                (kept_adds, replaced || rest)
+            });
+            // Clause 1: another of this step's additions is kept (`line` is
+            // one of them, so it is left out of the count when kept).
+            if kept_adds - usize::from(have.contains_key(line)) > 0 || other_clause {
+                return true;
+            }
+        }
+        !ours
+    }
+}
+
+/// [`remover_saw`] for many removers of one path (finding 214): the own
+/// steps are built once, and each remover's version is counted and diffed
+/// once, not once per removed line.
+pub struct RemoverCheck<'a, 'b> {
+    steps: Vec<SealStep<'a>>,
+    in_base: &'b HashSet<&'b str>,
+}
+
+impl<'a, 'b> RemoverCheck<'a, 'b> {
+    /// `steps`, `in_base`, `genesis` as for [`remover_saw`].
+    pub fn new(
+        steps: &[(&'a str, &'a str)],
+        in_base: &'b HashSet<&'b str>,
+        genesis: &HashSet<&str>,
+    ) -> Self {
+        Self {
+            steps: SealStep::all(steps, in_base, Some(genesis)),
+            in_base,
+        }
+    }
+
+    /// The informed removals of a seal that recorded `old -> new`
+    /// ([`informed_removals`], per copy) whose remover saw the own seal that
+    /// added the line: exactly the lines for which [`remover_saw`] holds.
+    pub fn seen_removals<'o>(&self, old: &'o str, new: &str) -> Vec<(&'o str, usize)> {
+        let removals = informed_removals(old, new);
+        if removals.is_empty() {
+            return Vec::new();
+        }
+        let have = counts(new.lines());
+        let seen = StepsSeen::new(&self.steps, &have);
+        let in_place: std::cell::OnceCell<HashSet<&'o str>> = std::cell::OnceCell::new();
+        removals
+            .into_iter()
+            .filter(|(line, _)| {
+                seen.saw(line)
+                    || in_place
+                        .get_or_init(|| {
+                            let old_lines: HashSet<&str> = old.lines().collect();
+                            replaced_in_place(old, new, |l| {
+                                !l.trim().is_empty()
+                                    && !old_lines.contains(l)
+                                    && !self.in_base.contains(l)
+                            })
+                        })
+                        .contains(line)
             })
             .collect()
     }
@@ -1397,13 +1546,38 @@ impl<'e> PathShared<'e> {
 
     fn removals(&self) -> &Vec<Option<HashMap<&'e str, usize>>> {
         self.removals.get_or_init(|| {
+            // Finding 214: `informed_removals(old, new)` from the per event
+            // counts; a recorded base that is another event's sealed text
+            // (the same loaded blob) reuses that event's counts too.
+            let counts_new = self.counts();
+            let by_text: HashMap<*const u8, usize> = self
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !e.deleted)
+                .map(|(i, e)| (e.new.as_ptr(), i))
+                .collect();
             self.events
                 .iter()
-                .map(|e| {
-                    e.old
-                        .as_deref()
-                        .map(|old| informed_removals(old, &e.new))
-                        .filter(|r| !r.is_empty())
+                .zip(counts_new)
+                .map(|(e, kept)| {
+                    let old = e.old.as_deref()?;
+                    let own;
+                    let before = match by_text.get(&old.as_ptr()) {
+                        Some(&j) if *self.events[j].new == *old => &counts_new[j],
+                        _ => {
+                            own = counts(old.lines());
+                            &own
+                        }
+                    };
+                    let r: HashMap<&'e str, usize> = before
+                        .iter()
+                        .filter_map(|(l, n)| {
+                            let gone = n.saturating_sub(kept.get(l).copied().unwrap_or(0));
+                            (gone > 0).then_some((*l, gone))
+                        })
+                        .collect();
+                    (!r.is_empty()).then_some(r)
                 })
                 .collect()
         })
@@ -1414,6 +1588,8 @@ impl<'e> PathShared<'e> {
 struct Texts<'r> {
     repo: &'r crate::Repository,
     cache: HashMap<String, Option<std::rc::Rc<str>>>,
+    /// Finding 214: pre-writ baselines' lookups, once per audit.
+    baselines: crate::repo::BaselineCache,
 }
 
 impl Texts<'_> {
@@ -1812,6 +1988,7 @@ fn audit_with(
     let mut texts = Texts {
         repo,
         cache: HashMap::new(),
+        baselines: Default::default(),
     };
 
     // Phase 1, per spec: its seals, own versions, paths and targets.
@@ -2212,7 +2389,12 @@ fn audit_file(
         Some(_) => None,
         None => texts
             .repo
-            .baseline_text(spec_rec, path, v.times.first().copied())?
+            .baseline_text_cached(
+                spec_rec,
+                path,
+                v.times.first().copied(),
+                &mut texts.baselines,
+            )?
             .map(|t| std::rc::Rc::<str>::from(t.as_str())),
     };
     let base = match v.first_old.as_deref() {
@@ -2266,7 +2448,24 @@ fn audit_file(
         },
         None => HashSet::new(),
     };
-    let steps = SealStep::all(&steps, &in_base, Some(&genesis));
+    // Finding 214: each step's line counts are the path's per event counts
+    // (the previous own event's for its old side, the base's for the first).
+    let event_counts_all = shared.counts();
+    let own_idx: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.seal.spec_id.as_deref() == Some(spec_id))
+        .map(|(i, _)| i)
+        .collect();
+    let base_counts = counts(base.lines());
+    let before: Vec<&HashMap<&str, usize>> = (0..own_idx.len())
+        .map(|k| match k {
+            0 => &base_counts,
+            _ => &event_counts_all[own_idx[k - 1]],
+        })
+        .collect();
+    let kept: Vec<&HashMap<&str, usize>> = own_idx.iter().map(|&i| &event_counts_all[i]).collect();
+    let steps = SealStep::all_with_counts(&steps, &before, &kept, &in_base, Some(&genesis));
     // Which own seal added each distinctive text (the latest that did).
     let mut adder: HashMap<&str, &str> = HashMap::new();
     for (step, e) in steps.iter().zip(&own_events) {
@@ -3416,6 +3615,104 @@ mod tests {
                 .map(|(_, v)| v.to_string())
                 .unwrap_or_default()
         }
+    }
+
+    /// Finding 214: the cached forms decide exactly what the per line forms
+    /// did. Random small files over a small alphabet (copies, blanks, lines
+    /// moving in and out), many seeds: `RemoverCheck::seen_removals` equals
+    /// `informed_removals` filtered by `remover_saw`, and
+    /// `SealStep::all_with_counts` equals `SealStep::all`.
+    #[test]
+    fn f214_cached_remover_check_matches_remover_saw() {
+        let mut seed: u64 = 0x2140_0214;
+        let mut rnd = move |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        let mut text = |rnd: &mut dyn FnMut(u64) -> u64, from: &str| -> String {
+            let mut lines: Vec<String> = from.lines().map(String::from).collect();
+            for _ in 0..(1 + rnd(5)) {
+                match rnd(3) {
+                    0 if !lines.is_empty() => {
+                        let i = rnd(lines.len() as u64) as usize;
+                        lines.remove(i);
+                    }
+                    1 if !lines.is_empty() => {
+                        let i = rnd(lines.len() as u64) as usize;
+                        lines[i] = format!("x{}", rnd(30));
+                    }
+                    _ => {
+                        let i = rnd(lines.len() as u64 + 1) as usize;
+                        let l = if rnd(8) == 0 {
+                            String::new()
+                        } else {
+                            format!("x{}", rnd(30))
+                        };
+                        lines.insert(i, l);
+                    }
+                }
+            }
+            lines.iter().map(|l| format!("{l}\n")).collect()
+        };
+        let mut compared = 0;
+        for _ in 0..400 {
+            let genesis_text = text(&mut rnd, "");
+            let base = text(&mut rnd, &genesis_text);
+            let mut versions = vec![base.clone()];
+            for _ in 0..(1 + rnd(4)) {
+                let next = text(&mut rnd, versions.last().unwrap());
+                versions.push(next);
+            }
+            let steps: Vec<(&str, &str)> = versions
+                .windows(2)
+                .map(|w| (w[0].as_str(), w[1].as_str()))
+                .collect();
+            let in_base: HashSet<&str> = base.lines().collect();
+            let genesis: HashSet<&str> = genesis_text.lines().collect();
+            let check = RemoverCheck::new(&steps, &in_base, &genesis);
+            let before: Vec<HashMap<&str, usize>> =
+                steps.iter().map(|(p, _)| counts(p.lines())).collect();
+            let kept: Vec<HashMap<&str, usize>> =
+                steps.iter().map(|(_, n)| counts(n.lines())).collect();
+            let a = SealStep::all(&steps, &in_base, Some(&genesis));
+            let b = SealStep::all_with_counts(
+                &steps,
+                &before.iter().collect::<Vec<_>>(),
+                &kept.iter().collect::<Vec<_>>(),
+                &in_base,
+                Some(&genesis),
+            );
+            for (x, y) in a.iter().zip(&b) {
+                let mut xr = x.removed.clone();
+                let mut yr = y.removed.clone();
+                xr.sort_unstable();
+                yr.sort_unstable();
+                assert_eq!(
+                    (&x.adds, &x.others, &x.kept, xr),
+                    (&y.adds, &y.others, &y.kept, yr)
+                );
+            }
+            for _ in 0..4 {
+                let from = versions[rnd(versions.len() as u64) as usize].clone();
+                let old = text(&mut rnd, &from);
+                let new = text(&mut rnd, &old);
+                let mut want: Vec<(&str, usize)> = informed_removals(&old, &new)
+                    .into_iter()
+                    .filter(|(l, _)| remover_saw(&old, &new, l, &steps, &in_base, &genesis))
+                    .collect();
+                let mut got = check.seen_removals(&old, &new);
+                want.sort_unstable();
+                got.sort_unstable();
+                compared += want.len();
+                assert_eq!(got, want, "old {old:?} new {new:?} versions {versions:?}");
+            }
+        }
+        assert!(
+            compared > 200,
+            "the fixture exercises removals ({compared})"
+        );
     }
 
     #[test]

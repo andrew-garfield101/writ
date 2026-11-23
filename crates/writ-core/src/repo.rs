@@ -1888,7 +1888,21 @@ impl Repository {
         path: &str,
         first_seal: Option<DateTime<Utc>>,
     ) -> WritResult<Option<String>> {
-        let bytes = match self.baseline_source(Some(spec), path, first_seal)? {
+        self.baseline_text_cached(spec, path, first_seal, &mut BaselineCache::default())
+    }
+
+    /// [`Self::baseline_text`] with the bridge tree and tree indexes kept in
+    /// `cache` (finding 214: one survival run asks once per (spec, path)
+    /// pair, and each uncached ask reloaded the whole seal log). The cache
+    /// lives for one call of its owner, never across calls or in the store.
+    pub(crate) fn baseline_text_cached(
+        &self,
+        spec: &Spec,
+        path: &str,
+        first_seal: Option<DateTime<Utc>>,
+        cache: &mut BaselineCache,
+    ) -> WritResult<Option<String>> {
+        let bytes = match self.baseline_source(Some(spec), path, first_seal, cache)? {
             Some(Baseline::Stored(hash)) => self.objects.retrieve(&hash)?,
             Some(Baseline::Git(bytes)) => bytes,
             None => return Ok(None),
@@ -1905,14 +1919,20 @@ impl Repository {
         spec: Option<&Spec>,
         path: &str,
         at: Option<DateTime<Utc>>,
+        cache: &mut BaselineCache,
     ) -> WritResult<Option<Baseline>> {
         let genesis = spec.and_then(|s| s.genesis_tree.clone());
-        let bridge = self.bridge_epoch_and_tree().1;
+        let bridge = cache
+            .bridge
+            .get_or_insert_with(|| self.bridge_epoch_and_tree().1)
+            .clone();
         for tree in genesis.iter().chain(bridge.iter()) {
-            if let Ok(index) = self.load_tree_index(tree) {
-                if let Some(entry) = index.entries.get(path) {
-                    return Ok(Some(Baseline::Stored(entry.hash.clone())));
-                }
+            let index = cache
+                .indexes
+                .entry(tree.clone())
+                .or_insert_with(|| self.load_tree_index(tree).ok());
+            if let Some(entry) = index.as_ref().and_then(|i| i.entries.get(path)) {
+                return Ok(Some(Baseline::Stored(entry.hash.clone())));
             }
         }
         Ok(git_blob_at_or_before(&self.root, path, at).map(Baseline::Git))
@@ -2105,6 +2125,9 @@ impl Repository {
         genesis: &HashSet<&str>,
     ) -> WritResult<HashMap<String, usize>> {
         let mut excused: HashMap<String, usize> = HashMap::new();
+        // Finding 214: the own steps at most once per call (one path), on
+        // the first remover, not once per removed line of every remover.
+        let check = std::cell::OnceCell::new();
         for (committed, seal) in others {
             if !*committed && seal.timestamp <= since {
                 continue;
@@ -2125,16 +2148,14 @@ impl Repository {
                     String::from_utf8_lossy(&old).into_owned(),
                     String::from_utf8_lossy(&new).into_owned(),
                 );
-                for (line, n) in convergence::survival::informed_removals(&old, &new) {
-                    // Finding 105: the recorded base is the shared index, so
-                    // "its base held the line" can be true in the record and
-                    // false in fact; excuse only if this seal saw the own
-                    // seal that added the line.
-                    if !convergence::survival::remover_saw(
-                        &old, &new, line, steps, in_base, genesis,
-                    ) {
-                        continue;
-                    }
+                // Finding 105: the recorded base is the shared index, so "its
+                // base held the line" can be true in the record and false in
+                // fact; excuse only lines whose remover saw the own seal that
+                // added them (`remover_saw`, per line, by RemoverCheck).
+                let check = check.get_or_init(|| {
+                    convergence::survival::RemoverCheck::new(steps, in_base, genesis)
+                });
+                for (line, n) in check.seen_removals(&old, &new) {
                     *excused.entry(line.to_string()).or_insert(0) += n;
                 }
             }
@@ -37953,6 +37974,88 @@ mod finding_65_tests {
             LifecycleState::Archived
         );
     }
+
+    /// Finding 214: the own line check builds the spec's step list once per
+    /// path per seal call, however many lines other specs' seals removed.
+    /// Before 0.4.6 it rebuilt it for every removed line of every remover
+    /// (131 s on repo.rs with 26 own seals); the refusal is unchanged.
+    #[test]
+    fn f214_own_line_check_builds_steps_once_per_path_per_seal() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let files = ["a.rs", "b.rs"];
+        let base: Vec<String> = (0..200).map(|i| format!("let v{i} = base({i});")).collect();
+        let write = |f: &str, lines: &[String]| {
+            fs::write(dir.path().join(f), lines.join("\n") + "\n").unwrap();
+        };
+        let seal = |who: &str, spec: &str| {
+            repo.seal_paths(
+                AgentIdentity {
+                    id: who.into(),
+                    agent_type: AgentType::Agent,
+                },
+                format!("{who} work"),
+                Some(spec.into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                &files.map(String::from),
+                false,
+            )
+        };
+        for id in ["base", "own", "other"] {
+            repo.add_spec(&Spec::new(id.into(), id.into(), String::new()))
+                .unwrap();
+        }
+        let mut text: Vec<Vec<String>> = files.iter().map(|_| base.clone()).collect();
+        for (f, t) in files.iter().zip(&text) {
+            write(f, t);
+        }
+        seal("setup", "base").unwrap();
+        // Three own seals, each rewriting ten lines in place.
+        for k in 0..3 {
+            for (f, t) in files.iter().zip(text.iter_mut()) {
+                for j in 0..10 {
+                    let i = k * 10 + j;
+                    t[i] = format!("let v{i} = own({k});");
+                }
+                write(f, t);
+            }
+            seal("agent-a", "own").unwrap();
+        }
+        // Two seals of another spec, each removing five base lines.
+        for k in 0..2 {
+            for (f, t) in files.iter().zip(text.iter_mut()) {
+                let at = 150 + k * 5;
+                t.drain(at..at + 5);
+                t.push(format!("other({k});"));
+                write(f, t);
+            }
+            seal("agent-b", "other").unwrap();
+        }
+        // The refactor shape: own lines dropped, new unsealed text added.
+        for (f, t) in files.iter().zip(text.iter_mut()) {
+            t.retain(|l| !l.ends_with("own(0);"));
+            t.insert(100, "refactor();".into());
+            write(f, t);
+        }
+        crate::convergence::survival::STEP_BUILDS.with(|c| c.set(0));
+        let err = seal("agent-a", "own").unwrap_err();
+        let builds = crate::convergence::survival::STEP_BUILDS.with(|c| c.get());
+        assert!(
+            matches!(err, WritError::OwnLinesRemoved { .. }),
+            "refused for own lines: {err}"
+        );
+        assert_eq!(builds, files.len(), "one step list per path per seal call");
+    }
+}
+
+/// Finding 214: what [`Repository::baseline_text_cached`] looked up once,
+/// for one caller's run: the last bridge import's tree (outer `None`: not
+/// looked up yet) and each tree's index (`None`: unreadable).
+#[derive(Default)]
+pub(crate) struct BaselineCache {
+    bridge: Option<Option<String>>,
+    indexes: HashMap<String, Option<Index>>,
 }
 
 /// Where a path's pre-writ baseline came from (finding 106).

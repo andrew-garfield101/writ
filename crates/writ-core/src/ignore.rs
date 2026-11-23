@@ -20,11 +20,20 @@
 //! matching line). A path under an ignored directory stays ignored, as in
 //! git. `.writ` is ALWAYS ignored, regardless of any file (negation cannot
 //! un-ignore it).
+//!
+//! Finding 210, git's own rule: ignore rules apply only to untracked files.
+//! A path in git's index is tracked by writ whatever a git derived rule
+//! says (layers 1 to 3, and the block `writ init` imported from
+//! `.gitignore` into `.writignore`), and a directory holding such a path is
+//! walked; untracked files in it stay ignored. A `.writignore` line written
+//! by hand (or the writ defaults) still hides a tracked path: that is the
+//! user's choice, and doctor names the count. Git's index is read only when
+//! a git derived rule ignores something, once per load.
 
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::Match;
@@ -58,6 +67,15 @@ pub struct InvalidPattern {
     pub reason: String,
 }
 
+/// The header `writ init` writes above the lines it copies from
+/// `.gitignore` into `.writignore` ([`create_writignore`]).
+const IMPORT_HEADER: &str = "# --- imported from .gitignore ---";
+
+/// The source tag on `.writignore` globs from the imported block, so one
+/// matcher keeps the file's line order and still says which kind of line
+/// decided.
+const IMPORTED_FROM: &str = ".writignore (imported from .gitignore)";
+
 /// A compiled, layered set of ignore rules.
 #[derive(Debug, Clone)]
 pub struct IgnoreRules {
@@ -67,9 +85,64 @@ pub struct IgnoreRules {
     root: Gitignore,
     /// Nested `.gitignore` files, when loaded from a repo on disk.
     nested: Option<Nested>,
-    /// `.writignore`, or the built-in defaults.
+    /// `.writignore`, or the built-in defaults. Globs from the block
+    /// `writ init` imported from `.gitignore` carry [`IMPORTED_FROM`]: git
+    /// derived, so they never hide a path git tracks (finding 210).
     writ: Gitignore,
+    /// Git's index, for repos loaded from disk (finding 210).
+    git: Option<GitTracked>,
     invalid: Vec<InvalidPattern>,
+}
+
+/// Which kind of layer ignored a path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// `.writignore` outside its imported block, or writ's defaults.
+    Writ,
+    /// git's own rules: global excludes, `.git/info/exclude`, `.gitignore`
+    /// files, and the block imported from `.gitignore`.
+    Git,
+}
+
+/// Paths in git's index, read lazily, plus a memo of directories a git
+/// derived rule ignores (a walk asks about each ancestor of every file).
+#[derive(Debug, Clone)]
+struct GitTracked {
+    repo_root: PathBuf,
+    paths: OnceLock<Arc<Vec<String>>>,
+    git_ignored_dirs: Arc<Mutex<HashMap<String, bool>>>,
+}
+
+impl GitTracked {
+    fn new(repo_root: &Path) -> Self {
+        GitTracked {
+            repo_root: repo_root.to_path_buf(),
+            paths: OnceLock::new(),
+            git_ignored_dirs: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Sorted, deduplicated index paths; empty when there is no readable
+    /// index (not a git repo, or a format this reader does not know), so
+    /// every git derived rule applies as before.
+    fn paths(&self) -> &[String] {
+        self.paths
+            .get_or_init(|| git_index::tracked_paths_cached(&self.repo_root))
+    }
+
+    fn contains(&self, rel_path: &str) -> bool {
+        self.paths()
+            .binary_search_by(|p| p.as_str().cmp(rel_path))
+            .is_ok()
+    }
+
+    /// True when git tracks a path below the directory `dir`.
+    fn has_under(&self, dir: &str) -> bool {
+        let prefix = format!("{dir}/");
+        let paths = self.paths();
+        let i = paths.partition_point(|p| p.as_str() < prefix.as_str());
+        paths.get(i).is_some_and(|p| p.starts_with(&prefix))
+    }
 }
 
 /// Lazily loaded `<dir>/.gitignore` matchers, keyed by repo-relative dir.
@@ -121,10 +194,23 @@ impl RulesBuilder {
 
     /// Add every rule from `content`. Later calls take precedence.
     fn add_content(&mut self, source: &str, content: &str) {
+        self.add_lines(source, content, false);
+    }
+
+    /// Add every rule from `content`; with `tag_import`, the pattern lines
+    /// right after [`IMPORT_HEADER`], up to the first blank or comment line
+    /// (the importer writes them with neither), are tagged [`IMPORTED_FROM`].
+    fn add_lines(&mut self, source: &str, content: &str, tag_import: bool) {
         let mut count = 0;
+        let mut in_block = false;
         for line in content.lines() {
             let trimmed = line.trim();
+            if tag_import && trimmed == IMPORT_HEADER {
+                in_block = true;
+                continue;
+            }
             if trimmed.is_empty() || trimmed.starts_with('#') {
+                in_block = false;
                 continue;
             }
             if trimmed.len() > MAX_PATTERN_LEN {
@@ -136,7 +222,8 @@ impl RulesBuilder {
                 continue;
             }
             count += 1;
-            if let Err(e) = self.builder.add_line(None, trimmed) {
+            let from = in_block.then(|| PathBuf::from(IMPORTED_FROM));
+            if let Err(e) = self.builder.add_line(from, trimmed) {
                 self.reject(source, trimmed, &e.to_string());
             }
         }
@@ -202,6 +289,7 @@ impl IgnoreRules {
         let (global, global_invalid) = global.finish();
         rules.global = global;
         rules.nested = Some(Nested::new(repo_root));
+        rules.git = Some(GitTracked::new(repo_root));
         rules.invalid.splice(0..0, global_invalid);
         rules.invalid.extend(read_errors);
         rules
@@ -219,7 +307,7 @@ impl IgnoreRules {
         }
         let mut writ = RulesBuilder::new();
         match writignore {
-            Some(content) => writ.add_content(".writignore", content),
+            Some(content) => writ.add_lines(".writignore", content, true),
             None => writ.add_dir_names("defaults", DEFAULT_IGNORE_DIRS),
         }
         let (root, mut invalid) = root.finish();
@@ -230,6 +318,7 @@ impl IgnoreRules {
             root,
             nested: None,
             writ,
+            git: None,
             invalid,
         }
     }
@@ -253,10 +342,21 @@ impl IgnoreRules {
     }
 
     /// The highest layer with a matching rule decides: ignore, whitelist,
-    /// or no opinion. Only `rel_path` itself is matched, not its parents.
-    fn decide(&self, rel_path: &str, is_dir: bool) -> Decision {
-        if let Some(d) = Decision::of(self.writ.matched(rel_path, is_dir)) {
-            return d;
+    /// or no opinion, with the kind of layer that ignored it. Only
+    /// `rel_path` itself is matched, not its parents.
+    fn decide(&self, rel_path: &str, is_dir: bool) -> Verdict {
+        let ignored_by = |d: Decision, source: Source| match d {
+            Decision::Ignore => Verdict::Ignored(source),
+            Decision::Whitelist => Verdict::Whitelisted,
+            Decision::None => Verdict::NoRule,
+        };
+        match self.writ.matched(rel_path, is_dir) {
+            Match::Ignore(glob) if glob.from() == Some(Path::new(IMPORTED_FROM)) => {
+                return Verdict::Ignored(Source::Git)
+            }
+            Match::Ignore(_) => return Verdict::Ignored(Source::Writ),
+            Match::Whitelist(_) => return Verdict::Whitelisted,
+            Match::None => {}
         }
         if let Some(nested) = &self.nested {
             // Proper ancestors, deepest first: "a/b/c" -> "a/b", "a".
@@ -266,41 +366,96 @@ impl IgnoreRules {
                 if let Some(m) = nested.get(dir) {
                     let below = &rel_path[slash + 1..];
                     if let Some(d) = Decision::of(m.matched(below, is_dir)) {
-                        return d;
+                        return ignored_by(d, Source::Git);
                     }
                 }
                 end = slash;
             }
         }
-        Decision::of(self.root.matched(rel_path, is_dir))
+        let d = Decision::of(self.root.matched(rel_path, is_dir))
             .or_else(|| Decision::of(self.global.matched(rel_path, is_dir)))
-            .unwrap_or(Decision::None)
+            .unwrap_or(Decision::None);
+        ignored_by(d, Source::Git)
+    }
+
+    /// Does a git derived rule ignore the directory itself? Memoized when
+    /// the repo's index is known, since walks ask once per file.
+    fn dir_git_ignored(&self, dir: &str) -> bool {
+        let Some(git) = &self.git else {
+            return self.decide(dir, true) == Verdict::Ignored(Source::Git);
+        };
+        if let Some(&hit) = git
+            .git_ignored_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(dir)
+        {
+            return hit;
+        }
+        let hit = self.decide(dir, true) == Verdict::Ignored(Source::Git);
+        git.git_ignored_dirs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(dir.to_string(), hit);
+        hit
+    }
+
+    /// True when a proper ancestor of `rel_path` is ignored by a git
+    /// derived rule. A walk only reaches such a path when the ancestor
+    /// holds a tracked path (finding 210); git ignores everything else in it.
+    fn git_ignored_ancestor(&self, rel_path: &str) -> bool {
+        self.git.is_some()
+            && rel_path
+                .match_indices('/')
+                .any(|(i, _)| self.dir_git_ignored(&rel_path[..i]))
+    }
+
+    /// Git's rule for a path a git derived rule ignores: ignored unless git
+    /// tracks it (a directory: unless git tracks a path below it).
+    fn git_ignores(&self, rel_path: &str, is_dir: bool) -> bool {
+        match &self.git {
+            None => true,
+            Some(git) if is_dir => !git.has_under(rel_path),
+            Some(git) => !git.contains(rel_path),
+        }
     }
 
     /// Should the directory at this repo-relative path be pruned from walks?
     ///
-    /// Only the path itself is checked; walkers prune parents before
-    /// reaching children. Use [`IgnoreRules::is_path_ignored`] for arbitrary paths.
+    /// The path itself is checked, plus (only when a repo's git index is
+    /// known) whether a git derived rule ignores an ancestor: walkers prune
+    /// parents before reaching children, but a git ignored directory that
+    /// holds a tracked path is walked (finding 210). Use
+    /// [`IgnoreRules::is_path_ignored`] for arbitrary paths.
     pub fn is_dir_ignored(&self, rel_path: &str) -> bool {
         if is_always_ignored(rel_path) {
             return true;
         }
-        self.decide(rel_path, true) == Decision::Ignore
+        match self.decide(rel_path, true) {
+            Verdict::Ignored(Source::Writ) => true,
+            Verdict::Ignored(Source::Git) => self.git_ignores(rel_path, true),
+            _ => self.git_ignored_ancestor(rel_path) && self.git_ignores(rel_path, true),
+        }
     }
 
     /// Should the file at this repo-relative path be ignored?
     ///
-    /// Only the path itself is checked (see [`IgnoreRules::is_dir_ignored`]).
+    /// Checked as [`IgnoreRules::is_dir_ignored`] checks a directory.
     pub fn is_file_ignored(&self, rel_path: &str) -> bool {
         if is_always_ignored(rel_path) {
             return true;
         }
-        self.decide(rel_path, false) == Decision::Ignore
+        match self.decide(rel_path, false) {
+            Verdict::Ignored(Source::Writ) => true,
+            Verdict::Ignored(Source::Git) => self.git_ignores(rel_path, false),
+            _ => self.git_ignored_ancestor(rel_path) && self.git_ignores(rel_path, false),
+        }
     }
 
     /// Is this repo-relative file path ignored, either directly or because
     /// any parent directory is ignored? Used for paths that did not come
-    /// from a pruned walk (index entries, seal trees).
+    /// from a pruned walk (index entries, seal trees). A path git tracks is
+    /// ignored only by a writ rule (finding 210).
     pub fn is_path_ignored(&self, rel_path: &str) -> bool {
         let rel_path = rel_path.trim_start_matches('/');
         if rel_path.is_empty() {
@@ -309,14 +464,67 @@ impl IgnoreRules {
         if is_always_ignored(rel_path) {
             return true;
         }
+        let mut git_hit = false;
         // Parents shallowest first, as a walk would prune them.
         for (i, _) in rel_path.match_indices('/') {
-            if self.decide(&rel_path[..i], true) == Decision::Ignore {
-                return true;
+            match self.decide(&rel_path[..i], true) {
+                Verdict::Ignored(Source::Writ) => return true,
+                Verdict::Ignored(Source::Git) => git_hit = true,
+                _ => {}
             }
         }
-        self.decide(rel_path, false) == Decision::Ignore
+        match self.decide(rel_path, false) {
+            Verdict::Ignored(Source::Writ) => return true,
+            Verdict::Ignored(Source::Git) => git_hit = true,
+            _ => {}
+        }
+        git_hit && self.git_ignores(rel_path, false)
     }
+
+    /// Paths git tracks that a writ rule (a hand line in `.writignore`, or
+    /// the writ defaults) hides from writ: the one case where writ and git
+    /// still disagree after finding 210, by the user's choice. `.writ` is
+    /// not counted (always ignored, never a choice). Reads git's index;
+    /// empty when there is none. One `.writignore` match per index path and
+    /// per directory (memoized), since only that layer can hide a tracked
+    /// path.
+    pub fn tracked_but_writ_ignored(&self) -> Vec<String> {
+        let Some(git) = &self.git else {
+            return Vec::new();
+        };
+        let hand_ignores = |rel: &str, is_dir: bool| match self.writ.matched(rel, is_dir) {
+            Match::Ignore(glob) => glob.from() != Some(Path::new(IMPORTED_FROM)),
+            _ => false,
+        };
+        let mut dirs: HashMap<&str, bool> = HashMap::new();
+        let mut hidden = Vec::new();
+        for path in git.paths().iter() {
+            if path.ends_with('/') || is_always_ignored(path) {
+                continue;
+            }
+            let mut by_dir = false;
+            for (i, _) in path.match_indices('/') {
+                let dir = &path[..i];
+                let hit = *dirs.entry(dir).or_insert_with(|| hand_ignores(dir, true));
+                if hit {
+                    by_dir = true;
+                    break;
+                }
+            }
+            if by_dir || hand_ignores(path, false) {
+                hidden.push(path.clone());
+            }
+        }
+        hidden
+    }
+}
+
+/// A path's verdict from the highest layer with a matching rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Ignored(Source),
+    Whitelisted,
+    NoRule,
 }
 
 /// One layer's verdict on a path.
@@ -472,6 +680,150 @@ pub(crate) fn glob_match(pattern: &str, text: &str) -> bool {
     }
 
     pi == p.len()
+}
+
+/// A reader of the path list in git's index (`.git/index`), versions 2
+/// to 4, for finding 210. Only paths are read; no checksum is verified,
+/// since a torn or unknown index only means writ falls back to applying
+/// every git derived rule, as it did before.
+mod git_index {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
+
+    /// The index file of the repo whose work tree is `repo_root`: `.git`
+    /// as a directory, or a `.git` file naming the git directory (linked
+    /// worktrees, submodules).
+    fn index_file(repo_root: &Path) -> Option<PathBuf> {
+        let dot_git = repo_root.join(".git");
+        let meta = fs::metadata(&dot_git).ok()?;
+        if meta.is_dir() {
+            return Some(dot_git.join("index"));
+        }
+        let text = fs::read_to_string(&dot_git).ok()?;
+        let dir = text.lines().find_map(|l| l.strip_prefix("gitdir:"))?.trim();
+        let dir = Path::new(dir);
+        let dir = if dir.is_absolute() {
+            dir.to_path_buf()
+        } else {
+            repo_root.join(dir)
+        };
+        Some(dir.join("index"))
+    }
+
+    /// The last index read in this process, keyed by its file, size, mtime
+    /// and inode (git writes the index to a lock file and renames it, so a
+    /// rewrite is a new inode): one seal loads the ignore rules several
+    /// times, and long running processes (watch, MCP, Python) see git's
+    /// later writes.
+    type Key = (PathBuf, u64, Option<SystemTime>, u64);
+    type Cached = (Key, Arc<Vec<String>>);
+    static LAST: Mutex<Option<Cached>> = Mutex::new(None);
+
+    /// [`tracked_paths`], reusing the last read while the file is unchanged.
+    /// Empty when there is no readable index.
+    pub(super) fn tracked_paths_cached(repo_root: &Path) -> Arc<Vec<String>> {
+        let Some(file) = index_file(repo_root) else {
+            return Arc::default();
+        };
+        let Ok(meta) = fs::metadata(&file) else {
+            return Arc::default();
+        };
+        #[cfg(unix)]
+        let inode = std::os::unix::fs::MetadataExt::ino(&meta);
+        #[cfg(not(unix))]
+        let inode = 0;
+        let key = (file, meta.len(), meta.modified().ok(), inode);
+        let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((k, paths)) = last.as_ref() {
+            if *k == key && key.2.is_some() {
+                return Arc::clone(paths);
+            }
+        }
+        let paths = Arc::new(read_paths(&key.0).unwrap_or_default());
+        *last = Some((key, Arc::clone(&paths)));
+        paths
+    }
+
+    /// Sorted, deduplicated paths in the index (every stage, so a path with
+    /// a merge conflict counts as tracked). `None` when there is no index or
+    /// it cannot be read.
+    #[cfg(test)]
+    pub(super) fn tracked_paths(repo_root: &Path) -> Option<Vec<String>> {
+        read_paths(&index_file(repo_root)?)
+    }
+
+    fn read_paths(file: &Path) -> Option<Vec<String>> {
+        let data = fs::read(file).ok()?;
+        let mut paths = parse(&data)?;
+        paths.sort_unstable();
+        paths.dedup();
+        Some(paths)
+    }
+
+    fn be32(data: &[u8], at: usize) -> Option<u32> {
+        Some(u32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?))
+    }
+
+    /// Git's offset varint (version 4 path prefix lengths).
+    fn varint(data: &[u8], pos: &mut usize) -> Option<usize> {
+        let mut c = *data.get(*pos)?;
+        *pos += 1;
+        let mut val = (c & 0x7f) as usize;
+        while c & 0x80 != 0 {
+            c = *data.get(*pos)?;
+            *pos += 1;
+            val = val.checked_add(1)?.checked_mul(128)? + (c & 0x7f) as usize;
+        }
+        Some(val)
+    }
+
+    /// Entry paths of an index file's bytes.
+    pub(super) fn parse(data: &[u8]) -> Option<Vec<String>> {
+        if data.get(0..4)? != b"DIRC" {
+            return None;
+        }
+        let version = be32(data, 4)?;
+        if !(2..=4).contains(&version) {
+            return None;
+        }
+        let count = be32(data, 8)? as usize;
+        // ctime, mtime (8 each), dev, ino, mode, uid, gid, size (4 each),
+        // object id (20), flags (2).
+        const FIXED: usize = 62;
+        let mut paths = Vec::with_capacity(count.min(data.len() / FIXED));
+        let mut pos = 12;
+        let mut prev: Vec<u8> = Vec::new();
+        for _ in 0..count {
+            let flags = u16::from_be_bytes(data.get(pos + 60..pos + 62)?.try_into().ok()?);
+            let extended = version >= 3 && flags & 0x4000 != 0;
+            let mut at = pos + FIXED + if extended { 2 } else { 0 };
+            let path: Vec<u8> = if version == 4 {
+                let strip = varint(data, &mut at)?;
+                let keep = prev.len().checked_sub(strip)?;
+                let rest = data.get(at..)?;
+                let nul = rest.iter().position(|&b| b == 0)?;
+                let mut path = prev[..keep].to_vec();
+                path.extend_from_slice(&rest[..nul]);
+                pos = at + nul + 1;
+                path
+            } else {
+                let rest = data.get(at..)?;
+                let nul = rest.iter().position(|&b| b == 0)?;
+                let path = rest[..nul].to_vec();
+                // Entries are NUL padded to a multiple of 8 bytes.
+                let len = at - pos + nul;
+                pos += (len + 8) & !7;
+                path
+            };
+            if let Ok(p) = std::str::from_utf8(&path) {
+                paths.push(p.to_string());
+            }
+            prev = path;
+        }
+        Some(paths)
+    }
 }
 
 #[cfg(test)]
@@ -1280,5 +1632,218 @@ mod tests {
         fn repo_root(repo: &Repository) -> &Path {
             repo.root()
         }
+    }
+
+    // ── finding 210: a path git tracks is tracked by writ ───────────
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("HOME", dir)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    }
+
+    fn write(dir: &Path, rel: &str, content: &str) {
+        let p = dir.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, content).unwrap();
+    }
+
+    /// The writ repo's own shape: `scripts/` in .gitignore and in the
+    /// imported block of .writignore, `scripts/bump-version.sh` force added.
+    fn tracked_ignored_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q"]);
+        write(d, "README.md", "x\n");
+        write(d, "scripts/bump-version.sh", "echo bump\n");
+        write(d, "scripts/lib/util.sh", "echo util\n");
+        write(d, "scripts/scratch.sh", "echo scratch\n");
+        write(d, "scripts/tmp/out.txt", "out\n");
+        write(d, "build/keep.txt", "keep\n");
+        write(d, ".gitignore", ".writ/\nscripts/\nbuild/\n");
+        write(
+            d,
+            ".writignore",
+            "# --- writ defaults ---\n.writ\n.git\ntarget\n\n\
+             # --- imported from .gitignore ---\n.writ/\nscripts/\n\n\
+             # hand\nbuild\n",
+        );
+        git(d, &["add", "README.md", ".gitignore", ".writignore"]);
+        git(
+            d,
+            &[
+                "add",
+                "-f",
+                "scripts/bump-version.sh",
+                "scripts/lib/util.sh",
+                "build/keep.txt",
+            ],
+        );
+        dir
+    }
+
+    #[test]
+    fn f210_git_tracked_path_under_a_gitignored_dir_is_not_ignored() {
+        let dir = tracked_ignored_repo();
+        let rules = IgnoreRules::load(dir.path());
+        // Tracked by git: tracked by writ, whatever .gitignore says.
+        assert!(!rules.is_path_ignored("scripts/bump-version.sh"));
+        assert!(!rules.is_path_ignored("scripts/lib/util.sh"));
+        assert!(!rules.is_dir_ignored("scripts"));
+        assert!(!rules.is_dir_ignored("scripts/lib"));
+        assert!(!rules.is_file_ignored("scripts/bump-version.sh"));
+        assert!(!rules.is_file_ignored("scripts/lib/util.sh"));
+        // Untracked in the same directory: ignored, as git ignores it.
+        assert!(rules.is_path_ignored("scripts/scratch.sh"));
+        assert!(rules.is_file_ignored("scripts/scratch.sh"));
+        assert!(rules.is_dir_ignored("scripts/tmp"));
+        assert!(rules.is_path_ignored("scripts/tmp/out.txt"));
+        assert!(rules.is_file_ignored("scripts/tmp/out.txt"));
+        // .writ stays ignored whatever git holds.
+        assert!(rules.is_dir_ignored(".writ"));
+    }
+
+    #[test]
+    fn f210_a_hand_writignore_line_still_hides_a_tracked_path() {
+        let dir = tracked_ignored_repo();
+        let rules = IgnoreRules::load(dir.path());
+        // `build` is a hand line in .writignore: the user's choice stands.
+        assert!(rules.is_dir_ignored("build"));
+        assert!(rules.is_path_ignored("build/keep.txt"));
+        assert_eq!(rules.tracked_but_writ_ignored(), vec!["build/keep.txt"]);
+    }
+
+    #[test]
+    fn f210_without_a_git_index_every_gitignore_rule_applies_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), ".gitignore", "scripts/\n");
+        write(dir.path(), "scripts/bump-version.sh", "echo\n");
+        let rules = IgnoreRules::load(dir.path());
+        assert!(rules.is_dir_ignored("scripts"));
+        assert!(rules.is_path_ignored("scripts/bump-version.sh"));
+        assert!(rules.tracked_but_writ_ignored().is_empty());
+        // No repo at all: layered rules are unchanged too.
+        let rules = IgnoreRules::layered(
+            Some("scripts/\n"),
+            Some("# --- imported from .gitignore ---\nlogs/\n"),
+        );
+        assert!(rules.is_dir_ignored("scripts"));
+        assert!(rules.is_dir_ignored("logs"));
+        assert!(rules.is_path_ignored("logs/a.txt"));
+    }
+
+    #[test]
+    fn f210_import_block_ends_at_the_first_blank_or_comment_line() {
+        let rules = IgnoreRules::layered(
+            None,
+            Some(
+                "# --- writ defaults ---\n.git\n\n# --- imported from .gitignore ---\n\
+                 docs/\nscripts/\n\n# compiled python extension\n*.so\n",
+            ),
+        );
+        assert_eq!(rules.decide(".git", true), Verdict::Ignored(Source::Writ));
+        assert_eq!(rules.decide("docs", true), Verdict::Ignored(Source::Git));
+        assert_eq!(rules.decide("scripts", true), Verdict::Ignored(Source::Git));
+        assert_eq!(rules.decide("a.so", false), Verdict::Ignored(Source::Writ));
+        // Line order within .writignore still decides: a later hand line
+        // re-includes what an imported line ignored.
+        let rules = IgnoreRules::layered(
+            None,
+            Some("# --- imported from .gitignore ---\n*.log\n\n!keep.log\n"),
+        );
+        assert_eq!(rules.decide("a.log", false), Verdict::Ignored(Source::Git));
+        assert_eq!(rules.decide("keep.log", false), Verdict::Whitelisted);
+    }
+
+    #[test]
+    fn f210_index_reader_matches_git_ls_files_for_versions_2_3_and_4() {
+        let dir = tracked_ignored_repo();
+        let d = dir.path();
+        write(d, "deep/a/b/c/one.txt", "1\n");
+        write(d, "deep/a/b/c/two.txt", "2\n");
+        write(d, "deep/a/b/three.txt", "3\n");
+        write(d, "na\u{ef}ve name.txt", "4\n");
+        git(d, &["add", "deep", "na\u{ef}ve name.txt"]);
+        // Intent to add sets an extended flag (a version 3 entry).
+        write(d, "later.txt", "5\n");
+        git(d, &["add", "-N", "later.txt"]);
+        let mut expected: Vec<String> = git(d, &["-c", "core.quotepath=off", "ls-files"])
+            .lines()
+            .map(str::to_string)
+            .collect();
+        expected.sort();
+        for version in ["3", "4", "2"] {
+            if version == "2" {
+                git(d, &["rm", "-q", "--cached", "later.txt"]);
+                expected.retain(|p| p != "later.txt");
+            }
+            git(d, &["update-index", "--index-version", version]);
+            let data = fs::read(d.join(".git/index")).unwrap();
+            assert_eq!(&data[4..8], &[0, 0, 0, version.parse::<u8>().unwrap()]);
+            assert_eq!(
+                git_index::tracked_paths(d).unwrap(),
+                expected,
+                "index version {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn f210_index_reader_follows_a_dot_git_file() {
+        let dir = tracked_ignored_repo();
+        let wt = tempfile::tempdir().unwrap();
+        let wt_path = wt.path().join("wt");
+        git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "-m",
+                "x",
+            ],
+        );
+        git(
+            dir.path(),
+            &["worktree", "add", "-q", wt_path.to_str().unwrap()],
+        );
+        assert!(wt_path.join(".git").is_file());
+        let paths = git_index::tracked_paths(&wt_path).unwrap();
+        assert!(
+            paths.contains(&"scripts/bump-version.sh".to_string()),
+            "{paths:?}"
+        );
+        assert!(!IgnoreRules::load(&wt_path).is_path_ignored("scripts/bump-version.sh"));
+    }
+
+    #[test]
+    fn f210_cached_index_sees_gits_next_write() {
+        let dir = tracked_ignored_repo();
+        let d = dir.path();
+        let rules = IgnoreRules::load(d);
+        assert!(rules.is_path_ignored("scripts/scratch.sh"));
+        git(d, &["add", "-f", "scripts/scratch.sh"]);
+        // A new load in the same process reads the rewritten index.
+        assert!(!IgnoreRules::load(d).is_path_ignored("scripts/scratch.sh"));
+        git(d, &["rm", "-q", "--cached", "scripts/scratch.sh"]);
+        assert!(IgnoreRules::load(d).is_path_ignored("scripts/scratch.sh"));
+    }
+
+    #[test]
+    fn f210_index_reader_rejects_garbage() {
+        assert_eq!(git_index::parse(b""), None);
+        assert_eq!(git_index::parse(b"DIRC\0\0\0\x09\0\0\0\0"), None);
+        // Declares one entry, holds none.
+        assert_eq!(git_index::parse(b"DIRC\0\0\0\x02\0\0\0\x01"), None);
+        assert_eq!(git_index::parse(b"DIRC\0\0\0\x02\0\0\0\0"), Some(vec![]));
     }
 }

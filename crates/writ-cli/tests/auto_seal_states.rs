@@ -4668,3 +4668,63 @@ fn f217_hook_seals_to_the_most_recently_claimed_spec() {
     all_exit_zero(&p.edit(Some(ALPHA), "sess-a", "Write", "b.txt"), "edit 4");
     assert_eq!(p.newest_seal()["spec_id"], auto.as_str(), "after re-claim");
 }
+
+/// Finding 210: a file git tracks under a directory .gitignore lists (and
+/// that `writ init` imported into .writignore, as on the writ repo itself:
+/// `scripts/bump-version.sh` under `scripts/`) is tracked by writ too,
+/// because .gitignore only ever applies to untracked files in git. Before
+/// the fix the hook recorded `paths: []` and nothing sealed the edit.
+#[test]
+fn f210_hook_seals_a_git_tracked_file_under_an_ignored_directory() {
+    let p = Project::new("f210-tracked-ignored");
+    p.write("tools/bump.sh", "#!/bin/sh\necho bump\n");
+    p.write(".gitignore", &format!("{}tools/\n", p.read(".gitignore")));
+    // The init time import block of .writignore, as `writ init` writes it.
+    let writignore = p.read(".writignore");
+    assert!(
+        writignore.contains("# --- imported from .gitignore ---\nignored.txt\n"),
+        "fixture .writignore changed shape:\n{writignore}"
+    );
+    p.write(
+        ".writignore",
+        &writignore.replace(
+            "# --- imported from .gitignore ---\nignored.txt\n",
+            "# --- imported from .gitignore ---\nignored.txt\ntools/\n",
+        ),
+    );
+    p.git_ok(&["add", "-f", "tools/bump.sh", ".gitignore"]);
+    p.git_ok(&["commit", "-q", "--no-verify", "-m", "force add a tool"]);
+    assert_eq!(
+        p.git_ok(&["ls-files", "-ci", "--exclude-standard"]).trim(),
+        "tools/bump.sh"
+    );
+
+    let before = p.seal_count();
+    p.write("tools/bump.sh", "#!/bin/sh\necho bump\necho tag\n");
+    all_exit_zero(
+        &p.edit(Some(ALPHA), "sess-a", "Edit", "tools/bump.sh"),
+        "edit of a tracked, ignored file",
+    );
+    let after = seals_since(&p, before);
+    assert!(
+        after.iter().any(|s| paths_of(s).contains("tools/bump.sh")),
+        "the hook did not seal tools/bump.sh; seals since: {after:?}\nhooks.log:\n{}",
+        p.hooks_log()
+    );
+
+    // git's rule cuts both ways: an untracked file in the same directory
+    // stays ignored, and the hook seals nothing for it.
+    let before = p.seal_count();
+    p.write("tools/scratch.sh", "echo scratch\n");
+    all_exit_zero(
+        &p.edit(Some(ALPHA), "sess-a", "Write", "tools/scratch.sh"),
+        "write of an untracked, ignored file",
+    );
+    let after = seals_since(&p, before);
+    assert!(
+        after
+            .iter()
+            .all(|s| !paths_of(s).contains("tools/scratch.sh")),
+        "an untracked file under an ignored directory was sealed: {after:?}"
+    );
+}

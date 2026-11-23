@@ -596,6 +596,7 @@ pub fn run(repo: &Repository) -> WritResult<DoctorReport> {
     let mut report = DoctorReport::from_findings(findings, checks_run, started);
     report.check_ms = check_ms;
     report.info.extend(watch_line(repo.writ_dir(), &specs));
+    report.info.extend(tracked_hidden_line(repo.root()));
     apply_survival_state(repo, &mut report);
     report.next_action = next_action(&report.findings, &specs);
     Ok(report)
@@ -1700,6 +1701,35 @@ fn watch_line(writ_dir: &Path, specs: &[crate::spec::Spec]) -> Option<String> {
             live.join(", ")
         )
     })
+}
+
+// ---------------------------------------------------------------------------
+// Info: git tracks a path a hand .writignore line hides (finding 210)
+// ---------------------------------------------------------------------------
+
+/// Finding 210: writ follows git's rule, so `.gitignore` (and the block
+/// `writ init` imported from it) never hides a path git tracks. A line
+/// written by hand in `.writignore` still does; that stays the user's
+/// choice, so it is an info line, never a finding: writ seals none of those
+/// paths and `writ finish` commits none of their changes.
+fn tracked_hidden_line(root: &Path) -> Option<String> {
+    let hidden = crate::ignore::IgnoreRules::load(root).tracked_but_writ_ignored();
+    if hidden.is_empty() {
+        return None;
+    }
+    let shown: Vec<&str> = hidden.iter().take(3).map(String::as_str).collect();
+    let more = if hidden.len() > shown.len() {
+        format!(", +{} more", hidden.len() - shown.len())
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{} path(s) git tracks are hidden from writ by a .writignore line ({}{more}); \
+         writ seals none of their changes and finish commits none; remove the line to \
+         track them",
+        hidden.len(),
+        shown.join(", ")
+    ))
 }
 
 // ---------------------------------------------------------------------------

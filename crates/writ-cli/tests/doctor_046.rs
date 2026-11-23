@@ -515,3 +515,68 @@ fn f215_a_running_watch_says_nothing() {
     let v = json(&writ(&s.0, &["doctor", "--format", "json"]));
     assert!(info_lines(&v).is_empty(), "{v:#}");
 }
+
+/// Finding 210: a path git tracks that a hand `.writignore` line hides is
+/// the one remaining disagreement between writ and git, by the user's
+/// choice: one info line with the count, never a finding. A path only
+/// `.gitignore` lists is tracked by writ, so it gets no line.
+#[test]
+fn f210_doctor_names_tracked_paths_a_hand_writignore_line_hides() {
+    let s = Scratch::new("tracked-hidden");
+    let proj = git_project(&s.0);
+    let git = |args: &[&str]| {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&proj)
+            .status()
+            .unwrap()
+            .success());
+    };
+    for (rel, body) in [
+        ("notes/a.md", "a\n"),
+        ("notes/b.md", "b\n"),
+        ("tools/bump.sh", "echo\n"),
+    ] {
+        fs::create_dir_all(proj.join(rel).parent().unwrap()).unwrap();
+        fs::write(proj.join(rel), body).unwrap();
+    }
+    fs::write(proj.join(".gitignore"), "tools/\n").unwrap();
+    git(&["add", "README.md", ".gitignore", "notes"]);
+    git(&["add", "-f", "tools/bump.sh"]);
+    git(&["commit", "-q", "-m", "base"]);
+    assert!(writ_home(&proj, &["init", "-y"]).status.success());
+
+    // tools/ comes from .gitignore (and init's import): no line.
+    let v = json(&writ_home(&proj, &["doctor", "--format", "json"]));
+    assert!(
+        info_lines(&v).iter().all(|l| !l.contains("git tracks")),
+        "{v:#}"
+    );
+
+    // A hand line hiding notes/: one info line naming the count.
+    let writignore = fs::read_to_string(proj.join(".writignore")).unwrap();
+    fs::write(
+        proj.join(".writignore"),
+        format!("{writignore}\n# mine\nnotes/\n"),
+    )
+    .unwrap();
+    let v = json(&writ_home(&proj, &["doctor", "--format", "json"]));
+    let lines: Vec<String> = info_lines(&v)
+        .into_iter()
+        .filter(|l| l.contains("git tracks"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{v:#}");
+    for want in [
+        "2 path(s) git tracks",
+        "notes/a.md",
+        "notes/b.md",
+        ".writignore",
+    ] {
+        assert!(lines[0].contains(want), "missing {want:?}: {}", lines[0]);
+    }
+    assert!(!lines[0].contains("tools/bump.sh"), "{}", lines[0]);
+    assert!(
+        findings_of(&v, "tracked_hidden").is_empty(),
+        "an info line, never a finding: {v:#}"
+    );
+}

@@ -1535,6 +1535,8 @@ impl Repository {
         atomic_write(&self.workspace_dir().join("HEAD"), seal.id.as_bytes())?;
         index.save(&self.workspace_dir().join("index.json"))?;
 
+        #[cfg(test)]
+        tests::f222_between_read_and_save();
         if let Some(ref sid) = spec_id {
             self.record_seal_on_spec(sid, spec_rec, &seal)?;
         }
@@ -2588,6 +2590,14 @@ impl Repository {
         seal: &Seal,
     ) -> WritResult<()> {
         self.write_spec_head(spec_id, &seal.id)?;
+        // Finding 222: the early read (finding 218) proved the record is
+        // readable; the record is read again here, under the seal's lock,
+        // so a claim or update written since is kept. The early copy is the
+        // fallback only if this read fails.
+        let spec = match spec {
+            Some(early) => Some(self.load_spec(spec_id).unwrap_or(early)),
+            None => None,
+        };
         if let Some(mut spec) = spec {
             spec.sealed_by.push(seal.id.clone());
             let now = chrono::Utc::now();
@@ -13259,6 +13269,109 @@ mod tests {
             .unwrap();
         let spec = repo.load_spec("models").unwrap();
         assert_eq!(spec.sealed_by, vec![seal.id]);
+    }
+
+    thread_local! {
+        static F222_BETWEEN: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Finding 222 injection point: runs once between the seal's early read
+    /// of the spec record and its save.
+    pub(super) fn f222_between_read_and_save() {
+        if let Some(f) = F222_BETWEEN.with(|c| c.borrow_mut().take()) {
+            f();
+        }
+    }
+
+    /// Finding 222 (widened by 218): a claim written to the spec record
+    /// after the seal's early read must survive the seal's save, and the
+    /// seal must still be in `sealed_by`.
+    #[test]
+    fn f222_a_claim_written_during_a_seal_survives_it() {
+        let dir = tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        repo.add_spec(&Spec::new("s".into(), "s".into(), String::new()))
+            .unwrap();
+        fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+        let writ_dir = repo.writ_dir().to_path_buf();
+        F222_BETWEEN.with(|c| {
+            *c.borrow_mut() = Some(Box::new(move || {
+                // Another process's `spec claim`, as it writes the record.
+                let other = Repository::open(writ_dir.parent().unwrap()).unwrap();
+                let mut spec = other.load_spec("s").unwrap();
+                spec.set_claim("bri");
+                other.save_spec(&spec).unwrap();
+            }))
+        });
+        let seal = repo
+            .seal(
+                test_agent(),
+                "x".into(),
+                Some("s".into()),
+                TaskStatus::InProgress,
+                Verification::default(),
+                false,
+            )
+            .unwrap();
+        let spec = repo.load_spec("s").unwrap();
+        assert_eq!(spec.claimed_by.as_deref(), Some("bri"), "claim lost");
+        assert_eq!(spec.sealed_by, vec![seal.id]);
+    }
+
+    /// Finding 222 (open): seals on one thread and spec updates on another
+    /// (two writers of one record, as two processes would be) should lose
+    /// nothing: every seal in `sealed_by` and the last update's notes kept.
+    /// Fails today: spec record writers outside the repo lock.
+    #[test]
+    #[ignore = "finding 222: spec record writers outside the repo lock lose updates; open"]
+    fn f222_concurrent_seals_and_updates_lose_no_sealed_by() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let repo = Repository::init(&root).unwrap();
+        repo.add_spec(&Spec::new("s".into(), "s".into(), String::new()))
+            .unwrap();
+        let updater = {
+            let root = root.clone();
+            std::thread::spawn(move || {
+                let r = Repository::open(&root).unwrap();
+                for i in 0..60 {
+                    r.update_spec(
+                        "s",
+                        crate::spec::SpecUpdate {
+                            design_notes: Some(vec![format!("note {i}")]),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                }
+            })
+        };
+        let mut ids = Vec::new();
+        for i in 0..30 {
+            fs::write(root.join("a.txt"), format!("v{i}\n")).unwrap();
+            ids.push(
+                repo.seal(
+                    test_agent(),
+                    format!("s{i}"),
+                    Some("s".into()),
+                    TaskStatus::InProgress,
+                    Verification::default(),
+                    false,
+                )
+                .unwrap()
+                .id,
+            );
+        }
+        updater.join().unwrap();
+        let spec = repo.load_spec("s").unwrap();
+        let missing: Vec<&String> = ids.iter().filter(|i| !spec.sealed_by.contains(i)).collect();
+        assert!(
+            missing.is_empty(),
+            "{} of 30 seals lost from sealed_by",
+            missing.len()
+        );
+        assert_eq!(spec.design_notes, vec!["note 59".to_string()]);
     }
 
     /// A spec file that exists but does not parse refuses the seal too

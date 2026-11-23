@@ -4619,3 +4619,52 @@ fn f190_finish_subject_uses_the_closing_summary_when_spec_done_had_one() {
     let subject = q.git_ok(&["log", "-1", "--format=%s"]);
     assert!(subject.contains("Fix the parser"), "{subject:?}");
 }
+
+/// Finding 217 (Aubs, run B's receipt): an agent the hook is sealing to its
+/// auto spec claims a second spec by hand; its later edits seal to the spec
+/// it claimed most recently, not to the first auto spec, so the receipt
+/// shows the hand spec with its seals instead of "(no agent; 0 seals)".
+#[test]
+fn f217_hook_seals_to_the_most_recently_claimed_spec() {
+    let p = Project::new("f217-latest-claim");
+    p.write("a.txt", &numbered(20, &[(1, "A")]));
+    all_exit_zero(&p.edit(Some(ALPHA), "sess-a", "Edit", "a.txt"), "edit 1");
+    let auto = p.newest_seal()["spec_id"].as_str().unwrap().to_string();
+    assert!(auto.starts_with("auto-"), "{auto}");
+
+    // The agent claims a second spec by hand, as run B's agent did.
+    p.ok(
+        ALPHA,
+        &[
+            "spec",
+            "add",
+            "--id",
+            "feature",
+            "--title",
+            "the feature",
+            "--claim",
+        ],
+    );
+    p.write("b.txt", &numbered(20, &[(2, "B")]));
+    all_exit_zero(&p.edit(Some(ALPHA), "sess-a", "Write", "b.txt"), "edit 2");
+    assert_eq!(
+        p.newest_seal()["spec_id"],
+        "feature",
+        "edit after the claim"
+    );
+    // A file the auto spec already sealed goes there too: the claim is
+    // where the agent's work now belongs.
+    p.write("a.txt", &numbered(20, &[(1, "A2")]));
+    all_exit_zero(&p.edit(Some(ALPHA), "sess-a", "Edit", "a.txt"), "edit 3");
+    assert_eq!(
+        p.newest_seal()["spec_id"],
+        "feature",
+        "a.txt after the claim"
+    );
+
+    // Claiming the auto spec again (re-claim) moves the seals back.
+    p.ok(ALPHA, &["spec", "claim", &auto, "--agent", ALPHA]);
+    p.write("b.txt", &numbered(20, &[(2, "B2")]));
+    all_exit_zero(&p.edit(Some(ALPHA), "sess-a", "Write", "b.txt"), "edit 4");
+    assert_eq!(p.newest_seal()["spec_id"], auto.as_str(), "after re-claim");
+}

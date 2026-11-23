@@ -151,6 +151,11 @@ pub struct Spec {
     /// Host the claiming process ran on; liveness is only judged on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claimed_host: Option<String>,
+    /// When the current holder took (or re-took) the claim (finding 217):
+    /// the hook seals an identity's edits to the spec it claimed last.
+    /// None for claims taken before 0.4.6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claimed_at: Option<DateTime<Utc>>,
     /// True once a claim on this spec was released with `--force` by
     /// someone other than its holder (finding 91). Distinct from a seal's
     /// `forced`; read by the hurdle ratio. `--stale` never sets it.
@@ -285,6 +290,7 @@ impl Spec {
             claimed_pid: None,
             claimed_pid_start: None,
             claimed_host: None,
+            claimed_at: None,
             release_forced: false,
             genesis_tree: None,
             post_commit_notes: Vec::new(),
@@ -324,6 +330,7 @@ impl Spec {
         self.claimed_pid = proc.as_ref().map(|p| p.pid);
         self.claimed_pid_start = proc.map(|p| p.start);
         self.claimed_host = crate::agent::session::host_name();
+        self.claimed_at = Some(Utc::now());
     }
 
     /// Drop the claim and its process record.
@@ -332,6 +339,7 @@ impl Spec {
         self.claimed_pid = None;
         self.claimed_pid_start = None;
         self.claimed_host = None;
+        self.claimed_at = None;
     }
 
     pub fn reopen(&mut self) {

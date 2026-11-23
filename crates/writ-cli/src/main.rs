@@ -11180,6 +11180,7 @@ mod tests {
             claimed_pid: None,
             claimed_pid_start: None,
             claimed_host: None,
+            claimed_at: None,
             release_forced: false,
             genesis_tree: None,
             post_commit_notes: Vec::new(),

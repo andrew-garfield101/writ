@@ -1961,8 +1961,11 @@ fn is_open(s: &Spec) -> bool {
 }
 
 /// The spec an auto seal goes under: the identity's one open claimed spec;
-/// with several, this session's auto spec, else the one whose scope covers
-/// the path, else the most recently active; with none, its one unclaimed
+/// with several, the one it claimed most recently (finding 217: a spec the
+/// agent claims by hand while the hook seals to its auto spec gets its
+/// later edits); when no claim records its time (claims before 0.4.6),
+/// this session's auto spec, else the one whose scope covers the path,
+/// else the most recently active; with none, its one unclaimed
 /// spec it created (claimed now, as a first hand seal would, finding 87);
 /// else a new auto spec, created and claimed.
 fn spec_for(
@@ -1977,6 +1980,13 @@ fn spec_for(
         .filter(|s| s.claimed_by.as_deref() == Some(who.id.as_str()) && is_open(s))
         .collect();
     if held.len() > 1 {
+        if let Some(s) = held
+            .iter()
+            .filter(|s| s.claimed_at.is_some())
+            .max_by_key(|s| s.claimed_at)
+        {
+            return Ok(s.id.clone());
+        }
         if let Some(s) = held.iter().find(|s| {
             s.auto
                 .as_ref()

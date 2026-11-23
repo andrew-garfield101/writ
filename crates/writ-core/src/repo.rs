@@ -3817,7 +3817,10 @@ impl Repository {
         let mut spec = self.resolve_spec(spec_id)?;
         if let Some(ref existing) = spec.claimed_by {
             if existing == agent_id {
-                return Ok(()); // idempotent — same agent re-claiming
+                // Idempotent for the holder, but a re-claim is the newest
+                // claim (finding 217): the hook seals there from now on.
+                spec.claimed_at = Some(chrono::Utc::now());
+                return self.save_spec(&spec);
             }
             return Err(WritError::SpecAlreadyClaimed {
                 spec_id: spec_id.to_string(),
@@ -11357,6 +11360,7 @@ impl Repository {
             claimed_pid: claim_src.claimed_pid,
             claimed_pid_start: claim_src.claimed_pid_start.clone(),
             claimed_host: claim_src.claimed_host.clone(),
+            claimed_at: claim_src.claimed_at,
             release_forced: existing.release_forced || incoming.release_forced,
             created_by: existing.created_by.clone().or(incoming.created_by.clone()),
             auto: existing.auto.clone().or(incoming.auto.clone()),
@@ -16988,6 +16992,7 @@ mod verify_all_chains_tests {
             claimed_pid: None,
             claimed_pid_start: None,
             claimed_host: None,
+            claimed_at: None,
             release_forced: false,
             genesis_tree: None,
             post_commit_notes: Vec::new(),
@@ -17062,6 +17067,7 @@ mod verify_all_chains_tests {
                 claimed_pid: None,
                 claimed_pid_start: None,
                 claimed_host: None,
+                claimed_at: None,
                 release_forced: false,
                 genesis_tree: None,
                 post_commit_notes: Vec::new(),
@@ -19608,6 +19614,7 @@ mod remote_tests {
             claimed_pid: None,
             claimed_pid_start: None,
             claimed_host: None,
+            claimed_at: None,
             release_forced: false,
             genesis_tree: None,
             post_commit_notes: Vec::new(),

@@ -2153,6 +2153,23 @@ fn subject_phrase(spec: &writ_core::spec::Spec) -> String {
         .unwrap_or_else(|| spec.title.clone())
 }
 
+/// Finding 216: the spec whose phrase leads the finish subject: the one
+/// with the most seals in the range (all seals of a committable spec are
+/// uncommitted), ties in listed order. A 0 seal spec leads only when no
+/// spec has a seal, and a 0 seal auto spec never does (`None`: the caller
+/// says "writ changes").
+fn subject_lead(specs: &[&writ_core::spec::Spec], seal_counts: &[usize]) -> Option<String> {
+    let best = specs
+        .iter()
+        .zip(seal_counts)
+        .enumerate()
+        .filter(|(_, (s, n))| **n > 0 || s.auto.is_none())
+        // max_by_key keeps the last of equals; key on the reversed index
+        // so the first listed wins a tie.
+        .max_by_key(|(i, (_, n))| (**n, std::cmp::Reverse(*i)))?;
+    Some(subject_phrase(best.1 .0))
+}
+
 /// Resolve the acting agent's ID through the one core resolver (S.3).
 ///
 /// Priority: explicit --agent > WRIT_AGENT_ID > settings.default_agent >
@@ -5403,8 +5420,12 @@ fn cmd_finish(
 
     // Generate commit message from committable specs (not all specs).
     let commit_message = {
-        let titles: Vec<String> = committable.iter().map(|s| subject_phrase(s)).collect();
-        let first_title = titles.first().map(String::as_str).unwrap_or("writ changes");
+        let seal_counts: Vec<usize> = committable
+            .iter()
+            .map(|s| repo.spec_seals(&s.id).map(|v| v.len()).unwrap_or(0))
+            .collect();
+        let first_title = subject_lead(&committable, &seal_counts);
+        let first_title = first_title.as_deref().unwrap_or("writ changes");
         if committable.len() == 1 {
             format!("writ: {}", first_title)
         } else {
@@ -11037,6 +11058,33 @@ fn cmd_watch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Finding 216: most seals leads, ties in listed order, 0 seal auto
+    /// specs never lead, a 0 seal hand spec only when nothing has seals.
+    #[test]
+    fn f216_subject_lead_rules() {
+        use writ_core::spec::{AutoSpec, Spec};
+        let mk = |id: &str, auto: bool| {
+            let mut s = Spec::new(id.into(), format!("{id} title"), String::new());
+            if auto {
+                s.auto = Some(AutoSpec {
+                    session: "s".into(),
+                    parent: None,
+                    host_agent_id: None,
+                    host_agent_type: None,
+                    closed_by_session_end: None,
+                });
+            }
+            s
+        };
+        let (a, b, c) = (mk("a", true), mk("b", false), mk("c", false));
+        let specs = [&a, &b, &c];
+        assert_eq!(subject_lead(&specs, &[0, 2, 5]).as_deref(), Some("c title"));
+        assert_eq!(subject_lead(&specs, &[0, 2, 2]).as_deref(), Some("b title"));
+        assert_eq!(subject_lead(&specs, &[0, 0, 0]).as_deref(), Some("b title"));
+        assert_eq!(subject_lead(&specs[..1], &[0]), None);
+        assert_eq!(subject_lead(&specs[..1], &[1]).as_deref(), Some("a title"));
+    }
 
     // -- common_directory_prefix tests --
 

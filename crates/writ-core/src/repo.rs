@@ -11721,10 +11721,14 @@ impl Repository {
         let has_workspace_convergence = !workspace_names.is_empty();
 
         // Build the headline.
-        let completed_specs: Vec<&SpecSummaryEntry> = specs_summary
+        let mut completed_specs: Vec<&SpecSummaryEntry> = specs_summary
             .iter()
             .filter(|s| s.status == "complete")
             .collect();
+        // Finding 216: the headline (the Python finish message) names the
+        // spec with the most seals first; a 0 seal spec never leads one with
+        // seals. Stable, so ties keep the listed order.
+        completed_specs.sort_by_key(|s| std::cmp::Reverse(s.seal_count));
         let agent_count = agents.len();
 
         let headline = if has_workspace_convergence && completed_specs.len() >= 2 {

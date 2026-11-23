@@ -160,10 +160,28 @@ pub fn note(writ_dir: &Path, rel: &str) {
     let Some(c) = cur.iter_mut().find(|c| c.writ_dir == writ_dir) else {
         return;
     };
+    if c.rec.paths.is_empty() && c.rec.end.is_none() {
+        // Finding 220: the marker goes to disk first and its own mtime
+        // (the kernel's clock) bounds the start, before this write happens.
+        save(&c.path, &c.rec);
+        let mtime = fs::metadata(&c.path).and_then(|m| m.modified()).ok();
+        c.rec.start = marker_start(c.rec.start, mtime);
+    }
     c.rec.last = now;
     if c.rec.paths.insert(rel.to_string()) || c.rec.end.is_some() {
         save(&c.path, &c.rec);
     }
+}
+
+/// Finding 220: the marker's start. The working tree file's mtime comes
+/// from the kernel's clock, which on Linux is the coarse one (up to a tick
+/// behind the process clock `now`), so the start is taken from the marker
+/// file's own mtime when it is earlier: both are stamped by the same clock
+/// and the marker is written before any working tree write.
+fn marker_start(now: DateTime<Utc>, marker_mtime: Option<std::time::SystemTime>) -> DateTime<Utc> {
+    marker_mtime
+        .map(DateTime::<Utc>::from)
+        .map_or(now, |m| m.min(now))
 }
 
 fn save(path: &Path, rec: &OwnWrite) {
@@ -227,6 +245,60 @@ mod tests {
         assert!(!r.covers("b.txt", Some(inside), Utc::now()));
         assert!(!r.covers("a.txt", Some(after), Utc::now()));
         assert!(!r.covers("a.txt", Some(ns(start) - 3 * COARSE_NS - 7), Utc::now()));
+    }
+
+    /// Finding 220 (Bri's probe, CI run 40796673034): Linux stamps mtimes
+    /// from the kernel's coarse clock, up to a tick before the process
+    /// clock. Marker start from the process clock (`now`) misses a write in
+    /// the same tick: a.txt at start - 2 ms. The start now comes from the
+    /// marker file's own mtime (the same clock as the write), here a tick
+    /// at now - 3 ms, so the write is covered; +1 ms is the control; a
+    /// write before the marker's tick is not writ's.
+    #[test]
+    fn f220_marker_start_uses_the_kernel_clock_of_the_marker_file() {
+        let now = Utc::now() - chrono::Duration::seconds(5);
+        let ms = |d: i128| ns(now) + d * 1_000_000;
+        let tick = std::time::UNIX_EPOCH + std::time::Duration::from_nanos((ms(-3)) as u64);
+        let r = rec(&["a.txt"], marker_start(now, Some(tick)), None);
+        assert!(
+            r.covers("a.txt", Some(ms(-2)), Utc::now()),
+            "same tick write"
+        );
+        assert!(r.covers("a.txt", Some(ms(1)), Utc::now()), "control +1 ms");
+        assert!(
+            !r.covers("a.txt", Some(ms(-5)), Utc::now()),
+            "before the tick"
+        );
+        // The marker's mtime never moves the start later than now.
+        let late = std::time::UNIX_EPOCH + std::time::Duration::from_nanos(ms(4) as u64);
+        assert_eq!(marker_start(now, Some(late)), now);
+        assert_eq!(marker_start(now, None), now);
+    }
+
+    /// `note` writes the marker first and its recorded start is no later
+    /// than the marker file's mtime, so any write after `note` (stamped by
+    /// the same kernel clock) is at or after the start.
+    #[test]
+    fn f220_note_start_is_not_after_the_marker_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = begin("restore");
+        note(dir.path(), "a.txt");
+        let marker = fs::read_dir(dir.path().join(DIR))
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().extension().is_some_and(|x| x == "json"))
+            .unwrap()
+            .path();
+        let mtime: DateTime<Utc> = fs::metadata(&marker).unwrap().modified().unwrap().into();
+        let recs = load(dir.path(), 3600);
+        assert!(recs[0].start <= mtime, "{} > {mtime}", recs[0].start);
+        fs::write(dir.path().join("a.txt"), "x").unwrap();
+        let m: DateTime<Utc> = fs::metadata(dir.path().join("a.txt"))
+            .unwrap()
+            .modified()
+            .unwrap()
+            .into();
+        assert!(recs[0].covers("a.txt", Some(ns(m)), Utc::now()));
     }
 
     #[test]

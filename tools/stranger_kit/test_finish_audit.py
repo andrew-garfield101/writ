@@ -112,3 +112,93 @@ def test_audit_of_an_amended_commit_finds_the_receipt_by_parent_and_tree(
     out, checked, lost, specs = _audit(script, finished, "HEAD")
     assert specs == ["s1"], f"the amended commit's specs were not found:\n{out}"
     assert checked == 3 and lost == 0, out
+
+
+# Finding 225: the audit found an amended commit's receipt by (parent hash,
+# tree). When two consecutive finish commits are both rewritten (new
+# subjects, same trees), the second one's parent is the rewritten first, not
+# the original, so no receipt matched and the audit printed "specs=[]", 0
+# lines checked, which reads like a pass. It now keys on (parent tree, tree)
+# and a commit with files that matches no receipt exits non zero.
+UNMATCHED = "no receipt matched this commit: not audited"
+
+
+def _audit_raw(script: Path, repo: Path, rev: str) -> subprocess.CompletedProcess:
+    env = dict(os.environ, WRIT_AUDIT_REPO=str(repo))
+    return subprocess.run([sys.executable, str(script), rev], capture_output=True, text=True,
+                          env=env, timeout=120)
+
+
+@pytest.fixture
+def two_finishes_rewritten(finished: Path) -> tuple[Path, str, str]:
+    """s1's finish, then s2's finish (b.txt, two lines), then both commits
+    recreated on the same base with new messages, trees unchanged."""
+    writ = _writ_bin()
+    _run(finished, writ, "spec", "add", "--id", "s2", "--title", "s2")
+    _run(finished, writ, "spec", "claim", "s2", "--agent", AGENT)
+    (finished / "b.txt").write_text("bee 1\nbee 2\n")
+    _run(finished, writ, "seal", "-s", "two lines", "--agent", AGENT, "--spec", "s2",
+         "--paths", "b.txt")
+    _run(finished, writ, "spec", "done", "s2", "--agent", AGENT, "--no-seal")
+    _run(finished, writ, "finish", "-y")
+    base = _run(finished, "git", "rev-parse", "HEAD~2").strip()
+    t1 = _run(finished, "git", "rev-parse", "HEAD~1^{tree}").strip()
+    t2 = _run(finished, "git", "rev-parse", "HEAD^{tree}").strip()
+    new1 = _run(finished, "git", "commit-tree", t1, "-p", base, "-m", "feat: s1 reworded").strip()
+    new2 = _run(finished, "git", "commit-tree", t2, "-p", new1, "-m", "feat: s2 reworded").strip()
+    _run(finished, "git", "update-ref", "refs/heads/main", new2)
+    return finished, new1, new2
+
+
+@pytest.mark.parametrize("script", AUDITS, ids=["bench", "kit"])
+def test_first_of_two_rewritten_finishes_finds_its_receipt(two_finishes_rewritten, script):
+    repo, new1, _ = two_finishes_rewritten
+    out, checked, lost, specs = _audit(script, repo, new1)
+    assert specs == ["s1"], out
+    assert checked == 3 and lost == 0, out
+
+
+@pytest.mark.parametrize("script", AUDITS, ids=["bench", "kit"])
+def test_second_of_two_rewritten_finishes_finds_its_receipt_by_parent_tree(
+        two_finishes_rewritten, script):
+    """225: the 5f64d45 / ba69567 shape. The parent hash changed, the parent tree did not."""
+    repo, _, new2 = two_finishes_rewritten
+    out, checked, lost, specs = _audit(script, repo, new2)
+    assert specs == ["s2"], f"the second rewritten commit's specs were not found:\n{out}"
+    assert checked == 2 and lost == 0, out
+
+
+@pytest.mark.parametrize("script", AUDITS, ids=["bench", "kit"])
+def test_commit_with_files_and_no_receipt_is_not_audited_and_fails(finished: Path, script):
+    (finished / "c.txt").write_text("not a finish\n")
+    _run(finished, "git", "add", "c.txt")
+    _run(finished, "git", "commit", "-q", "--no-verify", "-m", "chore: hand commit")
+    r = _audit_raw(script, finished, "HEAD")
+    assert r.returncode != 0, f"an unmatched commit must not exit 0:\n{r.stdout}{r.stderr}"
+    assert UNMATCHED in r.stdout, r.stdout
+    assert "LOST: 0" not in r.stdout, f"must not print a count that reads as a pass:\n{r.stdout}"
+
+
+@pytest.mark.parametrize("script", AUDITS, ids=["bench", "kit"])
+def test_unmatched_commit_fails_the_whole_run_but_others_are_still_audited(
+        finished: Path, script):
+    """Several commits in one call (the kit's collect does this): the matched one
+    still prints its count, and the run exits non zero for the unmatched one."""
+    finish = _run(finished, "git", "rev-parse", "HEAD").strip()
+    (finished / "c.txt").write_text("not a finish\n")
+    _run(finished, "git", "add", "c.txt")
+    _run(finished, "git", "commit", "-q", "--no-verify", "-m", "chore: hand commit")
+    env = dict(os.environ, WRIT_AUDIT_REPO=str(finished))
+    r = subprocess.run([sys.executable, str(script), finish, "HEAD"], capture_output=True,
+                       text=True, env=env, timeout=120)
+    assert r.returncode != 0, r.stdout
+    assert "added lines checked: 3; superseded by a later seal: 0; LOST: 0" in r.stdout, r.stdout
+    assert r.stdout.count(UNMATCHED) == 1, r.stdout
+
+
+@pytest.mark.parametrize("script", AUDITS, ids=["bench", "kit"])
+def test_empty_commit_with_no_receipt_is_not_an_error(finished: Path, script):
+    _run(finished, "git", "commit", "-q", "--no-verify", "--allow-empty", "-m", "chore: empty")
+    r = _audit_raw(script, finished, "HEAD")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert UNMATCHED not in r.stdout, r.stdout

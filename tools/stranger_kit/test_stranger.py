@@ -639,3 +639,11 @@ def test_fleet_freeze7_web_builder_edits_are_4_and_all_sealed():
     seals = json.loads((FLEET_F7 / "seals.json").read_text())
     w = stranger.unsealed_window(i["edits"], seals, kit["project"])
     assert (w["edits"], w["sealed"], w["never_sealed"]) == (4, 4, 0)
+
+
+def test_r225_lost_lines_is_unknown_when_a_commit_was_not_audited():
+    """Finding 225: an unmatched commit is a lookup failure, never 0 lost."""
+    audited = "=== abc specs=['s1']\nadded lines checked: 3; superseded by a later seal: 0; LOST: 0\n"
+    unmatched = "=== def specs=[]\nno receipt matched this commit: not audited (2 file(s) in the commit)\n"
+    assert stranger.lost_lines(audited) == 0
+    assert stranger.lost_lines(audited + unmatched) is None

@@ -976,7 +976,11 @@ def credit_moved(recs: list[dict], seals: list) -> list[str]:
     return out
 
 
-def lost_lines(audit_text: str) -> int:
+def lost_lines(audit_text: str) -> int | None:
+    """Sum of LOST over the audited commits; None when any commit was not
+    audited (finding 225: no receipt matched it), which is never 0 lost."""
+    if "not audited" in audit_text:
+        return None
     return sum(int(m) for m in re.findall(r"LOST: (\d+)", audit_text))
 
 

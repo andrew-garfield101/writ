@@ -48,22 +48,33 @@ def rev(spec):
     return r.stdout.strip() if r.returncode == 0 else None
 
 def amended_from(full):
-    """Finding 207: the finish commit an amend replaced: the one finish
-    record (.writ/receipts/<commit>.json) whose commit has the same parent
-    and tree as `full`. None when no record, or more than one, matches."""
-    key = (rev(full + "^"), rev(full + "^{tree}"))
+    """Findings 207 and 225: the finish commit a rewrite replaced: the one
+    finish record (.writ/receipts/<commit>.json) whose commit has the same
+    parent tree and tree as `full`. Keyed on the parent's tree, not its hash:
+    when two consecutive finish commits are both rewritten, the second one's
+    parent is the rewritten first, a new hash with the old tree. None when no
+    record, or more than one, matches."""
+    key = (rev(full + "^^{tree}"), rev(full + "^{tree}"))
+    if None in key:
+        return None
     found = []
     for f in glob.glob(f"{W}/receipts/*.json"):
         c = json.load(open(f)).get("commit") or ""
-        if c and c != full and (rev(c + "^"), rev(c + "^{tree}")) == key:
+        if c and c != full and (rev(c + "^^{tree}"), rev(c + "^{tree}")) == key:
             found.append(c)
     return found[0] if len(found) == 1 else None
+
+# Finding 225: a commit with files whose specs cannot be found is a lookup
+# failure, not a pass. It prints this line instead of a count, and the run
+# exits 1, so "specs=[]" can never be read as 0 lost.
+UNMATCHED = "no receipt matched this commit: not audited"
+not_audited = 0
 
 for c in sys.argv[1:]:
     full = rev(c) or ""
     spec_ids = sorted(s for s, d in specs.items() if (d.get("commit_hash") or "") == full)
     if not spec_ids and (orig := amended_from(full)):
-        print(f"{c} is an amend of finish commit {orig[:12]} (same parent and tree)")
+        print(f"{c} is an amend of finish commit {orig[:12]} (same parent tree and tree)")
         spec_ids = sorted(s for s, d in specs.items() if (d.get("commit_hash") or "") == orig)
     committed = set(subprocess.run(["git", "-C", REPO, "show", "--name-only", "--format=", full], capture_output=True, text=True).stdout.split())
     by_file = collections.defaultdict(dict)  # file -> spec -> last seal change
@@ -73,6 +84,10 @@ for c in sys.argv[1:]:
                 by_file[ch["path"]][s["spec_id"]] = (s, ch)
     multi = sorted(f for f, d in by_file.items() if len(d) > 1)
     print(f"=== {c} specs={spec_ids}")
+    if not spec_ids and committed:
+        print(f"{UNMATCHED} ({len(committed)} file(s) in the commit)\n")
+        not_audited += 1
+        continue
     print(f"files sealed: {len(by_file)}; in commit: {len(committed)}; sealed by >1 spec: {len(multi)} {multi}")
     print(f"sealed but not in commit: {sorted(set(by_file) - committed)}")
     print(f"in commit but never sealed by these specs: {sorted(committed - set(by_file))}")
@@ -106,3 +121,4 @@ for c in sys.argv[1:]:
                     lost += 1
                     print(f"  LOST {f}:{j+1} spec={spec} seal={s['id'][:12]} line={line[:100]!r}")
     print(f"added lines checked: {checked}; superseded by a later seal: {superseded}; LOST: {lost}\n")
+sys.exit(1 if not_audited else 0)

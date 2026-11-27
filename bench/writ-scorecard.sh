@@ -35,14 +35,17 @@ BENCH_DIR="$ROOT/bench/context"
 #      for what the store cannot show. Deduplicated by (kind, seal).
 # Sprints are assigned by the seal's spec created_at against WRIT_SPRINTS.
 hurdles_section() {
-    local log_json
-    log_json="$(cd "$REPO" && "$WRIT" log --all --format json 2>/dev/null)" || { echo "scorecard: writ log failed" >&2; return 2; }
-    LOG_JSON="$log_json" REPO_DIR="$REPO" python3 - <<'PY'
+    # The log goes by file: on a store of a few hundred seals it is larger
+    # than the environment may hold ("Argument list too long", 0.4.6 at 573).
+    local log_file
+    log_file="$(mktemp "${TMPDIR:-/tmp}/scorecard-log.XXXXXX")"
+    (cd "$REPO" && "$WRIT" log --all --format json 2>/dev/null) >"$log_file" || { rm -f "$log_file"; echo "scorecard: writ log failed" >&2; return 2; }
+    LOG_JSON_FILE="$log_file" REPO_DIR="$REPO" python3 - <<'PY'
 import collections, glob, json, os, re
 from pathlib import Path
 
 repo = Path(os.environ["REPO_DIR"]); writ = repo / ".writ"
-seals = json.loads(os.environ["LOG_JSON"])
+seals = json.loads(Path(os.environ["LOG_JSON_FILE"]).read_text())
 sprints = sorted(
     (start, name) for name, start in (
         kv.split("=", 1) for kv in os.environ.get(
@@ -165,6 +168,9 @@ ratio = f"{bri3 / bri2:.2f}x; target <= 0.50x" if bri2 and n3 else "no sprint-3 
 print(f"- bri sprint-3 vs sprint-2: {bri3} vs {bri2} ({ratio})")
 print()
 PY
+    local rc=$?
+    rm -f "$log_file"
+    return $rc
 }
 
 # --- Records-only hurdle ratio (sprint 4, harness-0-4-1) ----------------------
@@ -175,9 +181,12 @@ PY
 #   "sprint-3=a,b,c;sprint-4=d,e" (default: sprint 3 and sprint 4's four specs).
 # An event naming no spec of any set is reported as unattributed.
 hurdles_records_section() {
-    local log_json
-    log_json="$(cd "$REPO" && "$WRIT" log --all --format json 2>/dev/null)" || { echo "scorecard: writ log failed" >&2; return 2; }
-    LOG_JSON="$log_json" REPO_DIR="$REPO" python3 - <<'PY'
+    # The log goes by file: on a store of a few hundred seals it is larger
+    # than the environment may hold ("Argument list too long", 0.4.6 at 573).
+    local log_file
+    log_file="$(mktemp "${TMPDIR:-/tmp}/scorecard-log.XXXXXX")"
+    (cd "$REPO" && "$WRIT" log --all --format json 2>/dev/null) >"$log_file" || { rm -f "$log_file"; echo "scorecard: writ log failed" >&2; return 2; }
+    LOG_JSON_FILE="$log_file" REPO_DIR="$REPO" python3 - <<'PY'
 import collections, json, os
 from pathlib import Path
 
@@ -191,7 +200,7 @@ for part in os.environ.get(
         name, specs = part.split("=", 1)
         sets[name.strip()] = [s.strip() for s in specs.split(",") if s.strip()]
 spec_set = {s: name for name, specs in sets.items() for s in specs}
-seals = json.loads(os.environ["LOG_JSON"])
+seals = json.loads(Path(os.environ["LOG_JSON_FILE"]).read_text())
 KINDS = ("seals", "forced", "allow_removals", "seal_refused", "finish_refused")
 by = collections.defaultdict(collections.Counter)
 unattributed = collections.Counter()
@@ -247,6 +256,9 @@ if len(names) >= 2:
         print(f"- {names[-1]} vs {names[-2]}: ratio undefined ({names[-2]} {h0}/{n0}, {names[-1]} {h1}/{n1})")
 print()
 PY
+    local rc=$?
+    rm -f "$log_file"
+    return $rc
 }
 
 if [[ $RECORDS_ONLY -eq 1 ]]; then

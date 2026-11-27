@@ -295,11 +295,12 @@ jobs:
   # 0.4.3 tag failed on std::os::unix (finding 185). A real MSVC check (C deps
   # included), not a test run, to keep CI time down. It is a job of this
   # workflow with no continue-on-error, so a failure here fails the CI status.
-  # Runner: windows-latest, the image release.yml builds the Windows CLI and
-  # wheel on, so CI checks the same toolchain and SDK the release uses.
+  # Runner: windows-2025, pinned (not windows-latest) and the same label
+  # release.yml builds the Windows CLI and wheel on, so CI checks the same
+  # toolchain and SDK the release uses. See the Windows pin note in release.yml.
   windows-check:
     name: Windows Check
-    runs-on: windows-latest
+    runs-on: windows-2025
     steps:
       - uses: actions/checkout@v5
 

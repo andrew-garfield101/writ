@@ -24,6 +24,16 @@ env:
 # the release build unreproducible. The image sets the SDK, not the floor: the
 # minimum macOS comes from rustc's default deployment target (minos 11.0 on the
 # 0.4.5 aarch64 binary, built with SDK 14.5 on macos-14).
+#
+# Windows pin (2026-11-27): windows-2025, not windows-latest, for the same
+# reason. The 0.4.5 release (run 40796003262) built on image
+# windows-2025-vs2026 (Windows Server 2025, Visual Studio 2026), and
+# windows-2025 still resolved to that image on 2026-11-27 (CI run
+# 46048696688). The pin fixes the OS, not Visual Studio: GitHub is moving
+# windows-2025 to its Visual Studio 2027 image and deprecates the
+# windows-2025-vs2026 label from 2026-12-01 (actions/runner-images#15373),
+# so that label is not used here. A Windows job log's "Runner Image" group
+# names the image a build actually got.
 
 jobs:
   # ── Build Python wheels for PyPI ──────────────────────────────────────
@@ -46,7 +56,7 @@ jobs:
             extra-args: "--features vendored-ssl"
           - os: macos-15
             target: aarch64-apple-darwin
-          - os: windows-latest
+          - os: windows-2025
             target: x86_64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v5
@@ -167,7 +177,7 @@ jobs:
           - os: macos-15
             target: aarch64-apple-darwin
             artifact: writ
-          - os: windows-latest
+          - os: windows-2025
             target: x86_64-pc-windows-msvc
             artifact: writ.exe
     steps:

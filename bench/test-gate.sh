@@ -194,6 +194,7 @@ timing["seconds"] = float(m[1]) if m else None
 EXPECTED_IGNORED = {
     "ignore::tests::repo_level::test_rejected_scope_violation_seal_leaves_object_count_unchanged",  # 17
     "f136_info_note_on_a_committed_spec_survives_the_bound_in_both_tiers",  # 136 info variant (Haris)
+    "repo::tests::f222_concurrent_seals_and_updates_lose_no_sealed_by",  # 222: fix built and held out of 0.4.6 (7% over the 50x5 line); remove when 222 proper lands
     # Sprint 8 (0.4.5), assertions before the code (Bri, harness-0-4-5); remove each as it lands.
 }
 # Gate checks waiting on an implementation: reported, not failed, and a

@@ -47,6 +47,23 @@ the CHANGELOG) and fails on it under `GATE_RELEASE=1`; `GATE_TAG=vX.Y.Z` adds th
 committed HEAD check. Controls: `v0.4.4` 7/7; `v0.4.4 1fd8c4f` (the wrong first tag) 3/7,
 failing exactly Cargo.toml, pyproject.toml, `__init__.py` and writ.rb.
 
+## After publish: smoke on the release binaries
+
+These run on the assets the Release workflow uploaded, not on a local build, at
+publish time (before the tap update is trusted):
+
+```bash
+d="$(mktemp -d)"
+gh release download vX.Y.Z -p 'writ-*-apple-darwin.tar.gz' -D "$d"
+for t in "$d"/*.tar.gz; do bench/release_checks/min_macos.sh "$t"; done
+```
+
+- `min_macos.sh`: the macOS binaries keep the minimum macOS of the last release
+  (finding 224: the builds moved from macos-14 to macos-15, which changes the
+  SDK, not the floor). arm64 `minos 11.0`, x86_64 `version 10.12`. Takes a
+  binary or a release tar.gz; needs `otool` (Xcode command line tools) and says
+  so when it is missing. v0.4.5 assets 2/2 each; a wrong expected floor fails.
+
 ## Index
 
 | Script | Claim | Checks |
@@ -83,6 +100,7 @@ failing exactly Cargo.toml, pyproject.toml, `__init__.py` and writ.rb.
 | `subagent_hand_command.sh` | 0.4.5, finding 202: `writ spec done -s` typed in a named subagent's shell with the parent's environment closes that subagent's spec with its words, says it ran as `reviewer`, leaves the parent's spec open, and the receipt carries the words on the subagent's spec line; with a live `reviewer` and no window running the command, or two windows with the same command, it runs as the parent and says so on stderr; with nobody else in the session it prints no identity line (6b). Brew 0.4.4: 3 of 9; tree with ee535f9e8824: 9 of 9 | 9 |
 | `own_writes.sh` | 0.4.5, finding 206: with two agents' commands open, the file `writ finish` writes, the file `writ restore` writes and the merge `writ converge --apply` writes are not asked about and leave no ambiguous record; an agent's own write afterwards is sealed under it. Brew 0.4.4: 4 of 7 (exactly 3, 5, 6 fail); tree with ee535f9e8824: 7 of 7 | 7 |
 | `titles.sh` | 0.4.5, findings 190 and 208: an auto spec is titled from the first sentence of the first prompt that is not an agent message, a cross session message, a `[SYSTEM NOTIFICATION` or a task notification, else `auto work by <id>`; an auto spec closed with `spec done -s` gives the finish subject the summary's first sentence. Brew 0.4.4: 1 of 6 (5, the task notification, is finding 133); its 6 reads `writ: <agent-message from=...>`, the 208 subject; tree with ee535f9e8824: 6 of 6 | 6 |
+| `min_macos.sh` | Finding 224: the macOS release binaries run on the same oldest macOS after the runner moved to macos-15 (arm64 minos 11.0 from LC_BUILD_VERSION, x86_64 10.12 from LC_VERSION_MIN_MACOSX; second argument overrides). Arguments `<binary or tar.gz> [<expected>]`, not `[WRIT_BIN]`. v0.4.5 assets: 2/2 each; brew 0.4.5: 2/2; expected 12.0 on arm64 or 11.0 on x86_64: 1/2, exit 1 | 2 |
 | `tag_version.sh` | Retro rule 1 (finding 208): every version site at the tagged commit equals the tag and the CHANGELOG's top heading is that version with a date. Arguments `<vX.Y.Z> [<rev>]` or `--tree`, not `[WRIT_BIN]`. v0.4.4 7/7; 1fd8c4f as v0.4.4 3/7 | 7 |
 
 `_hooks.py` holds the shared hook driver for these scripts; its `done(N)` prints passed/N and fails when fewer than N checks ran (hook_failure.sh had declared 12 for its 15) (settings commands run with `sh -c`, stdin JSON, identity from `CLAUDECODE`/`CLAUDE_CODE_SESSION_ID` or a writ agent id standing in for a second main agent).

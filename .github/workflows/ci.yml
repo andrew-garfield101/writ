@@ -17,8 +17,12 @@ env:
 # Pinned in all four workflows for consistency. Revisit once Ubuntu 26 has a
 # full setup-python matrix and we decide on the glibc floor deliberately.
 #
-# macOS pin (2026-10-04): CI uses macos-14 to match release.yml, so tests run
-# on the same image the release binaries and wheels are built on.
+# macOS pin (2026-11-27, finding 224): CI uses macos-15 to match release.yml,
+# so tests run on the same image the release binaries and wheels are built on.
+# Pinned, not macos-latest (macos-26 today), so CI and Release move together on
+# purpose. macos-14 was retired: run 46048696688 cancelled all three macOS jobs
+# with "The configuration 'macos-14-arm64-us-default' is not supported".
+# macos-15 is now the oldest arm64 GA image and is next in line to retire.
 #
 # Toolchain pin (2026-10-05): the Rust version comes from rust-toolchain.toml at
 # the repo root (1.99.0). Jobs install it with `rustup toolchain install`, which
@@ -32,7 +36,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
+        os: [ubuntu-24.04, macos-15]
     steps:
       - uses: actions/checkout@v5
 
@@ -242,7 +246,7 @@ jobs:
       # PREPARED, NOT ENABLED (sprint 3, doctor-ops). Target state once the
       # count above is zero: replace the step above with this one. --workspace
       # adds writ-py and writ-mcp; writ-py's pyo3 build script needs a python3
-      # on PATH, which ubuntu-24.04 and macos-14 both ship. Enable only after
+      # on PATH, which ubuntu-24.04 and macos-15 both ship. Enable only after
       # `cargo clippy --workspace --all-features -- -D warnings` exits 0 locally
       # on the pinned 1.99.0.
       # - name: Run clippy
@@ -321,7 +325,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, macos-14]
+        os: [ubuntu-24.04, macos-15]
         python-version: ["3.10", "3.12"]
     steps:
       - uses: actions/checkout@v5

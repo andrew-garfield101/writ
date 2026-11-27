@@ -17,6 +17,13 @@ env:
 # floor (GLIBC_2.39 today); a silent image bump would raise it for every user.
 # Pinned in all four workflows for consistency. Revisit once Ubuntu 26 has a
 # full setup-python matrix and we decide on the glibc floor deliberately.
+#
+# macOS pin (2026-11-27, finding 224): both macOS targets build on macos-15
+# (arm64); x86_64-apple-darwin is a cross target on the same arm64 runner, so
+# no Intel label is needed. Pinned, never macos-latest: a floating label makes
+# the release build unreproducible. The image sets the SDK, not the floor: the
+# minimum macOS comes from rustc's default deployment target (minos 11.0 on the
+# 0.4.5 aarch64 binary, built with SDK 14.5 on macos-14).
 
 jobs:
   # ── Build Python wheels for PyPI ──────────────────────────────────────
@@ -34,10 +41,10 @@ jobs:
           - os: ubuntu-24.04
             target: aarch64-unknown-linux-gnu
             extra-args: "--features vendored-ssl"
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             extra-args: "--features vendored-ssl"
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
@@ -153,11 +160,11 @@ jobs:
             target: aarch64-unknown-linux-gnu
             artifact: writ
             cross: true
-          - os: macos-14
+          - os: macos-15
             target: x86_64-apple-darwin
             artifact: writ
             vendored-ssl: true
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
             artifact: writ
           - os: windows-latest
